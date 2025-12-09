@@ -1,0 +1,21 @@
+{
+  "langrev": "1",
+  "warnings": [ "no-unused" ],
+  "dependency-search-paths": [ "lib" ],
+  "authors": [ "8lall0" ],
+  "version": "0.0.1",
+  "sources": [ "src/**" ],
+  "test-sources": [ "test/**" ],
+  "build-dir": "build",
+  "output": "build",
+  "targets": {
+    "racccoon": {
+      "target":  "elf-riscv32",
+      "type": "object-files"
+    }
+  },
+  "cpu": "generic",
+  "opt": "O0",
+  "link-libc": false,
+  "custom-libc": true
+}
