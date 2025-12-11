@@ -86,3 +86,28 @@ fn Process *create_process(uint pc) {
     proc.sp = (uint) sp;
     return proc;
 }
+
+Process *current_proc; // Currently running process
+Process *idle_proc;    // Idle process
+
+fn void yield() {
+    // Search for a runnable process
+    Process *next = idle_proc;
+    for (int i = 0; i < PROCS_MAX; i++) {
+        Process *proc = &procs[(current_proc.pid + i) % PROCS_MAX];
+        if (proc.state == PROC_RUNNABLE && proc.pid > 0) {
+            next = proc;
+            break;
+        }
+    }
+
+    // If there's no runnable process other than the current one, return and continue processing
+    if (next == current_proc) {
+        return;
+    }
+
+    // Context switch
+    Process *prev = current_proc;
+    current_proc = next;
+    switch_context(&prev.sp, &next.sp);
+}
