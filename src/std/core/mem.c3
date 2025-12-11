@@ -38,12 +38,6 @@ fn void* __memcpy(void* dst, void* src, usz n) @weak @export("memcpy")
 
 fn void* __memmove(void* dst, void* src, usz n) @weak @export("memmove")
 {
-	char* d = dst;
-	char* s = src;
-	for (usz i = 0; i < n; i++, d++, s++)
-	{
-		*d = *s;
-	}
-	return dst;
+    return __memcpy(dst, src, n);
 }
 

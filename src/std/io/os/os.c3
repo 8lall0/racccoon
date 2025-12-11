@@ -1,6 +1,6 @@
 module std::io::os @if(env::CUSTOM_LIBC);
 import libc;
-
+import io_native;
 
 alias FopenFn = fn void*?(String, String);
 alias FreopenFn = fn void*?(void*, String, String);
@@ -88,3 +88,15 @@ import std::io::path;
 macro Path? native_home_directory(Allocator allocator) => io::PATH_COULD_NOT_BE_FOUND?;
 macro Path? native_temp_directory(Allocator allocator) => io::PATH_COULD_NOT_BE_FOUND?;
 fn Path? native_user_directory(Allocator allocator, NativeSystemDir dir) => io::PATH_COULD_NOT_BE_FOUND?;
+
+
+io::os::FopenFn native_fopen_fn = &io_native::my_fopen;
+io::os::FcloseFn native_fclose_fn = &io_native::my_fclose;
+io::os::FreopenFn native_freopen_fn = &io_native::my_freopen;
+io::os::FseekFn native_fseek_fn = &io_native::my_fseek;
+io::os::FtellFn native_ftell_fn = &io_native::my_ftell;
+io::os::FwriteFn native_fwrite_fn = &io_native::my_fwrite;
+io::os::FreadFn native_fread_fn = &io_native::my_fread;
+io::os::FputcFn native_fputc_fn = &io_native::my_fputc;
+io::os::RemoveFn native_remove_fn = &io_native::my_remove;
+

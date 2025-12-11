@@ -15,7 +15,7 @@
     }
   },
   "cpu": "generic",
-  "opt": "O0",
+  "opt": "O2",
   "link-libc": false,
   "custom-libc": true
 }
