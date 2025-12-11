@@ -27,17 +27,19 @@ Process *proc_a;
 Process *proc_b;
 
 fn void proc_a_entry() {
-    io::printfn("starting process A");
+    io::print("starting process A\n");
     for (;;) {
         libc::putchar('A');
+        delay();
         yield();
     }
 }
 
 fn void proc_b_entry() {
-    io::printfn("starting process B");
+    io::print("starting process B\n");
     for (;;) {
         libc::putchar('B');
+        delay();
         yield();
     }
 }
@@ -52,13 +54,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip {
     current_proc = idle_proc;
     proc_a = create_process((uint) &proc_a_entry);
     proc_b = create_process((uint) &proc_b_entry);
-    proc_a_entry();
 
     yield();
     panic::panic("BOOTED");
-    /*for (;;) {
-        asm {
-            wfi;
-        }
-    }*/
 }

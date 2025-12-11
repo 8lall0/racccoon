@@ -108,13 +108,12 @@ fn void yield() {
     }
 
     // SHOULD FIX
-    uint ns = (uint) &next.stack + STACK_SIZE;
+    uint ns = (uint) (&next.stack + STACK_SIZE);
     asm {
         sw $t0, [ns];
     }
     asm("csrw sscratch, t0");
 
-    // Context switch
     Process *prev = current_proc;
     current_proc = next;
     switch_context(&prev.sp, &next.sp);

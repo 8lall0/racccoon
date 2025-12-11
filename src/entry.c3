@@ -19,7 +19,7 @@ macro write_reg(String $reg, String $value)
 
 fn void kernel_entry() @align(4) @export("kernel_entry") @noinline @nostrip {
     asm(`
-        csrw sscratch, sp
+        csrrw sp, sscratch, sp
         addi sp, sp, -4 * 31
         sw ra,  4 * 0(sp)
         sw gp,  4 * 1(sp)
@@ -51,12 +51,16 @@ fn void kernel_entry() @align(4) @export("kernel_entry") @noinline @nostrip {
         sw s9,  4 * 27(sp)
         sw s10, 4 * 28(sp)
         sw s11, 4 * 29(sp)
+
         csrr a0, sscratch
         sw a0, 4 * 30(sp)
+
         addi a0, sp, 4 * 31
+
         csrw sscratch, a0
         mv a0, sp
         call handle_trap
+
         lw ra,  4 * 0(sp)
         lw gp,  4 * 1(sp)
         lw tp,  4 * 2(sp)
