@@ -30,7 +30,6 @@ fn void proc_a_entry() {
     io::printfn("starting process A");
     for (;;) {
         libc::putchar('A');
-        delay();
         yield();
     }
 }
@@ -39,7 +38,6 @@ fn void proc_b_entry() {
     io::printfn("starting process B");
     for (;;) {
         libc::putchar('B');
-        delay();
         yield();
     }
 }

@@ -5,12 +5,13 @@ import panic;
 const PROCS_MAX = 8;        // Maximum number of processes
 const PROC_UNUSED = 0;      // Unused process control structure
 const PROC_RUNNABLE = 1;    // Runnable process
+const STACK_SIZE = 8192;    // Stack size
 
 struct Process {
     int pid;                // Process ID
     int state;              // Process state: PROC_UNUSED or PROC_RUNNABLE
     uint sp;                // Stack pointer
-    char [8192]stack;       // Kernel stack
+    char [STACK_SIZE]stack;       // Kernel stack
 }
 
 fn void switch_context(uint *prev_sp, uint *next_sp) @naked @noinline {
@@ -105,6 +106,13 @@ fn void yield() {
     if (next == current_proc) {
         return;
     }
+
+    // SHOULD FIX
+    uint ns = (uint) &next.stack + STACK_SIZE;
+    asm {
+        sw $t0, [ns];
+    }
+    asm("csrw sscratch, t0");
 
     // Context switch
     Process *prev = current_proc;
