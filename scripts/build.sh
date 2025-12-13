@@ -1,13 +1,14 @@
 #!/bin/bash
 
-rm -rf ../build/obj
-rm -rf ../build/kernel.*
-
 set -e
 
 (
   cd ..
-  c3c build --no-entry --safe=no --riscv-cpu=rvimac
+  rm -rf build/obj
+  rm -rf build/llvm
+  rm -rf build/kernel.*
+
+  c3c build --no-entry --safe=no --riscv-cpu=rvimac --emit-llvm
 
   /opt/riscv/bin/ld.lld \
     build/obj/elf-riscv32/*.o \

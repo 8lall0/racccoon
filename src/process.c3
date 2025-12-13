@@ -1,6 +1,8 @@
 module kernel;
 
 import panic;
+import libc;
+import std::io;
 
 const PROCS_MAX = 8;        // Maximum number of processes
 const PROC_UNUSED = 0;      // Unused process control structure
@@ -11,6 +13,7 @@ struct Process {
     int pid;                // Process ID
     int state;              // Process state: PROC_UNUSED or PROC_RUNNABLE
     uint sp;                // Stack pointer
+    uint *page_table;
     char [STACK_SIZE]stack;       // Kernel stack
 }
 
@@ -70,29 +73,48 @@ fn Process *create_process(uint pc) {
     uint * sp = (uint *) &proc.stack;
     sp += 2048;
     for (int j = 0; j < 12; j++) {
-        sp--;
-        asm {
-         sw $zero, [sp];
-        }
+        *(--sp) = 0;
     }
     // Setting RA
-    sp--;
-    asm {
-        sw pc, [sp];
+    *(--sp) = pc;
+
+    uint *page_table = (uint *) alloc_pages(1);
+    io::printfn("Creating page table at: %x", (uint)page_table);
+    for (
+        uint paddr = (uint) &__kernel_base;
+        paddr < (uint) &__free_ram_end;
+        paddr += PAGE_SIZE
+    ) {
+        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+    }
+
+    io::printfn("Mapped %x to %x", (uint)&__kernel_base, (uint)&__free_ram);
+
+    // Verify the mapping worked - try to look up a test address
+    uint test_addr = 0x80200000;
+    uint vpn1 = (test_addr >> 22) & 0x3ff;
+    uint vpn0 = (test_addr >> 12) & 0x3ff;
+    io::printfn("Page table[%d] = %x", vpn1, page_table[vpn1]);
+
+    // NEW: Check the second-level table
+    if (page_table[vpn1] & PAGE_V) {
+        uint *table0 = (uint *) (((page_table[vpn1] >> 10)) << 12);
+        io::printfn("L2 table at: %x", (uint)table0);
+        io::printfn("Page table L2[%d] = %x", vpn0, table0[vpn0]);
     }
 
     // Initialize fields.
     proc.pid = i + 1;
     proc.state = PROC_RUNNABLE;
     proc.sp = (uint) sp;
+    proc.page_table = page_table;
     return proc;
 }
 
 Process *current_proc; // Currently running process
 Process *idle_proc;    // Idle process
 
-fn void yield() {
-    // Search for a runnable process
+fn void yield() @noinline {
     Process *next = idle_proc;
     for (int i = 0; i < PROCS_MAX; i++) {
         Process *proc = &procs[(current_proc.pid + i) % PROCS_MAX];
@@ -102,19 +124,31 @@ fn void yield() {
         }
     }
 
-    // If there's no runnable process other than the current one, return and continue processing
     if (next == current_proc) {
         return;
     }
 
-    // SHOULD FIX
-    uint ns = (uint) (&next.stack + STACK_SIZE);
-    asm {
-        sw $t0, [ns];
-    }
-    asm("csrw sscratch, t0");
-
     Process *prev = current_proc;
     current_proc = next;
+
+    uint satp = SATP_SV32 | (uint) ((uint) next.page_table / PAGE_SIZE);
+    uint sscratch = (uint) &next.stack[^1] + 1;
+
+    asm {
+        lw $t0, [&satp];
+        lw $t1, [&sscratch];
+    }
+
+    // UPER DUPER WORKAROUND
+    libc::putchar('\0');
+
+    asm(`
+        sfence.vma
+        csrw satp, t0
+        sfence.vma
+        csrw sscratch, t1
+    `);
+
     switch_context(&prev.sp, &next.sp);
 }
+
