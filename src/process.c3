@@ -17,7 +17,7 @@ struct Process {
     char [STACK_SIZE]stack;       // Kernel stack
 }
 
-fn void switch_context(uint *prev_sp, uint *next_sp) @naked @noinline {
+fn void switch_context(uint *prev_sp, uint *next_sp, uint satp, uint sscratch) @naked @noinline {
     asm(`
         addi sp, sp, -13 * 4
         sw ra,  0  * 4(sp)
@@ -34,6 +34,12 @@ fn void switch_context(uint *prev_sp, uint *next_sp) @naked @noinline {
         sw s10, 11 * 4(sp)
         sw s11, 12 * 4(sp)
         sw sp, (a0)
+
+        sfence.vma
+        csrw satp, a2
+        sfence.vma
+        csrw sscratch, a3
+
         lw sp, (a1)
         lw ra,  0  * 4(sp)
         lw s0,  1  * 4(sp)
@@ -131,24 +137,10 @@ fn void yield() @noinline {
     Process *prev = current_proc;
     current_proc = next;
 
-    uint satp = SATP_SV32 | (uint) ((uint) next.page_table / PAGE_SIZE);
-    uint sscratch = (uint) &next.stack[^1] + 1;
-
-    asm {
-        lw $t0, [&satp];
-        lw $t1, [&sscratch];
-    }
-
-    // UPER DUPER WORKAROUND
-    libc::putchar('\0');
-
-    asm(`
-        sfence.vma
-        csrw satp, t0
-        sfence.vma
-        csrw sscratch, t1
-    `);
-
-    switch_context(&prev.sp, &next.sp);
+    switch_context(
+        &prev.sp,
+        &next.sp,
+        ((uint)next.page_table >> 12) | 0x80000000,
+        (uint)&next.stack[8191] + 1);
 }
 
