@@ -9,12 +9,12 @@ import libc;
 typedef LibcAllocator (Allocator) = uptr;
 const LibcAllocator LIBC_ALLOCATOR = {};
 
-fn void*? LibcAllocator.acquire(&self, usz bytes, AllocInitType init_type, usz alignment) @dynamic
+fn void*? LibcAllocator.acquire(&self, sz bytes, AllocInitType init_type, sz alignment) @dynamic
 {
 	return null;
 }
 
-fn void*? LibcAllocator.resize(&self, void* old_ptr, usz new_bytes, usz alignment) @dynamic
+fn void*? LibcAllocator.resize(&self, void* old_ptr, sz new_bytes, sz alignment) @dynamic
 {
 	return null;
 }

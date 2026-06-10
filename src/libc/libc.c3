@@ -139,3 +139,11 @@ fn int fputs(ZString str, CFile* stream) @cname("fputs") @nostrip
 }
 
 extern fn CFile tmpfile();
+extern fn void exit(CInt status);
+
+fn usz strlen(char* s) @cname("strlen") @nostrip @weak
+{
+	char* p = s;
+	while (*p) p++;
+	return (usz)(p - s);
+}

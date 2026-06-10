@@ -49,7 +49,7 @@ fn void? Vmem.init(&self, usz preferred_size, usz reserve_page_size = 0, VmemOpt
  @require size > 0
  @return? mem::INVALID_ALLOC_SIZE, mem::OUT_OF_MEMORY
 *>
-fn void*? Vmem.acquire(&self, usz size, AllocInitType init_type, usz alignment) @dynamic
+fn void*? Vmem.acquire(&self, sz size, AllocInitType init_type, sz alignment) @dynamic
 {
 	return null;
 }
@@ -67,7 +67,7 @@ fn bool Vmem.owns_pointer(&self, void* ptr) @inline
  @require size > 0
  @return? mem::INVALID_ALLOC_SIZE, mem::OUT_OF_MEMORY
 *>
-fn void*? Vmem.resize(&self, void *old_pointer, usz size, usz alignment) @dynamic
+fn void*? Vmem.resize(&self, void *old_pointer, sz size, sz alignment) @dynamic
 {
 	return null;
 }

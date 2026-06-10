@@ -13,6 +13,6 @@ fn uint alloc_pages(uint n) {
         panic::panic("Out of memory");
     }
 
-    mem::set((void *) paddr, 0, n * PAGE_SIZE);
+    mem::set((void *) paddr, 0, (sz)(n * PAGE_SIZE));
     return paddr;
 }

@@ -11,7 +11,7 @@ char[] __stack_top @export("__stack_top");
 char[] __free_ram @export("__free_ram");
 char[] __free_ram_end @export("__free_ram_end");
 
-fn void boot() @naked @extern("boot") @section(".text.boot") @noinline @nostrip @used {
+fn void boot() @naked @export("boot") @section(".text.boot") @noinline @nostrip @used {
     asm(`
         la sp, __stack_top
         j kernel_main
@@ -46,7 +46,7 @@ fn void proc_b_entry() {
 }
 
 fn void kernel_main() @export("kernel_main") @noinline @nostrip {
-    mem::set(&__bss, 0, (uint) &__bss_end - (uint) &__bss);
+    mem::set(&__bss, 0, (sz)((uint) &__bss_end - (uint) &__bss));
 
     io::print("1: BSS cleared\n");
 
