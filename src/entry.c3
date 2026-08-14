@@ -4,7 +4,23 @@ import std::io;
 import panic;
 import sbi;
 
-const SCAUSE_ECALL = 8;
+const SCAUSE_ECALL             = 8;
+const SCAUSE_INTERRUPT_BIT     = 0x80000000; // MSB of scause: set for interrupts, clear for exceptions
+const SCAUSE_SUPERVISOR_EXTERNAL = 9;        // interrupt cause code for a PLIC-routed external interrupt
+
+// Dedicated trap-frame anchor for traps taken during kernel_main's
+// bare-mode phase (before any process exists — this is when fs_init()'s
+// disk reads happen, now interrupt-driven). Deliberately NOT __stack_top:
+// __stack_top is the *top* of the live boot stack kernel_main is actively
+// executing on, not a spare/unused region — anchoring sscratch there
+// means the trap frame plus handle_trap's own call depth (io::printfn,
+// plic_claim, ...) grows down from the top of a stack kernel_main is
+// simultaneously using several frames deep into, and collides with it.
+// A real process doesn't have this problem: its sscratch points at its
+// own dedicated 64KB stack, which nothing else is using concurrently.
+// This buffer plays that same "dedicated, nothing else touches it" role
+// for the brief pre-process window.
+char[4096] boot_trap_stack;
 
 // Syscall numbers. Kernel and user are separate c3c compilations with no
 // shared header, so these must be kept in sync by hand with the SYS_*
@@ -62,7 +78,41 @@ fn void write_sepc(uint value) @noinline
     `);
 }
 
-fn void kernel_entry() @align(4) @export("kernel_entry") @noinline @nostrip
+uint write_csr_tmp @export("write_csr_tmp");
+
+macro write_csr(String $reg, value)
+{
+	// Same memory-bridged, single-atomic-asm() pattern as write_sepc,
+	// generalized to any CSR name (known at compile time, so @sprintf's
+	// %s-only limitation is fine here).
+	write_csr_tmp = value;
+	asm(@sprintf(`
+        la t0, write_csr_tmp
+        lw t0, 0(t0)
+        csrw %s, t0
+    `, $reg));
+}
+
+const SIE_SEIE     = (1 << 9);  // sie: supervisor external interrupt enable
+const SSTATUS_SIE  = (1 << 1);  // sstatus: global supervisor interrupt enable
+
+fn void enable_external_interrupts()
+{
+	write_csr("sie", read_reg("sie") | SIE_SEIE);
+	write_csr("sstatus", read_reg("sstatus") | SSTATUS_SIE);
+}
+
+// @align(4) alone is not reliably honored (found via disassembly diffing:
+// unrelated code-size changes elsewhere shifted this function to a
+// 2-byte-but-not-4-byte-aligned address in a real build). stvec's low 2
+// bits ARE the trap mode field per the RISC-V spec (0=Direct, 1=Vectored,
+// 2/3=Reserved) — writing a misaligned address here puts the CPU into
+// Reserved trap mode, undefined behavior, which is almost certainly the
+// real mechanism behind this project's whole string of "silent reboot,
+// no trap ever printed" bugs blamed on the compiler. Pinned into its own
+// section with linker-enforced alignment in kernel.ld instead, since the
+// linker script's ALIGN() is what's actually trustworthy here.
+fn void kernel_entry() @align(4) @section(".text.trap") @export("kernel_entry") @noinline @nostrip
 {
 	asm(`
         csrrw sp, sscratch, sp
@@ -299,7 +349,29 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 	uint stval   = read_reg("stval");
 	uint user_pc = read_reg("sepc");
 
-	if (scause == SCAUSE_ECALL)
+	if (scause & SCAUSE_INTERRUPT_BIT)
+	{
+		uint code = scause & ~SCAUSE_INTERRUPT_BIT;
+		if (code == SCAUSE_SUPERVISOR_EXTERNAL)
+		{
+			// Claiming acknowledges the IRQ to the PLIC; we don't need to
+			// do anything else with it here — whatever was wfi-waiting on
+			// this (read_write_disk) just needed the CPU to wake up, and
+			// re-checks the real completion state (the used ring index)
+			// itself. 0 means a spurious claim (nothing pending) — don't
+			// complete an IRQ that wasn't actually claimed.
+			uint irq = plic_claim();
+			if (irq != 0)
+			{
+				plic_complete(irq);
+			}
+		}
+		// No sepc adjustment for interrupts: unlike ecall (which must skip
+		// past the trapping instruction), the hardware already points sepc
+		// at the correct resume address — for wfi specifically, the
+		// instruction right after it.
+	}
+	else if (scause == SCAUSE_ECALL)
 	{
 		handle_syscall(f);
 		write_sepc(user_pc + 4);

@@ -200,7 +200,17 @@ fn void read_write_disk(void* buf, uint sector, bool is_write)
 
 	virtq_kick(vq, 0);
 
-	while (virtq_is_busy(vq)) {}
+	// wfi halts the CPU until *any* interrupt arrives, so this still has
+	// to re-check the real completion state (the used ring index) after
+	// waking — the interrupt handler's only job is to wake us up, not to
+	// signal specifically "this request is the one that finished".
+	while (virtq_is_busy(vq))
+	{
+		asm
+		{
+			wfi;
+		}
+	}
 
 	if (blk_req.status != 0)
 	{

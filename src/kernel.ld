@@ -8,6 +8,17 @@ SECTIONS {
         KEEP(*(.text.boot));
     } :text
 
+    /* kernel_entry (the trap handler) must land on a real 4-byte boundary:
+       stvec's low 2 bits are the trap mode field per the RISC-V spec, and
+       a misaligned value there puts the CPU in Reserved trap mode
+       (undefined behavior). @align(4) on the function alone was not
+       reliably honored once other code size changed enough to shift it
+       off a 4-byte boundary — this explicit, linker-enforced ALIGN() is
+       the trustworthy version. See entry.c3's comment on kernel_entry. */
+    .text.trap : ALIGN(4) {
+        KEEP(*(.text.trap));
+    } :text
+
     .text : {
         *(.text .text.*);
     } :text

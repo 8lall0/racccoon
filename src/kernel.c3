@@ -1,7 +1,6 @@
 module kernel;
 
 import std::io;
-import panic;
 
 // Also hardcoded (can't be interpolated into compile-time asm() strings,
 // see write_reg's comment in entry.c3) as the literal 0x1000000 in
@@ -34,6 +33,19 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 
 	write_reg("stvec", "kernel_entry");
 
+	// Trap-frame anchor for traps taken *before* the first switch_context
+	// call (i.e. while running kernel_main itself, bare-mode, no process
+	// yet — this is exactly when fs_init()'s disk reads happen, now
+	// interrupt-driven). See boot_trap_stack's comment in entry.c3 for why
+	// this is a dedicated buffer and not __stack_top itself. Must be set
+	// before any interrupt can actually fire — kernel_entry's very first
+	// instruction (csrrw sp, sscratch, sp) would otherwise swap in garbage
+	// and build the trap frame at a bogus address.
+	write_csr("sscratch", (uint)&boot_trap_stack + boot_trap_stack.len);
+
+	plic_init();
+	enable_external_interrupts();
+
 	io::print("2: Trap handler set\n");
 
 	virtio_blk_init();
@@ -46,22 +58,27 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	current_proc = idle_proc;
 
 	io::print("4: Idle configured\n");
-
-	create_process((void*)&_binary_shell_bin_start, (uint)&_binary_shell_bin_size);
-	io::print("5: Shell process created\n");
-
-	idle_entry();
-
-	io::print("6: Should never reach here\n");
-
-	panic::panic("BOOTED");
-}
-
-fn void idle_entry()
-{
 	io::print("Idle process started\n");
+
+	// Single call site for create_process(shell), used for both the
+	// initial spawn and every respawn once idle notices nothing else is
+	// runnable.
 	for (;;)
 	{
+		bool shell_running = false;
+		for (int i = 0; i < PROCS_MAX; i++)
+		{
+			if (procs[i].state == PROC_RUNNABLE && procs[i].pid > 0)
+			{
+				shell_running = true;
+				break;
+			}
+		}
+		if (!shell_running)
+		{
+			create_process((void*)&_binary_shell_bin_start, (uint)&_binary_shell_bin_size);
+		}
+
 		yield();
 	}
 }

@@ -126,6 +126,15 @@ fn Process* create_process(void* image, uint image_size)
 	// from kernel_main's bare-addressing bring-up.
 	map_page(page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, PAGE_R | PAGE_W);
 
+	// PLIC registers: same reasoning as virtio-blk above — handle_trap's
+	// plic_claim()/plic_complete() run under whichever process's page
+	// table happens to be active when the interrupt arrives, since
+	// read_write_disk's wfi wait can be reached from inside a syscall.
+	// Three separate pages, not a range — see plic.c3.
+	map_page(page_table, PLIC_PRIORITY_PAGE, PLIC_PRIORITY_PAGE, PAGE_R | PAGE_W);
+	map_page(page_table, PLIC_ENABLE_PAGE, PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
+	map_page(page_table, PLIC_CLAIM_PAGE, PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
+
 	// Copy the process image into freshly allocated user pages, page by page.
 	char* img = image;
 	for (uint off = 0; off < image_size; off += PAGE_SIZE)
