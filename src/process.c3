@@ -71,9 +71,11 @@ const SSTATUS_SUM   = (1 << 18); // let S-mode access U-mode pages (needed for s
 
 fn void user_entry() @naked @noinline @noreturn
 {
-	// USER_BASE and SSTATUS_SPIE|SSTATUS_SUM (0x40020) hardcoded:
-	// compile-time asm() only supports %s substitution, so the constants
-	// can't be interpolated here.
+	// USER_BASE (kernel.c3's const of the same name) and
+	// SSTATUS_SPIE|SSTATUS_SUM (0x40020, this file's consts above)
+	// hardcoded: compile-time asm() only supports %s substitution, so the
+	// constants can't be interpolated here. USER_BASE must also match
+	// user/user.ld's base address.
 	asm(`
         li t0, 0x1000000
         csrw sepc, t0

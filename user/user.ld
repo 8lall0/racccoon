@@ -1,6 +1,8 @@
 ENTRY(start)
 
 SECTIONS {
+    /* Must match kernel.c3's USER_BASE and process.c3 user_entry()'s
+       hardcoded sepc value. */
     . = 0x1000000;
 
     /DISCARD/ : {

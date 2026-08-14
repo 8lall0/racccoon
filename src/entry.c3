@@ -4,7 +4,11 @@ import std::io;
 import panic;
 import sbi;
 
-const SCAUSE_ECALL  = 8;
+const SCAUSE_ECALL = 8;
+
+// Syscall numbers. Kernel and user are separate c3c compilations with no
+// shared header, so these must be kept in sync by hand with the SYS_*
+// consts in user/user.c3.
 const SYS_PUTCHAR   = 1;
 const SYS_GETCHAR   = 2;
 const SYS_READFILE  = 4;
@@ -192,6 +196,16 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 		case SYS_READFILE:
 		case SYS_WRITEFILE:
+			// NOTE: this logic looks like it belongs next to fs_lookup/
+			// fs_flush in fs.c3, and it did live there as fs_handle_syscall(f)
+			// at one point — but that alone (nothing else changed) made the
+			// kernel fail on the very first syscall (SYS_PUTCHAR, unrelated
+			// to this code path) with a reboot loop, reproducible even with
+			// @noinline on the extracted function. Root cause not
+			// identified — smells like a c3c 0.8.2 codegen bug tied to
+			// calling a function taking Trap_frame* across the file
+			// boundary. Left inline here since this version is proven
+			// correct; revisit if this ever needs touching again.
 			char* filename = (char*)f.a0;
 			char* buf      = (char*)f.a1;
 			int len        = (int)f.a2;

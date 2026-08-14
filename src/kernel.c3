@@ -1,9 +1,12 @@
 module kernel;
 
-import libc;
 import std::io;
 import panic;
 
+// Also hardcoded (can't be interpolated into compile-time asm() strings,
+// see write_reg's comment in entry.c3) as the literal 0x1000000 in
+// process.c3's user_entry() and in user/user.ld's base address. Keep all
+// three in sync if this ever changes.
 const USER_BASE = 0x1000000;
 
 char[] __kernel_base @export("__kernel_base");
@@ -63,17 +66,3 @@ fn void idle_entry()
 	}
 }
 
-fn void print_hex(uint val)
-{
-	char[9] hex = "00000000";
-	for (int i = 7; i >= 0; i--)
-	{
-		uint digit = val & 0xF;
-		hex[i] = (char)(digit < 10 ? '0' + digit : 'a' + digit - 10);
-		val >>= 4;
-	}
-	for (int i = 0; i < 8; i++)
-	{
-		libc::putchar(hex[i]);
-	}
-}

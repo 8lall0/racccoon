@@ -4,6 +4,9 @@ module user;
 // @cname ensures no mangling
 extern char[] __stack_top @cname("__stack_top");
 
+// Syscall numbers. Must be kept in sync by hand with the SYS_* consts in
+// src/entry.c3 — kernel and user are separate c3c compilations with no
+// shared header.
 const int SYS_PUTCHAR   = 1;
 const int SYS_GETCHAR   = 2;
 const int SYS_READFILE  = 4;
