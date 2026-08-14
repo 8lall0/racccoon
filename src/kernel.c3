@@ -33,6 +33,16 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 
 	io::print("2: Trap handler set\n");
 
+	virtio_blk_init();
+
+	char[SECTOR_SIZE] disk_buf @noinit;
+	read_write_disk(&disk_buf, 0, false);
+	io::printfn("first sector: %s", (ZString)&disk_buf);
+
+	char[32] disk_msg = "hello from kernel!!!\n";
+	mem::copy(&disk_buf, &disk_msg, disk_msg.len);
+	read_write_disk(&disk_buf, 0, true);
+
 	idle_proc = create_process(null, 0);
 	io::print("3: Idle created\n");
 
