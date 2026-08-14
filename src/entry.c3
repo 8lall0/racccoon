@@ -11,6 +11,7 @@ const SCAUSE_ECALL = 8;
 // consts in user/user.c3.
 const SYS_PUTCHAR   = 1;
 const SYS_GETCHAR   = 2;
+const SYS_EXIT      = 3;
 const SYS_READFILE  = 4;
 const SYS_WRITEFILE = 5;
 
@@ -194,6 +195,50 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				}
 				yield();
 			}
+		case SYS_EXIT:
+			// Inlined rather than factored into a process.c3 function on
+			// purpose: a call to a moderately complex freshly-defined
+			// function from inside this switch (proc.c3's free_process_pages,
+			// taking Process*) reproducibly broke boot before even reaching
+			// SYS_EXIT at runtime — same unexplained-c3c-bug shape as the
+			// SYS_READFILE/WRITEFILE extraction below, just with a different
+			// parameter type this time, so it's not specifically about
+			// Trap_frame*. Not going to keep chasing it; inline is proven
+			// safe both times.
+			//
+			// Frees everything this process's page table owns: every leaf
+			// page mapped PAGE_U (its private image pages — never the
+			// shared kernel-identity or virtio-MMIO mappings, which lack
+			// PAGE_U precisely because they're not this process's own
+			// memory), every on-demand 2nd-level table map_page allocated
+			// for it, and the top-level table itself.
+			uint* exiting_table1 = current_proc.page_table;
+			for (uint vpn1 = 0; vpn1 < 1024; vpn1++)
+			{
+				if ((exiting_table1[vpn1] & PAGE_V) == 0) continue;
+
+				uint* table0 = (uint*)((exiting_table1[vpn1] >> 10) * PAGE_SIZE);
+				for (uint vpn0 = 0; vpn0 < 1024; vpn0++)
+				{
+					if ((table0[vpn0] & PAGE_V) == 0) continue;
+					if (table0[vpn0] & PAGE_U)
+					{
+						uint leaf_paddr = (table0[vpn0] >> 10) * PAGE_SIZE;
+						free_pages(leaf_paddr, 1);
+					}
+				}
+
+				free_pages((uint)table0, 1);
+			}
+			free_pages((uint)exiting_table1, 1);
+
+			current_proc.state = PROC_UNUSED;
+			current_proc.pid = 0;
+
+			// yield() never returns here: current_proc is now PROC_UNUSED,
+			// so its scan can't match itself, and switch_context's `ret`
+			// jumps permanently into whatever process it picks instead.
+			yield();
 		case SYS_READFILE:
 		case SYS_WRITEFILE:
 			// NOTE: this logic looks like it belongs next to fs_lookup/

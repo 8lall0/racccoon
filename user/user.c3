@@ -9,11 +9,16 @@ extern char[] __stack_top @cname("__stack_top");
 // shared header.
 const int SYS_PUTCHAR   = 1;
 const int SYS_GETCHAR   = 2;
+const int SYS_EXIT      = 3;
 const int SYS_READFILE  = 4;
 const int SYS_WRITEFILE = 5;
 
 // @export gives these functions C-compatible names so asm can call them
 fn void exit() @noreturn @export("exit") {
+    syscall(SYS_EXIT, 0, 0, 0);
+    // Unreachable in practice — the kernel frees this process and switches
+    // away permanently on SYS_EXIT, it never returns here. Kept as a
+    // fallback so this still satisfies @noreturn if that ever changes.
     for (;;);
 }
 
