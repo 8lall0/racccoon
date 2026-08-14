@@ -10,6 +10,9 @@ LLVM_LLD=${LLVM_LLD:-/opt/riscv/bin/ld.lld}
   # Build user app first (produces build/user/shell.bin.o)
   bash scripts/build_user.sh
 
+  echo "==> Building disk image..."
+  (cd disk && tar cf ../build/disk.tar --format=ustar *.txt)
+
   echo "==> Compiling kernel..."
   rm -rf build/obj build/llvm build/kernel.*
   c3c build --no-entry --safe=no --riscv-cpu=rvimac --emit-llvm

@@ -4,8 +4,10 @@ module user;
 // @cname ensures no mangling
 extern char[] __stack_top @cname("__stack_top");
 
-const int SYS_PUTCHAR = 1;
-const int SYS_GETCHAR = 2;
+const int SYS_PUTCHAR   = 1;
+const int SYS_GETCHAR   = 2;
+const int SYS_READFILE  = 4;
+const int SYS_WRITEFILE = 5;
 
 // @export gives these functions C-compatible names so asm can call them
 fn void exit() @noreturn @export("exit") {
@@ -38,6 +40,14 @@ fn void print(char* s) {
         putchar(*s);
         s++;
     }
+}
+
+fn int readfile(char* filename, char* buf, int len) @export("readfile") {
+    return syscall(SYS_READFILE, (int)filename, (int)buf, len);
+}
+
+fn int writefile(char* filename, char* buf, int len) @export("writefile") {
+    return syscall(SYS_WRITEFILE, (int)filename, (int)buf, len);
 }
 
 fn int strcmp(char* a, char* b) {

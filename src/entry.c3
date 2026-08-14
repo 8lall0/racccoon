@@ -4,9 +4,11 @@ import std::io;
 import panic;
 import sbi;
 
-const SCAUSE_ECALL = 8;
+const SCAUSE_ECALL  = 8;
 const SYS_PUTCHAR   = 1;
 const SYS_GETCHAR   = 2;
+const SYS_READFILE  = 4;
+const SYS_WRITEFILE = 5;
 
 uint read_reg_tmp @export("read_reg_tmp");
 
@@ -188,6 +190,45 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				}
 				yield();
 			}
+		case SYS_READFILE:
+		case SYS_WRITEFILE:
+			char* filename = (char*)f.a0;
+			char* buf      = (char*)f.a1;
+			int len        = (int)f.a2;
+			File* file     = fs_lookup(filename);
+			if (!file)
+			{
+				io::printfn("file not found: %s", (ZString)filename);
+				f.a0 = (uint)(-1);
+				break;
+			}
+
+			if (f.a3 == SYS_WRITEFILE)
+			{
+				// Never write more than the file's own storage can hold.
+				if (len > (int)file.data.len)
+				{
+					len = (int)file.data.len;
+				}
+				mem::copy(&file.data, buf, (sz)len);
+				file.size = (uint)len;
+				fs_flush();
+			}
+			else
+			{
+				// Never hand back more than the file actually contains —
+				// the caller's buffer is only guaranteed to hold `len`
+				// bytes, so returning more than that (even if it fits in
+				// the file's own 1024-byte storage) would have the caller
+				// read/index past its own buffer.
+				if (len > (int)file.size)
+				{
+					len = (int)file.size;
+				}
+				mem::copy(buf, &file.data, (sz)len);
+			}
+
+			f.a0 = (uint)len;
 		default:
 			panic::panic("unexpected syscall");
 	}

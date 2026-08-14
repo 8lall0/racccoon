@@ -7,7 +7,12 @@ import std::io;
 const PROCS_MAX     = 8; // Maximum number of processes
 const PROC_UNUSED   = 0; // Unused process control structure
 const PROC_RUNNABLE = 1; // Runnable process
-const STACK_SIZE    = 8192; // Stack size
+// 8192 was enough for the syscall-only trap path (getchar/putchar), but the
+// file-system call chain (handle_syscall -> fs_lookup/fs_flush ->
+// read_write_disk -> virtq_kick/virtq_is_busy) overflowed it, corrupting
+// adjacent Process structs in the procs[] array. Confirmed by reproducing
+// with this bumped up and the corruption disappearing.
+const STACK_SIZE    = 65536; // Stack size
 
 struct Process
 {
@@ -62,15 +67,17 @@ fn void switch_context(uint* prev_sp, uint* next_sp, uint satp, uint sscratch) @
 }
 
 const SSTATUS_SPIE = (1 << 5);
+const SSTATUS_SUM   = (1 << 18); // let S-mode access U-mode pages (needed for syscalls like readfile/writefile that dereference user pointers directly)
 
 fn void user_entry() @naked @noinline @noreturn
 {
-	// USER_BASE and SSTATUS_SPIE hardcoded: compile-time asm() only supports
-	// %s substitution, so the constants can't be interpolated here.
+	// USER_BASE and SSTATUS_SPIE|SSTATUS_SUM (0x40020) hardcoded:
+	// compile-time asm() only supports %s substitution, so the constants
+	// can't be interpolated here.
 	asm(`
         li t0, 0x1000000
         csrw sepc, t0
-        li t1, 0x20
+        li t1, 0x40020
         csrw sstatus, t1
         sret
     `);
@@ -98,7 +105,7 @@ fn Process* create_process(void* image, uint image_size)
 	}
 
 	uint* sp = (uint*)&proc.stack;
-	sp += 2048;
+	sp += STACK_SIZE / 4;
 	for (int j = 0; j < 12; j++)
 	{
 		*(--sp) = 0;
@@ -111,6 +118,11 @@ fn Process* create_process(void* image, uint image_size)
 	{
 		map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
 	}
+	// virtio-blk MMIO registers: outside the kernel image/RAM range above,
+	// but syscalls like SYS_WRITEFILE reach the driver (fs_flush ->
+	// read_write_disk) from inside a process's own page table, not just
+	// from kernel_main's bare-addressing bring-up.
+	map_page(page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, PAGE_R | PAGE_W);
 
 	// Copy the process image into freshly allocated user pages, page by page.
 	char* img = image;
@@ -156,5 +168,5 @@ fn void yield() @noinline
 	Process* prev = current_proc;
 	current_proc = next;
 
-	switch_context(&prev.sp, &next.sp, ((uint)next.page_table >> 12) | 0x80000000, (uint)&next.stack[8191] + 1);
+	switch_context(&prev.sp, &next.sp, ((uint)next.page_table >> 12) | 0x80000000, (uint)&next.stack + STACK_SIZE);
 }

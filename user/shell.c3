@@ -31,6 +31,16 @@ fn void main() @export("main") {
             print("Hello world from shell!\n");
         } else if (strcmp(cmd, "exit") == 0) {
             exit();
+        } else if (strcmp(cmd, "readfile") == 0) {
+            char[128] buf @noinit;
+            int len = readfile("hello.txt", &buf, 128);
+            if (len >= 0) {
+                buf[len] = 0;
+                print(&buf);
+                print("\n");
+            }
+        } else if (strcmp(cmd, "writefile") == 0) {
+            writefile("hello.txt", "Hello from shell!\n", 19);
         } else {
             print("unknown command: ");
             print(cmd);
