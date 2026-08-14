@@ -7,7 +7,7 @@ import libc;
  The LibcAllocator is a wrapper around malloc to conform to the Allocator interface.
 *>
 typedef LibcAllocator (Allocator) = uptr;
-const LibcAllocator LIBC_ALLOCATOR = {};
+const LibcAllocator LIBC_ALLOCATOR = { };
 
 fn void*? LibcAllocator.acquire(&self, sz bytes, AllocInitType init_type, sz alignment) @dynamic
 {

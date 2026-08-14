@@ -1,5 +1,5 @@
 module std::core::mem::allocator @if(env::CUSTOM_LIBC);
-import std::math,libc, std::bits;
+import std::math, libc, std::bits;
 import std::core::mem;
 import std::core::env;
 
@@ -34,11 +34,17 @@ bitstruct VmemOptions : int
  @require !reserve_page_size || math::is_power_of_2(reserve_page_size)
  @require reserve_page_size <= preferred_size : "The min reserve_page_size size must be less or equal to the preferred size"
  @require preferred_size >= 1 * mem::KB : "The preferred size must exceed 1 KB"
- @return? mem::INVALID_ALLOC_SIZE, mem::OUT_OF_MEMORY, VMEM_RESERVE_FAILED
+ @return ? mem::INVALID_ALLOC_SIZE, mem::OUT_OF_MEMORY, VMEM_RESERVE_FAILED
 *>
-fn void? Vmem.init(&self, usz preferred_size, usz reserve_page_size = 0, VmemOptions options = { true, true, env::COMPILER_SAFE_MODE }, usz min_size = 0)
+fn void? Vmem.init(
+	&self,
+	usz preferred_size,
+	usz reserve_page_size = 0,
+	VmemOptions options = { true, true, env::COMPILER_SAFE_MODE },
+	usz min_size = 0
+)
 {
-    return;
+	return;
 }
 
 <*
@@ -47,7 +53,7 @@ fn void? Vmem.init(&self, usz preferred_size, usz reserve_page_size = 0, VmemOpt
  @require !alignment || math::is_power_of_2(alignment)
  @require alignment <= mem::MAX_MEMORY_ALIGNMENT : `alignment too big`
  @require size > 0
- @return? mem::INVALID_ALLOC_SIZE, mem::OUT_OF_MEMORY
+ @return ? mem::INVALID_ALLOC_SIZE, mem::OUT_OF_MEMORY
 *>
 fn void*? Vmem.acquire(&self, sz size, AllocInitType init_type, sz alignment) @dynamic
 {
@@ -65,9 +71,9 @@ fn bool Vmem.owns_pointer(&self, void* ptr) @inline
  @require alignment <= mem::MAX_MEMORY_ALIGNMENT : `alignment too big`
  @require old_pointer != null
  @require size > 0
- @return? mem::INVALID_ALLOC_SIZE, mem::OUT_OF_MEMORY
+ @return ? mem::INVALID_ALLOC_SIZE, mem::OUT_OF_MEMORY
 *>
-fn void*? Vmem.resize(&self, void *old_pointer, sz size, sz alignment) @dynamic
+fn void*? Vmem.resize(&self, void* old_pointer, sz size, sz alignment) @dynamic
 {
 	return null;
 }
@@ -79,7 +85,7 @@ fn void*? Vmem.resize(&self, void *old_pointer, sz size, sz alignment) @dynamic
 *>
 fn void Vmem.release(&self, void* ptr, bool) @dynamic
 {
-    return;
+	return;
 }
 
 fn usz Vmem.mark(&self)
@@ -92,15 +98,15 @@ fn usz Vmem.mark(&self)
 *>
 fn void Vmem.reset(&self, usz mark)
 {
-    return;
-	//if (mark == self.allocated) return;
-	//unprotect(self, mark);
+	return;
+	// if (mark == self.allocated) return;
+	// unprotect(self, mark);
 }
 
 fn void Vmem.free(&self)
 {
-    return;
-	/*if (!self.memory.ptr) return;
+	return;
+	/* if (!self.memory.ptr) return;
 	$switch:
 		$case env::ADDRESS_SANITIZER:
 			asan::poison_memory_region(self.memory.ptr, self.memory.size);
@@ -108,7 +114,7 @@ fn void Vmem.free(&self)
     	    ((char*)self.memory.ptr)[0:self.allocated] = 0xAA;
 	$endswitch
 	(void)self.memory.destroy();
-	*self = {};*/
+	*self = {}; */
 }
 
 // Internal data
@@ -121,14 +127,14 @@ struct VmemHeader @local
 
 macro void? protect(Vmem* mem, usz after) @local
 {
-	usz shift = mem.page_pot;
-	usz page_after = (after + mem.pagesize - 1) >> shift;
-	usz last_page = mem.last_page;
+	usz shift            = mem.page_pot;
+	usz page_after       = (after + mem.pagesize - 1) >> shift;
+	usz last_page        = mem.last_page;
 	bool over_high_water = mem.high_water < after;
 	if (page_after > last_page)
 	{
 		usz page_start = last_page << shift;
-		usz page_len = (page_after - last_page) << shift;
+		usz page_len   = (page_after - last_page) << shift;
 		mem.memory.commit(page_start, page_len)!;
 		if (mem.options.protect_unused_pages || over_high_water)
 		{
@@ -145,8 +151,8 @@ macro void? protect(Vmem* mem, usz after) @local
 
 macro void unprotect(Vmem* mem, usz after) @local
 {
-	usz shift = mem.page_pot;
-	usz last_page = mem.last_page;
+	usz shift      = mem.page_pot;
+	usz last_page  = mem.last_page;
 	usz page_after = mem.last_page = (after + mem.pagesize - 1) >> shift;
 	$if env::ADDRESS_SANITIZER:
 		asan::poison_memory_region(mem.memory.ptr + after, mem.allocated - after);
@@ -159,7 +165,7 @@ macro void unprotect(Vmem* mem, usz after) @local
 	if ((mem.options.shrink_on_reset || mem.options.protect_unused_pages) && page_after < last_page)
 	{
 		usz start = page_after << shift;
-		usz len = (last_page - page_after) << shift;
+		usz len   = (last_page - page_after) << shift;
 		if (mem.options.shrink_on_reset) (void)mem.memory.decommit(start, len, false);
 		if (mem.options.protect_unused_pages) (void)mem.memory.protect(start, len, PROTECTED);
 	}

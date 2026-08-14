@@ -2,23 +2,62 @@ module kernel;
 
 import std::io;
 import panic;
+import sbi;
+
+const SCAUSE_ECALL = 8;
+const SYS_PUTCHAR   = 1;
+const SYS_GETCHAR   = 2;
+
+uint read_reg_tmp @export("read_reg_tmp");
 
 macro read_reg(String $reg)
 {
-    uptr x;
-    asm(@sprintf("csrr a0, %s", $reg));
-    asm { mv x, $a0; }
-    return x;
+	// Bridged through memory (t0/t1), not a0: the previous version read the
+	// CSR into a0 via opaque string asm(), which the compiler can't see the
+	// side effects of. Any caller that still has a value live in a0 at this
+	// point (e.g. a pointer parameter it hasn't spilled) gets it silently
+	// clobbered — this corrupted handle_trap's own Trap_frame* parameter in
+	// practice, since the compiler had no reason to move it out of a0.
+	asm(@sprintf(`
+        csrr t0, %s
+        la t1, read_reg_tmp
+        sw t0, 0(t1)
+    `, $reg));
+	return read_reg_tmp;
 }
 
 macro write_reg(String $reg, String $value)
 {
-    asm(@sprintf("la t0, %s", $value));
-    asm(@sprintf("csrw %s, t0", $reg));
+	// Single asm() call: two separate asm() statements bridging a value
+	// through t0 can be reordered/interleaved by the optimizer, since it
+	// doesn't know t0 must stay live across them (this bit us for real:
+	// stvec ended up not pointing at kernel_entry until this was merged).
+	asm(@sprintf(`
+        la t0, %s
+        csrw %s, t0
+    `, $value, $reg));
 }
 
-fn void kernel_entry() @align(4) @export("kernel_entry") @noinline @nostrip {
-    asm(`
+uint write_sepc_tmp @export("write_sepc_tmp");
+
+fn void write_sepc(uint value) @noinline
+{
+	// Single asm() call, bridged through a memory location rather than a
+	// register: a normal (non-naked) function gives no guarantee about
+	// which register `value` lives in by the time this runs, and splitting
+	// this across separate asm() statements reintroduces the reordering
+	// hazard described on write_reg.
+	write_sepc_tmp = value;
+	asm(`
+        la t0, write_sepc_tmp
+        lw t0, 0(t0)
+        csrw sepc, t0
+    `);
+}
+
+fn void kernel_entry() @align(4) @export("kernel_entry") @noinline @nostrip
+{
+	asm(`
         csrrw sp, sscratch, sp
 
         addi sp, sp, -4 * 31
@@ -97,45 +136,77 @@ fn void kernel_entry() @align(4) @export("kernel_entry") @noinline @nostrip {
     `);
 }
 
-struct Trap_frame @packed {
-    uint ra;
-    uint gp;
-    uint tp;
-    uint t0;
-    uint t1;
-    uint t2;
-    uint t3;
-    uint t4;
-    uint t5;
-    uint t6;
-    uint a0;
-    uint a1;
-    uint a2;
-    uint a3;
-    uint a4;
-    uint a5;
-    uint a6;
-    uint a7;
-    uint s0;
-    uint s1;
-    uint s2;
-    uint s3;
-    uint s4;
-    uint s5;
-    uint s6;
-    uint s7;
-    uint s8;
-    uint s9;
-    uint s10;
-    uint s11;
-    uint sp;
+struct Trap_frame @packed
+{
+	uint ra;
+	uint gp;
+	uint tp;
+	uint t0;
+	uint t1;
+	uint t2;
+	uint t3;
+	uint t4;
+	uint t5;
+	uint t6;
+	uint a0;
+	uint a1;
+	uint a2;
+	uint a3;
+	uint a4;
+	uint a5;
+	uint a6;
+	uint a7;
+	uint s0;
+	uint s1;
+	uint s2;
+	uint s3;
+	uint s4;
+	uint s5;
+	uint s6;
+	uint s7;
+	uint s8;
+	uint s9;
+	uint s10;
+	uint s11;
+	uint sp;
 }
 
-fn void handle_trap(Trap_frame *f) @export("handle_trap") @noinline @nostrip {
-    uint scause = read_reg("scause");
-    uint stval = read_reg("stval");
-    uint user_pc = read_reg("sepc");
+fn void handle_syscall(Trap_frame* f) @noinline
+{
+	switch (f.a3)
+	{
+		case SYS_PUTCHAR:
+			sbi::__putchar((int)f.a0);
+		case SYS_GETCHAR:
+			for (;;)
+			{
+				int ch = sbi::__getchar();
+				if (ch >= 0)
+				{
+					f.a0 = (uint)ch;
+					break;
+				}
+				yield();
+			}
+		default:
+			panic::panic("unexpected syscall");
+	}
+}
 
-    io::printfn("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
-    panic::panic("it's a trap!");
+fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
+{
+	uint scause  = read_reg("scause");
+	uint stval   = read_reg("stval");
+	uint user_pc = read_reg("sepc");
+
+	if (scause == SCAUSE_ECALL)
+	{
+		handle_syscall(f);
+		write_sepc(user_pc + 4);
+	}
+	else
+	{
+		io::printfn("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
+		panic::panic("it's a trap!");
+	}
 }

@@ -38,6 +38,5 @@ fn void* __memcpy(void* dst, void* src, usz n) @weak @export("memcpy")
 
 fn void* __memmove(void* dst, void* src, usz n) @weak @export("memmove")
 {
-    return __memcpy(dst, src, n);
+	return __memcpy(dst, src, n);
 }
-

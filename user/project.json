@@ -1,0 +1,19 @@
+{
+  "langrev": "1",
+  "warnings": [ "no-unused" ],
+  "authors": [ "8lall0" ],
+  "version": "0.0.1",
+  "sources": [ "*.c3" ],
+  "build-dir": "../build/user",
+  "output": "../build/user",
+  "targets": {
+    "shell": {
+      "target": "elf-riscv32",
+      "type": "object-files"
+    }
+  },
+  "cpu": "generic",
+  "opt": "O2",
+  "link-libc": false,
+  "custom-libc": true
+}

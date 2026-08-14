@@ -4,21 +4,23 @@ import panic;
 import libc;
 import std::io;
 
-const PROCS_MAX = 8;        // Maximum number of processes
-const PROC_UNUSED = 0;      // Unused process control structure
-const PROC_RUNNABLE = 1;    // Runnable process
-const STACK_SIZE = 8192;    // Stack size
+const PROCS_MAX     = 8; // Maximum number of processes
+const PROC_UNUSED   = 0; // Unused process control structure
+const PROC_RUNNABLE = 1; // Runnable process
+const STACK_SIZE    = 8192; // Stack size
 
-struct Process {
-    int pid;                // Process ID
-    int state;              // Process state: PROC_UNUSED or PROC_RUNNABLE
-    uint sp;                // Stack pointer
-    uint *page_table;
-    char [STACK_SIZE]stack;       // Kernel stack
+struct Process
+{
+	int pid; // Process ID
+	int state; // Process state: PROC_UNUSED or PROC_RUNNABLE
+	uint sp; // Stack pointer
+	uint* page_table;
+	char[STACK_SIZE] stack; // Kernel stack
 }
 
-fn void switch_context(uint *prev_sp, uint *next_sp, uint satp, uint sscratch) @naked @noinline {
-    asm(`
+fn void switch_context(uint* prev_sp, uint* next_sp, uint satp, uint sscratch) @naked @noinline
+{
+	asm(`
         addi sp, sp, -13 * 4
         sw ra,  0  * 4(sp)
         sw s0,  1  * 4(sp)
@@ -59,88 +61,100 @@ fn void switch_context(uint *prev_sp, uint *next_sp, uint satp, uint sscratch) @
     `);
 }
 
-Process [PROCS_MAX]procs; // All process control structures.
+const SSTATUS_SPIE = (1 << 5);
 
-fn Process *create_process(uint pc) {
-    // Find an unused process control structure.
-    Process *proc = null;
-    int i;
-    for (i = 0; i < PROCS_MAX; i++) {
-        if (procs[i].state == PROC_UNUSED) {
-            proc = &procs[i];
-            break;
-        }
-    }
-
-    if (!proc) {
-        panic::panic("no free process slots");
-    }
-
-    uint * sp = (uint *) &proc.stack;
-    sp += 2048;
-    for (int j = 0; j < 12; j++) {
-        *(--sp) = 0;
-    }
-    // Setting RA
-    *(--sp) = pc;
-
-    uint *page_table = (uint *) alloc_pages(1);
-    io::printfn("Creating page table at: %x", (uint)page_table);
-    for (
-        uint paddr = (uint) &__kernel_base;
-        paddr < (uint) &__free_ram_end;
-        paddr += PAGE_SIZE
-    ) {
-        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
-    }
-
-    io::printfn("Mapped %x to %x", (uint)&__kernel_base, (uint)&__free_ram);
-
-    // Verify the mapping worked - try to look up a test address
-    uint test_addr = 0x80200000;
-    uint vpn1 = (test_addr >> 22) & 0x3ff;
-    uint vpn0 = (test_addr >> 12) & 0x3ff;
-    io::printfn("Page table[%d] = %x", vpn1, page_table[vpn1]);
-
-    // NEW: Check the second-level table
-    if (page_table[vpn1] & PAGE_V) {
-        uint *table0 = (uint *) (((page_table[vpn1] >> 10)) << 12);
-        io::printfn("L2 table at: %x", (uint)table0);
-        io::printfn("Page table L2[%d] = %x", vpn0, table0[vpn0]);
-    }
-
-    // Initialize fields.
-    proc.pid = i + 1;
-    proc.state = PROC_RUNNABLE;
-    proc.sp = (uint) sp;
-    proc.page_table = page_table;
-    return proc;
+fn void user_entry() @naked @noinline @noreturn
+{
+	// USER_BASE and SSTATUS_SPIE hardcoded: compile-time asm() only supports
+	// %s substitution, so the constants can't be interpolated here.
+	asm(`
+        li t0, 0x1000000
+        csrw sepc, t0
+        li t1, 0x20
+        csrw sstatus, t1
+        sret
+    `);
 }
 
-Process *current_proc; // Currently running process
-Process *idle_proc;    // Idle process
+Process[PROCS_MAX] procs; // All process control structures.
 
-fn void yield() @noinline {
-    Process *next = idle_proc;
-    for (int i = 0; i < PROCS_MAX; i++) {
-        Process *proc = &procs[(current_proc.pid + i) % PROCS_MAX];
-        if (proc.state == PROC_RUNNABLE && proc.pid > 0) {
-            next = proc;
-            break;
-        }
-    }
+fn Process* create_process(void* image, uint image_size)
+{
+	// Find an unused process control structure.
+	Process* proc = null;
+	int i;
+	for (i = 0; i < PROCS_MAX; i++)
+	{
+		if (procs[i].state == PROC_UNUSED)
+		{
+			proc = &procs[i];
+			break;
+		}
+	}
 
-    if (next == current_proc) {
-        return;
-    }
+	if (!proc)
+	{
+		panic::panic("no free process slots");
+	}
 
-    Process *prev = current_proc;
-    current_proc = next;
+	uint* sp = (uint*)&proc.stack;
+	sp += 2048;
+	for (int j = 0; j < 12; j++)
+	{
+		*(--sp) = 0;
+	}
+	// Setting RA
+	*(--sp) = (uint)&user_entry;
 
-    switch_context(
-        &prev.sp,
-        &next.sp,
-        ((uint)next.page_table >> 12) | 0x80000000,
-        (uint)&next.stack[8191] + 1);
+	uint* page_table = (uint*)alloc_pages(1);
+	for (uint paddr = (uint)&__kernel_base; paddr < (uint)&__free_ram_end; paddr += PAGE_SIZE)
+	{
+		map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+	}
+
+	// Copy the process image into freshly allocated user pages, page by page.
+	char* img = image;
+	for (uint off = 0; off < image_size; off += PAGE_SIZE)
+	{
+		uint page          = alloc_pages(1);
+		uint remaining     = image_size - off;
+		uint copy_size     = remaining < PAGE_SIZE ? remaining : PAGE_SIZE;
+
+		mem::copy((void*)page, img + off, (sz)copy_size);
+		map_page(page_table, USER_BASE + off, page, PAGE_U | PAGE_R | PAGE_W | PAGE_X);
+	}
+
+	// Initialize fields.
+	proc.pid = i + 1;
+	proc.state = PROC_RUNNABLE;
+	proc.sp = (uint)sp;
+	proc.page_table = page_table;
+	return proc;
 }
 
+Process* current_proc; // Currently running process
+Process* idle_proc;    // Idle process
+
+fn void yield() @noinline
+{
+	Process* next = idle_proc;
+	for (int i = 0; i < PROCS_MAX; i++)
+	{
+		Process* proc = &procs[(current_proc.pid + i) % PROCS_MAX];
+		if (proc.state == PROC_RUNNABLE && proc.pid > 0)
+		{
+			next = proc;
+			break;
+		}
+	}
+
+	if (next == current_proc)
+	{
+		return;
+	}
+
+	Process* prev = current_proc;
+	current_proc = next;
+
+	switch_context(&prev.sp, &next.sp, ((uint)next.page_table >> 12) | 0x80000000, (uint)&next.stack[8191] + 1);
+}
