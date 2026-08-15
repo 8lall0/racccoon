@@ -16,7 +16,7 @@ LLC=${LLC:-llc}
 
   echo "==> Compiling kernel to LLVM IR..."
   rm -rf build/obj build/llvm build/obj_medany build/kernel.*
-  c3c build --no-entry --safe=no --riscv-cpu=rvimac --emit-llvm
+  c3c build racccoon --no-entry --safe=no --riscv-cpu=rvimac --emit-llvm
 
   # RV64 port: c3c's own object-file codegen only knows RISC-V's default
   # "small"/medlow code model, which requires every absolute address it

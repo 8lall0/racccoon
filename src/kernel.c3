@@ -1,6 +1,7 @@
 module kernel;
 
 import std::io;
+import board;
 
 // Also hardcoded (can't be interpolated into compile-time asm() strings,
 // see write_reg's comment in entry.c3) as the literal 0x1000000 in
@@ -66,7 +67,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	// the trap frame at a bogus address.
 	write_csr("sscratch", (uptr)&boot_trap_stack + boot_trap_stack.len);
 
-	plic_init();
+	board::plic_init();
 	enable_external_interrupts();
 
 	io::print("2: Trap handler set\n");
@@ -89,25 +90,35 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	create_process((void*)&_binary_echod_bin_start, (uint)((uptr)&_binary_echod_bin_end - (uptr)&_binary_echod_bin_start));
 	io::print("Idle process started\n");
 
-	// diskd next (see user/diskd.c3, microkernel plan phase 4) — created
-	// after echod so echod keeps its pid-2 convention above.
-	Process* diskd_proc = create_process((void*)&_binary_diskd_bin_start, (uint)((uptr)&_binary_diskd_bin_end - (uptr)&_binary_diskd_bin_start));
-	setup_diskd_mappings(diskd_proc);
-	io::print("diskd created\n");
+	// diskd/fsd (see user/diskd.c3 and user/fsd.c3, microkernel plan
+	// phases 4/5) need a real block device — board::HAS_BLOCK_DEVICE is
+	// false on any platform without one (Milk-V Duo, for now: no
+	// virtio-mmio equivalent, no storage driver yet — see
+	// docs/devlog.md). Skipped entirely there: fsd_pid stays 0, and
+	// every later create_process's default "" -> fsd namespace mount
+	// just never resolves to anything, so the shell's
+	// readfile/writefile commands fail cleanly instead of hanging on a
+	// server that was never spawned.
+	if (board::HAS_BLOCK_DEVICE)
+	{
+		// Created after echod so echod keeps its pid-2 convention above.
+		Process* diskd_proc = create_process((void*)&_binary_diskd_bin_start, (uint)((uptr)&_binary_diskd_bin_end - (uptr)&_binary_diskd_bin_start));
+		setup_diskd_mappings(diskd_proc);
+		io::print("diskd created\n");
 
-	// fsd (see user/fsd.c3, microkernel plan phase 5) — the filesystem,
-	// now entirely out of the kernel. Created after diskd so diskd is
-	// already registered (diskd_pid) by the time fsd's own fs_init()
-	// (run the first time the scheduler picks it, same as any other
-	// process) sends it a request. fsd_pid has to be set before ANY
-	// later create_process call populates a default namespace, since
-	// that's where it's actually consumed — every process created from
-	// here on (i.e. every shell) gets a working "" -> fsd mount;
-	// idle/echod/diskd, created before this line, don't and don't need
-	// to (see process.c3's create_process).
-	Process* fsd_proc = create_process((void*)&_binary_fsd_bin_start, (uint)((uptr)&_binary_fsd_bin_end - (uptr)&_binary_fsd_bin_start));
-	fsd_pid = fsd_proc.pid;
-	io::print("fsd created\n");
+		// Created after diskd so diskd is already registered (diskd_pid)
+		// by the time fsd's own fs_init() (run the first time the
+		// scheduler picks it, same as any other process) sends it a
+		// request. fsd_pid has to be set before ANY later create_process
+		// call populates a default namespace, since that's where it's
+		// actually consumed — every process created from here on (i.e.
+		// every shell) gets a working "" -> fsd mount; idle/echod/diskd,
+		// created before this line, don't and don't need to (see
+		// process.c3's create_process).
+		Process* fsd_proc = create_process((void*)&_binary_fsd_bin_start, (uint)((uptr)&_binary_fsd_bin_end - (uptr)&_binary_fsd_bin_start));
+		fsd_pid = fsd_proc.pid;
+		io::print("fsd created\n");
+	}
 
 	// Single call site for create_process(shell), used for both the
 	// initial spawn and every respawn once idle notices nothing else is

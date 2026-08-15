@@ -2,7 +2,7 @@ module kernel;
 
 import std::io;
 import panic;
-import sbi;
+import board;
 
 const SCAUSE_ECALL             = 8;
 // RV64 port: the interrupt bit is scause's MSB — bit 63 on RV64, not
@@ -295,11 +295,11 @@ fn void handle_syscall(Trap_frame* f) @noinline
 	switch (f.a3)
 	{
 		case SYS_PUTCHAR:
-			sbi::__putchar((int)f.a0);
+			board::console_putchar((int)f.a0);
 		case SYS_GETCHAR:
 			for (;;)
 			{
-				int ch = sbi::__getchar();
+				int ch = board::console_getchar();
 				if (ch >= 0)
 				{
 					f.a0 = (ulong)ch;
@@ -625,9 +625,9 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				{
 					map_page(child_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
 				}
-				map_page(child_table, PLIC_PRIORITY_PAGE, PLIC_PRIORITY_PAGE, PAGE_R | PAGE_W);
-				map_page(child_table, PLIC_ENABLE_PAGE, PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
-				map_page(child_table, PLIC_CLAIM_PAGE, PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
+				map_page(child_table, board::PLIC_PRIORITY_PAGE, board::PLIC_PRIORITY_PAGE, PAGE_R | PAGE_W);
+				map_page(child_table, board::PLIC_ENABLE_PAGE, board::PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
+				map_page(child_table, board::PLIC_CLAIM_PAGE, board::PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
 
 				ulong* parent_table2 = current_proc.page_table;
 				for (uint vpn2 = 0; vpn2 < 512; vpn2++)
@@ -793,8 +793,8 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 			// Claiming acknowledges the IRQ to the PLIC. 0 means a
 			// spurious claim (nothing pending) — don't complete an IRQ
 			// that wasn't actually claimed.
-			uint irq = plic_claim();
-			if (irq == IRQ_VIRTIO_BLK && diskd_pid != 0)
+			uint irq = board::plic_claim();
+			if (irq == board::IRQ_VIRTIO_BLK && diskd_pid != 0)
 			{
 				// Wake diskd specifically, rather than relying on
 				// "whatever happened to be running/wfi-waiting" like the
@@ -822,7 +822,7 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 			}
 			if (irq != 0)
 			{
-				plic_complete(irq);
+				board::plic_complete(irq);
 			}
 		}
 		// No sepc adjustment for interrupts: unlike ecall (which must skip

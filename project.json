@@ -11,7 +11,13 @@
   "targets": {
     "racccoon": {
       "target":  "elf-riscv64",
-      "type": "object-files"
+      "type": "object-files",
+      "sources": [ "boards/qemu/**" ]
+    },
+    "racccoon-duo": {
+      "target":  "elf-riscv64",
+      "type": "object-files",
+      "sources": [ "boards/duo/**" ]
     }
   },
   "cpu": "generic",

@@ -4,6 +4,104 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-16 — Milk-V Duo bring-up, part 1: a `board` abstraction layer
+
+**Goal:** the user has the actual Milk-V Duo board, an SD card, and a
+USB-UART adapter in hand now and wants to move past QEMU. Planned this
+as its own effort (`~/.claude/plans/giggly-prancing-iverson.md`,
+separate from the RV64/Sv39 port's own plan) — real hardware is a
+fundamentally different kind of work: I can build/boot/iterate on QEMU
+myself in a loop, but I have no way to flash an SD card or watch a
+physical UART, so every hardware-touching step needs the user
+physically present. This entry covers the software-only first stage,
+done autonomously; flashing and first boot are next, and need the user.
+
+**Research, before writing any code:** pulled the real CV1800B/CV1801B
+datasheet and cross-referenced two independent bring-up reports rather
+than guessing addresses. Confirmed: DDR at `0x80000000` (same base as
+QEMU, good), UART0 at `0x04140000` (16550-compatible), PLIC at
+`0x70000000` (confirmed from an actual upstream Linux devicetree patch
+for `cv1800b.dtsi`, not inferred from a sibling chip), boot chain is
+BootROM → FSBL → OpenSBI (S-mode handoff, same shape as QEMU). One
+finding corrected an earlier assumption from a secondary source: a
+third-party Zephyr bring-up report used fiptool's `BLCP_2ND` payload
+slot, but reading the actual FSBL C source
+(`fsbl/plat/cv180x/bl2/bl2_opt.c` in `duo-buildroot-sdk`) showed
+`load_blcp_2nd()` calls `reset_c906l()` directly — that slot is
+explicitly the *second* C906 core's firmware, not what racccoon wants.
+The correct slot is `LOADER_2ND` (ATF's standard "BL33" stage — what
+OpenSBI jumps to on the *main* core after its own init), which needs a
+small synthesizable 32-byte header prepended to the raw kernel binary,
+and whose real jump entry is `RUNADDR + 32` (past the header), not
+`RUNADDR` itself — traced directly through `load_loader_2nd()`'s
+`loader_2nd_entry = loader_2nd_header->runaddr + sizeof(header)`. The
+exact safe `RUNADDR` value is still unconfirmed — the real board-config
+header (`cvi_board_memmap.h`) is generated during the SDK's own build,
+not committed to the repo, so this needs the user's actual build output
+to nail down, not more static reading.
+
+**Asked for the design before building it.** Drafted a plan that just
+edited `plic.c3`'s constants in place for the Duo — the user rejected
+it: "auto mode, but make it with the right abstraction so porting to
+other platforms will be easier." Redesigned Stage 1 around a `board`
+module contract (data *and* behavior — `plic_init`/`plic_claim`/
+`plic_complete`/`console_putchar`/`console_getchar`, not just address
+constants, since it's genuinely unconfirmed whether `thead,c900-plic`'s
+register layout matches QEMU virt's SiFive-style PLIC closely enough
+for a base-address swap alone to be correct) with one implementation
+per platform, so a third board later means one new file, not another
+pass through `plic.c3`/`process.c3`/`kernel.c3`.
+
+**Implementation:** `boards/qemu/board.c3` and `boards/duo/board.c3` —
+new top-level `boards/` directory (not under `src/`) specifically to
+use `c3c`'s per-target additive `sources` property cleanly
+(`c3c --list-project-properties` confirmed this exists:
+`sources`/`sources-override` are real per-target overrides, not just a
+global list) rather than needing glob-exclusion syntax. `project.json`
+now defines two targets, `racccoon` (existing, QEMU) and `racccoon-duo`
+(new), each pulling in only its own board directory on top of the
+shared `src/**`. `src/plic.c3` is gone — its logic split into both
+`board.c3` files; call sites in `entry.c3`/`process.c3`/`kernel.c3` now
+go through `board::` instead of bare `plic_*`/`sbi::__*` calls.
+`kernel.c3`'s diskd/fsd spawn is gated on `board::HAS_BLOCK_DEVICE`
+(false on Duo — no virtio-mmio equivalent, no storage driver yet;
+`fsd_pid` staying 0 already made every later namespace's `"" -> fsd`
+mount resolve to nothing, so this fails cleanly, not silently).
+`boards/duo/kernel.ld` reserves the 32-byte `LOADER_2ND` header space
+ahead of `.text.boot`, with `RUNADDR` written as an explicit,
+impossible-to-miss placeholder (`0x80400000`, clearly commented
+UNCONFIRMED) pending Stage 0.1's real build output.
+
+**Verification, not just "it compiles":** the QEMU board file is a
+straight refactor of already-working code, so rebuilding the `racccoon`
+target and rerunning the full manual regression (`hello`, `ping`,
+`p9test`, `nstest`, `writefile`/`readfile`, `rforktest`, `sandboxtest`,
+`racetest`) doubled as the regression check for the abstraction itself
+— identical output to before the refactor, confirming the refactor
+didn't silently change QEMU behavior while adding the new platform.
+`bash scripts/build_duo.sh` (new) also builds `racccoon-duo` clean;
+`llvm-readelf`/`llvm-nm` on the result confirm `__kernel_base`/`boot()`
+land exactly at `0x80400020` (`RUNADDR + 32`, matching the header-offset
+math above) — can't boot-test this one myself, but the address math
+checks out.
+
+**End state:** both targets build clean; QEMU path fully regression-
+tested and unchanged. Duo path is real code, not a stub, but genuinely
+untested past "the linker is happy" — first real test is Stage 2, once
+Stage 0.1 (confirm the physical setup with a stock vendor image) and
+0.2 (the real `fiptool`/`RUNADDR` values from an actual SDK build) are
+done, which need the user's hands.
+
+**Next up:** Stage 0.1 (user, hardware) — boot the stock `milkv-duo`
+image, confirm serial works. Stage 0.2 (mine, once 0.1's SDK checkout
+exists) — resolve the real `LOADER_2ND` `RUNADDR` and the exact
+`fiptool.py` packaging command. Then Stage 2: first real boot.
+
+**Files changed this session:** `project.json`, `boards/qemu/board.c3`
+(new), `boards/duo/board.c3` (new), `boards/duo/kernel.ld` (new),
+`scripts/build.sh`, `scripts/build_duo.sh` (new), `src/plic.c3`
+(removed), `src/entry.c3`, `src/process.c3`, `src/kernel.c3`.
+
 ## 2026-08-15 (12) — RV64/Sv39 port: paging, trap frame, and a real 2GB
 code-model wall
 

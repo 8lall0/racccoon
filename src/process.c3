@@ -3,6 +3,7 @@ module kernel;
 import panic;
 import libc;
 import std::io;
+import board;
 
 const PROCS_MAX     = 8; // Maximum number of processes
 const PROC_UNUSED   = 0; // Unused process control structure
@@ -338,9 +339,9 @@ fn Process* create_process(void* image, uint image_size)
 	// trap, not something any one process specifically owns (unlike the
 	// virtio-blk MMIO above, which now belongs to diskd alone). Three
 	// separate pages, not a range — see plic.c3.
-	map_page(page_table, PLIC_PRIORITY_PAGE, PLIC_PRIORITY_PAGE, PAGE_R | PAGE_W);
-	map_page(page_table, PLIC_ENABLE_PAGE, PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
-	map_page(page_table, PLIC_CLAIM_PAGE, PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
+	map_page(page_table, board::PLIC_PRIORITY_PAGE, board::PLIC_PRIORITY_PAGE, PAGE_R | PAGE_W);
+	map_page(page_table, board::PLIC_ENABLE_PAGE, board::PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
+	map_page(page_table, board::PLIC_CLAIM_PAGE, board::PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
 
 	// Copy the process image into freshly allocated user pages, page by page.
 	char* img = image;

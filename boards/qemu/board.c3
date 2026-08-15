@@ -1,11 +1,28 @@
-module kernel;
+module board;
+
+import kernel;
+import sbi;
+
+// The `board` module is the one seam the rest of the kernel is allowed
+// to reach through for anything platform-specific — memory map, PLIC,
+// console. Adding a new target means adding a new `boards/<name>/`
+// directory implementing this same contract, not re-touching
+// entry.c3/process.c3/kernel.c3 again. See docs/devlog.md for why this
+// exists (Milk-V Duo hardware bring-up) and
+// ~/.claude/plans/giggly-prancing-iverson.md for the port plan.
+//
+// This file is QEMU's implementation — a straight refactor of what
+// used to live directly in src/plic.c3/src/kernel/sbi.c3, not new
+// logic. It should produce an identical boot to what existed before
+// this refactor; that's the regression check for the abstraction
+// itself.
 
 // QEMU's virt machine PLIC. Register layout matches the standard
 // SiFive-style PLIC used across RISC-V platforms (same one xv6-riscv
-// targets): a small handful of scattered pages, not one contiguous block,
-// which is why create_process maps three specific pages for it rather
-// than a range. Addresses are uptr (RV64 port — pointer-sized, not a
-// fixed 32-bit uint); the *registers themselves* stay 32-bit values
+// targets): a small handful of scattered pages, not one contiguous
+// block, which is why the PLIC_*_PAGE constants below are three
+// separate pages, not a range. Addresses are uptr (pointer-sized, not
+// a fixed 32-bit uint); the *registers themselves* stay 32-bit values
 // (irq numbers, priority, enable bitmask) — PLIC register width is
 // fixed by the hardware spec, independent of hart XLEN.
 const uptr PLIC_BASE = 0x0c000000;
@@ -26,10 +43,15 @@ const uptr PLIC_CLAIM         = PLIC_BASE + 0x200004 + PLIC_S_CONTEXT * 0x1000;
 
 // Page-aligned bases of the three distinct pages the registers above fall
 // in (PLIC_ENABLE_BASE and PLIC_THRESHOLD/PLIC_CLAIM aren't page-aligned
-// themselves), for create_process to map into every process's page table.
-const uptr PLIC_PRIORITY_PAGE = PLIC_PRIORITY_BASE & (uptr)~(PAGE_SIZE - 1);
-const uptr PLIC_ENABLE_PAGE   = PLIC_ENABLE_BASE & (uptr)~(PAGE_SIZE - 1);
-const uptr PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uptr)~(PAGE_SIZE - 1);
+// themselves), for process.c3's create_process to map into every
+// process's page table.
+const uptr PLIC_PRIORITY_PAGE = PLIC_PRIORITY_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
+const uptr PLIC_ENABLE_PAGE   = PLIC_ENABLE_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
+const uptr PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uptr)~(kernel::PAGE_SIZE - 1);
+
+// QEMU's virt board always has virtio-blk attached (see scripts/launch64.sh) —
+// diskd/fsd get spawned and the shell has real file access.
+const bool HAS_BLOCK_DEVICE = true;
 
 fn void plic_init()
 {
@@ -63,4 +85,17 @@ fn void plic_complete(uint irq)
 {
 	uint* complete = (uint*)PLIC_CLAIM;
 	mem::store(complete, irq, 4, true);
+}
+
+// QEMU's OpenSBI wires its console extension straight to the virt
+// board's UART — the ecall round trip already proven working since the
+// very first RV32 slice of this project.
+fn int console_putchar(int ch)
+{
+	return sbi::__putchar(ch);
+}
+
+fn int console_getchar()
+{
+	return sbi::__getchar();
 }
