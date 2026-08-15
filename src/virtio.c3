@@ -204,6 +204,16 @@ fn void read_write_disk(void* buf, uint sector, bool is_write)
 	// to re-check the real completion state (the used ring index) after
 	// waking — the interrupt handler's only job is to wake us up, not to
 	// signal specifically "this request is the one that finished".
+	//
+	// disable_interrupts() around the whole check-and-wait loop closes a
+	// real lost-wakeup race: without it, a completion interrupt landing in
+	// the gap between the busy check and the wfi instruction gets claimed
+	// and consumed by a normal trap right there, and the wfi that follows
+	// then waits forever for an interrupt that already happened. wfi still
+	// wakes on a pending-but-globally-disabled interrupt (that's the whole
+	// point of this pattern) — it just doesn't let the trap fire and
+	// consume it until we're done checking.
+	disable_interrupts();
 	while (virtq_is_busy(vq))
 	{
 		asm
@@ -211,6 +221,28 @@ fn void read_write_disk(void* buf, uint sector, bool is_write)
 			wfi;
 		}
 	}
+
+	// Whatever woke the last wfi is still pending at the PLIC — it was
+	// never claimed, since interrupts stayed globally disabled the whole
+	// time. Claim (and complete) it ourselves now, BEFORE re-enabling.
+	// Skipping this was a real, serious bug, not just an oversight: with a
+	// completion still pending, re-enabling interrupts makes the CPU take
+	// it immediately as a *nested* trap, while this whole call chain
+	// (kernel_entry -> handle_trap -> handle_syscall -> ... -> here) is
+	// still on the stack from the *original* trap that got us here. Both
+	// traps share the same fixed sscratch anchor, so the nested trap's own
+	// prologue overwrites the still-in-progress outer trap's saved
+	// context in place — including its saved sp — with garbage. That
+	// showed up as a process's sp getting corrupted to point into the
+	// kernel's own procs[] array right after a SYS_WRITEFILE syscall
+	// returned. Claiming here first means there's nothing left pending
+	// when SIE flips back on, so no nested trap happens at all.
+	uint pending_irq = plic_claim();
+	if (pending_irq != 0)
+	{
+		plic_complete(pending_irq);
+	}
+	enable_interrupts();
 
 	if (blk_req.status != 0)
 	{

@@ -8,43 +8,56 @@ LLVM_LLD=${LLVM_LLD:-/opt/riscv/bin/ld.lld}
 ROOT="$(dirname "$0")/.."
 cd "$ROOT"
 
-mkdir -p build/user/obj
+# Builds one user-mode program from user/user.c3 (the shared library:
+# syscall wrappers, start()/exit()) plus its own main-providing source
+# file(s), producing build/user/<name>.bin.o ready to embed in the kernel
+# image. Every program links at the same USER_BASE (user/user.ld) — that's
+# fine, each one only ever exists in its own process's own page table.
+build_user_program() {
+  local name="$1"
+  shift
+  local sources=("$@")
 
-echo "==> Compiling user app..."
-c3c compile-only \
-  --no-entry \
-  --use-stdlib=no \
-  --link-libc=no \
-  --target elf-riscv32 \
-  --riscv-cpu=rvimac \
-  --output-dir build/user/obj \
-  user/user.c3 \
-  user/shell.c3
+  mkdir -p "build/user/$name/obj"
 
-OBJ_DIR="build/user/obj/obj/elf-riscv32"
+  echo "==> Compiling $name..."
+  c3c compile-only \
+    --no-entry \
+    --use-stdlib=no \
+    --link-libc=no \
+    --target elf-riscv32 \
+    --riscv-cpu=rvimac \
+    --output-dir "build/user/$name/obj" \
+    "${sources[@]}"
 
-echo "==> Linking shell.elf..."
-$LLVM_LLD \
-  "$OBJ_DIR"/*.o \
-  -T user/user.ld \
-  -Map=build/user/shell.map \
-  -o build/user/shell.elf
+  local obj_dir="build/user/$name/obj/obj/elf-riscv32"
 
-echo "==> Converting ELF -> raw binary..."
-$LLVM_OBJCOPY \
-  --set-section-flags .bss=alloc,contents \
-  -O binary \
-  build/user/shell.elf \
-  build/user/shell.bin
+  echo "==> Linking $name.elf..."
+  $LLVM_LLD \
+    "$obj_dir"/*.o \
+    -T user/user.ld \
+    -Map="build/user/$name.map" \
+    -o "build/user/$name.elf"
 
-echo "==> Embedding binary as linkable object..."
-(
-  cd build/user
+  echo "==> Converting ELF -> raw binary..."
   $LLVM_OBJCOPY \
-    -Ibinary \
-    -Oelf32-littleriscv \
-    shell.bin \
-    shell.bin.o
-)
+    --set-section-flags .bss=alloc,contents \
+    -O binary \
+    "build/user/$name.elf" \
+    "build/user/$name.bin"
 
-echo "==> Done: build/user/shell.bin.o"
+  echo "==> Embedding binary as linkable object..."
+  (
+    cd build/user
+    $LLVM_OBJCOPY \
+      -Ibinary \
+      -Oelf32-littleriscv \
+      "$name.bin" \
+      "$name.bin.o"
+  )
+
+  echo "==> Done: build/user/$name.bin.o"
+}
+
+build_user_program shell user/user.c3 user/shell.c3
+build_user_program echod user/user.c3 user/echod.c3

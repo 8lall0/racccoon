@@ -61,6 +61,20 @@ fn bool str_eq(char* a, char* b)
 	return a[i] == b[i];
 }
 
+// True if `s` starts with `prefix` (prefix may be shorter than s; an empty
+// prefix matches everything). Used by namespace resolution (process.c3's
+// Mount table) to match a path against a mount's prefix.
+fn bool str_starts_with(char* s, char* prefix)
+{
+	uint i = 0;
+	while (prefix[i] != 0)
+	{
+		if (s[i] != prefix[i]) return false;
+		i++;
+	}
+	return true;
+}
+
 fn int oct2int(char* oct, int len)
 {
 	int dec = 0;

@@ -30,6 +30,9 @@ const SYS_GETCHAR   = 2;
 const SYS_EXIT      = 3;
 const SYS_READFILE  = 4;
 const SYS_WRITEFILE = 5;
+const SYS_IPC_SEND  = 6;
+const SYS_IPC_RECV  = 7;
+const SYS_NS_RESOLVE = 8;
 
 uint read_reg_tmp @export("read_reg_tmp");
 
@@ -99,6 +102,29 @@ const SSTATUS_SIE  = (1 << 1);  // sstatus: global supervisor interrupt enable
 fn void enable_external_interrupts()
 {
 	write_csr("sie", read_reg("sie") | SIE_SEIE);
+	write_csr("sstatus", read_reg("sstatus") | SSTATUS_SIE);
+}
+
+// For the standard check-condition-then-wfi race: if the completion
+// interrupt arrives in the gap between checking a condition and executing
+// wfi, the trap fires right there (claimed/completed as a normal
+// interrupt), and a subsequent wfi then waits forever for an interrupt
+// that already happened — a real lost wakeup, not a hypothetical one (see
+// docs/devlog.md). The fix is the textbook one: disable interrupts before
+// the check, keep them disabled across the whole check-and-wfi loop, only
+// re-enable once the condition is actually met. wfi still wakes on a
+// pending-but-globally-disabled interrupt per the RISC-V spec — that's
+// the whole point of this pattern — it just doesn't let the trap actually
+// fire and consume it until we're done checking.
+fn void disable_interrupts()
+{
+	write_csr("sstatus", read_reg("sstatus") & (uint)~SSTATUS_SIE);
+}
+
+fn void enable_interrupts()
+{
+	// Just the global gate — sie.SEIE was already set once at boot by
+	// enable_external_interrupts() and never needs touching again.
 	write_csr("sstatus", read_reg("sstatus") | SSTATUS_SIE);
 }
 
@@ -338,6 +364,87 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 
 			f.a0 = (uint)len;
+		case SYS_IPC_SEND:
+			// Inline for the same reason as SYS_EXIT/SYS_READFILE above —
+			// this is the pattern proven not to trigger the unexplained
+			// c3c reboot bug in this switch. dest_pid/type/data are a0-a2
+			// as usual; len is a4, since a3 is always the syscall number
+			// (see syscall4 in user/user.c3 — this is the one syscall that
+			// needs a 4th argument).
+			int ipc_dest_pid = (int)f.a0;
+			uint ipc_type    = f.a1;
+			char* ipc_data   = (char*)f.a2;
+			int ipc_len      = (int)f.a4;
+			Process* ipc_target = proc_by_pid(ipc_dest_pid);
+			if (!ipc_target)
+			{
+				f.a0 = (uint)(-1);
+				break;
+			}
+			int ipc_copy_len = ipc_len > MSG_MAX ? MSG_MAX : ipc_len;
+			if (ipc_copy_len < 0) ipc_copy_len = 0;
+			mem::copy(&ipc_target.msg_data, ipc_data, (sz)ipc_copy_len);
+			ipc_target.msg_from = current_proc.pid;
+			ipc_target.msg_type = ipc_type;
+			ipc_target.has_message = true;
+			if (ipc_target.state == PROC_BLOCKED)
+			{
+				ipc_target.state = PROC_RUNNABLE;
+			}
+			f.a0 = 0;
+		case SYS_IPC_RECV:
+			// a2 (previously always 0 from user.c3's original ipc_recv) is
+			// now an optional out-pointer for the message's type/verb —
+			// null means "don't care", same as every existing call site
+			// still passes.
+			char* recv_buf       = (char*)f.a0;
+			int recv_len         = (int)f.a1;
+			uint* recv_type_out  = (uint*)f.a2;
+			for (;;)
+			{
+				if (current_proc.has_message)
+				{
+					int recv_copy_len = recv_len > MSG_MAX ? MSG_MAX : recv_len;
+					if (recv_copy_len < 0) recv_copy_len = 0;
+					mem::copy(recv_buf, &current_proc.msg_data, (sz)recv_copy_len);
+					if (recv_type_out != null)
+					{
+						*recv_type_out = current_proc.msg_type;
+					}
+					f.a0 = (uint)current_proc.msg_from;
+					current_proc.has_message = false;
+					break;
+				}
+				current_proc.state = PROC_BLOCKED;
+				yield();
+			}
+		case SYS_NS_RESOLVE:
+			// Inline for the same reason as every other case in this
+			// switch — see SYS_EXIT's comment. Walks the caller's own
+			// namespace (never a different process's — resolution is
+			// always relative to whoever's asking) for the first mount
+			// whose prefix matches the given path, longest-prefix-first so
+			// a more specific mount always wins over a broader one that
+			// also matches. Returns -1 (in f.a0, read as signed by the
+			// caller) if nothing matches.
+			char* ns_path = (char*)f.a0;
+			int ns_result = -1;
+			int ns_best_len = -1;
+			for (int m = 0; m < NS_MOUNTS_MAX; m++)
+			{
+				if (current_proc.namespace[m].server_pid == 0) continue;
+				char* ns_prefix = &current_proc.namespace[m].prefix[0];
+				if (!str_starts_with(ns_path, ns_prefix)) continue;
+
+				int ns_len = 0;
+				while (ns_prefix[ns_len] != 0) ns_len++;
+				if (ns_len > ns_best_len)
+				{
+					ns_best_len = ns_len;
+					ns_result = current_proc.namespace[m].server_pid;
+				}
+			}
+			f.a0 = (uint)ns_result;
 		default:
 			panic::panic("unexpected syscall");
 	}

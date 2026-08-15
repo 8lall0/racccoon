@@ -21,6 +21,7 @@ LLVM_LLD=${LLVM_LLD:-/opt/riscv/bin/ld.lld}
   $LLVM_LLD \
     build/obj/elf-riscv32/*.o \
     build/user/shell.bin.o \
+    build/user/echod.bin.o \
     -T src/kernel.ld \
     -L /opt/riscv/lib/linux \
     -lclang_rt.builtins-riscv32 \

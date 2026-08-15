@@ -16,6 +16,8 @@ char[] __free_ram @export("__free_ram");
 char[] __free_ram_end @export("__free_ram_end");
 extern char[] _binary_shell_bin_start @cname("_binary_shell_bin_start");
 extern char[] _binary_shell_bin_size @cname("_binary_shell_bin_size");
+extern char[] _binary_echod_bin_start @cname("_binary_echod_bin_start");
+extern char[] _binary_echod_bin_size @cname("_binary_echod_bin_size");
 
 fn void boot() @naked @export("boot") @section(".text.boot") @noinline @nostrip @used
 {
@@ -58,6 +60,15 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	current_proc = idle_proc;
 
 	io::print("4: Idle configured\n");
+
+	// Spawned once, here, not through the respawn loop below — echod is
+	// the IPC test server (see docs/devlog.md), not something that needs
+	// to come back after exiting. It's always the first process created
+	// after idle, so it always lands in the first free slot and gets
+	// pid 2 — user/shell.c3's "ping" command hardcodes that. Good enough
+	// for proving IPC works; a real name -> pid lookup is namespace work,
+	// not part of this first slice.
+	create_process((void*)&_binary_echod_bin_start, (uint)&_binary_echod_bin_size);
 	io::print("Idle process started\n");
 
 	// Single call site for create_process(shell), used for both the

@@ -7,6 +7,25 @@ import std::io;
 const PROCS_MAX     = 8; // Maximum number of processes
 const PROC_UNUSED   = 0; // Unused process control structure
 const PROC_RUNNABLE = 1; // Runnable process
+const PROC_BLOCKED  = 2; // Waiting on SYS_IPC_RECV for a message to arrive
+
+const MSG_MAX = 64; // Fixed-size IPC payload — enough for a short 9P-lite
+                     // path/header later, not bulk file data. yield()'s
+                     // scan only matches PROC_RUNNABLE, so PROC_BLOCKED is
+                     // automatically skipped without any scheduler change.
+
+const NS_MOUNTS_MAX = 4;   // Small fixed table — v1 only ever populates one
+                            // real entry ("/" -> echod), room to grow once
+                            // diskd/fsd exist without changing the shape.
+const NS_PREFIX_MAX = 32;  // Longest path prefix a mount entry can match.
+
+// One binding in a process's namespace: any path starting with `prefix`
+// resolves to `server_pid`. A zero server_pid marks an unused slot.
+struct Mount
+{
+	char[NS_PREFIX_MAX] prefix;
+	int                 server_pid;
+}
 // 8192 was enough for the syscall-only trap path (getchar/putchar), but the
 // file-system call chain (handle_syscall -> fs_lookup/fs_flush ->
 // read_write_disk -> virtq_kick/virtq_is_busy) overflowed it, corrupting
@@ -17,10 +36,40 @@ const STACK_SIZE    = 65536; // Stack size
 struct Process
 {
 	int pid; // Process ID
-	int state; // Process state: PROC_UNUSED or PROC_RUNNABLE
+	int state; // Process state: PROC_UNUSED, PROC_RUNNABLE, or PROC_BLOCKED
 	uint sp; // Stack pointer
 	uint* page_table;
+
+	// Single-slot inbox: at most one pending message per process. SEND
+	// doesn't block the sender even if this is already occupied (it just
+	// overwrites) — a known v1 simplification, fine as long as callers
+	// keep to one outstanding request at a time (which is all this phase
+	// ever does). RECV blocks (PROC_BLOCKED) until has_message is true.
+	bool has_message;
+	int  msg_from;
+	uint msg_type;
+	char[MSG_MAX] msg_data;
+
+	// Per-process namespace: path prefix -> server pid. Every process gets
+	// an identical default namespace today (populated in create_process) —
+	// there's no fork()/namespace inheritance yet to make private ones
+	// meaningful — but the table itself already lives on the Process
+	// struct, not a global, so a future sandboxed process can get a
+	// restricted view later without a redesign.
+	Mount[NS_MOUNTS_MAX] namespace;
+
 	char[STACK_SIZE] stack; // Kernel stack
+}
+
+// pid -> Process*, per how create_process assigns pid = slot index + 1.
+// Returns null for an out-of-range pid or a slot that isn't actually that
+// process anymore (freed and possibly reused, or never used).
+fn Process* proc_by_pid(int pid)
+{
+	if (pid < 1 || pid > PROCS_MAX) return null;
+	Process* p = &procs[pid - 1];
+	if (p.pid != pid || p.state == PROC_UNUSED) return null;
+	return p;
 }
 
 fn void switch_context(uint* prev_sp, uint* next_sp, uint satp, uint sscratch) @naked @noinline
@@ -152,6 +201,20 @@ fn Process* create_process(void* image, uint image_size)
 	proc.state = PROC_RUNNABLE;
 	proc.sp = (uint)sp;
 	proc.page_table = page_table;
+
+	// Default namespace: everything under "/" resolves to echod, which is
+	// always pid 2 (see kernel.c3 — it's the first process spawned after
+	// idle, deterministically). This is the same placeholder binding
+	// shell.c3's p9test used to hardcode directly; now it's a real
+	// per-process kernel lookup instead, ready to point somewhere else
+	// (fsd, once it exists) without touching any client code.
+	str_copy(&proc.namespace[0].prefix[0], "/", NS_PREFIX_MAX);
+	proc.namespace[0].server_pid = 2;
+	for (int m = 1; m < NS_MOUNTS_MAX; m++)
+	{
+		proc.namespace[m].server_pid = 0;
+	}
+
 	return proc;
 }
 
