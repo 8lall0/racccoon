@@ -86,8 +86,14 @@ fn void plic_complete(uint irq)
 // The boot chain research (BootROM -> FSBL -> OpenSBI -> payload,
 // S-mode) makes this plausible, but it's genuinely unconfirmed whether
 // the vendor's OpenSBI build actually wires its console extension to
-// UART0 (0x04140000, confirmed from the CV1800B datasheet, standard
-// 16550-compatible register layout) the way QEMU's does.
+// the board's actual debug UART the way QEMU's does.
+//
+// If a raw-MMIO fallback ever needs writing, target UART3
+// (0x04170000, per the datasheet's per-UART base table — see
+// docs/devlog.md), not UART0: the Duo's physically exposed debug
+// header (pins 6/7) is wired to UART3, confirmed from Milk-V's own
+// getting-started docs, not UART0 as earlier notes in this file
+// assumed before that was checked.
 //
 // If Stage 2's real boot shows no console output at all (and the rest
 // of the boot sequence otherwise looks alive — no immediate trap/panic),
