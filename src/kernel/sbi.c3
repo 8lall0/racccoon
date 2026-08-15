@@ -6,7 +6,7 @@ struct Sbiret
 	long value;
 }
 
-fn Sbiret sbi_call(int arg0, int arg1, int arg2, int arg3, int arg4, int arg5, int fid, int eid)
+fn Sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4, long arg5, long fid, long eid)
 {
 	Sbiret output;
 	long error;
@@ -25,8 +25,8 @@ fn Sbiret sbi_call(int arg0, int arg1, int arg2, int arg3, int arg4, int arg5, i
 
 		ecall;
 
-		sw $a0, [&error];
-		sw $a1, [&value];
+		sd $a0, [&error];
+		sd $a1, [&value];
 	}
 
 	output.value = value;
@@ -37,7 +37,7 @@ fn Sbiret sbi_call(int arg0, int arg1, int arg2, int arg3, int arg4, int arg5, i
 
 fn int __putchar(int ch)
 {
-	sbi_call(ch, 0, 0, 0, 0, 0, 0, 1);
+	sbi_call((long)ch, 0, 0, 0, 0, 0, 0, 1);
 	return ch;
 }
 

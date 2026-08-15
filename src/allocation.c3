@@ -34,7 +34,10 @@ fn void clear_bit(uint page_idx)
 
 // Finds n consecutive free pages by scanning for a run of n clear bits,
 // marks them used, and returns the physical address of the first page.
-fn uint alloc_pages(uint n)
+// Addresses are uptr (pointer-sized), not uint: on RV64 a plain uint is
+// only 32 bits, too narrow to hold a real physical address once pointers
+// are 64-bit — see docs/devlog.md for the RV64 port this was widened for.
+fn uptr alloc_pages(uint n)
 {
 	uint run_start = 0;
 	uint run_len   = 0;
@@ -60,7 +63,7 @@ fn uint alloc_pages(uint n)
 				set_bit(j);
 			}
 
-			uint paddr = (uint)&__free_ram + run_start * PAGE_SIZE;
+			uptr paddr = (uptr)&__free_ram + (uptr)(run_start * PAGE_SIZE);
 			mem::set((void*)paddr, 0, (sz)(n * PAGE_SIZE));
 			return paddr;
 		}
@@ -69,9 +72,9 @@ fn uint alloc_pages(uint n)
 	panic::panic("Out of memory");
 }
 
-fn void free_pages(uint paddr, uint n)
+fn void free_pages(uptr paddr, uint n)
 {
-	uint start_idx = (paddr - (uint)&__free_ram) / PAGE_SIZE;
+	uint start_idx = (uint)((paddr - (uptr)&__free_ram) / PAGE_SIZE);
 	for (uint j = start_idx; j < start_idx + n; j++)
 	{
 		clear_bit(j);

@@ -14,14 +14,32 @@ char[] __bss_end @export("__bss_end");
 char[] __stack_top @export("__stack_top");
 char[] __free_ram @export("__free_ram");
 char[] __free_ram_end @export("__free_ram_end");
+// _bin_end (a real address, objcopy-provided), not _bin_size: RV64 port.
+// _bin_size is an objcopy convention where the symbol's "address" isn't
+// a real memory location at all — it's the byte count itself, encoded
+// as an absolute (SHN_ABS) symbol value, and `&_bin_size` is the
+// classic trick to read that value back as an integer. That trick only
+// works under *absolute* addressing (lui+addi materializing the literal
+// value). This kernel's own code now compiles under RV64's medium code
+// model (see docs/devlog.md — kernel_main lives ~2GB from address 0,
+// past what "small"/medlow absolute addressing can reach at all), which
+// generates *PC-relative* (auipc-based) addressing for every symbol
+// reference uniformly — computing a PC-relative delta to a fake
+// "address" that's actually just a small integer produces a huge,
+// meaningless offset (kernel_main's real PC minus a value near zero),
+// which is exactly what overflowed the ±2GB link-time range check.
+// _bin_end has no such problem: it's a real address in the same
+// section as _bin_start, so `_bin_end - _bin_start` (both real,
+// nearby, PC-relative-safe addresses) gives the same byte count
+// without ever materializing the broken fake-address symbol.
 extern char[] _binary_shell_bin_start @cname("_binary_shell_bin_start");
-extern char[] _binary_shell_bin_size @cname("_binary_shell_bin_size");
+extern char[] _binary_shell_bin_end @cname("_binary_shell_bin_end");
 extern char[] _binary_echod_bin_start @cname("_binary_echod_bin_start");
-extern char[] _binary_echod_bin_size @cname("_binary_echod_bin_size");
+extern char[] _binary_echod_bin_end @cname("_binary_echod_bin_end");
 extern char[] _binary_diskd_bin_start @cname("_binary_diskd_bin_start");
-extern char[] _binary_diskd_bin_size @cname("_binary_diskd_bin_size");
+extern char[] _binary_diskd_bin_end @cname("_binary_diskd_bin_end");
 extern char[] _binary_fsd_bin_start @cname("_binary_fsd_bin_start");
-extern char[] _binary_fsd_bin_size @cname("_binary_fsd_bin_size");
+extern char[] _binary_fsd_bin_end @cname("_binary_fsd_bin_end");
 
 fn void boot() @naked @export("boot") @section(".text.boot") @noinline @nostrip @used
 {
@@ -33,7 +51,7 @@ fn void boot() @naked @export("boot") @section(".text.boot") @noinline @nostrip 
 
 fn void kernel_main() @export("kernel_main") @noinline @nostrip
 {
-	mem::set(&__bss, 0, (sz)((uint)&__bss_end - (uint)&__bss));
+	mem::set(&__bss, 0, (sz)((uptr)&__bss_end - (uptr)&__bss));
 
 	io::print("1: BSS cleared\n");
 
@@ -46,7 +64,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	// interrupt can actually fire — kernel_entry's very first instruction
 	// (csrrw sp, sscratch, sp) would otherwise swap in garbage and build
 	// the trap frame at a bogus address.
-	write_csr("sscratch", (uint)&boot_trap_stack + boot_trap_stack.len);
+	write_csr("sscratch", (uptr)&boot_trap_stack + boot_trap_stack.len);
 
 	plic_init();
 	enable_external_interrupts();
@@ -68,12 +86,12 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	// pid 2 — user/shell.c3's "ping" command hardcodes that. Good enough
 	// for proving IPC works; a real name -> pid lookup is namespace work,
 	// not part of this first slice.
-	create_process((void*)&_binary_echod_bin_start, (uint)&_binary_echod_bin_size);
+	create_process((void*)&_binary_echod_bin_start, (uint)((uptr)&_binary_echod_bin_end - (uptr)&_binary_echod_bin_start));
 	io::print("Idle process started\n");
 
 	// diskd next (see user/diskd.c3, microkernel plan phase 4) — created
 	// after echod so echod keeps its pid-2 convention above.
-	Process* diskd_proc = create_process((void*)&_binary_diskd_bin_start, (uint)&_binary_diskd_bin_size);
+	Process* diskd_proc = create_process((void*)&_binary_diskd_bin_start, (uint)((uptr)&_binary_diskd_bin_end - (uptr)&_binary_diskd_bin_start));
 	setup_diskd_mappings(diskd_proc);
 	io::print("diskd created\n");
 
@@ -87,7 +105,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	// here on (i.e. every shell) gets a working "" -> fsd mount;
 	// idle/echod/diskd, created before this line, don't and don't need
 	// to (see process.c3's create_process).
-	Process* fsd_proc = create_process((void*)&_binary_fsd_bin_start, (uint)&_binary_fsd_bin_size);
+	Process* fsd_proc = create_process((void*)&_binary_fsd_bin_start, (uint)((uptr)&_binary_fsd_bin_end - (uptr)&_binary_fsd_bin_start));
 	fsd_pid = fsd_proc.pid;
 	io::print("fsd created\n");
 
@@ -107,7 +125,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		}
 		if (!shell_running)
 		{
-			create_process((void*)&_binary_shell_bin_start, (uint)&_binary_shell_bin_size);
+			create_process((void*)&_binary_shell_bin_start, (uint)((uptr)&_binary_shell_bin_end - (uptr)&_binary_shell_bin_start));
 		}
 
 		yield();

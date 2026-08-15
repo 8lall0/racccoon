@@ -109,56 +109,83 @@ struct Virtio_blk_req @packed
 // outside the CPU's view. An asm block's contents run as written, not
 // subject to that kind of reordering (the same property src/entry.c3's
 // read_reg/write_reg macros rely on).
-fn uint mmio_read32(uint addr)
+//
+// RV64 port: `addr` and every local bound into this block-form asm
+// widen to `uptr`/`ulong` — a plain 32-bit `uint` in that binding
+// position is rejected by c3c on a 64-bit target, the same restriction
+// that forced src/kernel/sbi.c3's params wider (see docs/devlog.md).
+// Separately, `lw` is a *signed* word load — on RV32 that didn't matter
+// (the register was only ever 32 bits wide anyway), but on RV64 it
+// sign-extends into the full 64-bit register. For mmio_read32 that's
+// harmless (the (uint) truncation below immediately discards whatever
+// landed in the upper 32 bits), but mmio_read64 combines two such loads
+// into one *unsigned* 64-bit value via shift+or, where a sign-extended
+// upper word would corrupt the result — masked off explicitly there.
+// `lwu` (a real zero-extending load) would be the more direct fix, but
+// c3c's block-form asm doesn't recognize it ("Unknown instruction for
+// the current target") — `lw` + an explicit mask is the workaround.
+fn uint mmio_read32(uptr addr)
 {
-	uint v;
+	ulong v;
 	asm
 	{
 		lw v, [addr];
 	}
-	return v;
+	return (uint)v;
 }
 
-fn void mmio_write32(uint addr, uint v)
+fn void mmio_write32(uptr addr, uint v)
 {
+	ulong vv = (ulong)v;
 	asm
 	{
-		sw v, [addr];
+		sw vv, [addr];
 	}
 }
 
-fn ulong mmio_read64(uint addr)
+fn ulong mmio_read64(uptr addr)
 {
-	uint lo;
-	uint hi;
+	ulong lo;
+	ulong hi;
 	asm
 	{
 		lw lo, [addr];
 		lw hi, [addr + 4];
 	}
-	return ((ulong)hi << 32) | (ulong)lo;
+	return ((hi & 0xffffffff) << 32) | (lo & 0xffffffff);
 }
 
-fn uint reg_read32(uint offset) { return mmio_read32(VIRTIO_BLK_PADDR + offset); }
-fn ulong reg_read64(uint offset) { return mmio_read64(VIRTIO_BLK_PADDR + offset); }
-fn void reg_write32(uint offset, uint v) { mmio_write32(VIRTIO_BLK_PADDR + offset, v); }
+fn uint reg_read32(uint offset) { return mmio_read32((uptr)(VIRTIO_BLK_PADDR + offset)); }
+fn ulong reg_read64(uint offset) { return mmio_read64((uptr)(VIRTIO_BLK_PADDR + offset)); }
+fn void reg_write32(uint offset, uint v) { mmio_write32((uptr)(VIRTIO_BLK_PADDR + offset), v); }
 fn void reg_fetch_or32(uint offset, uint v) { reg_write32(offset, reg_read32(offset) | v); }
 
 Virtio_virtq*   vq;
 Virtio_blk_req* req;
-uint            req_paddr;
+uptr            req_paddr;
 
 fn void diskd_panic(char* msg)
 {
 	print("diskd: ");
 	print(msg);
 	print("\n");
-	for (;;) {}
+	// Not `for (;;) {}`: an empty infinite loop with no side effects is
+	// UB by C/LLVM's rules and is a real optimizer target, not just a
+	// theoretical one — under -O2 this got silently dropped, falling
+	// straight through back into diskd_init()'s caller with diskd in a
+	// half-initialized state instead of actually halting, which is what
+	// caused the repeated "diskd: invalid device id" prints and eventual
+	// illegal-instruction crash this was found chasing (see
+	// docs/devlog.md). exit() is both correct (this really is fatal —
+	// nothing after this point can do anything useful) and immune to
+	// the same class of bug, since it's a real syscall with a real
+	// side effect the optimizer can't reason away.
+	exit();
 }
 
 fn void diskd_init()
 {
-	uint vq_paddr;
+	uptr vq_paddr;
 	if (diskd_info(&vq_paddr, &req_paddr) < 0)
 	{
 		diskd_panic("failed to get buffer info");
@@ -186,7 +213,7 @@ fn void diskd_init()
 
 	reg_write32(VIRTIO_REG_QUEUE_SEL, 0);
 	reg_write32(VIRTIO_REG_QUEUE_NUM, VIRTQ_ENTRY_NUM);
-	reg_write32(VIRTIO_REG_QUEUE_PFN, vq_paddr / PAGE_SIZE);
+	reg_write32(VIRTIO_REG_QUEUE_PFN, (uint)(vq_paddr / PAGE_SIZE));
 	vq.queue_index = 0;
 	vq.used_index  = &vq.used.index;
 
@@ -265,12 +292,12 @@ fn void main() @export("main")
 		vq.descs[0].flags = VIRTQ_DESC_F_NEXT;
 		vq.descs[0].next  = 1;
 
-		vq.descs[1].addr  = (ulong)(uint)&req.data;
+		vq.descs[1].addr  = (ulong)(uptr)&req.data;
 		vq.descs[1].len   = SECTOR_SIZE;
 		vq.descs[1].flags = VIRTQ_DESC_F_NEXT | (is_write ? (ushort)0 : VIRTQ_DESC_F_WRITE);
 		vq.descs[1].next  = 2;
 
-		vq.descs[2].addr  = (ulong)(uint)&req.status;
+		vq.descs[2].addr  = (ulong)(uptr)&req.status;
 		vq.descs[2].len   = 1;
 		vq.descs[2].flags = VIRTQ_DESC_F_WRITE;
 

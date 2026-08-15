@@ -193,10 +193,15 @@ fn void main() @export("main") {
             // minimal demonstration like this.
             rfork_shared_value = 42;
             rfork_child_ran = 0;
-            int rf_flags = RFPROC | RFMEM;
-            int rf_sysno = SYS_RFORK;
-            int rf_gen_out = 0; // null — this child is never joined
-            int r;
+            // RV64 port: these locals widen to `long` — c3c's block-form
+            // asm (the `$a0`-style bindings below) requires a register
+            // binding to be native register width, and a 32-bit `int`
+            // is rejected on a 64-bit target (same restriction as
+            // user.c3's syscall()/syscall4() — see docs/devlog.md).
+            long rf_flags = RFPROC | RFMEM;
+            long rf_sysno = SYS_RFORK;
+            long rf_gen_out = 0; // null — this child is never joined
+            long r;
             asm {
                 mv $a0, rf_flags;
                 mv $a1, rf_gen_out;
@@ -208,7 +213,7 @@ fn void main() @export("main") {
                 print("rfork failed\n");
             } else if (r == 0) {
                 rfork_child_ran = rfork_shared_value;
-                int exit_sysno = SYS_EXIT;
+                long exit_sysno = SYS_EXIT;
                 asm {
                     mv $a3, exit_sysno;
                     ecall;

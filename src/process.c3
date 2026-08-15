@@ -31,8 +31,8 @@ const MSG_MAX = 1128;
 // alloc_pages() directly and its own per-page image mapping can't
 // guarantee the physical contiguity DMA needs.
 int  diskd_pid = 0;
-uint diskd_vq_paddr;
-uint diskd_req_paddr;
+uptr diskd_vq_paddr;
+uptr diskd_req_paddr;
 
 // The filesystem server (see user/fsd.c3) — 0 until created, consulted
 // only by create_process below to populate every new process's default
@@ -63,8 +63,8 @@ struct Process
 {
 	int pid; // Process ID
 	int state; // Process state: PROC_UNUSED, PROC_RUNNABLE, or PROC_BLOCKED
-	uint sp; // Stack pointer
-	uint* page_table;
+	uptr sp; // Stack pointer
+	ulong* page_table; // Sv39 top-level (root) table — see page.c3
 
 	// Bumped every time this slot is (re)used — never reset, persists
 	// across a slot's unused periods. Exists purely so SYS_JOIN
@@ -156,51 +156,58 @@ fn Process* proc_by_pid(int pid)
 	return p;
 }
 
-fn void switch_context(uint* prev_sp, uint* next_sp, uint satp, uint sscratch) @naked @noinline
+// RV64 port: sd/ld instead of sw/lw, 8*N offsets instead of 4*N — every
+// register (including satp/sscratch's own carrier args) is now 8 bytes,
+// not 4. Same 13-word (ra + s0-s11) shape as the RV32 version, just twice
+// the byte stride. satp is a genuine ulong here (Sv39's MODE field lives
+// in the top 4 bits of a 64-bit register, not RV32's single top bit — see
+// page.c3's SATP_SV39), not merely "an address happens to be pointer-sized".
+fn void switch_context(uptr* prev_sp, uptr* next_sp, ulong satp, uptr sscratch) @naked @noinline
 {
 	asm(`
-        addi sp, sp, -13 * 4
-        sw ra,  0  * 4(sp)
-        sw s0,  1  * 4(sp)
-        sw s1,  2  * 4(sp)
-        sw s2,  3  * 4(sp)
-        sw s3,  4  * 4(sp)
-        sw s4,  5  * 4(sp)
-        sw s5,  6  * 4(sp)
-        sw s6,  7  * 4(sp)
-        sw s7,  8  * 4(sp)
-        sw s8,  9  * 4(sp)
-        sw s9,  10 * 4(sp)
-        sw s10, 11 * 4(sp)
-        sw s11, 12 * 4(sp)
-        sw sp, (a0)
+        addi sp, sp, -13 * 8
+        sd ra,  0  * 8(sp)
+        sd s0,  1  * 8(sp)
+        sd s1,  2  * 8(sp)
+        sd s2,  3  * 8(sp)
+        sd s3,  4  * 8(sp)
+        sd s4,  5  * 8(sp)
+        sd s5,  6  * 8(sp)
+        sd s6,  7  * 8(sp)
+        sd s7,  8  * 8(sp)
+        sd s8,  9  * 8(sp)
+        sd s9,  10 * 8(sp)
+        sd s10, 11 * 8(sp)
+        sd s11, 12 * 8(sp)
+        sd sp, (a0)
 
         sfence.vma
         csrw satp, a2
         sfence.vma
         csrw sscratch, a3
 
-        lw sp, (a1)
-        lw ra,  0  * 4(sp)
-        lw s0,  1  * 4(sp)
-        lw s1,  2  * 4(sp)
-        lw s2,  3  * 4(sp)
-        lw s3,  4  * 4(sp)
-        lw s4,  5  * 4(sp)
-        lw s5,  6  * 4(sp)
-        lw s6,  7  * 4(sp)
-        lw s7,  8  * 4(sp)
-        lw s8,  9  * 4(sp)
-        lw s9,  10 * 4(sp)
-        lw s10, 11 * 4(sp)
-        lw s11, 12 * 4(sp)
-        addi sp, sp, 13 * 4
+        ld sp, (a1)
+        ld ra,  0  * 8(sp)
+        ld s0,  1  * 8(sp)
+        ld s1,  2  * 8(sp)
+        ld s2,  3  * 8(sp)
+        ld s3,  4  * 8(sp)
+        ld s4,  5  * 8(sp)
+        ld s5,  6  * 8(sp)
+        ld s6,  7  * 8(sp)
+        ld s7,  8  * 8(sp)
+        ld s8,  9  * 8(sp)
+        ld s9,  10 * 8(sp)
+        ld s10, 11 * 8(sp)
+        ld s11, 12 * 8(sp)
+        addi sp, sp, 13 * 8
         ret
     `);
 }
 
 const SSTATUS_SPIE = (1 << 5);
 const SSTATUS_SUM   = (1 << 18); // let S-mode access U-mode pages (needed for syscalls like readfile/writefile that dereference user pointers directly)
+                                  // Same bit positions on RV64: sstatus's low, commonly-used bits are defined identically across XLEN in the priv spec.
 
 fn void user_entry() @naked @noinline @noreturn
 {
@@ -208,7 +215,9 @@ fn void user_entry() @naked @noinline @noreturn
 	// SSTATUS_SPIE|SSTATUS_SUM (0x40020, this file's consts above)
 	// hardcoded: compile-time asm() only supports %s substitution, so the
 	// constants can't be interpolated here. USER_BASE must also match
-	// user/user.ld's base address.
+	// user/user.ld's base address. `li` with a small constant like this
+	// compiles the same way regardless of XLEN, so this function is
+	// otherwise unchanged from the RV32 version.
 	asm(`
         li t0, 0x1000000
         csrw sepc, t0
@@ -236,44 +245,47 @@ fn void user_entry() @naked @noinline @noreturn
 // stvec alignment saga, the sscratch reentrancy bug) says to avoid
 // unless there's no other way. A few duplicated lines here is cheaper
 // than that risk.
+//
+// RV64 port: sd/ld and 8*N offsets, same as switch_context above — the
+// 32-word block is now 256 bytes, not 124.
 fn void fork_entry() @naked @noinline @noreturn
 {
 	asm(`
-        addi t0, sp, 4 * 31
-        lw t0, 0(t0)
+        addi t0, sp, 8 * 31
+        ld t0, 0(t0)
         csrw sepc, t0
 
-        lw ra,  4 * 0(sp)
-        lw gp,  4 * 1(sp)
-        lw tp,  4 * 2(sp)
-        lw t0,  4 * 3(sp)
-        lw t1,  4 * 4(sp)
-        lw t2,  4 * 5(sp)
-        lw t3,  4 * 6(sp)
-        lw t4,  4 * 7(sp)
-        lw t5,  4 * 8(sp)
-        lw t6,  4 * 9(sp)
-        lw a0,  4 * 10(sp)
-        lw a1,  4 * 11(sp)
-        lw a2,  4 * 12(sp)
-        lw a3,  4 * 13(sp)
-        lw a4,  4 * 14(sp)
-        lw a5,  4 * 15(sp)
-        lw a6,  4 * 16(sp)
-        lw a7,  4 * 17(sp)
-        lw s0,  4 * 18(sp)
-        lw s1,  4 * 19(sp)
-        lw s2,  4 * 20(sp)
-        lw s3,  4 * 21(sp)
-        lw s4,  4 * 22(sp)
-        lw s5,  4 * 23(sp)
-        lw s6,  4 * 24(sp)
-        lw s7,  4 * 25(sp)
-        lw s8,  4 * 26(sp)
-        lw s9,  4 * 27(sp)
-        lw s10, 4 * 28(sp)
-        lw s11, 4 * 29(sp)
-        lw sp,  4 * 30(sp)
+        ld ra,  8 * 0(sp)
+        ld gp,  8 * 1(sp)
+        ld tp,  8 * 2(sp)
+        ld t0,  8 * 3(sp)
+        ld t1,  8 * 4(sp)
+        ld t2,  8 * 5(sp)
+        ld t3,  8 * 6(sp)
+        ld t4,  8 * 7(sp)
+        ld t5,  8 * 8(sp)
+        ld t6,  8 * 9(sp)
+        ld a0,  8 * 10(sp)
+        ld a1,  8 * 11(sp)
+        ld a2,  8 * 12(sp)
+        ld a3,  8 * 13(sp)
+        ld a4,  8 * 14(sp)
+        ld a5,  8 * 15(sp)
+        ld a6,  8 * 16(sp)
+        ld a7,  8 * 17(sp)
+        ld s0,  8 * 18(sp)
+        ld s1,  8 * 19(sp)
+        ld s2,  8 * 20(sp)
+        ld s3,  8 * 21(sp)
+        ld s4,  8 * 22(sp)
+        ld s5,  8 * 23(sp)
+        ld s6,  8 * 24(sp)
+        ld s7,  8 * 25(sp)
+        ld s8,  8 * 26(sp)
+        ld s9,  8 * 27(sp)
+        ld s10, 8 * 28(sp)
+        ld s11, 8 * 29(sp)
+        ld sp,  8 * 30(sp)
         sret
     `);
 }
@@ -299,17 +311,17 @@ fn Process* create_process(void* image, uint image_size)
 		panic::panic("no free process slots");
 	}
 
-	uint* sp = (uint*)&proc.stack;
-	sp += STACK_SIZE / 4;
+	uptr* sp = (uptr*)&proc.stack;
+	sp += STACK_SIZE / 8;
 	for (int j = 0; j < 12; j++)
 	{
 		*(--sp) = 0;
 	}
 	// Setting RA
-	*(--sp) = (uint)&user_entry;
+	*(--sp) = (uptr)&user_entry;
 
-	uint* page_table = (uint*)alloc_pages(1);
-	for (uint paddr = (uint)&__kernel_base; paddr < (uint)&__free_ram_end; paddr += PAGE_SIZE)
+	ulong* page_table = (ulong*)alloc_pages(1);
+	for (uptr paddr = (uptr)&__kernel_base; paddr < (uptr)&__free_ram_end; paddr += PAGE_SIZE)
 	{
 		map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
 	}
@@ -334,19 +346,19 @@ fn Process* create_process(void* image, uint image_size)
 	char* img = image;
 	for (uint off = 0; off < image_size; off += PAGE_SIZE)
 	{
-		uint page          = alloc_pages(1);
+		uptr page          = alloc_pages(1);
 		uint remaining     = image_size - off;
 		uint copy_size     = remaining < PAGE_SIZE ? remaining : PAGE_SIZE;
 
 		mem::copy((void*)page, img + off, (sz)copy_size);
-		map_page(page_table, USER_BASE + off, page, PAGE_U | PAGE_R | PAGE_W | PAGE_X);
+		map_page(page_table, (uptr)USER_BASE + (uptr)off, page, PAGE_U | PAGE_R | PAGE_W | PAGE_X);
 	}
 
 	// Initialize fields.
 	proc.pid = i + 1;
 	proc.generation++;
 	proc.state = PROC_RUNNABLE;
-	proc.sp = (uint)sp;
+	proc.sp = (uptr)sp;
 	proc.page_table = page_table;
 
 	// Default namespace: everything under "/" resolves to echod, which is
@@ -400,14 +412,14 @@ fn void setup_diskd_mappings(Process* proc)
 	map_page(proc.page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, PAGE_U | PAGE_R | PAGE_W);
 
 	uint vq_pages = (uint)(mem::aligned_offset((sz)Virtio_virtq::size, PAGE_SIZE) / PAGE_SIZE);
-	uint vq_paddr = alloc_pages(vq_pages);
+	uptr vq_paddr = alloc_pages(vq_pages);
 	for (uint off = 0; off < vq_pages * PAGE_SIZE; off += PAGE_SIZE)
 	{
 		map_page(proc.page_table, vq_paddr + off, vq_paddr + off, PAGE_U | PAGE_R | PAGE_W);
 	}
 
 	uint req_pages = (uint)(mem::aligned_offset((sz)Virtio_blk_req::size, PAGE_SIZE) / PAGE_SIZE);
-	uint req_paddr = alloc_pages(req_pages);
+	uptr req_paddr = alloc_pages(req_pages);
 	for (uint off = 0; off < req_pages * PAGE_SIZE; off += PAGE_SIZE)
 	{
 		map_page(proc.page_table, req_paddr + off, req_paddr + off, PAGE_U | PAGE_R | PAGE_W);
@@ -442,5 +454,5 @@ fn void yield() @noinline
 	Process* prev = current_proc;
 	current_proc = next;
 
-	switch_context(&prev.sp, &next.sp, ((uint)next.page_table >> 12) | 0x80000000, (uint)&next.stack + STACK_SIZE);
+	switch_context(&prev.sp, &next.sp, ((ulong)(uptr)next.page_table >> 12) | SATP_SV39, (uptr)&next.stack + STACK_SIZE);
 }

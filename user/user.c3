@@ -48,7 +48,7 @@ fn void exit() @noreturn @export("exit") {
 // pid got reused by something unrelated" (see src/process.c3's
 // Process.generation and SYS_JOIN's case in src/entry.c3).
 fn int rfork(int flags, uint* generation_out) @export("rfork") {
-    return syscall(SYS_RFORK, flags, (int)generation_out, 0);
+    return syscall(SYS_RFORK, flags, (long)generation_out, 0);
 }
 
 // Stack-aware wrapper around rfork(RFPROC|RFMEM): unlike calling rfork()
@@ -79,7 +79,7 @@ fn int rfork(int flags, uint* generation_out) @export("rfork") {
 // stack is irrelevant to the child from that point on, not just briefly
 // avoided.
 //
-// The leading save/restore of s1-s3/ra around the ecall is a separate,
+// The leading save/restore of s1-s4/ra around the ecall is a separate,
 // ABI-compliance concern: as a @naked function, nothing else guarantees
 // this doesn't clobber whatever threadcreate's own *caller* had live in
 // those callee-saved registers. Restored before the parent-side return;
@@ -100,14 +100,19 @@ fn int rfork(int flags, uint* generation_out) @export("rfork") {
 // it arrives in a3 — the same register this function needs for the
 // SYS_RFORK syscall number moments later — so it has to be saved off
 // before that overwrite, exactly like func/arg/stack_top already are.
+//
+// RV64 port: sd/ld and 8*N offsets, not sw/lw and 4*N — every saved
+// register is a full 64-bit value now (s1-s4 and ra are always native
+// register width regardless of XLEN, so the save area just got wider,
+// same shape as every other hand-written asm block in this port).
 fn int threadcreate(void* func, void* arg, void* stack_top, uint* generation_out) @naked @noinline @export("threadcreate") {
     asm(`
-        addi sp, sp, -20
-        sw s1, 0(sp)
-        sw s2, 4(sp)
-        sw s3, 8(sp)
-        sw s4, 12(sp)
-        sw ra, 16(sp)
+        addi sp, sp, -40
+        sd s1, 0(sp)
+        sd s2, 8(sp)
+        sd s3, 16(sp)
+        sd s4, 24(sp)
+        sd ra, 32(sp)
 
         mv s1, a0
         mv s2, a1
@@ -125,18 +130,27 @@ fn int threadcreate(void* func, void* arg, void* stack_top, uint* generation_out
         j .
 
     1:
-        lw s1, 0(sp)
-        lw s2, 4(sp)
-        lw s3, 8(sp)
-        lw s4, 12(sp)
-        lw ra, 16(sp)
-        addi sp, sp, 20
+        ld s1, 0(sp)
+        ld s2, 8(sp)
+        ld s3, 16(sp)
+        ld s4, 24(sp)
+        ld ra, 32(sp)
+        addi sp, sp, 40
         ret
     `);
 }
 
-fn int syscall(int sysno, int arg0, int arg1, int arg2) {
-    int result;
+// RV64 port: all four params are `long` (not `int`) — c3c's block-form
+// asm (the `$a0`-style pseudo-register bindings below) requires locals
+// bound into a register position to be native register width; a 32-bit
+// `int` is rejected outright on a 64-bit target (the same restriction
+// that forced src/kernel/sbi.c3's sbi_call to widen its own params —
+// see docs/devlog.md). This also happens to be exactly the width
+// needed for pointer-valued arguments (buffers, out-pointers) to
+// survive the round trip without truncation, so callers that used to
+// cast a pointer through `(int)` now go through `(long)` instead.
+fn int syscall(long sysno, long arg0, long arg1, long arg2) {
+    long result;
     asm {
         mv $a0, arg0;
         mv $a1, arg1;
@@ -145,15 +159,15 @@ fn int syscall(int sysno, int arg0, int arg1, int arg2) {
         ecall;
         mv result, $a0;
     }
-    return result;
+    return (int)result;
 }
 
-fn int syscall4(int sysno, int arg0, int arg1, int arg2, int arg3) {
+fn int syscall4(long sysno, long arg0, long arg1, long arg2, long arg3) {
     // Same shape as syscall(), one more argument in a4 — a3 is always the
     // syscall number, so a 4th real argument needs a register beyond the
     // 3-arg ABI. Only SYS_IPC_SEND needs this so far (dest_pid, type,
     // data_ptr, len).
-    int result;
+    long result;
     asm {
         mv $a0, arg0;
         mv $a1, arg1;
@@ -163,15 +177,15 @@ fn int syscall4(int sysno, int arg0, int arg1, int arg2, int arg3) {
         ecall;
         mv result, $a0;
     }
-    return result;
+    return (int)result;
 }
 
 fn int ipc_send(int dest_pid, uint type, char* data, int len) @export("ipc_send") {
-    return syscall4(SYS_IPC_SEND, dest_pid, (int)type, (int)data, len);
+    return syscall4(SYS_IPC_SEND, dest_pid, (long)type, (long)data, len);
 }
 
 fn int ipc_recv_type(char* buf, int len, uint* out_type) @export("ipc_recv_type") {
-    return syscall(SYS_IPC_RECV, (int)buf, len, (int)out_type);
+    return syscall(SYS_IPC_RECV, (long)buf, len, (long)out_type);
 }
 
 fn int ipc_recv(char* buf, int len) @export("ipc_recv") {
@@ -183,7 +197,7 @@ fn int ipc_recv(char* buf, int len) @export("ipc_recv") {
 // SYS_IPC_POLL case for why this exists (diskd's completion-wait needs
 // it specifically — a blocking recv there is unsafe).
 fn int ipc_poll_type(char* buf, int len, uint* out_type) @export("ipc_poll_type") {
-    return syscall(SYS_IPC_POLL, (int)buf, len, (int)out_type);
+    return syscall(SYS_IPC_POLL, (long)buf, len, (long)out_type);
 }
 
 // --- 9P-lite: a tiny message-oriented protocol layered directly on top
@@ -209,7 +223,7 @@ fn int p9_call(int dest_pid, uint verb, char* data, int len, char* reply_buf, in
 // resolved kernel-side since user code can't read another process's
 // memory). -1 means no mount matched.
 fn int ns_resolve(char* path) @export("ns_resolve") {
-    return syscall(SYS_NS_RESOLVE, (int)path, 0, 0);
+    return syscall(SYS_NS_RESOLVE, (long)path, 0, 0);
 }
 
 // Removes one of *this process's own* namespace mounts, matched by
@@ -219,7 +233,7 @@ fn int ns_resolve(char* path) @export("ns_resolve") {
 // the namespace — see src/entry.c3's SYS_RFORK case) can use this to
 // sandbox itself without affecting its parent or siblings.
 fn int ns_unmount(char* prefix) @export("ns_unmount") {
-    return syscall(SYS_NS_UNMOUNT, (int)prefix, 0, 0);
+    return syscall(SYS_NS_UNMOUNT, (long)prefix, 0, 0);
 }
 
 // Blocks until the process with this pid no longer exists — e.g. a
@@ -236,7 +250,7 @@ fn int ns_unmount(char* prefix) @export("ns_unmount") {
 // src/process.c3's Process.generation and SYS_JOIN's case in
 // src/entry.c3 for the full reasoning).
 fn int join(int pid, uint generation) @export("join") {
-    return syscall(SYS_JOIN, pid, (int)generation, 0);
+    return syscall(SYS_JOIN, pid, (long)generation, 0);
 }
 
 // Same as p9_call, but addresses the server by path (resolved through the
@@ -252,8 +266,12 @@ fn int p9_call_path(char* path, uint verb, char* data, int len, char* reply_buf,
 // buffer, allocated (and identity-mapped into diskd's own page table) by
 // the kernel at process-creation time — see setup_diskd_mappings in
 // src/process.c3 for why diskd can't know or derive these itself.
-fn int diskd_info(uint* vq_paddr_out, uint* req_paddr_out) @export("diskd_info") {
-    return syscall(SYS_DISKD_INFO, (int)vq_paddr_out, (int)req_paddr_out, 0);
+// uptr* (not uint*): the kernel writes full pointer-sized physical
+// addresses into these out-params (src/entry.c3's SYS_DISKD_INFO case) —
+// a uint* here would only reserve 4 bytes for what the kernel's 8-byte
+// store actually writes, corrupting whatever's next on diskd's stack.
+fn int diskd_info(uptr* vq_paddr_out, uptr* req_paddr_out) @export("diskd_info") {
+    return syscall(SYS_DISKD_INFO, (long)vq_paddr_out, (long)req_paddr_out, 0);
 }
 
 fn void putchar(char ch) @export("putchar") {

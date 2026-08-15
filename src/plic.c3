@@ -4,8 +4,11 @@ module kernel;
 // SiFive-style PLIC used across RISC-V platforms (same one xv6-riscv
 // targets): a small handful of scattered pages, not one contiguous block,
 // which is why create_process maps three specific pages for it rather
-// than a range.
-const uint PLIC_BASE = 0x0c000000;
+// than a range. Addresses are uptr (RV64 port — pointer-sized, not a
+// fixed 32-bit uint); the *registers themselves* stay 32-bit values
+// (irq numbers, priority, enable bitmask) — PLIC register width is
+// fixed by the hardware spec, independent of hart XLEN.
+const uptr PLIC_BASE = 0x0c000000;
 
 // virtio-mmio devices on QEMU's virt board get IRQ N for slot N; we only
 // ever attach one device (bus=virtio-mmio-bus.0, slot 0), so IRQ 1.
@@ -14,19 +17,19 @@ const uint IRQ_VIRTIO_BLK = 1;
 // Context = (hart, privilege mode) pair the PLIC targets. QEMU virt wires
 // context 2*hart for M-mode and 2*hart+1 for S-mode; single-hart S-mode
 // kernel, so context 1.
-const uint PLIC_S_CONTEXT = 1;
+const uptr PLIC_S_CONTEXT = 1;
 
-const uint PLIC_PRIORITY_BASE = PLIC_BASE;                                    // + 4*irq
-const uint PLIC_ENABLE_BASE   = PLIC_BASE + 0x2000 + PLIC_S_CONTEXT * 0x80;    // + (irq/32)*4, bit irq%32
-const uint PLIC_THRESHOLD     = PLIC_BASE + 0x200000 + PLIC_S_CONTEXT * 0x1000;
-const uint PLIC_CLAIM         = PLIC_BASE + 0x200004 + PLIC_S_CONTEXT * 0x1000;
+const uptr PLIC_PRIORITY_BASE = PLIC_BASE;                                    // + 4*irq
+const uptr PLIC_ENABLE_BASE   = PLIC_BASE + 0x2000 + PLIC_S_CONTEXT * 0x80;    // + (irq/32)*4, bit irq%32
+const uptr PLIC_THRESHOLD     = PLIC_BASE + 0x200000 + PLIC_S_CONTEXT * 0x1000;
+const uptr PLIC_CLAIM         = PLIC_BASE + 0x200004 + PLIC_S_CONTEXT * 0x1000;
 
 // Page-aligned bases of the three distinct pages the registers above fall
 // in (PLIC_ENABLE_BASE and PLIC_THRESHOLD/PLIC_CLAIM aren't page-aligned
 // themselves), for create_process to map into every process's page table.
-const uint PLIC_PRIORITY_PAGE = PLIC_PRIORITY_BASE & (uint)~(PAGE_SIZE - 1);
-const uint PLIC_ENABLE_PAGE   = PLIC_ENABLE_BASE & (uint)~(PAGE_SIZE - 1);
-const uint PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uint)~(PAGE_SIZE - 1);
+const uptr PLIC_PRIORITY_PAGE = PLIC_PRIORITY_BASE & (uptr)~(PAGE_SIZE - 1);
+const uptr PLIC_ENABLE_PAGE   = PLIC_ENABLE_BASE & (uptr)~(PAGE_SIZE - 1);
+const uptr PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uptr)~(PAGE_SIZE - 1);
 
 fn void plic_init()
 {

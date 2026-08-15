@@ -26,19 +26,19 @@ build_user_program() {
     --safe=no \
     --use-stdlib=no \
     --link-libc=no \
-    --target elf-riscv32 \
+    --target elf-riscv64 \
     --riscv-cpu=rvimac \
     --output-dir "build/user/$name/obj" \
     "${sources[@]}"
 
-  local obj_dir="build/user/$name/obj/obj/elf-riscv32"
+  local obj_dir="build/user/$name/obj/obj/elf-riscv64"
 
+  # RV64 port: no libclang_rt.builtins-riscv64 available or needed — see
+  # build.sh's matching comment.
   echo "==> Linking $name.elf..."
   $LLVM_LLD \
     "$obj_dir"/*.o \
     -T user/user.ld \
-    -L /opt/riscv/lib/linux \
-    -lclang_rt.builtins-riscv32 \
     -Map="build/user/$name.map" \
     -o "build/user/$name.elf"
 
@@ -54,7 +54,7 @@ build_user_program() {
     cd build/user
     $LLVM_OBJCOPY \
       -Ibinary \
-      -Oelf32-littleriscv \
+      -Oelf64-littleriscv \
       "$name.bin" \
       "$name.bin.o"
   )

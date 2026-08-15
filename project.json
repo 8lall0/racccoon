@@ -10,7 +10,7 @@
   "output": "build",
   "targets": {
     "racccoon": {
-      "target":  "elf-riscv32",
+      "target":  "elf-riscv64",
       "type": "object-files"
     }
   },

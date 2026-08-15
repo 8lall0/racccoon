@@ -5,8 +5,12 @@ import panic;
 import sbi;
 
 const SCAUSE_ECALL             = 8;
-const SCAUSE_INTERRUPT_BIT     = 0x80000000; // MSB of scause: set for interrupts, clear for exceptions
-const SCAUSE_SUPERVISOR_EXTERNAL = 9;        // interrupt cause code for a PLIC-routed external interrupt
+// RV64 port: the interrupt bit is scause's MSB — bit 63 on RV64, not
+// bit 31 as on RV32. This is a real correctness-critical difference,
+// not just a width bump; getting it wrong silently misclassifies every
+// interrupt as an exception (or vice versa).
+const ulong SCAUSE_INTERRUPT_BIT = (1ul << 63);
+const SCAUSE_SUPERVISOR_EXTERNAL = 9;        // interrupt cause code for a PLIC-routed external interrupt — same code on both XLENs
 
 // Dedicated trap-frame anchor for traps taken during kernel_main's
 // bare-mode phase, between enable_external_interrupts() and the first
@@ -58,7 +62,11 @@ const int RFMEM  = 1 << 1;
 // request in diskd's single inbox slot. Must match user/diskd.c3's copy.
 const uint DISKD_IRQ_NOTIFY = 0xFFFFFFFF;
 
-uint read_reg_tmp @export("read_reg_tmp");
+// RV64 port: these bridge globals carry full CSR values now (sepc/satp
+// hold real 64-bit addresses; sstatus/sie are 64-bit bitfields), so they
+// widen from uint to ulong — and every asm block bridging through them
+// uses sd/ld instead of sw/lw accordingly.
+ulong read_reg_tmp @export("read_reg_tmp");
 
 macro read_reg(String $reg)
 {
@@ -71,7 +79,7 @@ macro read_reg(String $reg)
 	asm(@sprintf(`
         csrr t0, %s
         la t1, read_reg_tmp
-        sw t0, 0(t1)
+        sd t0, 0(t1)
     `, $reg));
 	return read_reg_tmp;
 }
@@ -88,9 +96,9 @@ macro write_reg(String $reg, String $value)
     `, $value, $reg));
 }
 
-uint write_sepc_tmp @export("write_sepc_tmp");
+ulong write_sepc_tmp @export("write_sepc_tmp");
 
-fn void write_sepc(uint value) @noinline
+fn void write_sepc(ulong value) @noinline
 {
 	// Single asm() call, bridged through a memory location rather than a
 	// register: a normal (non-naked) function gives no guarantee about
@@ -100,12 +108,12 @@ fn void write_sepc(uint value) @noinline
 	write_sepc_tmp = value;
 	asm(`
         la t0, write_sepc_tmp
-        lw t0, 0(t0)
+        ld t0, 0(t0)
         csrw sepc, t0
     `);
 }
 
-uint write_csr_tmp @export("write_csr_tmp");
+ulong write_csr_tmp @export("write_csr_tmp");
 
 macro write_csr(String $reg, value)
 {
@@ -115,7 +123,7 @@ macro write_csr(String $reg, value)
 	write_csr_tmp = value;
 	asm(@sprintf(`
         la t0, write_csr_tmp
-        lw t0, 0(t0)
+        ld t0, 0(t0)
         csrw %s, t0
     `, $reg));
 }
@@ -142,7 +150,7 @@ fn void enable_external_interrupts()
 // fire and consume it until we're done checking.
 fn void disable_interrupts()
 {
-	write_csr("sstatus", read_reg("sstatus") & (uint)~SSTATUS_SIE);
+	write_csr("sstatus", read_reg("sstatus") & ~(ulong)SSTATUS_SIE);
 }
 
 fn void enable_interrupts()
@@ -162,120 +170,124 @@ fn void enable_interrupts()
 // no trap ever printed" bugs blamed on the compiler. Pinned into its own
 // section with linker-enforced alignment in kernel.ld instead, since the
 // linker script's ALIGN() is what's actually trustworthy here.
+//
+// RV64 port: sd/ld instead of sw/lw, 8*N offsets instead of 4*N — every
+// saved register is 8 bytes now, so the 31-word frame is 248 bytes, not
+// 124.
 fn void kernel_entry() @align(4) @section(".text.trap") @export("kernel_entry") @noinline @nostrip
 {
 	asm(`
         csrrw sp, sscratch, sp
 
-        addi sp, sp, -4 * 31
-        sw ra,  4 * 0(sp)
-        sw gp,  4 * 1(sp)
-        sw tp,  4 * 2(sp)
-        sw t0,  4 * 3(sp)
-        sw t1,  4 * 4(sp)
-        sw t2,  4 * 5(sp)
-        sw t3,  4 * 6(sp)
-        sw t4,  4 * 7(sp)
-        sw t5,  4 * 8(sp)
-        sw t6,  4 * 9(sp)
-        sw a0,  4 * 10(sp)
-        sw a1,  4 * 11(sp)
-        sw a2,  4 * 12(sp)
-        sw a3,  4 * 13(sp)
-        sw a4,  4 * 14(sp)
-        sw a5,  4 * 15(sp)
-        sw a6,  4 * 16(sp)
-        sw a7,  4 * 17(sp)
-        sw s0,  4 * 18(sp)
-        sw s1,  4 * 19(sp)
-        sw s2,  4 * 20(sp)
-        sw s3,  4 * 21(sp)
-        sw s4,  4 * 22(sp)
-        sw s5,  4 * 23(sp)
-        sw s6,  4 * 24(sp)
-        sw s7,  4 * 25(sp)
-        sw s8,  4 * 26(sp)
-        sw s9,  4 * 27(sp)
-        sw s10, 4 * 28(sp)
-        sw s11, 4 * 29(sp)
+        addi sp, sp, -8 * 31
+        sd ra,  8 * 0(sp)
+        sd gp,  8 * 1(sp)
+        sd tp,  8 * 2(sp)
+        sd t0,  8 * 3(sp)
+        sd t1,  8 * 4(sp)
+        sd t2,  8 * 5(sp)
+        sd t3,  8 * 6(sp)
+        sd t4,  8 * 7(sp)
+        sd t5,  8 * 8(sp)
+        sd t6,  8 * 9(sp)
+        sd a0,  8 * 10(sp)
+        sd a1,  8 * 11(sp)
+        sd a2,  8 * 12(sp)
+        sd a3,  8 * 13(sp)
+        sd a4,  8 * 14(sp)
+        sd a5,  8 * 15(sp)
+        sd a6,  8 * 16(sp)
+        sd a7,  8 * 17(sp)
+        sd s0,  8 * 18(sp)
+        sd s1,  8 * 19(sp)
+        sd s2,  8 * 20(sp)
+        sd s3,  8 * 21(sp)
+        sd s4,  8 * 22(sp)
+        sd s5,  8 * 23(sp)
+        sd s6,  8 * 24(sp)
+        sd s7,  8 * 25(sp)
+        sd s8,  8 * 26(sp)
+        sd s9,  8 * 27(sp)
+        sd s10, 8 * 28(sp)
+        sd s11, 8 * 29(sp)
 
         csrr a0, sscratch
-        sw a0, 4 * 30(sp)
+        sd a0, 8 * 30(sp)
 
-        addi a0, sp, 4 * 31
+        addi a0, sp, 8 * 31
 
         csrw sscratch, a0
         mv a0, sp
         call handle_trap
 
-        lw ra,  4 * 0(sp)
-        lw gp,  4 * 1(sp)
-        lw tp,  4 * 2(sp)
-        lw t0,  4 * 3(sp)
-        lw t1,  4 * 4(sp)
-        lw t2,  4 * 5(sp)
-        lw t3,  4 * 6(sp)
-        lw t4,  4 * 7(sp)
-        lw t5,  4 * 8(sp)
-        lw t6,  4 * 9(sp)
-        lw a0,  4 * 10(sp)
-        lw a1,  4 * 11(sp)
-        lw a2,  4 * 12(sp)
-        lw a3,  4 * 13(sp)
-        lw a4,  4 * 14(sp)
-        lw a5,  4 * 15(sp)
-        lw a6,  4 * 16(sp)
-        lw a7,  4 * 17(sp)
-        lw s0,  4 * 18(sp)
-        lw s1,  4 * 19(sp)
-        lw s2,  4 * 20(sp)
-        lw s3,  4 * 21(sp)
-        lw s4,  4 * 22(sp)
-        lw s5,  4 * 23(sp)
-        lw s6,  4 * 24(sp)
-        lw s7,  4 * 25(sp)
-        lw s8,  4 * 26(sp)
-        lw s9,  4 * 27(sp)
-        lw s10, 4 * 28(sp)
-        lw s11, 4 * 29(sp)
-        lw sp,  4 * 30(sp)
+        ld ra,  8 * 0(sp)
+        ld gp,  8 * 1(sp)
+        ld tp,  8 * 2(sp)
+        ld t0,  8 * 3(sp)
+        ld t1,  8 * 4(sp)
+        ld t2,  8 * 5(sp)
+        ld t3,  8 * 6(sp)
+        ld t4,  8 * 7(sp)
+        ld t5,  8 * 8(sp)
+        ld t6,  8 * 9(sp)
+        ld a0,  8 * 10(sp)
+        ld a1,  8 * 11(sp)
+        ld a2,  8 * 12(sp)
+        ld a3,  8 * 13(sp)
+        ld a4,  8 * 14(sp)
+        ld a5,  8 * 15(sp)
+        ld a6,  8 * 16(sp)
+        ld a7,  8 * 17(sp)
+        ld s0,  8 * 18(sp)
+        ld s1,  8 * 19(sp)
+        ld s2,  8 * 20(sp)
+        ld s3,  8 * 21(sp)
+        ld s4,  8 * 22(sp)
+        ld s5,  8 * 23(sp)
+        ld s6,  8 * 24(sp)
+        ld s7,  8 * 25(sp)
+        ld s8,  8 * 26(sp)
+        ld s9,  8 * 27(sp)
+        ld s10, 8 * 28(sp)
+        ld s11, 8 * 29(sp)
+        ld sp,  8 * 30(sp)
         sret
     `);
 }
 
 struct Trap_frame @packed
 {
-	uint ra;
-	uint gp;
-	uint tp;
-	uint t0;
-	uint t1;
-	uint t2;
-	uint t3;
-	uint t4;
-	uint t5;
-	uint t6;
-	uint a0;
-	uint a1;
-	uint a2;
-	uint a3;
-	uint a4;
-	uint a5;
-	uint a6;
-	uint a7;
-	uint s0;
-	uint s1;
-	uint s2;
-	uint s3;
-	uint s4;
-	uint s5;
-	uint s6;
-	uint s7;
-	uint s8;
-	uint s9;
-	uint s10;
-	uint s11;
-	uint sp;
+	ulong ra;
+	ulong gp;
+	ulong tp;
+	ulong t0;
+	ulong t1;
+	ulong t2;
+	ulong t3;
+	ulong t4;
+	ulong t5;
+	ulong t6;
+	ulong a0;
+	ulong a1;
+	ulong a2;
+	ulong a3;
+	ulong a4;
+	ulong a5;
+	ulong a6;
+	ulong a7;
+	ulong s0;
+	ulong s1;
+	ulong s2;
+	ulong s3;
+	ulong s4;
+	ulong s5;
+	ulong s6;
+	ulong s7;
+	ulong s8;
+	ulong s9;
+	ulong s10;
+	ulong s11;
+	ulong sp;
 }
 
 fn void handle_syscall(Trap_frame* f) @noinline
@@ -290,7 +302,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				int ch = sbi::__getchar();
 				if (ch >= 0)
 				{
-					f.a0 = (uint)ch;
+					f.a0 = (ulong)ch;
 					break;
 				}
 				yield();
@@ -310,8 +322,10 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// page mapped PAGE_U (its private image pages — never the
 			// shared kernel-identity or virtio-MMIO mappings, which lack
 			// PAGE_U precisely because they're not this process's own
-			// memory), every on-demand 2nd-level table map_page allocated
-			// for it, and the top-level table itself.
+			// memory), every on-demand 2nd/3rd-level table map_page
+			// allocated for it, and the top-level table itself. Sv39: 3
+			// levels (table2/table1/table0), not RV32/Sv32's 2 — see
+			// page.c3.
 			//
 			// Skipped entirely if some other live process shares this
 			// exact page_table pointer — an rfork(RFPROC|RFMEM) sibling
@@ -334,25 +348,33 @@ fn void handle_syscall(Trap_frame* f) @noinline
 
 			if (!exit_table_shared)
 			{
-				uint* exiting_table1 = current_proc.page_table;
-				for (uint vpn1 = 0; vpn1 < 1024; vpn1++)
+				ulong* exiting_table2 = current_proc.page_table;
+				for (uint vpn2 = 0; vpn2 < 512; vpn2++)
 				{
-					if ((exiting_table1[vpn1] & PAGE_V) == 0) continue;
+					if ((exiting_table2[vpn2] & PAGE_V) == 0) continue;
+					ulong* table1 = (ulong*)(uptr)((exiting_table2[vpn2] >> 10) * PAGE_SIZE);
 
-					uint* table0 = (uint*)((exiting_table1[vpn1] >> 10) * PAGE_SIZE);
-					for (uint vpn0 = 0; vpn0 < 1024; vpn0++)
+					for (uint vpn1 = 0; vpn1 < 512; vpn1++)
 					{
-						if ((table0[vpn0] & PAGE_V) == 0) continue;
-						if (table0[vpn0] & PAGE_U)
+						if ((table1[vpn1] & PAGE_V) == 0) continue;
+						ulong* table0 = (ulong*)(uptr)((table1[vpn1] >> 10) * PAGE_SIZE);
+
+						for (uint vpn0 = 0; vpn0 < 512; vpn0++)
 						{
-							uint leaf_paddr = (table0[vpn0] >> 10) * PAGE_SIZE;
-							free_pages(leaf_paddr, 1);
+							if ((table0[vpn0] & PAGE_V) == 0) continue;
+							if (table0[vpn0] & PAGE_U)
+							{
+								uptr leaf_paddr = (uptr)((table0[vpn0] >> 10) * PAGE_SIZE);
+								free_pages(leaf_paddr, 1);
+							}
 						}
+
+						free_pages((uptr)table0, 1);
 					}
 
-					free_pages((uint)table0, 1);
+					free_pages((uptr)table1, 1);
 				}
-				free_pages((uint)exiting_table1, 1);
+				free_pages((uptr)exiting_table2, 1);
 			}
 
 			current_proc.state = PROC_UNUSED;
@@ -370,15 +392,15 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// syscall4 in user/user.c3 — this is the one syscall that
 			// needs a 4th argument).
 			int ipc_dest_pid = (int)f.a0;
-			uint ipc_type    = f.a1;
-			char* ipc_data   = (char*)f.a2;
+			uint ipc_type    = (uint)f.a1;
+			char* ipc_data   = (char*)(uptr)f.a2;
 			int ipc_len      = (int)f.a4;
 			int ipc_copy_len = ipc_len > MSG_MAX ? MSG_MAX : ipc_len;
 			if (ipc_copy_len < 0) ipc_copy_len = 0;
 			Process* ipc_target = proc_by_pid(ipc_dest_pid);
 			if (!ipc_target)
 			{
-				f.a0 = (uint)(-1);
+				f.a0 = (ulong)(-1);
 				break;
 			}
 
@@ -420,9 +442,9 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// now an optional out-pointer for the message's type/verb —
 			// null means "don't care", same as every existing call site
 			// still passes.
-			char* recv_buf       = (char*)f.a0;
+			char* recv_buf       = (char*)(uptr)f.a0;
 			int recv_len         = (int)f.a1;
-			uint* recv_type_out  = (uint*)f.a2;
+			uint* recv_type_out  = (uint*)(uptr)f.a2;
 			for (;;)
 			{
 				if (current_proc.has_message)
@@ -434,7 +456,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 					{
 						*recv_type_out = current_proc.msg_type;
 					}
-					f.a0 = (uint)current_proc.msg_from;
+					f.a0 = (ulong)current_proc.msg_from;
 					current_proc.has_message = false;
 
 					// Wake the sender: it's genuinely blocked (see
@@ -478,12 +500,12 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// mid-trap between polls, so sstatus.SIE's natural value
 			// (on, from user_entry) is safe to leave alone, and the
 			// interrupt can fire and get routed normally in between.
-			char* poll_buf      = (char*)f.a0;
+			char* poll_buf      = (char*)(uptr)f.a0;
 			int poll_len        = (int)f.a1;
-			uint* poll_type_out = (uint*)f.a2;
+			uint* poll_type_out = (uint*)(uptr)f.a2;
 			if (!current_proc.has_message)
 			{
-				f.a0 = (uint)(-1);
+				f.a0 = (ulong)(-1);
 				break;
 			}
 			int poll_copy_len = poll_len > MSG_MAX ? MSG_MAX : poll_len;
@@ -493,7 +515,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			{
 				*poll_type_out = current_proc.msg_type;
 			}
-			f.a0 = (uint)current_proc.msg_from;
+			f.a0 = (ulong)current_proc.msg_from;
 			current_proc.has_message = false;
 
 			// Same "wake the real sender" step as SYS_IPC_RECV — normally
@@ -519,7 +541,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// a more specific mount always wins over a broader one that
 			// also matches. Returns -1 (in f.a0, read as signed by the
 			// caller) if nothing matches.
-			char* ns_path = (char*)f.a0;
+			char* ns_path = (char*)(uptr)f.a0;
 			int ns_result = -1;
 			int ns_best_len = -1;
 			for (int m = 0; m < NS_MOUNTS_MAX; m++)
@@ -536,15 +558,15 @@ fn void handle_syscall(Trap_frame* f) @noinline
 					ns_result = current_proc.namespace[m].server_pid;
 				}
 			}
-			f.a0 = (uint)ns_result;
+			f.a0 = (ulong)(iptr)ns_result;
 		case SYS_DISKD_INFO:
 			// diskd-only, called once at its own startup — see
 			// setup_diskd_mappings in process.c3 for why these addresses
 			// can't be known at compile time or derived by diskd itself.
 			// a0/a1 are out-pointers (same convention as SYS_IPC_RECV's
 			// optional type-out pointer): a0 -> vq paddr, a1 -> req paddr.
-			uint* diskd_vq_out  = (uint*)f.a0;
-			uint* diskd_req_out = (uint*)f.a1;
+			uptr* diskd_vq_out  = (uptr*)(uptr)f.a0;
+			uptr* diskd_req_out = (uptr*)(uptr)f.a1;
 			*diskd_vq_out  = diskd_vq_paddr;
 			*diskd_req_out = diskd_req_paddr;
 		case SYS_RFORK:
@@ -555,7 +577,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			int rfork_flags = (int)f.a0;
 			if ((rfork_flags & RFPROC) == 0)
 			{
-				f.a0 = (uint)(-1);
+				f.a0 = (ulong)(-1);
 				break;
 			}
 
@@ -571,13 +593,13 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			if (!child)
 			{
-				f.a0 = (uint)(-1);
+				f.a0 = (ulong)(-1);
 				break;
 			}
 
 			if (rfork_flags & RFMEM)
 			{
-				// True sharing: same L1 table pointer, so every mapping
+				// True sharing: same root table pointer, so every mapping
 				// either process makes or already has is visible to
 				// both — this is what makes it a "thread" rather than a
 				// process. SYS_EXIT's own free loop above has a guard
@@ -586,15 +608,20 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			else
 			{
-				// Independent copy: fresh L1 table, same kernel-range +
-				// PLIC identity mapping create_process always does,
-				// then every PAGE_U leaf in the parent's table gets a
-				// fresh physical page with a byte-for-byte copy, mapped
-				// at the same vaddr with the same flags. Same walk
-				// shape as SYS_EXIT's free loop above, copy instead of
-				// free.
-				uint* child_table = (uint*)alloc_pages(1);
-				for (uint paddr = (uint)&__kernel_base; paddr < (uint)&__free_ram_end; paddr += PAGE_SIZE)
+				// Independent copy: fresh root table, same kernel-range +
+				// PLIC identity mapping create_process always does, then
+				// every PAGE_U leaf in the parent's table gets a fresh
+				// physical page with a byte-for-byte copy, mapped at the
+				// same vaddr with the same flags — map_page() allocates
+				// the child's own intermediate (2nd/3rd level) tables on
+				// demand as each leaf is mapped, exactly like
+				// create_process already relies on, so this walk only
+				// needs to find the parent's leaves and their flags, not
+				// manage the child's table structure itself. Same walk
+				// shape as SYS_EXIT's free loop above (now 3 levels for
+				// Sv39, not 2), copy instead of free.
+				ulong* child_table = (ulong*)alloc_pages(1);
+				for (uptr paddr = (uptr)&__kernel_base; paddr < (uptr)&__free_ram_end; paddr += PAGE_SIZE)
 				{
 					map_page(child_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
 				}
@@ -602,24 +629,30 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				map_page(child_table, PLIC_ENABLE_PAGE, PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
 				map_page(child_table, PLIC_CLAIM_PAGE, PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
 
-				uint* parent_table1 = current_proc.page_table;
-				for (uint vpn1 = 0; vpn1 < 1024; vpn1++)
+				ulong* parent_table2 = current_proc.page_table;
+				for (uint vpn2 = 0; vpn2 < 512; vpn2++)
 				{
-					if ((parent_table1[vpn1] & PAGE_V) == 0) continue;
+					if ((parent_table2[vpn2] & PAGE_V) == 0) continue;
+					ulong* parent_table1 = (ulong*)(uptr)((parent_table2[vpn2] >> 10) * PAGE_SIZE);
 
-					uint* parent_table0 = (uint*)((parent_table1[vpn1] >> 10) * PAGE_SIZE);
-					for (uint vpn0 = 0; vpn0 < 1024; vpn0++)
+					for (uint vpn1 = 0; vpn1 < 512; vpn1++)
 					{
-						if ((parent_table0[vpn0] & PAGE_V) == 0) continue;
-						if ((parent_table0[vpn0] & PAGE_U) == 0) continue;
+						if ((parent_table1[vpn1] & PAGE_V) == 0) continue;
+						ulong* parent_table0 = (ulong*)(uptr)((parent_table1[vpn1] >> 10) * PAGE_SIZE);
 
-						uint parent_leaf_paddr = (parent_table0[vpn0] >> 10) * PAGE_SIZE;
-						uint child_leaf_paddr  = alloc_pages(1);
-						mem::copy((void*)child_leaf_paddr, (void*)parent_leaf_paddr, (sz)PAGE_SIZE);
+						for (uint vpn0 = 0; vpn0 < 512; vpn0++)
+						{
+							if ((parent_table0[vpn0] & PAGE_V) == 0) continue;
+							if ((parent_table0[vpn0] & PAGE_U) == 0) continue;
 
-						uint child_vaddr  = (vpn1 << 22) | (vpn0 << 12);
-						uint parent_flags = parent_table0[vpn0] & 0x1f; // V|R|W|X|U — see page.c3's map_page encoding
-						map_page(child_table, child_vaddr, child_leaf_paddr, parent_flags);
+							uptr parent_leaf_paddr = (uptr)((parent_table0[vpn0] >> 10) * PAGE_SIZE);
+							uptr child_leaf_paddr  = alloc_pages(1);
+							mem::copy((void*)child_leaf_paddr, (void*)parent_leaf_paddr, (sz)PAGE_SIZE);
+
+							uptr child_vaddr  = ((uptr)vpn2 << 30) | ((uptr)vpn1 << 21) | ((uptr)vpn0 << 12);
+							uint parent_flags = (uint)(parent_table0[vpn0] & 0x1f); // V|R|W|X|U — see page.c3's map_page encoding
+							map_page(child_table, child_vaddr, child_leaf_paddr, parent_flags);
+						}
 					}
 				}
 				child.page_table = child_table;
@@ -639,40 +672,42 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// value), plus this trap's own resume address as an extra
 			// 32nd word, since sepc is a single CSR fork_entry can't
 			// otherwise inherit. See fork_entry's own comment in
-			// process.c3 for how this block gets consumed.
-			uint* child_sp = (uint*)&child.stack;
-			child_sp += STACK_SIZE / 4;
+			// process.c3 for how this block gets consumed. 32 words of
+			// 8 bytes now (Sv64 port), not 4.
+			uptr* child_sp = (uptr*)&child.stack;
+			child_sp += STACK_SIZE / 8;
 			child_sp -= 32;
 
 			mem::copy((void*)child_sp, f, (sz)Trap_frame::size);
 			Trap_frame* child_frame = (Trap_frame*)child_sp;
 			child_frame.a0 = 0;
-			child_sp[31] = read_reg("sepc") + 4;
+			child_sp[31] = (uptr)(read_reg("sepc") + 4);
 
 			for (int rf_j = 0; rf_j < 12; rf_j++)
 			{
 				*(--child_sp) = 0;
 			}
-			*(--child_sp) = (uint)&fork_entry;
+			*(--child_sp) = (uptr)&fork_entry;
 
 			child.has_message = false;
 			child.pid   = child_i + 1;
 			child.generation++;
-			child.sp    = (uint)child_sp;
+			child.sp    = (uptr)child_sp;
 			child.state = PROC_RUNNABLE;
 
 			// Optional out-pointer (a1), same "null means don't care"
 			// convention as SYS_IPC_RECV's type_out — lets the caller
 			// capture this child's generation for a later SYS_JOIN to
 			// check against, so a join can tell "this pid exited" apart
-			// from "this pid got reused by something else."
-			uint* rfork_gen_out = (uint*)f.a1;
+			// from "this pid got reused by something else." generation
+			// itself stays a plain uint (a counter, not an address).
+			uint* rfork_gen_out = (uint*)(uptr)f.a1;
 			if (rfork_gen_out != null)
 			{
 				*rfork_gen_out = child.generation;
 			}
 
-			f.a0 = (uint)child.pid;
+			f.a0 = (ulong)child.pid;
 		case SYS_NS_UNMOUNT:
 			// Removes one of the *caller's own* namespace mounts by
 			// exact prefix match (str_eq, not the longest-prefix match
@@ -683,7 +718,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// lets a child sandbox itself after forking, without
 			// affecting the parent or any other process. Returns 0 if
 			// found and removed, -1 if no mount had that exact prefix.
-			char* unmount_prefix = (char*)f.a0;
+			char* unmount_prefix = (char*)(uptr)f.a0;
 			int unmount_result = -1;
 			for (int um = 0; um < NS_MOUNTS_MAX; um++)
 			{
@@ -695,7 +730,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 					break;
 				}
 			}
-			f.a0 = (uint)unmount_result;
+			f.a0 = (ulong)(iptr)unmount_result;
 		case SYS_JOIN:
 			// Blocks until the joined process is actually gone — plain
 			// polling (check, yield(), recheck), the same proven shape
@@ -714,13 +749,13 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// original process still running, and join would wait for
 			// the wrong thing.
 			int join_pid = (int)f.a0;
-			uint join_generation = f.a1;
+			uint join_generation = (uint)f.a1;
 			if (join_pid == current_proc.pid)
 			{
 				// Can't wait for yourself to disappear while you're the
 				// one running — always self-deadlock. Reject rather than
 				// hang.
-				f.a0 = (uint)(-1);
+				f.a0 = (ulong)(-1);
 				break;
 			}
 			// Stays PROC_RUNNABLE throughout, same as SYS_GETCHAR's own
@@ -746,13 +781,13 @@ fn void handle_syscall(Trap_frame* f) @noinline
 
 fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 {
-	uint scause  = read_reg("scause");
-	uint stval   = read_reg("stval");
-	uint user_pc = read_reg("sepc");
+	ulong scause  = read_reg("scause");
+	ulong stval   = read_reg("stval");
+	ulong user_pc = read_reg("sepc");
 
 	if (scause & SCAUSE_INTERRUPT_BIT)
 	{
-		uint code = scause & ~SCAUSE_INTERRUPT_BIT;
+		ulong code = scause & ~SCAUSE_INTERRUPT_BIT;
 		if (code == SCAUSE_SUPERVISOR_EXTERNAL)
 		{
 			// Claiming acknowledges the IRQ to the PLIC. 0 means a
