@@ -113,6 +113,20 @@ fn bool str_starts_with(char* s, char* prefix)
 	return true;
 }
 
+// Also moved from the deleted src/fs.c3 — needed again by
+// SYS_NS_UNMOUNT (entry.c3), which unmounts by exact prefix match, not
+// the longest-prefix match SYS_NS_RESOLVE uses.
+fn bool str_eq(char* a, char* b)
+{
+	uint i = 0;
+	while (a[i] != 0 && b[i] != 0)
+	{
+		if (a[i] != b[i]) return false;
+		i++;
+	}
+	return a[i] == b[i];
+}
+
 // pid -> Process*, per how create_process assigns pid = slot index + 1.
 // Returns null for an out-of-range pid or a slot that isn't actually that
 // process anymore (freed and possibly reused, or never used).

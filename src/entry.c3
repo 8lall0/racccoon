@@ -38,6 +38,7 @@ const SYS_NS_RESOLVE = 8;
 const SYS_DISKD_INFO = 9; // diskd-only: returns its vq/req physical addrs
 const SYS_IPC_POLL   = 10; // non-blocking SYS_IPC_RECV, see its case below
 const SYS_RFORK       = 11;
+const SYS_NS_UNMOUNT  = 12; // remove one of the caller's own namespace mounts by exact prefix
 
 // rfork flags — Plan 9 names, this kernel's own subset. RFPROC is
 // required (rfork() without it returns -1 in this v1: real Plan 9 uses
@@ -605,6 +606,29 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			child.state = PROC_RUNNABLE;
 
 			f.a0 = (uint)child.pid;
+		case SYS_NS_UNMOUNT:
+			// Removes one of the *caller's own* namespace mounts by
+			// exact prefix match (str_eq, not the longest-prefix match
+			// SYS_NS_RESOLVE uses — this targets one specific entry, not
+			// "whichever mount a path would resolve to"). Since a fresh
+			// rfork(RFPROC) child gets its own independent copy of the
+			// parent's namespace (see SYS_RFORK above), this is what
+			// lets a child sandbox itself after forking, without
+			// affecting the parent or any other process. Returns 0 if
+			// found and removed, -1 if no mount had that exact prefix.
+			char* unmount_prefix = (char*)f.a0;
+			int unmount_result = -1;
+			for (int um = 0; um < NS_MOUNTS_MAX; um++)
+			{
+				if (current_proc.namespace[um].server_pid == 0) continue;
+				if (str_eq(&current_proc.namespace[um].prefix[0], unmount_prefix))
+				{
+					current_proc.namespace[um].server_pid = 0;
+					unmount_result = 0;
+					break;
+				}
+			}
+			f.a0 = (uint)unmount_result;
 		default:
 			panic::panic("unexpected syscall");
 	}

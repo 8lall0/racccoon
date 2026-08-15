@@ -20,6 +20,7 @@ const int SYS_NS_RESOLVE = 8;
 const int SYS_DISKD_INFO = 9;
 const int SYS_IPC_POLL   = 10;
 const int SYS_RFORK      = 11;
+const int SYS_NS_UNMOUNT = 12;
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -41,6 +42,79 @@ fn void exit() @noreturn @export("exit") {
 // resume from this exact call site, not a fresh entry point.
 fn int rfork(int flags) @export("rfork") {
     return syscall(SYS_RFORK, flags, 0, 0);
+}
+
+// Stack-aware wrapper around rfork(RFPROC|RFMEM): unlike calling rfork()
+// directly, this is actually safe to use for "spawn a thread." Bare
+// RFMEM shares the live user stack, not just the address space — the
+// child's saved resume point sits mid-call inside rfork()'s and
+// syscall()'s own stack frames, and those wrappers' own return
+// addresses get spilled onto that now-shared stack at typical
+// optimization levels. The parent's very next function call overwrites
+// exactly that memory before the child is ever scheduled (this is not
+// hypothetical — see docs/devlog.md and rforkmemtest's own history).
+// Real Plan 9 code never calls rfork(RFMEM) bare for this reason either
+// — libthread's threadcreate() is a userland trampoline built the same
+// way this one is: give the child a fresh stack and a fresh entry point
+// before anything resembling normal C-level control flow ever touches
+// the shared stack.
+//
+// Hand-written, @naked, string-form asm rather than syscall()'s usual
+// block form: from the moment execution resumes right after `ecall`
+// (both parent and child land there, exactly like any rfork call)
+// through the branch and the stack switch, nothing touches memory at
+// all — the branch test and the three saved values (fn/arg/stack_top)
+// live purely in registers, which the kernel's own trap-frame
+// save/restore (src/process.c3's fork_entry, unchanged) already
+// guarantees survive the round trip. By the time the child would
+// otherwise need to read anything through sp, sp already points at its
+// own private buffer — the parent's subsequent use of the old shared
+// stack is irrelevant to the child from that point on, not just briefly
+// avoided.
+//
+// The leading save/restore of s1-s3/ra around the ecall is a separate,
+// ABI-compliance concern: as a @naked function, nothing else guarantees
+// this doesn't clobber whatever threadcreate's own *caller* had live in
+// those callee-saved registers. Restored before the parent-side return;
+// never needed by the child, which doesn't return through this frame at
+// all.
+//
+// func is expected to call exit() itself when done, matching every other
+// process entry point in this codebase — the trailing `j .` is a safety
+// net, not the intended path, in case it ever doesn't.
+//
+// Returns the same thing rfork() does: the new thread's pid to the
+// caller, or -1 on failure. Never returns 0 — the "child" branch here
+// never comes back to this call site at all.
+fn int threadcreate(void* func, void* arg, void* stack_top) @naked @noinline @export("threadcreate") {
+    asm(`
+        addi sp, sp, -16
+        sw s1, 0(sp)
+        sw s2, 4(sp)
+        sw s3, 8(sp)
+        sw ra, 12(sp)
+
+        mv s1, a0
+        mv s2, a1
+        mv s3, a2
+        li a0, 3
+        li a3, 11
+        ecall
+        bnez a0, 1f
+
+        mv sp, s3
+        mv a0, s2
+        jalr s1
+        j .
+
+    1:
+        lw s1, 0(sp)
+        lw s2, 4(sp)
+        lw s3, 8(sp)
+        lw ra, 12(sp)
+        addi sp, sp, 16
+        ret
+    `);
 }
 
 fn int syscall(int sysno, int arg0, int arg1, int arg2) {
@@ -118,6 +192,16 @@ fn int p9_call(int dest_pid, uint verb, char* data, int len, char* reply_buf, in
 // memory). -1 means no mount matched.
 fn int ns_resolve(char* path) @export("ns_resolve") {
     return syscall(SYS_NS_RESOLVE, (int)path, 0, 0);
+}
+
+// Removes one of *this process's own* namespace mounts, matched by
+// exact prefix (not the longest-prefix match ns_resolve/SYS_NS_RESOLVE
+// use). Returns 0 if found and removed, -1 if no mount had that exact
+// prefix. A process that rfork(RFPROC)'d (a real, independent copy of
+// the namespace — see src/entry.c3's SYS_RFORK case) can use this to
+// sandbox itself without affecting its parent or siblings.
+fn int ns_unmount(char* prefix) @export("ns_unmount") {
+    return syscall(SYS_NS_UNMOUNT, (int)prefix, 0, 0);
 }
 
 // Same as p9_call, but addresses the server by path (resolved through the
