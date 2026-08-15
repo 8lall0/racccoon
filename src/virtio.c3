@@ -1,36 +1,18 @@
 module kernel;
 
-import panic;
-import std::io;
+// The kernel no longer talks to the virtio-blk device directly — diskd
+// (user/diskd.c3) owns it now (see docs/devlog.md, microkernel phase 4).
+// What's left here is just what src/process.c3's setup_diskd_mappings
+// still needs: the struct shapes, to size diskd's virtqueue/request
+// buffer correctly, and the few constants other kernel code (fs.c3's
+// sector-size math, process.c3's MMIO mapping) still references. The
+// struct definitions are duplicated in user/diskd.c3 — kernel and user
+// are separate c3c compilations with no shared header, same convention
+// already used for the syscall numbers in user/user.c3.
 
 const uint SECTOR_SIZE       = 512;
 const uint VIRTQ_ENTRY_NUM   = 16;
-const uint VIRTIO_DEVICE_BLK = 2;
 const uint VIRTIO_BLK_PADDR  = 0x10001000;
-
-const uint VIRTIO_REG_MAGIC         = 0x00;
-const uint VIRTIO_REG_VERSION       = 0x04;
-const uint VIRTIO_REG_DEVICE_ID     = 0x08;
-const uint VIRTIO_REG_PAGE_SIZE     = 0x28;
-const uint VIRTIO_REG_QUEUE_SEL     = 0x30;
-const uint VIRTIO_REG_QUEUE_NUM_MAX = 0x34;
-const uint VIRTIO_REG_QUEUE_NUM     = 0x38;
-const uint VIRTIO_REG_QUEUE_PFN     = 0x40;
-const uint VIRTIO_REG_QUEUE_READY   = 0x44;
-const uint VIRTIO_REG_QUEUE_NOTIFY  = 0x50;
-const uint VIRTIO_REG_DEVICE_STATUS = 0x70;
-const uint VIRTIO_REG_DEVICE_CONFIG = 0x100;
-
-const uint VIRTIO_STATUS_ACK       = 1;
-const uint VIRTIO_STATUS_DRIVER    = 2;
-const uint VIRTIO_STATUS_DRIVER_OK = 4;
-
-const ushort VIRTQ_DESC_F_NEXT          = 1;
-const ushort VIRTQ_DESC_F_WRITE         = 2;
-const ushort VIRTQ_AVAIL_F_NO_INTERRUPT = 1;
-
-const uint VIRTIO_BLK_T_IN  = 0;
-const uint VIRTIO_BLK_T_OUT = 1;
 
 struct Virtq_desc @packed
 {
@@ -80,178 +62,4 @@ struct Virtio_blk_req @packed
 	ulong     sector;
 	char[512] data;
 	char      status;
-}
-
-fn uint virtio_reg_read32(uint offset)
-{
-	uint* ptr = (uint*)(VIRTIO_BLK_PADDR + offset);
-	return mem::load(ptr, 4, true);
-}
-
-fn ulong virtio_reg_read64(uint offset)
-{
-	ulong* ptr = (ulong*)(VIRTIO_BLK_PADDR + offset);
-	return mem::load(ptr, 8, true);
-}
-
-fn void virtio_reg_write32(uint offset, uint value)
-{
-	uint* ptr = (uint*)(VIRTIO_BLK_PADDR + offset);
-	mem::store(ptr, value, 4, true);
-}
-
-fn void virtio_reg_fetch_and_or32(uint offset, uint value)
-{
-	virtio_reg_write32(offset, virtio_reg_read32(offset) | value);
-}
-
-Virtio_virtq*   blk_request_vq;
-Virtio_blk_req* blk_req;
-uint            blk_req_paddr;
-ulong           blk_capacity;
-
-fn Virtio_virtq* virtq_init(uint index)
-{
-	uint pages       = (uint)(mem::aligned_offset((sz)Virtio_virtq::size, PAGE_SIZE) / PAGE_SIZE);
-	uint virtq_paddr = alloc_pages(pages);
-	Virtio_virtq* vq = (Virtio_virtq*)virtq_paddr;
-	vq.queue_index   = (int)index;
-	vq.used_index    = &vq.used.index;
-	virtio_reg_write32(VIRTIO_REG_QUEUE_SEL, index);
-	virtio_reg_write32(VIRTIO_REG_QUEUE_NUM, VIRTQ_ENTRY_NUM);
-	virtio_reg_write32(VIRTIO_REG_QUEUE_PFN, virtq_paddr / PAGE_SIZE);
-	return vq;
-}
-
-fn void virtio_blk_init()
-{
-	if (virtio_reg_read32(VIRTIO_REG_MAGIC) != 0x74726976)
-	{
-		panic::panic("virtio: invalid magic value");
-	}
-	if (virtio_reg_read32(VIRTIO_REG_VERSION) != 1)
-	{
-		panic::panic("virtio: invalid version");
-	}
-	if (virtio_reg_read32(VIRTIO_REG_DEVICE_ID) != VIRTIO_DEVICE_BLK)
-	{
-		panic::panic("virtio: invalid device id");
-	}
-
-	virtio_reg_write32(VIRTIO_REG_DEVICE_STATUS, 0);
-	virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_ACK);
-	virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER);
-	virtio_reg_write32(VIRTIO_REG_PAGE_SIZE, PAGE_SIZE);
-	blk_request_vq = virtq_init(0);
-	virtio_reg_write32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER_OK);
-
-	blk_capacity = virtio_reg_read64(VIRTIO_REG_DEVICE_CONFIG) * SECTOR_SIZE;
-	io::printfn("virtio-blk: capacity is %d bytes", (uint)blk_capacity);
-
-	uint req_pages = (uint)(mem::aligned_offset((sz)Virtio_blk_req::size, PAGE_SIZE) / PAGE_SIZE);
-	blk_req_paddr  = alloc_pages(req_pages);
-	blk_req        = (Virtio_blk_req*)blk_req_paddr;
-}
-
-fn void virtq_kick(Virtio_virtq* vq, int desc_index)
-{
-	vq.avail.ring[vq.avail.index % VIRTQ_ENTRY_NUM] = (ushort)desc_index;
-	vq.avail.index++;
-	asm("fence");
-	virtio_reg_write32(VIRTIO_REG_QUEUE_NOTIFY, (uint)vq.queue_index);
-	vq.last_used_index++;
-}
-
-fn bool virtq_is_busy(Virtio_virtq* vq)
-{
-	return vq.last_used_index != mem::load(vq.used_index, 2, true);
-}
-
-fn void read_write_disk(void* buf, uint sector, bool is_write)
-{
-	uint capacity_sectors = (uint)(blk_capacity / SECTOR_SIZE);
-	if (sector >= capacity_sectors)
-	{
-		io::printfn("virtio: tried to read/write sector=%d, but capacity is %d", sector, capacity_sectors);
-		return;
-	}
-
-	blk_req.sector = sector;
-	blk_req.type   = is_write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
-	if (is_write)
-	{
-		mem::copy(&blk_req.data, buf, SECTOR_SIZE);
-	}
-
-	Virtio_virtq* vq = blk_request_vq;
-	vq.descs[0].addr  = (ulong)blk_req_paddr;
-	vq.descs[0].len   = 16; // type + reserved + sector
-	vq.descs[0].flags = VIRTQ_DESC_F_NEXT;
-	vq.descs[0].next  = 1;
-
-	vq.descs[1].addr  = (ulong)(uint)&blk_req.data;
-	vq.descs[1].len   = SECTOR_SIZE;
-	vq.descs[1].flags = VIRTQ_DESC_F_NEXT | (is_write ? (ushort)0 : VIRTQ_DESC_F_WRITE);
-	vq.descs[1].next  = 2;
-
-	vq.descs[2].addr  = (ulong)(uint)&blk_req.status;
-	vq.descs[2].len   = 1;
-	vq.descs[2].flags = VIRTQ_DESC_F_WRITE;
-
-	virtq_kick(vq, 0);
-
-	// wfi halts the CPU until *any* interrupt arrives, so this still has
-	// to re-check the real completion state (the used ring index) after
-	// waking — the interrupt handler's only job is to wake us up, not to
-	// signal specifically "this request is the one that finished".
-	//
-	// disable_interrupts() around the whole check-and-wait loop closes a
-	// real lost-wakeup race: without it, a completion interrupt landing in
-	// the gap between the busy check and the wfi instruction gets claimed
-	// and consumed by a normal trap right there, and the wfi that follows
-	// then waits forever for an interrupt that already happened. wfi still
-	// wakes on a pending-but-globally-disabled interrupt (that's the whole
-	// point of this pattern) — it just doesn't let the trap fire and
-	// consume it until we're done checking.
-	disable_interrupts();
-	while (virtq_is_busy(vq))
-	{
-		asm
-		{
-			wfi;
-		}
-	}
-
-	// Whatever woke the last wfi is still pending at the PLIC — it was
-	// never claimed, since interrupts stayed globally disabled the whole
-	// time. Claim (and complete) it ourselves now, BEFORE re-enabling.
-	// Skipping this was a real, serious bug, not just an oversight: with a
-	// completion still pending, re-enabling interrupts makes the CPU take
-	// it immediately as a *nested* trap, while this whole call chain
-	// (kernel_entry -> handle_trap -> handle_syscall -> ... -> here) is
-	// still on the stack from the *original* trap that got us here. Both
-	// traps share the same fixed sscratch anchor, so the nested trap's own
-	// prologue overwrites the still-in-progress outer trap's saved
-	// context in place — including its saved sp — with garbage. That
-	// showed up as a process's sp getting corrupted to point into the
-	// kernel's own procs[] array right after a SYS_WRITEFILE syscall
-	// returned. Claiming here first means there's nothing left pending
-	// when SIE flips back on, so no nested trap happens at all.
-	uint pending_irq = plic_claim();
-	if (pending_irq != 0)
-	{
-		plic_complete(pending_irq);
-	}
-	enable_interrupts();
-
-	if (blk_req.status != 0)
-	{
-		io::printfn("virtio: warn: failed to read/write sector=%d status=%d", sector, (int)blk_req.status);
-		return;
-	}
-
-	if (!is_write)
-	{
-		mem::copy(buf, &blk_req.data, SECTOR_SIZE);
-	}
 }

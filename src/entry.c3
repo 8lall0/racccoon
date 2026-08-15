@@ -9,8 +9,9 @@ const SCAUSE_INTERRUPT_BIT     = 0x80000000; // MSB of scause: set for interrupt
 const SCAUSE_SUPERVISOR_EXTERNAL = 9;        // interrupt cause code for a PLIC-routed external interrupt
 
 // Dedicated trap-frame anchor for traps taken during kernel_main's
-// bare-mode phase (before any process exists — this is when fs_init()'s
-// disk reads happen, now interrupt-driven). Deliberately NOT __stack_top:
+// bare-mode phase, between enable_external_interrupts() and the first
+// process existing — a brief window, but interrupts are live during it.
+// Deliberately NOT __stack_top:
 // __stack_top is the *top* of the live boot stack kernel_main is actively
 // executing on, not a spare/unused region — anchoring sscratch there
 // means the trap frame plus handle_trap's own call depth (io::printfn,
@@ -28,11 +29,20 @@ char[4096] boot_trap_stack;
 const SYS_PUTCHAR   = 1;
 const SYS_GETCHAR   = 2;
 const SYS_EXIT      = 3;
-const SYS_READFILE  = 4;
-const SYS_WRITEFILE = 5;
+// 4 and 5 were SYS_READFILE/SYS_WRITEFILE — removed once fsd (user/fsd.c3)
+// took over file access entirely (microkernel plan phase 5). Left unused
+// rather than renumbered, matching user/user.c3's copy.
 const SYS_IPC_SEND  = 6;
 const SYS_IPC_RECV  = 7;
 const SYS_NS_RESOLVE = 8;
+const SYS_DISKD_INFO = 9; // diskd-only: returns its vq/req physical addrs
+const SYS_IPC_POLL   = 10; // non-blocking SYS_IPC_RECV, see its case below
+
+// Sentinel msg_type handle_trap uses to wake diskd on a virtio-blk PLIC
+// interrupt (see handle_trap's interrupt branch below) — distinguishes
+// "the device finished, go check the used ring" from an actual client
+// request in diskd's single inbox slot. Must match user/diskd.c3's copy.
+const uint DISKD_IRQ_NOTIFY = 0xFFFFFFFF;
 
 uint read_reg_tmp @export("read_reg_tmp");
 
@@ -315,74 +325,25 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// so its scan can't match itself, and switch_context's `ret`
 			// jumps permanently into whatever process it picks instead.
 			yield();
-		case SYS_READFILE:
-		case SYS_WRITEFILE:
-			// NOTE: this logic looks like it belongs next to fs_lookup/
-			// fs_flush in fs.c3, and it did live there as fs_handle_syscall(f)
-			// at one point — but that alone (nothing else changed) made the
-			// kernel fail on the very first syscall (SYS_PUTCHAR, unrelated
-			// to this code path) with a reboot loop, reproducible even with
-			// @noinline on the extracted function. Root cause not
-			// identified — smells like a c3c 0.8.2 codegen bug tied to
-			// calling a function taking Trap_frame* across the file
-			// boundary. Left inline here since this version is proven
-			// correct; revisit if this ever needs touching again.
-			char* filename = (char*)f.a0;
-			char* buf      = (char*)f.a1;
-			int len        = (int)f.a2;
-			File* file     = fs_lookup(filename);
-			if (!file)
-			{
-				io::printfn("file not found: %s", (ZString)filename);
-				f.a0 = (uint)(-1);
-				break;
-			}
-
-			if (f.a3 == SYS_WRITEFILE)
-			{
-				// Never write more than the file's own storage can hold.
-				if (len > (int)file.data.len)
-				{
-					len = (int)file.data.len;
-				}
-				mem::copy(&file.data, buf, (sz)len);
-				file.size = (uint)len;
-				fs_flush();
-			}
-			else
-			{
-				// Never hand back more than the file actually contains —
-				// the caller's buffer is only guaranteed to hold `len`
-				// bytes, so returning more than that (even if it fits in
-				// the file's own 1024-byte storage) would have the caller
-				// read/index past its own buffer.
-				if (len > (int)file.size)
-				{
-					len = (int)file.size;
-				}
-				mem::copy(buf, &file.data, (sz)len);
-			}
-
-			f.a0 = (uint)len;
 		case SYS_IPC_SEND:
-			// Inline for the same reason as SYS_EXIT/SYS_READFILE above —
-			// this is the pattern proven not to trigger the unexplained
-			// c3c reboot bug in this switch. dest_pid/type/data are a0-a2
-			// as usual; len is a4, since a3 is always the syscall number
-			// (see syscall4 in user/user.c3 — this is the one syscall that
+			// Inline for the same reason as SYS_EXIT above — this is the
+			// pattern proven not to trigger the unexplained c3c reboot
+			// bug in this switch. dest_pid/type/data are a0-a2 as usual;
+			// len is a4, since a3 is always the syscall number (see
+			// syscall4 in user/user.c3 — this is the one syscall that
 			// needs a 4th argument).
 			int ipc_dest_pid = (int)f.a0;
 			uint ipc_type    = f.a1;
 			char* ipc_data   = (char*)f.a2;
 			int ipc_len      = (int)f.a4;
+			int ipc_copy_len = ipc_len > MSG_MAX ? MSG_MAX : ipc_len;
+			if (ipc_copy_len < 0) ipc_copy_len = 0;
 			Process* ipc_target = proc_by_pid(ipc_dest_pid);
 			if (!ipc_target)
 			{
 				f.a0 = (uint)(-1);
 				break;
 			}
-			int ipc_copy_len = ipc_len > MSG_MAX ? MSG_MAX : ipc_len;
-			if (ipc_copy_len < 0) ipc_copy_len = 0;
 			mem::copy(&ipc_target.msg_data, ipc_data, (sz)ipc_copy_len);
 			ipc_target.msg_from = current_proc.pid;
 			ipc_target.msg_type = ipc_type;
@@ -418,6 +379,46 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				current_proc.state = PROC_BLOCKED;
 				yield();
 			}
+		case SYS_IPC_POLL:
+			// Non-blocking counterpart to SYS_IPC_RECV: checks once,
+			// never sets PROC_BLOCKED, never yields. Exists for diskd's
+			// completion-wait (user/diskd.c3), which genuinely needs an
+			// interrupt to fire to make progress — and a *blocking*
+			// ipc_recv there is unsafe: sstatus.SIE has no per-process
+			// save/restore (kernel_entry only saves GPRs), and
+			// switch_context unconditionally resets sscratch to a fixed
+			// "top of this process's stack" value on every switch,
+			// including when *resuming* a process that's paused mid-trap
+			// (not freshly entering one). That reset is only correct for
+			// a fresh trap entry; enabling interrupts while blocked mid-
+			// trap risks a nested trap building its frame at that fixed
+			// address, colliding with — and corrupting — the still-in-
+			// progress outer frame lower on the same stack. Confirmed
+			// empirically: doing exactly that (enable_interrupts() right
+			// before yield() in SYS_IPC_RECV's loop) turned an
+			// intermittent hang into an intermittent page-fault panic
+			// instead of fixing it. Polling from genuine user-mode code
+			// sidesteps the whole problem: this process is never parked
+			// mid-trap between polls, so sstatus.SIE's natural value
+			// (on, from user_entry) is safe to leave alone, and the
+			// interrupt can fire and get routed normally in between.
+			char* poll_buf      = (char*)f.a0;
+			int poll_len        = (int)f.a1;
+			uint* poll_type_out = (uint*)f.a2;
+			if (!current_proc.has_message)
+			{
+				f.a0 = (uint)(-1);
+				break;
+			}
+			int poll_copy_len = poll_len > MSG_MAX ? MSG_MAX : poll_len;
+			if (poll_copy_len < 0) poll_copy_len = 0;
+			mem::copy(poll_buf, &current_proc.msg_data, (sz)poll_copy_len);
+			if (poll_type_out != null)
+			{
+				*poll_type_out = current_proc.msg_type;
+			}
+			f.a0 = (uint)current_proc.msg_from;
+			current_proc.has_message = false;
 		case SYS_NS_RESOLVE:
 			// Inline for the same reason as every other case in this
 			// switch — see SYS_EXIT's comment. Walks the caller's own
@@ -445,6 +446,16 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				}
 			}
 			f.a0 = (uint)ns_result;
+		case SYS_DISKD_INFO:
+			// diskd-only, called once at its own startup — see
+			// setup_diskd_mappings in process.c3 for why these addresses
+			// can't be known at compile time or derived by diskd itself.
+			// a0/a1 are out-pointers (same convention as SYS_IPC_RECV's
+			// optional type-out pointer): a0 -> vq paddr, a1 -> req paddr.
+			uint* diskd_vq_out  = (uint*)f.a0;
+			uint* diskd_req_out = (uint*)f.a1;
+			*diskd_vq_out  = diskd_vq_paddr;
+			*diskd_req_out = diskd_req_paddr;
 		default:
 			panic::panic("unexpected syscall");
 	}
@@ -461,13 +472,36 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 		uint code = scause & ~SCAUSE_INTERRUPT_BIT;
 		if (code == SCAUSE_SUPERVISOR_EXTERNAL)
 		{
-			// Claiming acknowledges the IRQ to the PLIC; we don't need to
-			// do anything else with it here — whatever was wfi-waiting on
-			// this (read_write_disk) just needed the CPU to wake up, and
-			// re-checks the real completion state (the used ring index)
-			// itself. 0 means a spurious claim (nothing pending) — don't
-			// complete an IRQ that wasn't actually claimed.
+			// Claiming acknowledges the IRQ to the PLIC. 0 means a
+			// spurious claim (nothing pending) — don't complete an IRQ
+			// that wasn't actually claimed.
 			uint irq = plic_claim();
+			if (irq == IRQ_VIRTIO_BLK && diskd_pid != 0)
+			{
+				// Wake diskd specifically, rather than relying on
+				// "whatever happened to be running/wfi-waiting" like the
+				// old kernel-resident driver did — this interrupt can
+				// land while any process (or the kernel's own boot code)
+				// is active, and diskd is the only one that cares. Uses
+				// the same single-slot inbox as ordinary client requests:
+				// safe because diskd only ever waits here (its second
+				// ipc_recv, inbox already drained by the first) right
+				// after kicking the virtqueue, never while a client
+				// request is still sitting unconsumed — see
+				// user/diskd.c3's main loop and setup_diskd_mappings'
+				// comment in process.c3.
+				Process* diskd_proc = proc_by_pid(diskd_pid);
+				if (diskd_proc != null)
+				{
+					diskd_proc.msg_from    = 0;
+					diskd_proc.msg_type    = DISKD_IRQ_NOTIFY;
+					diskd_proc.has_message = true;
+					if (diskd_proc.state == PROC_BLOCKED)
+					{
+						diskd_proc.state = PROC_RUNNABLE;
+					}
+				}
+			}
 			if (irq != 0)
 			{
 				plic_complete(irq);

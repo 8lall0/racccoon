@@ -33,14 +33,14 @@ fn void main() @export("main") {
             exit();
         } else if (strcmp(cmd, "readfile") == 0) {
             char[128] buf @noinit;
-            int len = readfile("hello.txt", &buf, 128);
+            int len = fs_read("hello.txt", &buf, 128);
             if (len >= 0) {
                 buf[len] = 0;
                 print(&buf);
                 print("\n");
             }
         } else if (strcmp(cmd, "writefile") == 0) {
-            writefile("hello.txt", "Hello from shell!\n", 19);
+            fs_write("hello.txt", "Hello from shell!\n", 19);
         } else if (strcmp(cmd, "ping") == 0) {
             // echod is always the first process spawned after idle (see
             // kernel.c3), so it's always pid 2 — a placeholder until
@@ -84,19 +84,20 @@ fn void main() @export("main") {
             }
         } else if (strcmp(cmd, "nstest") == 0) {
             // Direct namespace-resolution smoke test: prove ns_resolve
-            // itself works (matches "/" -> pid 2, rejects an unmounted
-            // prefix), independent of the 9P-lite layer built on top of it.
+            // itself works, independent of the 9P-lite/fsd layers built
+            // on top of it. Two mounts today (src/process.c3's
+            // create_process): "/" -> echod (pid 2), and a "" catch-all
+            // -> fsd (pid 4) for anything that doesn't start with "/" —
+            // which is every plain filename, "nope" included.
             int pid_root = ns_resolve("/anything");
             print("resolve /anything -> pid ");
             putchar((char)('0' + pid_root));
             print("\n");
 
-            int pid_none = ns_resolve("nope");
-            if (pid_none < 0) {
-                print("resolve nope -> no mount (as expected)\n");
-            } else {
-                print("resolve nope -> unexpectedly matched\n");
-            }
+            int pid_fallback = ns_resolve("nope");
+            print("resolve nope -> pid ");
+            putchar((char)('0' + pid_fallback));
+            print(" (catch-all)\n");
         } else {
             print("unknown command: ");
             print(cmd);

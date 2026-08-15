@@ -23,6 +23,7 @@ build_user_program() {
   echo "==> Compiling $name..."
   c3c compile-only \
     --no-entry \
+    --safe=no \
     --use-stdlib=no \
     --link-libc=no \
     --target elf-riscv32 \
@@ -36,6 +37,8 @@ build_user_program() {
   $LLVM_LLD \
     "$obj_dir"/*.o \
     -T user/user.ld \
+    -L /opt/riscv/lib/linux \
+    -lclang_rt.builtins-riscv32 \
     -Map="build/user/$name.map" \
     -o "build/user/$name.elf"
 
@@ -61,3 +64,5 @@ build_user_program() {
 
 build_user_program shell user/user.c3 user/shell.c3
 build_user_program echod user/user.c3 user/echod.c3
+build_user_program diskd user/user.c3 user/diskd.c3
+build_user_program fsd user/user.c3 user/fsd.c3

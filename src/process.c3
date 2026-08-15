@@ -9,14 +9,40 @@ const PROC_UNUSED   = 0; // Unused process control structure
 const PROC_RUNNABLE = 1; // Runnable process
 const PROC_BLOCKED  = 2; // Waiting on SYS_IPC_RECV for a message to arrive
 
-const MSG_MAX = 64; // Fixed-size IPC payload — enough for a short 9P-lite
-                     // path/header later, not bulk file data. yield()'s
-                     // scan only matches PROC_RUNNABLE, so PROC_BLOCKED is
-                     // automatically skipped without any scheduler change.
+// 1128 = 100-byte filename + 4-byte length header + one full 1024-byte
+// file (fsd's own protocol, see user/fsd.c3 — matches the File struct's
+// own data capacity there, so moving file I/O out of the kernel doesn't
+// shrink the max file size the old direct SYS_WRITEFILE syscall allowed).
+// Comfortably covers diskd's smaller 516-byte sector protocol too — every
+// process's inbox is sized for the largest thing anyone speaks over IPC,
+// not per-conversation.
+const MSG_MAX = 1128;
+                     // yield()'s scan only matches PROC_RUNNABLE, so
+                     // PROC_BLOCKED is automatically skipped without any
+                     // scheduler change.
 
-const NS_MOUNTS_MAX = 4;   // Small fixed table — v1 only ever populates one
-                            // real entry ("/" -> echod), room to grow once
-                            // diskd/fsd exist without changing the shape.
+// The disk driver process (see user/diskd.c3) — 0 until it's created and
+// registered by setup_diskd_mappings, checked by handle_trap before
+// routing a virtio-blk PLIC interrupt to it. diskd_vq_paddr/diskd_req_paddr
+// are the physical addresses of its virtqueue and request buffer,
+// allocated once at diskd's creation time (see setup_diskd_mappings) and
+// handed back to diskd itself via the SYS_DISKD_INFO syscall — diskd's own
+// user-mode code has no other way to learn them, since it can't call
+// alloc_pages() directly and its own per-page image mapping can't
+// guarantee the physical contiguity DMA needs.
+int  diskd_pid = 0;
+uint diskd_vq_paddr;
+uint diskd_req_paddr;
+
+// The filesystem server (see user/fsd.c3) — 0 until created, consulted
+// only by create_process below to populate every new process's default
+// namespace. Unlike diskd, fsd is meant to be reached by ordinary
+// clients (the shell), so it's addressed through namespace resolution,
+// not a hardcoded pid — see the "" catch-all mount below.
+int fsd_pid = 0;
+
+const NS_MOUNTS_MAX = 4;   // Small fixed table — two real entries today
+                            // ("/" -> echod, "" -> fsd), room to grow.
 const NS_PREFIX_MAX = 32;  // Longest path prefix a mount entry can match.
 
 // One binding in a process's namespace: any path starting with `prefix`
@@ -59,6 +85,32 @@ struct Process
 	Mount[NS_MOUNTS_MAX] namespace;
 
 	char[STACK_SIZE] stack; // Kernel stack
+}
+
+// Moved here from the now-deleted src/fs.c3 (its tar-parsing logic moved
+// to user/fsd.c3, phase 5 of the microkernel plan) — these two are still
+// needed kernel-side: str_copy by create_process's default namespace
+// population above, str_starts_with by entry.c3's SYS_NS_RESOLVE.
+fn void str_copy(char* dst, char* src, uint max)
+{
+	uint i = 0;
+	while (src[i] != 0 && i < max - 1)
+	{
+		dst[i] = src[i];
+		i++;
+	}
+	dst[i] = 0;
+}
+
+fn bool str_starts_with(char* s, char* prefix)
+{
+	uint i = 0;
+	while (prefix[i] != 0)
+	{
+		if (s[i] != prefix[i]) return false;
+		i++;
+	}
+	return true;
 }
 
 // pid -> Process*, per how create_process assigns pid = slot index + 1.
@@ -169,17 +221,19 @@ fn Process* create_process(void* image, uint image_size)
 	{
 		map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
 	}
-	// virtio-blk MMIO registers: outside the kernel image/RAM range above,
-	// but syscalls like SYS_WRITEFILE reach the driver (fs_flush ->
-	// read_write_disk) from inside a process's own page table, not just
-	// from kernel_main's bare-addressing bring-up.
-	map_page(page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, PAGE_R | PAGE_W);
+	// virtio-blk MMIO is deliberately NOT mapped here anymore: diskd (see
+	// user/diskd.c3) is now the sole owner of the device, mapped only
+	// into its own page table by setup_diskd_mappings below. No other
+	// process — including the kernel's own S-mode code — touches it
+	// directly; everyone else talks to diskd over IPC.
 
-	// PLIC registers: same reasoning as virtio-blk above — handle_trap's
-	// plic_claim()/plic_complete() run under whichever process's page
-	// table happens to be active when the interrupt arrives, since
-	// read_write_disk's wfi wait can be reached from inside a syscall.
-	// Three separate pages, not a range — see plic.c3.
+	// PLIC registers: handle_trap's plic_claim()/plic_complete() run
+	// under whichever process's page table happens to be active when the
+	// interrupt arrives — could be any process, or the kernel's own
+	// bare-mode boot code — since it's S-mode code reached from inside a
+	// trap, not something any one process specifically owns (unlike the
+	// virtio-blk MMIO above, which now belongs to diskd alone). Three
+	// separate pages, not a range — see plic.c3.
 	map_page(page_table, PLIC_PRIORITY_PAGE, PLIC_PRIORITY_PAGE, PAGE_R | PAGE_W);
 	map_page(page_table, PLIC_ENABLE_PAGE, PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
 	map_page(page_table, PLIC_CLAIM_PAGE, PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
@@ -206,16 +260,69 @@ fn Process* create_process(void* image, uint image_size)
 	// always pid 2 (see kernel.c3 — it's the first process spawned after
 	// idle, deterministically). This is the same placeholder binding
 	// shell.c3's p9test used to hardcode directly; now it's a real
-	// per-process kernel lookup instead, ready to point somewhere else
-	// (fsd, once it exists) without touching any client code.
+	// per-process kernel lookup instead.
 	str_copy(&proc.namespace[0].prefix[0], "/", NS_PREFIX_MAX);
 	proc.namespace[0].server_pid = 2;
-	for (int m = 1; m < NS_MOUNTS_MAX; m++)
+
+	// "" is a catch-all — str_starts_with treats an empty prefix as
+	// matching everything, and its zero length always loses a longest-
+	// prefix-match tie against "/" above — so this only ever wins for
+	// paths that don't start with "/" at all: plain filenames like
+	// "hello.txt", exactly how user.c3's fs_read/fs_write call
+	// ns_resolve(). Routes them to fsd (0 — "unused" — for any process
+	// created before fsd exists, namely idle/echod/diskd themselves,
+	// none of which ever need this).
+	str_copy(&proc.namespace[1].prefix[0], "", NS_PREFIX_MAX);
+	proc.namespace[1].server_pid = fsd_pid;
+
+	for (int m = 2; m < NS_MOUNTS_MAX; m++)
 	{
 		proc.namespace[m].server_pid = 0;
 	}
 
 	return proc;
+}
+
+// Called once, right after create_process() spawns diskd (see kernel.c3),
+// to give it what it needs to own the virtio-blk device: MMIO access, plus
+// a virtqueue and request buffer diskd can actually use for DMA.
+//
+// The virtqueue/request buffer can't just be ordinary bytes within
+// diskd's own process image: create_process's per-page image-copy loop
+// calls alloc_pages(1) once per page, so consecutive *virtual* pages of
+// an image have no guaranteed relationship between their *physical*
+// backing — but the device's QUEUE_PFN and descriptor addr fields are
+// physical, and the legacy virtio layout derives the avail/used ring
+// locations from a single physical base, so this memory has to be one
+// physically contiguous run. alloc_pages(n) (unlike the per-page image
+// loop) guarantees that.
+//
+// Mapped identity (vaddr == paddr) rather than at some other chosen
+// virtual address: that way the same number diskd's own pointers resolve
+// to *is* the physical address the device needs, and diskd never needs a
+// virtual-to-physical translation of its own — it just gets told the
+// number once, via SYS_DISKD_INFO (src/entry.c3), and uses it both ways.
+fn void setup_diskd_mappings(Process* proc)
+{
+	map_page(proc.page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, PAGE_U | PAGE_R | PAGE_W);
+
+	uint vq_pages = (uint)(mem::aligned_offset((sz)Virtio_virtq::size, PAGE_SIZE) / PAGE_SIZE);
+	uint vq_paddr = alloc_pages(vq_pages);
+	for (uint off = 0; off < vq_pages * PAGE_SIZE; off += PAGE_SIZE)
+	{
+		map_page(proc.page_table, vq_paddr + off, vq_paddr + off, PAGE_U | PAGE_R | PAGE_W);
+	}
+
+	uint req_pages = (uint)(mem::aligned_offset((sz)Virtio_blk_req::size, PAGE_SIZE) / PAGE_SIZE);
+	uint req_paddr = alloc_pages(req_pages);
+	for (uint off = 0; off < req_pages * PAGE_SIZE; off += PAGE_SIZE)
+	{
+		map_page(proc.page_table, req_paddr + off, req_paddr + off, PAGE_U | PAGE_R | PAGE_W);
+	}
+
+	diskd_pid       = proc.pid;
+	diskd_vq_paddr  = vq_paddr;
+	diskd_req_paddr = req_paddr;
 }
 
 Process* current_proc; // Currently running process
