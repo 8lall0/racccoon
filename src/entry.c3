@@ -37,6 +37,18 @@ const SYS_IPC_RECV  = 7;
 const SYS_NS_RESOLVE = 8;
 const SYS_DISKD_INFO = 9; // diskd-only: returns its vq/req physical addrs
 const SYS_IPC_POLL   = 10; // non-blocking SYS_IPC_RECV, see its case below
+const SYS_RFORK       = 11;
+
+// rfork flags — Plan 9 names, this kernel's own subset. RFPROC is
+// required (rfork() without it returns -1 in this v1: real Plan 9 uses
+// that combination to change the *caller's* own group membership in
+// place, not meaningful yet here since there's nothing group-scoped
+// besides memory to change). RFMEM shares the parent's address space
+// instead of copying it — the one flag that turns this same call into
+// "spawn a thread." See the SYS_RFORK case below and process.c3's
+// fork_entry for the full mechanism.
+const int RFPROC = 1 << 0;
+const int RFMEM  = 1 << 1;
 
 // Sentinel msg_type handle_trap uses to wake diskd on a virtio-blk PLIC
 // interrupt (see handle_trap's interrupt branch below) — distinguishes
@@ -298,25 +310,48 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// PAGE_U precisely because they're not this process's own
 			// memory), every on-demand 2nd-level table map_page allocated
 			// for it, and the top-level table itself.
-			uint* exiting_table1 = current_proc.page_table;
-			for (uint vpn1 = 0; vpn1 < 1024; vpn1++)
+			//
+			// Skipped entirely if some other live process shares this
+			// exact page_table pointer — an rfork(RFPROC|RFMEM) sibling
+			// (see SYS_RFORK below). page_table pointers are never aliased
+			// any other way (every ordinary create_process call gets its
+			// own fresh alloc_pages(1) result), so this linear
+			// PROCS_MAX-sized scan is a correct, sufficient stand-in for a
+			// real refcount at this scale — no new field needed.
+			bool exit_table_shared = false;
+			for (int share_i = 0; share_i < PROCS_MAX; share_i++)
 			{
-				if ((exiting_table1[vpn1] & PAGE_V) == 0) continue;
-
-				uint* table0 = (uint*)((exiting_table1[vpn1] >> 10) * PAGE_SIZE);
-				for (uint vpn0 = 0; vpn0 < 1024; vpn0++)
+				if (&procs[share_i] == current_proc) continue;
+				if (procs[share_i].state == PROC_UNUSED) continue;
+				if (procs[share_i].page_table == current_proc.page_table)
 				{
-					if ((table0[vpn0] & PAGE_V) == 0) continue;
-					if (table0[vpn0] & PAGE_U)
-					{
-						uint leaf_paddr = (table0[vpn0] >> 10) * PAGE_SIZE;
-						free_pages(leaf_paddr, 1);
-					}
+					exit_table_shared = true;
+					break;
 				}
-
-				free_pages((uint)table0, 1);
 			}
-			free_pages((uint)exiting_table1, 1);
+
+			if (!exit_table_shared)
+			{
+				uint* exiting_table1 = current_proc.page_table;
+				for (uint vpn1 = 0; vpn1 < 1024; vpn1++)
+				{
+					if ((exiting_table1[vpn1] & PAGE_V) == 0) continue;
+
+					uint* table0 = (uint*)((exiting_table1[vpn1] >> 10) * PAGE_SIZE);
+					for (uint vpn0 = 0; vpn0 < 1024; vpn0++)
+					{
+						if ((table0[vpn0] & PAGE_V) == 0) continue;
+						if (table0[vpn0] & PAGE_U)
+						{
+							uint leaf_paddr = (table0[vpn0] >> 10) * PAGE_SIZE;
+							free_pages(leaf_paddr, 1);
+						}
+					}
+
+					free_pages((uint)table0, 1);
+				}
+				free_pages((uint)exiting_table1, 1);
+			}
 
 			current_proc.state = PROC_UNUSED;
 			current_proc.pid = 0;
@@ -456,6 +491,120 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			uint* diskd_req_out = (uint*)f.a1;
 			*diskd_vq_out  = diskd_vq_paddr;
 			*diskd_req_out = diskd_req_paddr;
+		case SYS_RFORK:
+			// Inline for the same reason as every other case in this
+			// switch — see SYS_EXIT's comment. See process.c3's
+			// fork_entry() for how the child actually resumes, and
+			// docs/devlog.md for the full design rationale.
+			int rfork_flags = (int)f.a0;
+			if ((rfork_flags & RFPROC) == 0)
+			{
+				f.a0 = (uint)(-1);
+				break;
+			}
+
+			Process* child = null;
+			int child_i;
+			for (child_i = 0; child_i < PROCS_MAX; child_i++)
+			{
+				if (procs[child_i].state == PROC_UNUSED)
+				{
+					child = &procs[child_i];
+					break;
+				}
+			}
+			if (!child)
+			{
+				f.a0 = (uint)(-1);
+				break;
+			}
+
+			if (rfork_flags & RFMEM)
+			{
+				// True sharing: same L1 table pointer, so every mapping
+				// either process makes or already has is visible to
+				// both — this is what makes it a "thread" rather than a
+				// process. SYS_EXIT's own free loop above has a guard
+				// specifically for this case.
+				child.page_table = current_proc.page_table;
+			}
+			else
+			{
+				// Independent copy: fresh L1 table, same kernel-range +
+				// PLIC identity mapping create_process always does,
+				// then every PAGE_U leaf in the parent's table gets a
+				// fresh physical page with a byte-for-byte copy, mapped
+				// at the same vaddr with the same flags. Same walk
+				// shape as SYS_EXIT's free loop above, copy instead of
+				// free.
+				uint* child_table = (uint*)alloc_pages(1);
+				for (uint paddr = (uint)&__kernel_base; paddr < (uint)&__free_ram_end; paddr += PAGE_SIZE)
+				{
+					map_page(child_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+				}
+				map_page(child_table, PLIC_PRIORITY_PAGE, PLIC_PRIORITY_PAGE, PAGE_R | PAGE_W);
+				map_page(child_table, PLIC_ENABLE_PAGE, PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
+				map_page(child_table, PLIC_CLAIM_PAGE, PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
+
+				uint* parent_table1 = current_proc.page_table;
+				for (uint vpn1 = 0; vpn1 < 1024; vpn1++)
+				{
+					if ((parent_table1[vpn1] & PAGE_V) == 0) continue;
+
+					uint* parent_table0 = (uint*)((parent_table1[vpn1] >> 10) * PAGE_SIZE);
+					for (uint vpn0 = 0; vpn0 < 1024; vpn0++)
+					{
+						if ((parent_table0[vpn0] & PAGE_V) == 0) continue;
+						if ((parent_table0[vpn0] & PAGE_U) == 0) continue;
+
+						uint parent_leaf_paddr = (parent_table0[vpn0] >> 10) * PAGE_SIZE;
+						uint child_leaf_paddr  = alloc_pages(1);
+						mem::copy((void*)child_leaf_paddr, (void*)parent_leaf_paddr, (sz)PAGE_SIZE);
+
+						uint child_vaddr  = (vpn1 << 22) | (vpn0 << 12);
+						uint parent_flags = parent_table0[vpn0] & 0x1f; // V|R|W|X|U — see page.c3's map_page encoding
+						map_page(child_table, child_vaddr, child_leaf_paddr, parent_flags);
+					}
+				}
+				child.page_table = child_table;
+			}
+
+			// Namespace: always copied, regardless of RFMEM — cheap
+			// (4 x Mount), and there's no mount/unmount syscall yet to
+			// make "shared" vs. "copied" observably different. The seam
+			// a future RFNAMEG-equivalent would slot into.
+			for (int ns_i = 0; ns_i < NS_MOUNTS_MAX; ns_i++)
+			{
+				child.namespace[ns_i] = current_proc.namespace[ns_i];
+			}
+
+			// Build the child's first-resume state: a copy of this
+			// trap's own Trap_frame (a0 zeroed — the child's return
+			// value), plus this trap's own resume address as an extra
+			// 32nd word, since sepc is a single CSR fork_entry can't
+			// otherwise inherit. See fork_entry's own comment in
+			// process.c3 for how this block gets consumed.
+			uint* child_sp = (uint*)&child.stack;
+			child_sp += STACK_SIZE / 4;
+			child_sp -= 32;
+
+			mem::copy((void*)child_sp, f, (sz)Trap_frame::size);
+			Trap_frame* child_frame = (Trap_frame*)child_sp;
+			child_frame.a0 = 0;
+			child_sp[31] = read_reg("sepc") + 4;
+
+			for (int rf_j = 0; rf_j < 12; rf_j++)
+			{
+				*(--child_sp) = 0;
+			}
+			*(--child_sp) = (uint)&fork_entry;
+
+			child.has_message = false;
+			child.pid   = child_i + 1;
+			child.sp    = (uint)child_sp;
+			child.state = PROC_RUNNABLE;
+
+			f.a0 = (uint)child.pid;
 		default:
 			panic::panic("unexpected syscall");
 	}

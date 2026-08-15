@@ -19,6 +19,11 @@ const int SYS_IPC_RECV  = 7;
 const int SYS_NS_RESOLVE = 8;
 const int SYS_DISKD_INFO = 9;
 const int SYS_IPC_POLL   = 10;
+const int SYS_RFORK      = 11;
+
+// rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
+const int RFPROC = 1 << 0; // required — create a new process
+const int RFMEM  = 1 << 1; // share the parent's address space instead of copying it
 
 // @export gives these functions C-compatible names so asm can call them
 fn void exit() @noreturn @export("exit") {
@@ -27,6 +32,15 @@ fn void exit() @noreturn @export("exit") {
     // away permanently on SYS_EXIT, it never returns here. Kept as a
     // fallback so this still satisfies @noreturn if that ever changes.
     for (;;);
+}
+
+// Returns the child's pid (>0) to the parent, 0 to the child, or -1 on
+// failure (no free process slot, or RFPROC not set) — same convention
+// as Plan 9's rfork(2). See src/entry.c3's SYS_RFORK case and
+// process.c3's fork_entry() for the actual mechanism: both halves
+// resume from this exact call site, not a fresh entry point.
+fn int rfork(int flags) @export("rfork") {
+    return syscall(SYS_RFORK, flags, 0, 0);
 }
 
 fn int syscall(int sysno, int arg0, int arg1, int arg2) {

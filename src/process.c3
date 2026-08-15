@@ -186,6 +186,66 @@ fn void user_entry() @naked @noinline @noreturn
     `);
 }
 
+// rfork's child resume point — see SYS_RFORK in entry.c3, which builds
+// the 32-word block this expects at the top of the child's kernel stack
+// before its first switch_context: a 31-word copy of the parent's own
+// Trap_frame at the moment of the rfork ecall (word 30 is the saved
+// *user-mode* sp — see Trap_frame's own layout in entry.c3 — restored
+// last, same as kernel_entry's own tail), with a0 overwritten to 0 (the
+// child's return value) and its own sepc as a 32nd word, since sepc is a
+// single CPU CSR with nothing to inherit it from at this point — unlike
+// kernel_entry's tail, which relies on write_sepc() having already set
+// the CSR earlier in the *same* trap, this function is the child's very
+// first instruction ever, on a different logical flow entirely.
+//
+// Deliberately a separate function from kernel_entry's own restore tail,
+// not a shared label jumped into from two places: touching kernel_entry
+// at all is exactly the kind of change this project's history (the
+// stvec alignment saga, the sscratch reentrancy bug) says to avoid
+// unless there's no other way. A few duplicated lines here is cheaper
+// than that risk.
+fn void fork_entry() @naked @noinline @noreturn
+{
+	asm(`
+        addi t0, sp, 4 * 31
+        lw t0, 0(t0)
+        csrw sepc, t0
+
+        lw ra,  4 * 0(sp)
+        lw gp,  4 * 1(sp)
+        lw tp,  4 * 2(sp)
+        lw t0,  4 * 3(sp)
+        lw t1,  4 * 4(sp)
+        lw t2,  4 * 5(sp)
+        lw t3,  4 * 6(sp)
+        lw t4,  4 * 7(sp)
+        lw t5,  4 * 8(sp)
+        lw t6,  4 * 9(sp)
+        lw a0,  4 * 10(sp)
+        lw a1,  4 * 11(sp)
+        lw a2,  4 * 12(sp)
+        lw a3,  4 * 13(sp)
+        lw a4,  4 * 14(sp)
+        lw a5,  4 * 15(sp)
+        lw a6,  4 * 16(sp)
+        lw a7,  4 * 17(sp)
+        lw s0,  4 * 18(sp)
+        lw s1,  4 * 19(sp)
+        lw s2,  4 * 20(sp)
+        lw s3,  4 * 21(sp)
+        lw s4,  4 * 22(sp)
+        lw s5,  4 * 23(sp)
+        lw s6,  4 * 24(sp)
+        lw s7,  4 * 25(sp)
+        lw s8,  4 * 26(sp)
+        lw s9,  4 * 27(sp)
+        lw s10, 4 * 28(sp)
+        lw s11, 4 * 29(sp)
+        lw sp,  4 * 30(sp)
+        sret
+    `);
+}
+
 Process[PROCS_MAX] procs; // All process control structures.
 
 fn Process* create_process(void* image, uint image_size)
