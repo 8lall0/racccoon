@@ -16,6 +16,35 @@ fn void thread_body(void* arg) {
     exit();
 }
 
+// racetest: two threads (true concurrency at the IPC level — both share
+// this process's memory and can genuinely interleave mid-send) message
+// echod at once. Before SYS_IPC_SEND was hardened into a rendezvous, a
+// second sender could silently overwrite the first sender's still-
+// unconsumed message in echod's single-slot inbox — this is what that
+// actually looks like when it goes wrong: one reply comes back matching
+// the *other* thread's payload instead of its own, or a thread hangs
+// forever waiting for a reply to a message echod never actually saw.
+char[4096] race_stack_a;
+char[4096] race_stack_b;
+char[16] race_reply_a;
+char[16] race_reply_b;
+int race_ok_a = 0;
+int race_ok_b = 0;
+
+fn void race_thread_a(void* arg) {
+    ipc_send(2, 0, "AAAA", 5);
+    ipc_recv(&race_reply_a, 16);
+    race_ok_a = strcmp(&race_reply_a, "AAAA") == 0 ? 1 : 0;
+    exit();
+}
+
+fn void race_thread_b(void* arg) {
+    ipc_send(2, 0, "BBBB", 5);
+    ipc_recv(&race_reply_b, 16);
+    race_ok_b = strcmp(&race_reply_b, "BBBB") == 0 ? 1 : 0;
+    exit();
+}
+
 fn void main() @export("main") {
     for (;;) {
         print("> ");
@@ -119,8 +148,10 @@ fn void main() @export("main") {
             // this process's address space (src/entry.c3's SYS_RFORK,
             // non-RFMEM branch). Both branches below are the *same*
             // rfork() call returning twice — proof that the child really
-            // resumed from here, not a fresh entry point.
-            int r = rfork(RFPROC);
+            // resumed from here, not a fresh entry point. Passing null
+            // for generation_out: this child is never joined, so there's
+            // nothing to capture it for.
+            int r = rfork(RFPROC, null);
             if (r < 0) {
                 print("rfork failed\n");
             } else if (r == 0) {
@@ -164,9 +195,11 @@ fn void main() @export("main") {
             rfork_child_ran = 0;
             int rf_flags = RFPROC | RFMEM;
             int rf_sysno = SYS_RFORK;
+            int rf_gen_out = 0; // null — this child is never joined
             int r;
             asm {
                 mv $a0, rf_flags;
+                mv $a1, rf_gen_out;
                 mv $a3, rf_sysno;
                 ecall;
                 mv r, $a0;
@@ -197,8 +230,9 @@ fn void main() @export("main") {
             // drops its own fsd mount right after forking; the parent's
             // own namespace (and any other process's) is untouched,
             // since the child got its own copy at fork time, not a
-            // reference to the parent's.
-            int r = rfork(RFPROC);
+            // reference to the parent's. Never joined, so null for
+            // generation_out.
+            int r = rfork(RFPROC, null);
             if (r < 0) {
                 print("rfork failed\n");
             } else if (r == 0) {
@@ -234,7 +268,9 @@ fn void main() @export("main") {
             // just a protected instant during the resume itself.
             thread_result = 0;
             char* thread_stack_top = (char*)&thread_stack + thread_stack.len;
-            int tid = threadcreate(&thread_body, null, thread_stack_top);
+            // Never joined here, so null for generation_out — that's
+            // exactly what threadjointest is for.
+            int tid = threadcreate(&thread_body, null, thread_stack_top, null);
             if (tid < 0) {
                 print("threadcreate failed\n");
             } else {
@@ -252,6 +288,42 @@ fn void main() @export("main") {
             putchar((char)('0' + thread_result / 10));
             putchar((char)('0' + thread_result % 10));
             print("\n");
+        } else if (strcmp(cmd, "threadjointest") == 0) {
+            // Same as threadtest, but joins the thread instead of
+            // leaving the caller to guess when it's safe to check —
+            // this is the whole reason join() exists. No more "ping a
+            // few times and hope": join() blocks until the thread is
+            // actually gone, so the result read right after it returns
+            // is guaranteed current, not a guess.
+            thread_result = 0;
+            char* thread_stack_top = (char*)&thread_stack + thread_stack.len;
+            uint tid_generation = 0;
+            int tid = threadcreate(&thread_body, null, thread_stack_top, &tid_generation);
+            if (tid < 0) {
+                print("threadcreate failed\n");
+            } else {
+                join(tid, tid_generation);
+                print("joined — thread_result = ");
+                putchar((char)('0' + thread_result / 10));
+                putchar((char)('0' + thread_result % 10));
+                print("\n");
+            }
+        } else if (strcmp(cmd, "racetest") == 0) {
+            race_ok_a = 0;
+            race_ok_b = 0;
+            char* stack_a_top = (char*)&race_stack_a + race_stack_a.len;
+            char* stack_b_top = (char*)&race_stack_b + race_stack_b.len;
+            uint gen_a = 0;
+            uint gen_b = 0;
+            int tid_a = threadcreate(&race_thread_a, null, stack_a_top, &gen_a);
+            int tid_b = threadcreate(&race_thread_b, null, stack_b_top, &gen_b);
+            join(tid_a, gen_a);
+            join(tid_b, gen_b);
+            print("racetest: a=");
+            putchar((char)('0' + race_ok_a));
+            print(" b=");
+            putchar((char)('0' + race_ok_b));
+            print(" (1=correct reply, 0=corrupted or lost)\n");
         } else {
             print("unknown command: ");
             print(cmd);

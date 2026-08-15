@@ -66,15 +66,33 @@ struct Process
 	uint sp; // Stack pointer
 	uint* page_table;
 
-	// Single-slot inbox: at most one pending message per process. SEND
-	// doesn't block the sender even if this is already occupied (it just
-	// overwrites) — a known v1 simplification, fine as long as callers
-	// keep to one outstanding request at a time (which is all this phase
-	// ever does). RECV blocks (PROC_BLOCKED) until has_message is true.
+	// Bumped every time this slot is (re)used — never reset, persists
+	// across a slot's unused periods. Exists purely so SYS_JOIN
+	// (entry.c3) can tell "the process I was waiting for exited" apart
+	// from "this pid got reused by an unrelated process, coincidentally
+	// landing in the same slot" — pids alone can't distinguish those,
+	// since a slot's next occupant always gets the exact same pid
+	// (pid = slot index + 1). See docs/devlog.md for the race this
+	// closes.
+	uint generation;
+
+	// Single-slot inbox, now a true two-sided rendezvous (src/entry.c3's
+	// SYS_IPC_SEND/RECV/POLL): SEND blocks until the target's inbox is
+	// actually free before depositing (never silently overwrites an
+	// unconsumed message), then blocks *again* until the receiver has
+	// genuinely consumed what it just deposited — RECV/POLL wake it via
+	// msg_acked, targeted at the specific sender (msg_from), not just by
+	// the inbox looking empty again (which could just as easily mean a
+	// different sender's message arrived and got consumed instead).
+	// Earlier versions of this kernel had SEND never block at all — a
+	// documented v1 simplification, safe only by accident of nothing yet
+	// sending concurrently; tightened once rfork/threadcreate made real
+	// concurrent senders possible (see docs/devlog.md).
 	bool has_message;
 	int  msg_from;
 	uint msg_type;
 	char[MSG_MAX] msg_data;
+	bool msg_acked; // set by the receiver once *this* process's own pending send has been consumed
 
 	// Per-process namespace: path prefix -> server pid. Every process gets
 	// an identical default namespace today (populated in create_process) —
@@ -326,6 +344,7 @@ fn Process* create_process(void* image, uint image_size)
 
 	// Initialize fields.
 	proc.pid = i + 1;
+	proc.generation++;
 	proc.state = PROC_RUNNABLE;
 	proc.sp = (uint)sp;
 	proc.page_table = page_table;

@@ -21,6 +21,7 @@ const int SYS_DISKD_INFO = 9;
 const int SYS_IPC_POLL   = 10;
 const int SYS_RFORK      = 11;
 const int SYS_NS_UNMOUNT = 12;
+const int SYS_JOIN       = 13;
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -40,8 +41,14 @@ fn void exit() @noreturn @export("exit") {
 // as Plan 9's rfork(2). See src/entry.c3's SYS_RFORK case and
 // process.c3's fork_entry() for the actual mechanism: both halves
 // resume from this exact call site, not a fresh entry point.
-fn int rfork(int flags) @export("rfork") {
-    return syscall(SYS_RFORK, flags, 0, 0);
+//
+// generation_out (optional, pass null if unneeded): the child's own
+// generation counter at creation time — capture this if you intend to
+// join() the child later, so join can tell "it exited" apart from "its
+// pid got reused by something unrelated" (see src/process.c3's
+// Process.generation and SYS_JOIN's case in src/entry.c3).
+fn int rfork(int flags, uint* generation_out) @export("rfork") {
+    return syscall(SYS_RFORK, flags, (int)generation_out, 0);
 }
 
 // Stack-aware wrapper around rfork(RFPROC|RFMEM): unlike calling rfork()
@@ -86,18 +93,28 @@ fn int rfork(int flags) @export("rfork") {
 // Returns the same thing rfork() does: the new thread's pid to the
 // caller, or -1 on failure. Never returns 0 — the "child" branch here
 // never comes back to this call site at all.
-fn int threadcreate(void* func, void* arg, void* stack_top) @naked @noinline @export("threadcreate") {
+//
+// generation_out (optional, pass null if unneeded): same purpose as
+// rfork()'s own — capture it if you intend to join() this thread later.
+// Threaded through in s4 (alongside s1-s3) rather than directly, since
+// it arrives in a3 — the same register this function needs for the
+// SYS_RFORK syscall number moments later — so it has to be saved off
+// before that overwrite, exactly like func/arg/stack_top already are.
+fn int threadcreate(void* func, void* arg, void* stack_top, uint* generation_out) @naked @noinline @export("threadcreate") {
     asm(`
-        addi sp, sp, -16
+        addi sp, sp, -20
         sw s1, 0(sp)
         sw s2, 4(sp)
         sw s3, 8(sp)
-        sw ra, 12(sp)
+        sw s4, 12(sp)
+        sw ra, 16(sp)
 
         mv s1, a0
         mv s2, a1
         mv s3, a2
+        mv s4, a3
         li a0, 3
+        mv a1, s4
         li a3, 11
         ecall
         bnez a0, 1f
@@ -111,8 +128,9 @@ fn int threadcreate(void* func, void* arg, void* stack_top) @naked @noinline @ex
         lw s1, 0(sp)
         lw s2, 4(sp)
         lw s3, 8(sp)
-        lw ra, 12(sp)
-        addi sp, sp, 16
+        lw s4, 12(sp)
+        lw ra, 16(sp)
+        addi sp, sp, 20
         ret
     `);
 }
@@ -202,6 +220,23 @@ fn int ns_resolve(char* path) @export("ns_resolve") {
 // sandbox itself without affecting its parent or siblings.
 fn int ns_unmount(char* prefix) @export("ns_unmount") {
     return syscall(SYS_NS_UNMOUNT, (int)prefix, 0, 0);
+}
+
+// Blocks until the process with this pid no longer exists — e.g. a
+// child from rfork() or a thread from threadcreate(). Replaces "call
+// something that happens to block for a while, then hope the target
+// has run by now" with an actual, correct wait. Returns -1 immediately
+// if pid is the caller's own (always a self-deadlock, rejected rather
+// than hung) or 0 once the target is gone.
+//
+// generation must be the value rfork()/threadcreate() wrote into their
+// own generation_out when this pid was created — without it, join
+// can't tell "this process exited" apart from "this pid got reused by
+// an unrelated process" (pids are slot-indexed and do get reused; see
+// src/process.c3's Process.generation and SYS_JOIN's case in
+// src/entry.c3 for the full reasoning).
+fn int join(int pid, uint generation) @export("join") {
+    return syscall(SYS_JOIN, pid, (int)generation, 0);
 }
 
 // Same as p9_call, but addresses the server by path (resolved through the

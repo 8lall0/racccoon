@@ -39,6 +39,7 @@ const SYS_DISKD_INFO = 9; // diskd-only: returns its vq/req physical addrs
 const SYS_IPC_POLL   = 10; // non-blocking SYS_IPC_RECV, see its case below
 const SYS_RFORK       = 11;
 const SYS_NS_UNMOUNT  = 12; // remove one of the caller's own namespace mounts by exact prefix
+const SYS_JOIN        = 13; // block until the given pid no longer exists — see its case below
 
 // rfork flags — Plan 9 names, this kernel's own subset. RFPROC is
 // required (rfork() without it returns -1 in this v1: real Plan 9 uses
@@ -380,13 +381,38 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				f.a0 = (uint)(-1);
 				break;
 			}
+
+			// Wait for the target's inbox to actually be free — a
+			// previous sender's message that hasn't been consumed yet
+			// must never be silently overwritten. Busy-poll like
+			// SYS_GETCHAR: nothing specifically wakes a queued sender
+			// when the slot frees up, it's whoever notices next.
+			while (ipc_target.has_message)
+			{
+				yield();
+			}
+
 			mem::copy(&ipc_target.msg_data, ipc_data, (sz)ipc_copy_len);
 			ipc_target.msg_from = current_proc.pid;
 			ipc_target.msg_type = ipc_type;
+			current_proc.msg_acked = false;
 			ipc_target.has_message = true;
 			if (ipc_target.state == PROC_BLOCKED)
 			{
 				ipc_target.state = PROC_RUNNABLE;
+			}
+
+			// True rendezvous: don't return to the caller until the
+			// receiver has actually consumed *this* message — SYS_IPC_RECV
+			// and SYS_IPC_POLL both wake us explicitly via msg_acked once
+			// they do (targeted at us specifically via msg_from, not just
+			// "the inbox looks empty again", which could just as easily
+			// mean a different sender's message arrived and got consumed
+			// instead).
+			while (!current_proc.msg_acked)
+			{
+				current_proc.state = PROC_BLOCKED;
+				yield();
 			}
 			f.a0 = 0;
 		case SYS_IPC_RECV:
@@ -410,6 +436,20 @@ fn void handle_syscall(Trap_frame* f) @noinline
 					}
 					f.a0 = (uint)current_proc.msg_from;
 					current_proc.has_message = false;
+
+					// Wake the sender: it's genuinely blocked (see
+					// SYS_IPC_SEND) waiting specifically for this ack,
+					// not just for the inbox to look empty from the
+					// outside.
+					Process* recv_acked_sender = proc_by_pid(current_proc.msg_from);
+					if (recv_acked_sender != null)
+					{
+						recv_acked_sender.msg_acked = true;
+						if (recv_acked_sender.state == PROC_BLOCKED)
+						{
+							recv_acked_sender.state = PROC_RUNNABLE;
+						}
+					}
 					break;
 				}
 				current_proc.state = PROC_BLOCKED;
@@ -455,6 +495,21 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			f.a0 = (uint)current_proc.msg_from;
 			current_proc.has_message = false;
+
+			// Same "wake the real sender" step as SYS_IPC_RECV — normally
+			// a no-op here, since diskd's only use of this is for the
+			// synthetic interrupt notify (msg_from=0, which proc_by_pid
+			// always rejects, so there's no real sender to wake), but
+			// correct regardless if that ever changes.
+			Process* poll_acked_sender = proc_by_pid(current_proc.msg_from);
+			if (poll_acked_sender != null)
+			{
+				poll_acked_sender.msg_acked = true;
+				if (poll_acked_sender.state == PROC_BLOCKED)
+				{
+					poll_acked_sender.state = PROC_RUNNABLE;
+				}
+			}
 		case SYS_NS_RESOLVE:
 			// Inline for the same reason as every other case in this
 			// switch — see SYS_EXIT's comment. Walks the caller's own
@@ -602,8 +657,20 @@ fn void handle_syscall(Trap_frame* f) @noinline
 
 			child.has_message = false;
 			child.pid   = child_i + 1;
+			child.generation++;
 			child.sp    = (uint)child_sp;
 			child.state = PROC_RUNNABLE;
+
+			// Optional out-pointer (a1), same "null means don't care"
+			// convention as SYS_IPC_RECV's type_out — lets the caller
+			// capture this child's generation for a later SYS_JOIN to
+			// check against, so a join can tell "this pid exited" apart
+			// from "this pid got reused by something else."
+			uint* rfork_gen_out = (uint*)f.a1;
+			if (rfork_gen_out != null)
+			{
+				*rfork_gen_out = child.generation;
+			}
 
 			f.a0 = (uint)child.pid;
 		case SYS_NS_UNMOUNT:
@@ -629,6 +696,49 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				}
 			}
 			f.a0 = (uint)unmount_result;
+		case SYS_JOIN:
+			// Blocks until the joined process is actually gone — plain
+			// polling (check, yield(), recheck), the same proven shape
+			// as SYS_GETCHAR's own retry loop, not an event-driven wake.
+			//
+			// "Actually gone" means either the slot is empty
+			// (proc_by_pid returns null) *or* it's been reused by an
+			// unrelated process — detected via the join_generation the
+			// caller captured when it created this pid (rfork's or
+			// threadcreate's optional generation_out), compared against
+			// Process.generation (src/process.c3), which increments on
+			// every reuse of a slot and never resets. Without this
+			// check, a pid recycled into a new process (always possible,
+			// since a slot's next occupant gets the exact same pid —
+			// pid = slot index + 1) would look identical to the
+			// original process still running, and join would wait for
+			// the wrong thing.
+			int join_pid = (int)f.a0;
+			uint join_generation = f.a1;
+			if (join_pid == current_proc.pid)
+			{
+				// Can't wait for yourself to disappear while you're the
+				// one running — always self-deadlock. Reject rather than
+				// hang.
+				f.a0 = (uint)(-1);
+				break;
+			}
+			// Stays PROC_RUNNABLE throughout, same as SYS_GETCHAR's own
+			// loop above — deliberately not PROC_BLOCKED: that state
+			// only ever gets cleared by something *else* explicitly
+			// flipping it back (SYS_IPC_SEND does this for a receiver).
+			// Nothing does that for a join — SYS_EXIT only ever touches
+			// its own process's state — so setting PROC_BLOCKED here
+			// would make this process permanently unschedulable the
+			// moment it's set, even after the joined pid actually exits.
+			for (;;)
+			{
+				Process* join_target = proc_by_pid(join_pid);
+				if (join_target == null) break;
+				if (join_target.generation != join_generation) break;
+				yield();
+			}
+			f.a0 = 0;
 		default:
 			panic::panic("unexpected syscall");
 	}
