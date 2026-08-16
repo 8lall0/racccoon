@@ -40,6 +40,8 @@ extern char[] _binary_echod_bin_start @cname("_binary_echod_bin_start");
 extern char[] _binary_echod_bin_end @cname("_binary_echod_bin_end");
 extern char[] _binary_diskd_bin_start @cname("_binary_diskd_bin_start");
 extern char[] _binary_diskd_bin_end @cname("_binary_diskd_bin_end");
+extern char[] _binary_sdd_bin_start @cname("_binary_sdd_bin_start");
+extern char[] _binary_sdd_bin_end @cname("_binary_sdd_bin_end");
 extern char[] _binary_fsd_bin_start @cname("_binary_fsd_bin_start");
 extern char[] _binary_fsd_bin_end @cname("_binary_fsd_bin_end");
 
@@ -56,6 +58,8 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	mem::set(&__bss, 0, (sz)((uptr)&__bss_end - (uptr)&__bss));
 
 	io::print("1: BSS cleared\n");
+
+	self_test_pte_roundtrip();
 
 	write_reg("stvec", "kernel_entry");
 
@@ -103,19 +107,34 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	if (board::HAS_BLOCK_DEVICE)
 	{
 		// Created after echod so echod keeps its pid-2 convention above.
-		Process* diskd_proc = create_process((void*)&_binary_diskd_bin_start, (uint)((uptr)&_binary_diskd_bin_end - (uptr)&_binary_diskd_bin_start));
-		setup_diskd_mappings(diskd_proc);
-		io::print("diskd created\n");
+		// Which driver — board::HAS_SD_BLOCK/HAS_VIRTIO_BLOCK (mutually
+		// exclusive, see board.c3) pick real-SD (Duo, user/sdd.c3) vs
+		// virtio-blk (QEMU, user/diskd.c3). Either way the driver process
+		// lands in this same third slot (pid 3, right after idle/echod),
+		// which is what lets fsd.c3's DISKD_PID hardcode stay valid
+		// unchanged regardless of which board this is.
+		if (board::HAS_SD_BLOCK)
+		{
+			Process* sdd_proc = create_process((void*)&_binary_sdd_bin_start, (uint)((uptr)&_binary_sdd_bin_end - (uptr)&_binary_sdd_bin_start));
+			setup_sdd_mappings(sdd_proc);
+			io::print("sdd created\n");
+		}
+		else if (board::HAS_VIRTIO_BLOCK)
+		{
+			Process* diskd_proc = create_process((void*)&_binary_diskd_bin_start, (uint)((uptr)&_binary_diskd_bin_end - (uptr)&_binary_diskd_bin_start));
+			setup_diskd_mappings(diskd_proc);
+			io::print("diskd created\n");
+		}
 
-		// Created after diskd so diskd is already registered (diskd_pid)
-		// by the time fsd's own fs_init() (run the first time the
-		// scheduler picks it, same as any other process) sends it a
-		// request. fsd_pid has to be set before ANY later create_process
-		// call populates a default namespace, since that's where it's
-		// actually consumed — every process created from here on (i.e.
-		// every shell) gets a working "" -> fsd mount; idle/echod/diskd,
-		// created before this line, don't and don't need to (see
-		// process.c3's create_process).
+		// Created after the storage driver so it's already registered
+		// (diskd_pid/sdd_pid) by the time fsd's own fs_init() (run the
+		// first time the scheduler picks it, same as any other process)
+		// sends it a request. fsd_pid has to be set before ANY later
+		// create_process call populates a default namespace, since that's
+		// where it's actually consumed — every process created from here
+		// on (i.e. every shell) gets a working "" -> fsd mount;
+		// idle/echod/the storage driver, created before this line, don't
+		// and don't need to (see process.c3's create_process).
 		Process* fsd_proc = create_process((void*)&_binary_fsd_bin_start, (uint)((uptr)&_binary_fsd_bin_end - (uptr)&_binary_fsd_bin_start));
 		fsd_pid = fsd_proc.pid;
 		io::print("fsd created\n");

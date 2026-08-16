@@ -58,6 +58,24 @@ const uptr PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uptr)~(kernel::PAGE_SIZE - 1);
 // diskd/fsd get spawned and the shell has real file access.
 const bool HAS_BLOCK_DEVICE = true;
 
+// Which driver process/kernel mapping helper kernel.c3 should use for the
+// block device HAS_BLOCK_DEVICE above promises — QEMU has virtio-mmio, not
+// real SD hardware. See boards/duo/board.c3 for the mirror image (SD, no
+// virtio-mmio).
+const bool HAS_SD_BLOCK     = false;
+const bool HAS_VIRTIO_BLOCK = true;
+
+// process.c3's setup_sdd_mappings references these unconditionally (one
+// kernel source tree, compiled separately per board — see this file's
+// header comment), even though QEMU never actually calls it
+// (HAS_SD_BLOCK is false here). No real SD hardware on QEMU, so no real
+// addresses to source — 0 is fine, same reasoning as IRQ_VIRTIO_BLK's "0
+// = not applicable on this board" convention in boards/duo/board.c3.
+const uptr SD_MMIO_BASE   = 0;
+const uptr SD_TOP_PAGE    = 0;
+const uptr SD_PINMUX_PAGE = 0;
+const uptr SD_CLOCK_PAGE  = 0;
+
 fn void plic_init()
 {
 	// Priority must be > 0 for the PLIC to ever forward the interrupt at

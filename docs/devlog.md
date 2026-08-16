@@ -4,6 +4,258 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-16 (7) — Real SD-card storage for the Duo: Stage 4, full working round trip
+
+**Continuing straight from this same day's "(6)" entry.** Stages 1-3
+(kernel plumbing, `sdd`'s driver skeleton, build wiring) were done and
+QEMU-verified; this entry is Stage 4 — real hardware bring-up — which
+took roughly a dozen flash/power-cycle round trips and turned up four
+real driver bugs, one serious pre-existing kernel bug, and one real
+safety hazard, before ending in a genuine, confirmed `writefile`/
+`readfile` round trip through `fsd` -> `sdd` -> physical SD card on real
+Milk-V Duo hardware.
+
+**The chase, in order:**
+
+1. **Wrong pad drive-strength values.** `sdd_pad_power_clock_init` had
+   CLK/CMD/DAT0-3 all at value 2 and PWR_EN at 1 — backwards versus
+   `duo-buildroot-sdk/u-boot-2021.10/board/cvitek/cv180x/sdhci_reg.h`'s
+   actual `REG_SDIO0_*_PAD_VALUE` constants (only CLK and PWR_EN should
+   be 2; everything else is 1). Read from memory instead of the real
+   header the first time; fixed by actually reading it.
+2. **Clock-divisor field overflow.** The initial ~400kHz enumeration
+   clock computed `256 << 8` for the divider field, which needs 9 bits
+   and silently overflowed into the adjacent timeout-control byte.
+3. **Missing vendor PHY TX/RX delay-line reset.** `cv180x_base.dtsi`'s
+   `sd:` node sets `reset_tx_rx_phy`, which `cvi_sdhci_probe()` acts on
+   with three extra register writes (`CVI_SDHCI_VENDOR_OFFSET`,
+   `CVI_SDHCI_PHY_TX_RX_DLY`, `CVI_SDHCI_PHY_CONFIG`) this driver
+   entirely omitted the first time through — ported from general SDHCI
+   spec knowledge only, never having actually read the vendor driver.
+4. **Self-inflicted clock clobbering.** A real, hard-won piece of
+   evidence: raw register readback showed the clock-control field
+   already had `INT_STABLE=1` *before* this driver's own software-reset
+   attempt — meaning BootROM (which has to read this exact card to load
+   FSBL at all, on this SD-boot board) had already left the SDHCI IP
+   correctly clocked and running. `SDHCI_SOFTWARE_RESET.RST_ALL` then
+   got stuck permanently asserted (confirmed: still asserted after a
+   20-million-iteration busy-wait, ruling out "just need a bigger
+   timeout" first), and this driver's *subsequent* full-word write to
+   set the clock divisor was silently force-clearing that stuck reset
+   bit as a side effect — without the hardware's own reset FSM having
+   actually finished, plausibly the reason the clock could never
+   re-stabilize afterward. Fix: stopped asking for a reset this exact IP
+   apparently can't cleanly complete, and stopped clobbering a clock
+   config that was already demonstrably working — `sdd_init` now skips
+   `SDHCI_SOFTWARE_RESET` and its own clock-divisor reconfiguration
+   entirely, just uses BootROM's pre-existing clock. Confirmed via
+   readback: `clock_stable` went from 0 to 1 the moment this stopped.
+
+5. **The real root cause, once the clock was confirmed stable and
+   commands *still* silently did nothing:** every register this driver
+   could inspect looked correct — writes to the SDHCI MMIO block
+   genuinely landed and persisted (confirmed with an unambiguous
+   `0xDEADBEEF` write/read-back test, and later with a real command word
+   reading back exactly as written) — yet `PRESENT_STATE` never moved a
+   single bit and `INT_STATUS` never showed one flicker of activity, no
+   matter what command was issued. Ruled out, in order: the clock-gate
+   register (`REG_CLK_EN_0`, already reading `0xFFFFFFFF` before any
+   write of ours — not the blocker), the dedicated SD0 reset line
+   (`RST_SD0`, confirmed unused by any boot stage, DT never wires it
+   up), `SD_SIGNAL_ENABLE` (added, no effect), UHS/preset-value state
+   (misread `HOST_CONTROL2`'s bit layout at first and had to correct
+   course — real bits: `PRESET_VAL_ENABLE`=0, `VDD_180`=0, `UHS_MODE_SEL`
+   =SDR12; no exotic state active at all), and `SDHCI_POWER_CONTROL`
+   (already `0x0F`/bus-power-on, confirmed by readback — this driver had
+   already gotten it right, just never verified). **Actual cause:**
+   `map_page()` (`src/page.c3`) applies `board::PTE_EXTRA_BITS`
+   (T-Head's SHARE|CACHE|BUF memory-attribute encoding — see this same
+   day's earlier entries on the Sv39 bring-up) to *every* mapping it
+   creates, unconditionally — including genuine device MMIO, not just
+   RAM. A cached write to a hardware register can sit in the CPU's own
+   cache line and never actually reach the device at all (until that
+   line happens to get evicted), and a cached read just as easily
+   returns a stale value instead of live device state — exactly
+   explaining "writes read back correctly (cache hit) while the actual
+   hardware shows zero sign of ever having received them." This is a
+   real, pre-existing bug that predates this session — it affected the
+   PLIC mapping too, from the very first Duo board-abstraction work —
+   just never surfaced before, because nothing had done tight MMIO
+   polling against real hardware on this board until `sdd`. **Fix:**
+   added `map_device_page()` (`src/page.c3`) alongside `map_page()` —
+   identical intermediate-table walk (still needs `PTE_EXTRA_BITS` at
+   that level, a genuine table-walker requirement, unrelated to the
+   leaf's own memory type), but the leaf entry omits `PTE_EXTRA_BITS`
+   entirely, landing at Strong-Order/non-cacheable (`docs/devlog.md`
+   already noted in passing, during the original Sv39 hang chase, that
+   an all-zero SO/C/B/SH/SEC field reads as exactly that). Switched
+   every genuine device-MMIO `map_page()` call site to
+   `map_device_page()`: PLIC (`process.c3`, and `entry.c3`'s rfork
+   child-table setup), `diskd`'s `VIRTIO_BLK_PADDR` mapping, and all
+   four of `sdd`'s new MMIO mappings. Left RAM-backed mappings (kernel
+   identity map, user image pages, `diskd`'s DMA vq/req buffers) on
+   `map_page()`, unchanged. Full QEMU regression re-verified unchanged
+   (`board::PTE_EXTRA_BITS=0` there regardless, so this cache-attribute
+   distinction is structurally a no-op on that board — real proof this
+   was a Duo-only latent bug, not something QEMU's regression suite
+   could ever have caught).
+
+   Once this landed: full enumeration succeeded on the very next boot —
+   `CMD0` -> `CMD8` (echoed the check pattern correctly) -> `ACMD41`
+   ready after 154 tries, `ocr` showing a high-capacity card -> `CMD2`/
+   `CMD3` (RCA assigned) -> `CMD7` SELECT_CARD -> "sdd: card ready".
+
+6. **A real safety hazard, caught before it did any damage.**
+   `writefile`/`readfile` both printed nothing on first try — not a bug
+   in the new addressing, but two separate things. First,
+   `fsd.c3`'s `FS_WRITE` handler only ever *updated* a file already
+   present in its in-memory table (built once at boot by tar-parsing the
+   disk) — no create path existed at all, so a write to a name never
+   seen at boot silently no-op'd. Harmless on QEMU (its `disk.tar`
+   always pre-seeds `hello.txt`) but meant nothing could ever be written
+   to a genuinely blank disk — exactly what a real SD card is on first
+   use. Second, and more serious: `fsd`/`sdd` address the SD card as raw
+   sectors starting at absolute LBA 0 — the *same* region as this card's
+   actual MBR/partition table (confirmed via `lsblk`/`sfdisk`: the
+   `DUOBOOT` FAT partition holding this board's own bootable `fip.bin`
+   starts at sector 2048, meaning sector 0 is the live MBR). Had
+   `writefile` succeeded before this was caught, `fs_flush()` would have
+   overwritten the partition table BootROM needs to find that partition
+   at all — data would likely survive physically, but the board would
+   probably stop booting until the MBR got manually reconstructed.
+   `fsd`'s own write-requires-existing-file limitation had been
+   accidentally protecting against this the whole time. Fixed both,
+   with the user's explicit sign-off before touching addressing at all
+   given the real-hardware stakes: added `DATA_SECTOR_OFFSET=64`
+   (`user/sdd.c3`), shifting every logical sector fsd addresses into the
+   unused ~1MB gap between the MBR and the first partition, comfortably
+   clear of both; and added a real create-on-write path to `fsd.c3`
+   (first unused slot in `files[]`, `FS_READ` still correctly fails for
+   a name that was never written). Full QEMU regression re-verified
+   unchanged (its own disk always has `hello.txt` pre-seeded, so the new
+   create path never actually triggers there).
+
+**Result: genuine `writefile`/`readfile` round trip on real Milk-V Duo
+hardware**, first time this whole project — `fsd: wrote 2560 bytes to
+disk` followed by `readfile` correctly printing back `Hello from
+shell!`, matching QEMU's own output exactly. Storage is no longer a
+QEMU-only feature.
+
+**Left as diagnostic instrumentation, on purpose, not cleaned up yet:**
+`sdd.c3` still prints a fair amount of one-time bring-up state
+(`clk_en_0`, the `0xDEADBEEF` write-test, `pll_reg`/`bypass_reg`,
+`power_control`, `clock_stable`, `host_control2`) and per-stage
+enumeration markers. Genuinely useful if this needs revisiting on a
+different physical card (drive-strength/timing margins are real
+per-card variables), consistent with this project's established
+practice of keeping this class of diagnostic (see `entry.c3`'s
+`current_pid` trap-print, kept since the original Sv39 chase) rather
+than stripping it the moment things work. A later pass could trim the
+noisiest of it once this has proven itself across more than one card
+and boot.
+
+**Files changed:** `user/sdd.c3` (all of the above: PHY reset writes,
+clock-clobber removal, `DATA_SECTOR_OFFSET`, drive-strength/divisor
+fixes, diagnostics), `src/page.c3` (`map_device_page()`, refactored
+`walk_to_leaf_table()` shared by both), `src/process.c3` and
+`src/entry.c3` (PLIC/`diskd`/`sdd` MMIO mappings switched to
+`map_device_page()`), `user/fsd.c3` (create-on-write path).
+
+---
+
+## 2026-08-16 (6) — Real SD-card storage for the Duo: sdd, Stages 1-3 done
+
+**Continuing straight from this same day's "(5)" entry.** With boot fully
+proven on real hardware, storage (the one explicitly-deferred gap —
+`writefile`/`readfile` correctly refused on the Duo since it has no
+virtio-mmio) was next. Plan file:
+`~/.claude/plans/wise-wobbling-music.md`.
+
+**Design:** a new, separate userland driver, `user/sdd.c3` — the Duo's
+SD controller (`cvitek,cv180x-sd`, MMIO `0x04310000`, PLIC IRQ 36) is a
+standard SDHCI-compliant controller (sourced from
+`duo-buildroot-sdk/u-boot-2021.10/drivers/mmc/cvitek/sdhci-cv180x.c` and
+`arch/riscv/dts/cv180x_base.dtsi`'s `sd:` node — real register values,
+not reverse-engineered), structurally unrelated to `diskd.c3`'s
+virtio-mmio protocol. PIO, not DMA — SDHCI's buffer-data-port register
+lets `sdd` read/write one 32-bit word at a time straight into its own
+process image, so unlike `diskd` it needs no kernel-allocated physically
+contiguous buffer and no `SYS_DISKD_INFO`-style syscall at all. No PLIC
+interrupt handling in v1 either — busy-polling `PRESENT_STATE`/
+`INT_STATUS` directly, since SDHCI commands complete in microseconds to
+low milliseconds and this sidesteps the sscratch-across-blocking-syscall
+hazard `diskd`'s own interrupt wait had to solve.
+
+**`board::HAS_SD_BLOCK`/`HAS_VIRTIO_BLOCK`** (both boards define both,
+mutually exclusive today) tell `kernel.c3`'s spawn gate which driver
+process + kernel-side mapping helper to use for the block device
+`HAS_BLOCK_DEVICE` promises exists. Duo: `HAS_BLOCK_DEVICE` flipped from
+`false` to `true`, `HAS_SD_BLOCK=true`. QEMU: unchanged behavior,
+`HAS_VIRTIO_BLOCK=true`. Either driver lands in the same third boot
+slot (pid 3, right after idle/echod), so `fsd.c3`'s hardcoded
+`DISKD_PID=3` needed zero changes — confirmed by reading `fsd.c3` in
+full first: it only ever speaks the sector-number/512-byte wire protocol
+to whatever answers at that pid, no virtio awareness anywhere in it.
+
+**Kernel-side plumbing** (`src/process.c3`): `setup_sdd_mappings`
+mirrors `setup_diskd_mappings` but simpler — no virtqueue/request-buffer
+`alloc_pages()` call, since PIO needs none. Maps `board::SD_MMIO_BASE`
+(the SDHCI block itself) plus three more separate pages the one-time
+pad/power/clock bring-up sequence needs: `SD_TOP_PAGE` (`0x03000000`,
+holds `REG_TOP_SD_PWRSW_CTRL`), `SD_PINMUX_PAGE` (`0x03001000`, pad
+function-select + drive-strength registers), `SD_CLOCK_PAGE`
+(`0x03002000`, the SD PLL divider + clock-bypass-select register) — all
+sourced from the same vendor headers as the SDHCI base address itself,
+not guessed.
+
+**`user/sdd.c3` itself:** `sdd_init` — pad mux, drive strength, power
+switch, PLL clock setup, SDHCI software reset, initial ~400kHz
+enumeration clock (spec-required: talk to a freshly powered card slowly
+before its real speed is negotiated). Then the standard SD Physical
+Layer command sequence (CMD0/CMD8/ACMD41/CMD2/CMD3/CMD9/CMD7, raise
+clock to ~25MHz, CMD16) — identical for any SDHCI controller, not
+chip-specific. Block read/write: CMD17/CMD24, poll the present-state
+ready bit, 128×32-bit words through the buffer port, poll transfer-
+complete. Main loop is `diskd.c3`'s shape verbatim (`ipc_recv_type` ->
+dispatch -> `ipc_send`), so `fsd` genuinely can't tell the two apart.
+
+**Verified this session:** both `bash scripts/build.sh` (QEMU) and
+`bash scripts/build_duo.sh` + `bash scripts/build_duo_fip.sh` (Duo, using
+the existing `$DUO_SDK` checkout at
+`~/Workspace/duo-buildroot-sdk-build/duo-buildroot-sdk`) build clean —
+`sdd.c3` compiles under the same `--use-stdlib=no` user-mode constraints
+`diskd.c3`/`fsd.c3` already do. Full QEMU regression
+(hello/ping/p9test/nstest/writefile/readfile/rforktest/sandboxtest/
+racetest) re-run and confirmed byte-for-byte unchanged from the "(5)"
+entry's baseline — `sdd` never spawns there (`HAS_SD_BLOCK=false`), so
+this is a real regression check, not just "it still compiles." (Along
+the way, discovered the test harness itself — piping `\n`-terminated
+commands into QEMU's stdin — was silently no-op'ing every command: the
+shell's read loop only ever breaks on `\r`, not `\n`, so bare-`\n` input
+just accumulates into one never-terminated line forever. Not a kernel
+bug; fixed by feeding `\r`-terminated lines instead.)
+
+**Not yet done — genuinely needs the user's hands (Stage 4):** real
+hardware bring-up. Register offsets and the command sequence are a
+careful, direct port of sourced values, but none of it has touched real
+silicon yet; expect iteration, same as the original Sv39 bring-up.
+Verification ladder, cheapest signal first: `sdd_init` completes and
+prints without hanging -> `CMD0`/`CMD8` get a response at all ->
+enumeration reaches `CMD7`/`SELECT_CARD` -> `writefile`/`readfile`
+round-trip correctly through `fsd`, matching QEMU's existing behavior.
+
+**Files changed:** `boards/duo/board.c3` (`SD_MMIO_BASE`, `IRQ_SDHCI`,
+`SD_TOP_PAGE`/`SD_PINMUX_PAGE`/`SD_CLOCK_PAGE`, `HAS_BLOCK_DEVICE` ->
+`true`, `HAS_SD_BLOCK`/`HAS_VIRTIO_BLOCK`), `boards/qemu/board.c3`
+(mirror `HAS_SD_BLOCK`/`HAS_VIRTIO_BLOCK` + dummy SD constants, needed
+since `process.c3` references them unconditionally regardless of board),
+`src/process.c3` (`sdd_pid`, `setup_sdd_mappings`), `src/kernel.c3`
+(spawn gate now picks `sdd` vs `diskd` by board flag), `user/sdd.c3`
+(new), `scripts/build_user.sh`/`build.sh`/`build_duo.sh` (build + link
+`sdd` alongside the other user binaries on both targets).
+
+---
+
 ## 2026-08-16 (5) — Milk-V Duo: full interactive shell, real hardware
 
 **Continuing straight from this same day's "(4)" entry.** Sv39 paging

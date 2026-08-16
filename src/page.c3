@@ -51,6 +51,28 @@ fn uptr pte_to_paddr(ulong entry)
 	return (uptr)(((entry >> 10) & PPN_MASK) * PAGE_SIZE);
 }
 
+// Regression guard for the PPN-masking bug itself (docs/devlog.md):
+// board::PTE_EXTRA_BITS is 0 on QEMU, which makes a masking bug in the
+// two functions above structurally invisible to the QEMU regression
+// suite no matter what code path runs them or when — it's not about
+// exercising the right *scenario*, it's that QEMU has no board-specific
+// "reserved" bits to corrupt anything with in the first place. Recreate
+// the actual bug shape directly instead: a synthetic PTE with T-Head's
+// real MAEE bit pattern set, independent of whatever this board's own
+// PTE_EXTRA_BITS happens to be, so this can never again pass on a board
+// that doesn't need it while silently failing on one that does. Called
+// once at boot, before any real page table exists.
+fn void self_test_pte_roundtrip()
+{
+	uptr test_paddr = (uptr)&__free_ram;
+	ulong fake_extra_bits = (1UL << 60) | (1UL << 61) | (1UL << 62);
+	ulong entry = paddr_to_ppn_field(test_paddr) | PAGE_V | fake_extra_bits;
+	if (pte_to_paddr(entry) != test_paddr)
+	{
+		panic::panic("pte_to_paddr round-trip self-test failed");
+	}
+}
+
 // Sv39 is 3-level (VPN2[38:30], VPN1[29:21], VPN0[20:12], each 9 bits,
 // 12-bit offset) where Sv32 was 2-level (VPN1[31:22], VPN0[21:12], each
 // 10 bits) — a real structural difference, not just wider fields. The
@@ -60,6 +82,40 @@ fn uptr pte_to_paddr(ulong entry)
 // which a 64-bit table entry (`ulong`, not `uint`) naturally
 // accommodates. Each level's table is still exactly one page, holding
 // 512 entries now (4096 / 8 bytes per PTE) instead of 1024.
+// Walks (allocating on demand) down to the leaf (3rd-level) table for
+// `vaddr`, creating table2/table1 entries as needed — shared by
+// map_page() and map_device_page() below, since both need the identical
+// intermediate-table walk and only differ in what they put in the final
+// leaf entry.
+//
+// board::PTE_EXTRA_BITS (see boards/duo/board.c3): applied to every
+// intermediate level here — this SoC's table walker apparently needs it
+// on intermediate table-pointer entries too, unlike this exact SDK's own
+// Linux fork (whose _PAGE_TABLE omits them); found by testing leaf-only
+// first, which made no observable difference at all to a real-hardware
+// hang, meaning the walk was failing before ever reaching the leaf. This
+// is a table-walker requirement, independent of whatever the *leaf*
+// mapping's own memory type should be (see map_device_page()'s comment
+// for why that part does need to differ).
+fn ulong* walk_to_leaf_table(ulong* table2, uptr vaddr)
+{
+	uint vpn2 = (uint)((vaddr >> 30) & 0x1ff);
+	if ((table2[vpn2] & PAGE_V) == 0)
+	{
+		uptr pt_paddr = alloc_pages(1);
+		table2[vpn2] = paddr_to_ppn_field(pt_paddr) | PAGE_V | board::PTE_EXTRA_BITS;
+	}
+	ulong* table1 = (ulong*)pte_to_paddr(table2[vpn2]);
+
+	uint vpn1 = (uint)((vaddr >> 21) & 0x1ff);
+	if ((table1[vpn1] & PAGE_V) == 0)
+	{
+		uptr pt_paddr = alloc_pages(1);
+		table1[vpn1] = paddr_to_ppn_field(pt_paddr) | PAGE_V | board::PTE_EXTRA_BITS;
+	}
+	return (ulong*)pte_to_paddr(table1[vpn1]);
+}
+
 fn void map_page(ulong* table2, uptr vaddr, uptr paddr, uint flags)
 {
 	if (!mem::ptr_is_aligned((void*)vaddr, PAGE_SIZE))
@@ -71,30 +127,7 @@ fn void map_page(ulong* table2, uptr vaddr, uptr paddr, uint flags)
 		panic::panic("unaligned paddr");
 	}
 
-	// board::PTE_EXTRA_BITS (see boards/duo/board.c3): applied to every
-	// level here, not just the leaf — this SoC's table walker apparently
-	// needs it on intermediate table-pointer entries too, unlike this
-	// exact SDK's own Linux fork (whose _PAGE_TABLE omits them); found by
-	// testing leaf-only first, which made no observable difference at
-	// all to a real-hardware hang, meaning the walk was failing before
-	// ever reaching the leaf.
-	uint vpn2 = (uint)((vaddr >> 30) & 0x1ff);
-	if ((table2[vpn2] & PAGE_V) == 0)
-	{
-		// Create the 2nd level page table if it doesn't exist.
-		uptr pt_paddr = alloc_pages(1);
-		table2[vpn2] = paddr_to_ppn_field(pt_paddr) | PAGE_V | board::PTE_EXTRA_BITS;
-	}
-	ulong* table1 = (ulong*)pte_to_paddr(table2[vpn2]);
-
-	uint vpn1 = (uint)((vaddr >> 21) & 0x1ff);
-	if ((table1[vpn1] & PAGE_V) == 0)
-	{
-		// Create the 1st level page table if it doesn't exist.
-		uptr pt_paddr = alloc_pages(1);
-		table1[vpn1] = paddr_to_ppn_field(pt_paddr) | PAGE_V | board::PTE_EXTRA_BITS;
-	}
-	ulong* table0 = (ulong*)pte_to_paddr(table1[vpn1]);
+	ulong* table0 = walk_to_leaf_table(table2, vaddr);
 
 	// Set the leaf (3rd level) page table entry to map the physical page.
 	//
@@ -113,11 +146,51 @@ fn void map_page(ulong* table2, uptr vaddr, uptr paddr, uint flags)
 	// clearing mxstatus, the official prebuilt firmware, an explicit
 	// D-cache flush, and a full U-Boot-mediated boot).
 	//
-	// board::PTE_EXTRA_BITS: T-Head's C906 repurposes Sv39's normally-
-	// reserved PTE bits 63:59 as memory-attribute bits (SO/C/B/SH/SEC)
-	// once its M-mode-only `mxstatus` MAEE bit is set — kept here as a
-	// correctness measure for cache attributes even though it wasn't
-	// what fixed the hang itself (tested and ruled out in isolation).
+	// board::PTE_EXTRA_BITS at the leaf: SHARE|CACHE|BUF — the correct
+	// memory type for ordinary RAM (kernel/user image pages, page
+	// tables), matching this exact SDK's own Linux fork's PAGE_KERNEL.
+	// NOT correct for device MMIO — see map_device_page() below, which
+	// every genuine hardware-register mapping in this codebase should
+	// use instead of this function.
 	uint vpn0 = (uint)((vaddr >> 12) & 0x1ff);
 	table0[vpn0] = paddr_to_ppn_field(paddr) | (ulong)flags | PAGE_V | PAGE_A | PAGE_D | board::PTE_EXTRA_BITS;
+}
+
+// Same as map_page(), for genuine device MMIO (PLIC, virtio-blk,
+// user/sdd.c3's SDHCI/pad-mux/clock registers, and any future real
+// hardware register block) rather than ordinary RAM. The one difference:
+// no board::PTE_EXTRA_BITS at the leaf.
+//
+// This isn't a style choice — board::PTE_EXTRA_BITS's SHARE|CACHE|BUF
+// combination (see map_page()'s own comment) marks a mapping cacheable,
+// which is correct for RAM but wrong for a hardware register: a cached
+// write can sit in the CPU's own cache line and never actually reach the
+// device at all until that line happens to get evicted, and a cached
+// read can just as easily return a stale value instead of the device's
+// live state, instead of silently doing the right thing the way it
+// would for RAM. docs/devlog.md already noted this in passing during
+// the original Sv39 bring-up ("leaving them zero reads as
+// Strong-Order/non-cacheable") but every map_page() call site at the time
+// happened to be RAM, so it never mattered in practice until this: every
+// map_page() call for real device MMIO on this board (PLIC included) was
+// silently marking those registers cacheable the whole time — found only
+// once user/sdd.c3's PIO-polling SD driver made the effect impossible to
+// miss (register writes reading back correctly — cache hit on the same
+// line — while the actual hardware never showed any sign of having
+// received them at all).
+fn void map_device_page(ulong* table2, uptr vaddr, uptr paddr, uint flags)
+{
+	if (!mem::ptr_is_aligned((void*)vaddr, PAGE_SIZE))
+	{
+		panic::panic("unaligned vaddr");
+	}
+	if (!mem::ptr_is_aligned((void*)paddr, PAGE_SIZE))
+	{
+		panic::panic("unaligned paddr");
+	}
+
+	ulong* table0 = walk_to_leaf_table(table2, vaddr);
+
+	uint vpn0 = (uint)((vaddr >> 12) & 0x1ff);
+	table0[vpn0] = paddr_to_ppn_field(paddr) | (ulong)flags | PAGE_V | PAGE_A | PAGE_D;
 }

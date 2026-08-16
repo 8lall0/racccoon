@@ -74,6 +74,26 @@ fn uptr alloc_pages(uint n)
 
 fn void free_pages(uptr paddr, uint n)
 {
+	// Bounds check: a process's page table can legitimately contain
+	// PAGE_U leaf entries that were never alloc_pages()'d at all — an
+	// MMIO identity-mapping like diskd's VIRTIO_BLK_PADDR or sdd's
+	// SD_MMIO_BASE/SD_TOP_PAGE/etc (see setup_diskd_mappings/
+	// setup_sdd_mappings, process.c3), both flagged PAGE_U for the same
+	// reason any other private mapping is. entry.c3's SYS_EXIT free loop
+	// walks every PAGE_U leaf and frees it unconditionally, so without
+	// this check, a real MMIO physical address (numerically far below
+	// __free_ram on both boards) underflows `paddr - __free_ram` into a
+	// huge unsigned value, producing a wildly out-of-bounds `bitmap`
+	// index and corrupting unrelated kernel memory. Latent since diskd's
+	// mapping was first added — never triggered before because diskd
+	// never legitimately called exit() in any tested path; surfaced for
+	// real once sdd's own panic-then-exit path (Milk-V Duo SD bring-up,
+	// see docs/devlog.md) became the first driver to actually exit with
+	// an MMIO mapping still present. A no-op here is the correct
+	// behavior, not a fallback: an MMIO page was never part of this
+	// allocator's pool, so there's genuinely nothing to free.
+	if (paddr < (uptr)&__free_ram || paddr >= (uptr)&__free_ram_end) return;
+
 	uint start_idx = (uint)((paddr - (uptr)&__free_ram) / PAGE_SIZE);
 	for (uint j = start_idx; j < start_idx + n; j++)
 	{

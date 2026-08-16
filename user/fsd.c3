@@ -292,6 +292,28 @@ fn void main() @export("main")
 		File* file = fs_lookup(&filename);
 		int* result_len_field = (int*)&buf;
 
+		// FS_WRITE creates a new file in the first unused slot if none
+		// with this name exists yet — FS_READ still fails for a missing
+		// file (nothing to read). Previously there was no create path at
+		// all, so a write to a name fsd hadn't already tar-parsed off
+		// disk at boot silently failed; harmless on QEMU (its disk.tar
+		// always pre-seeds hello.txt) but meant writefile could never
+		// actually do anything on a genuinely blank disk — a real SD
+		// card on first use, for instance (see docs/devlog.md).
+		if (!file && verb == FS_WRITE)
+		{
+			for (uint i = 0; i < FILES_MAX; i++)
+			{
+				if (!files[i].in_use)
+				{
+					file = &files[i];
+					file.in_use = true;
+					str_copy(&file.name[0], &filename[0], file.name.len);
+					break;
+				}
+			}
+		}
+
 		if (!file)
 		{
 			*result_len_field = -1;

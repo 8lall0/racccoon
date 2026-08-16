@@ -10,12 +10,13 @@ LLC=${LLC:-llc}
 
   # Same user-mode binaries as the QEMU build — user-mode code has no
   # board dependency at all (USER_BASE is well under 2GiB regardless of
-  # target, and none of shell/echod/diskd/fsd touch PLIC/console
-  # directly, only through kernel syscalls). diskd/fsd still get built
-  # and linked in even though board::HAS_BLOCK_DEVICE gates them off at
-  # runtime (see src/kernel.c3) — kernel.c3 still references their
-  # embedded-binary symbols unconditionally, just inside an `if` that
-  # never runs on this board, so the linker still needs them present.
+  # target, and none of shell/echod/diskd/sdd/fsd touch PLIC/console
+  # directly, only through kernel syscalls). diskd and sdd both still get
+  # built and linked in on every target even though only one of them ever
+  # actually runs on a given board (board::HAS_SD_BLOCK/HAS_VIRTIO_BLOCK
+  # picks which — see src/kernel.c3) — kernel.c3 references both
+  # embedded-binary symbols unconditionally, each inside an `if` that
+  # only runs on one board, so the linker needs both present regardless.
   bash scripts/build_user.sh
 
   echo "==> Compiling kernel to LLVM IR (racccoon-duo target)..."
@@ -41,6 +42,7 @@ LLC=${LLC:-llc}
     build/user/shell.bin.o \
     build/user/echod.bin.o \
     build/user/diskd.bin.o \
+    build/user/sdd.bin.o \
     build/user/fsd.bin.o \
     -T boards/duo/kernel.ld \
     -Map=build/kernel_duo.map \

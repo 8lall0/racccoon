@@ -35,6 +35,14 @@ int  diskd_pid = 0;
 uptr diskd_vq_paddr;
 uptr diskd_req_paddr;
 
+// The SD driver process (see user/sdd.c3) — Duo's real-hardware
+// counterpart to diskd above, mutually exclusive with it at runtime (see
+// board::HAS_SD_BLOCK/HAS_VIRTIO_BLOCK, kernel.c3). No vq/req physical
+// addresses to track here: sdd talks to its SDHCI controller in PIO mode,
+// not DMA, so it needs no physically-contiguous buffer handed back the
+// way diskd does — see setup_sdd_mappings below.
+int sdd_pid = 0;
+
 // The filesystem server (see user/fsd.c3) — 0 until created, consulted
 // only by create_process below to populate every new process's default
 // namespace. Unlike diskd, fsd is meant to be reached by ordinary
@@ -339,9 +347,9 @@ fn Process* create_process(void* image, uint image_size)
 	// trap, not something any one process specifically owns (unlike the
 	// virtio-blk MMIO above, which now belongs to diskd alone). Three
 	// separate pages, not a range — see plic.c3.
-	map_page(page_table, board::PLIC_PRIORITY_PAGE, board::PLIC_PRIORITY_PAGE, PAGE_R | PAGE_W);
-	map_page(page_table, board::PLIC_ENABLE_PAGE, board::PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
-	map_page(page_table, board::PLIC_CLAIM_PAGE, board::PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
+	map_device_page(page_table, board::PLIC_PRIORITY_PAGE, board::PLIC_PRIORITY_PAGE, PAGE_R | PAGE_W);
+	map_device_page(page_table, board::PLIC_ENABLE_PAGE, board::PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
+	map_device_page(page_table, board::PLIC_CLAIM_PAGE, board::PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
 
 	// Copy the process image into freshly allocated user pages, page by page.
 	char* img = image;
@@ -410,7 +418,7 @@ fn Process* create_process(void* image, uint image_size)
 // number once, via SYS_DISKD_INFO (src/entry.c3), and uses it both ways.
 fn void setup_diskd_mappings(Process* proc)
 {
-	map_page(proc.page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, PAGE_U | PAGE_R | PAGE_W);
+	map_device_page(proc.page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, PAGE_U | PAGE_R | PAGE_W);
 
 	uint vq_pages = (uint)(mem::aligned_offset((sz)Virtio_virtq::size, PAGE_SIZE) / PAGE_SIZE);
 	uptr vq_paddr = alloc_pages(vq_pages);
@@ -429,6 +437,31 @@ fn void setup_diskd_mappings(Process* proc)
 	diskd_pid       = proc.pid;
 	diskd_vq_paddr  = vq_paddr;
 	diskd_req_paddr = req_paddr;
+}
+
+// Called once, right after create_process() spawns sdd (see kernel.c3),
+// to give it access to the SDHCI controller's MMIO registers. Identity-
+// mapped for the same reason as diskd's virtio-blk MMIO above — not that
+// it matters for translation here (PIO never needs sdd to hand a physical
+// address to the device), just kept consistent with this codebase's one
+// existing MMIO-mapping convention. No virtqueue/request-buffer
+// allocation, no SYS_*_INFO syscall needed: unlike diskd, sdd never has
+// to tell the kernel-allocated DMA buffer's physical address to a device,
+// because there isn't one — block data is read/written one 32-bit word at
+// a time through the SDHCI buffer-data-port register, into/out of
+// ordinary memory already inside sdd's own process image.
+fn void setup_sdd_mappings(Process* proc)
+{
+	map_device_page(proc.page_table, board::SD_MMIO_BASE, board::SD_MMIO_BASE, PAGE_U | PAGE_R | PAGE_W);
+
+	// Pad/power/clock one-time bring-up registers (see board.c3's own
+	// comment on these three) — separate pages from SD_MMIO_BASE and from
+	// each other.
+	map_device_page(proc.page_table, board::SD_TOP_PAGE, board::SD_TOP_PAGE, PAGE_U | PAGE_R | PAGE_W);
+	map_device_page(proc.page_table, board::SD_PINMUX_PAGE, board::SD_PINMUX_PAGE, PAGE_U | PAGE_R | PAGE_W);
+	map_device_page(proc.page_table, board::SD_CLOCK_PAGE, board::SD_CLOCK_PAGE, PAGE_U | PAGE_R | PAGE_W);
+
+	sdd_pid = proc.pid;
 }
 
 Process* current_proc; // Currently running process

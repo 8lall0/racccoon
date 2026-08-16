@@ -67,13 +67,40 @@ const uptr PLIC_PRIORITY_PAGE = PLIC_PRIORITY_BASE & (uptr)~(kernel::PAGE_SIZE -
 const uptr PLIC_ENABLE_PAGE   = PLIC_ENABLE_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
 const uptr PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uptr)~(kernel::PAGE_SIZE - 1);
 
-// No virtio-blk (or any storage driver at all yet) on real hardware —
-// virtio-mmio is a QEMU paravirtual device with no physical equivalent.
-// kernel.c3 skips spawning diskd/fsd entirely when this is false; the
-// shell loses readfile/writefile until a real SD/eMMC driver exists —
-// explicit, flagged scope cut (see the plan file), not silently
-// dropped.
-const bool HAS_BLOCK_DEVICE = false;
+// SDHCI-compliant SD controller (cvitek,cv180x-sd), sourced from
+// duo-buildroot-sdk's own U-Boot driver (drivers/mmc/cvitek/sdhci-cv180x.c)
+// and arch/riscv/dts/cv180x_base.dtsi's `sd:` node — a real, documented
+// register layout, not reverse-engineered. See user/sdd.c3 for the driver
+// that actually owns this (pad/power/clock bring-up, standard SD command
+// sequence, PIO block transfers — no DMA, no PLIC involvement in v1).
+const uptr SD_MMIO_BASE = 0x04310000;
+const uint IRQ_SDHCI    = 36; // unused by v1's busy-poll design; recorded
+                               // now since it's real and already sourced,
+                               // not because anything reads it yet.
+
+// One-time SD pad/power/clock bring-up (see user/sdd.c3's sdd_init) needs
+// three more, separate MMIO pages besides SD_MMIO_BASE itself — none of
+// them adjacent to it or to each other, so all three (plus SD_MMIO_BASE)
+// get mapped individually by setup_sdd_mappings (process.c3). Register
+// offsets within these pages are sdd.c3's concern, not this file's — this
+// is just the page-granularity access list the page table needs.
+const uptr SD_TOP_PAGE    = 0x03000000; // REG_TOP_SD_PWRSW_CTRL @ +0x1F4
+const uptr SD_PINMUX_PAGE = 0x03001000; // PAD_SDIO0_* function-select +
+                                          // REG_SDIO0_*_PAD_REG drive-
+                                          // strength regs, both in range
+const uptr SD_CLOCK_PAGE  = 0x03002000; // pll_reg @ +0x70,
+                                          // CLOCK_BYPASS_SELECT_REGISTER @ +0x30
+
+// This board has a block device (real SD storage, via sdd — see
+// user/sdd.c3) but no virtio-mmio (a QEMU paravirtual device with no
+// physical equivalent on real hardware). HAS_BLOCK_DEVICE gates whether
+// kernel.c3 spawns *any* storage driver + fsd; HAS_SD_BLOCK/HAS_VIRTIO_BLOCK
+// (mutually exclusive, both boards define both) tell it *which* driver
+// process and kernel-side mapping helper to use for the one this board
+// has. See boards/qemu/board.c3 for the mirror image.
+const bool HAS_BLOCK_DEVICE = true;
+const bool HAS_SD_BLOCK     = true;
+const bool HAS_VIRTIO_BLOCK = false;
 
 // Same register formulas as boards/qemu/board.c3 — see this file's own
 // PLIC_BASE comment for why these are unverified rather than assumed

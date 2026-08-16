@@ -51,6 +51,7 @@ LLC=${LLC:-llc}
     build/user/shell.bin.o \
     build/user/echod.bin.o \
     build/user/diskd.bin.o \
+    build/user/sdd.bin.o \
     build/user/fsd.bin.o \
     -T src/kernel.ld \
     -Map=build/kernel.map \
