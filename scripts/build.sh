@@ -11,8 +11,19 @@ LLC=${LLC:-llc}
   # Build user app first (produces build/user/shell.bin.o)
   bash scripts/build_user.sh
 
-  echo "==> Building disk image..."
-  (cd disk && tar cf ../build/disk.tar --format=ustar *.txt)
+  echo "==> Building disk image (FAT32)..."
+  # user/fsd.c3 now reads a real FAT32 filesystem (see docs/devlog.md),
+  # not the tar format this used to build. Whole-disk FAT32 (no MBR/
+  # partition table, board::FS_PARTITION_START_SECTOR=0 for QEMU — see
+  # boards/qemu/board.c3) — the simplest thing mkfs.vfat can produce.
+  # `-F 32` forces FAT32 specifically: dosfstools defaults to FAT16 below
+  # its own size threshold, and fsd.c3 only parses the FAT32 BPB layout.
+  # mtools' mcopy writes into the image directly, no root/loop-mount
+  # needed. 64M comfortably clears FAT32's own minimum practical size.
+  rm -f build/disk.img
+  dd if=/dev/zero of=build/disk.img bs=1M count=64 status=none
+  mkfs.vfat -F 32 build/disk.img > /dev/null
+  mcopy -i build/disk.img disk/*.txt ::
 
   echo "==> Compiling kernel to LLVM IR..."
   rm -rf build/obj build/llvm build/obj_medany build/kernel.*

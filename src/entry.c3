@@ -44,6 +44,11 @@ const SYS_IPC_POLL   = 10; // non-blocking SYS_IPC_RECV, see its case below
 const SYS_RFORK       = 11;
 const SYS_NS_UNMOUNT  = 12; // remove one of the caller's own namespace mounts by exact prefix
 const SYS_JOIN        = 13; // block until the given pid no longer exists — see its case below
+const SYS_FS_PARTITION_INFO = 14; // fsd-only: returns board::FS_PARTITION_START_SECTOR —
+                                    // board is a kernel-only module (see user/sdd.c3's own
+                                    // header comment), so this is fsd.c3's only way to learn
+                                    // a board-specific fact despite being one board-agnostic
+                                    // user binary, same shape as SYS_DISKD_INFO above.
 
 // rfork flags — Plan 9 names, this kernel's own subset. RFPROC is
 // required (rfork() without it returns -1 in this v1: real Plan 9 uses
@@ -569,6 +574,11 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			uptr* diskd_req_out = (uptr*)(uptr)f.a1;
 			*diskd_vq_out  = diskd_vq_paddr;
 			*diskd_req_out = diskd_req_paddr;
+		case SYS_FS_PARTITION_INFO:
+			// fsd-only, called once at its own startup — a0 is an
+			// out-pointer, same convention as SYS_DISKD_INFO above.
+			uint* fs_partition_out = (uint*)(uptr)f.a0;
+			*fs_partition_out = (uint)board::FS_PARTITION_START_SECTOR;
 		case SYS_RFORK:
 			// Inline for the same reason as every other case in this
 			// switch — see SYS_EXIT's comment. See process.c3's

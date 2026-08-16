@@ -37,13 +37,6 @@ const uint DISKD_WRITE   = 11;
 const uint DISKD_MSG_MAX = 516;
 const uint SECTOR_SIZE   = 512;
 
-// See sdd_block_rw's own comment — every logical sector fsd addresses
-// gets shifted by this many sectors before touching the card, to stay
-// entirely inside the unused gap between the MBR (sector 0) and the
-// DUOBOOT FAT boot partition (starts at sector 2048 on the card this was
-// bring-up-tested on).
-const uint DATA_SECTOR_OFFSET = 64;
-
 // --- SDHCI register block (relative to board::SD_MMIO_BASE). Each
 // constant here is one 32-bit-aligned register; sub-word fields (8/16-bit
 // per the spec) are accessed via shift/mask on the enclosing 32-bit word
@@ -416,7 +409,26 @@ fn bool sd_send_cmd(uint index, uint arg, uint resp_flags, bool data)
 	// far more common convention.
 	uint flags = resp_flags;
 	if (data) flags |= SD_CMD_DATA_PRESENT;
-	uint xfer = data ? (SD_TRNS_BLK_CNT_EN) : 0;
+	// Data Transfer Direction Select (SD_TRNS_READ) was defined as a
+	// constant but never actually set anywhere — real, concrete bug,
+	// not a timing issue: every data-bearing command left this bit 0
+	// ("host-to-card"/write direction) regardless of which command was
+	// actually issued, so a CMD17 (read) left the controller configured
+	// for a write-direction transfer. PRESENT_STATE confirmed this
+	// directly on real hardware: SPACE_AVAILABLE (write-ready) came up
+	// set, DATA_AVAILABLE (what a real read needs) never did — sdd_
+	// block_rw's own wait for DATA_AVAILABLE then timed out forever,
+	// looking exactly like a device that never responds, for a read
+	// that had actually already succeeded at the command level (CMD17
+	// got a valid R1 response, card state = "tran"). Inferred from the
+	// command index rather than a new parameter: CMD17/CMD24 are the
+	// only two data-bearing commands this driver ever issues.
+	uint xfer = 0;
+	if (data)
+	{
+		xfer = SD_TRNS_BLK_CNT_EN;
+		if (index == 17) xfer |= SD_TRNS_READ;
+	}
 	uint cmd_word = ((index & 0x3F) << 24) | ((flags & 0xFF) << 16) | xfer;
 	sd_reg_write(SD_XFERMODE_CMD, cmd_word);
 
@@ -429,19 +441,41 @@ fn bool sd_send_cmd(uint index, uint arg, uint resp_flags, bool data)
 		complete_wait++;
 	}
 	sd_last_int_status = status;
-	// Clear the WHOLE status word, not just SD_INT_RESPONSE|SD_INT_ERROR.
-	// SD_INT_ERROR (bit 15) is a *summary* bit over eleven separate
-	// detail bits (TIMEOUT/CRC/END_BIT/INDEX/DATA_TIMEOUT/DATA_CRC/
-	// DATA_END_BIT/BUS_POWER/ACMD12ERR/ADMA_ERROR, bits 16-25 — see the
-	// real header), and clearing only the summary bit while a detail bit
-	// underneath it stays set does nothing lasting — the summary just
-	// re-asserts. Correct practice regardless, even though it turned out
-	// NOT to be the cause of the real interrupt storm chased during this
-	// board's PLIC bring-up — that was a genuine PLIC-level hardware
-	// quirk, isolated and unrelated to this device-side clearing at all
-	// (see docs/devlog.md's 2026-08-17 entry and sdd_block_rw's own
-	// header comment).
-	sd_reg_write(SD_INT_STATUS, SD_INT_ALL_MASK);
+	// On error, clear the WHOLE status word, not just SD_INT_RESPONSE|
+	// SD_INT_ERROR: SD_INT_ERROR (bit 15) is a *summary* bit over eleven
+	// separate detail bits (TIMEOUT/CRC/END_BIT/INDEX/DATA_TIMEOUT/
+	// DATA_CRC/DATA_END_BIT/BUS_POWER/ACMD12ERR/ADMA_ERROR, bits 16-25 —
+	// see the real header), and clearing only the summary bit while a
+	// detail bit underneath it stays set does nothing lasting. The
+	// transfer is being abandoned on this path anyway (return false
+	// below), so a full clear is safe here.
+	//
+	// On success for a data-bearing command, don't write SD_INT_STATUS at
+	// all here — defer entirely to the caller (sdd_block_rw), which does
+	// one single combined clear (RESPONSE|DATA_AVAIL together) right
+	// before draining the buffer. This started as "clear only
+	// SD_INT_RESPONSE, not the whole word" (on the theory that a blanket
+	// clear was wiping data-ready bits before the data-phase ever saw
+	// them), which cut a measured, byte-exact 16-byte PIO data loss down
+	// to 8 bytes — real progress, but not zero. That a *narrower* write
+	// to this register, still made while CMD17's data phase was actively
+	// in flight, still cost exactly one more 8-byte granule points at the
+	// write itself (to this register, mid-transfer, regardless of which
+	// bits it sets) being what perturbs this SDHCI clone's FIFO — not
+	// which bits happen to be set in the value. Not writing here at all
+	// for a data command is the only way left to test that directly. On
+	// success for a non-data command, SD_INT_RESPONSE alone is still
+	// correct and safe to clear immediately (nothing else in flight).
+	// On error, still clear everything (see this block's own comment
+	// above) — the transfer is being abandoned either way.
+	if ((status & SD_INT_ERROR) != 0)
+	{
+		sd_reg_write(SD_INT_STATUS, SD_INT_ALL_MASK);
+	}
+	else if (!data)
+	{
+		sd_reg_write(SD_INT_STATUS, SD_INT_RESPONSE);
+	}
 
 	if ((status & SD_INT_RESPONSE) == 0) return false;
 
@@ -637,62 +671,123 @@ fn void sdd_panic(char* msg)
 // engineering support), not just source-reading.
 fn bool sdd_block_rw(char* data, uint sector, bool is_write)
 {
-	sd_reg_write(SD_BLKSIZE_BLKCNT, (1 << 16) | SECTOR_SIZE);
+	// Writes rejected entirely, for now. fsd (the only real client) is
+	// read-only (see docs/devlog.md's FAT32 entry) and, unlike the old
+	// tar-based fsd this replaced, addresses real, absolute sectors on
+	// the actual DUOBOOT partition (via board::FS_PARTITION_START_SECTOR)
+	// — the same partition holding this board's own bootable fip.bin —
+	// not an offset relative to a small reserved-and-bounds-checked gap.
+	// A prior version of this function kept exactly that kind of gap
+	// (DATA_SECTOR_OFFSET) with its own bounds check, sized for the old
+	// fsd's small, safely-isolated data region; removed once it started
+	// actively rejecting the new fsd's own legitimate reads of the real
+	// partition — the two designs used the same `sector` parameter to
+	// mean genuinely different things. There's no longer a well-defined
+	// "safe to write" region here at all, and nothing currently sends a
+	// write. Real write support, whenever it's built, needs its own
+	// design at this layer — not a resurrection of this one.
+	if (is_write) return false;
 
-	// DATA_SECTOR_OFFSET: fsd's `sector` argument (user/fsd.c3) is a
-	// logical index starting at 0 — but sector 0 on THIS physical card
-	// is the MBR/partition table, and everything from sector 2048 on is
-	// the DUOBOOT FAT partition holding this board's own bootable
-	// fip.bin (confirmed via `sfdisk`/`lsblk` against the actual card
-	// this was bring-up-tested on). Writing fsd's tar-formatted file
-	// data at raw sector 0 would destroy the partition table BootROM
-	// needs to find that partition at all — the disk stays physically
-	// intact but the board would very likely stop booting until the MBR
-	// got manually reconstructed. Offsetting into the unused gap between
-	// the MBR and the first partition (sectors 1-2047, ~1MB, comfortably
-	// more than fsd's ~2560-byte DISK_MAX_SIZE) keeps racccoon's own
-	// data entirely out of both the MBR and the boot partition — see
-	// docs/devlog.md for the full reasoning. 64 is arbitrary within that
-	// safe range, just comfortably clear of sector 0 on either side.
-	uint absolute_sector = sector + DATA_SECTOR_OFFSET;
+	sd_reg_write(SD_BLKSIZE_BLKCNT, (1 << 16) | SECTOR_SIZE);
 
 	// SDHC/SDXC: block addressing, argument = block number directly.
 	// SDSC: byte addressing, argument = sector * 512.
-	uint arg = sd_high_capacity ? absolute_sector : (absolute_sector * SECTOR_SIZE);
+	uint arg = sd_high_capacity ? sector : (sector * SECTOR_SIZE);
 
 	uint resp = SD_CMD_RESP_SHORT | SD_CMD_CRC_CHECK | SD_CMD_INDEX_CHECK;
-	uint index = is_write ? 24 : 17;
-	if (!sd_send_cmd(index, arg, resp, true)) return false;
-
-	uint ready_bit = is_write ? SD_PRESENT_SPACE_AVAIL : SD_PRESENT_DATA_AVAIL;
-	int ready_wait = 0;
-	while ((sd_reg_read(SD_PRESENT_STATE) & ready_bit) == 0 && ready_wait < SD_WAIT_MAX)
+	bool cmd17_ok = sd_send_cmd(17, arg, resp, true);
+	if (!cmd17_ok)
 	{
+		// Aborting anyway — nothing left to race against, safe to print
+		// here (see this function's own header comment on why every
+		// print() between CMD17 completing and the buffer-drain loop was
+		// removed from the success path).
+		print("sdd: CMD17 TIMED OUT resp0=");
+		print_hex32(sd_response0);
+		print("\n");
+		return false;
+	}
+
+	// SD_SETUP_WAIT_MAX (400x SD_WAIT_MAX), not SD_WAIT_MAX, for both
+	// waits below — deliberately different from sd_send_cmd's own
+	// command-level wait, which stays tight since it's paid repeatedly
+	// during ACMD41's retry loop (a slow bound there makes a genuinely
+	// non-responding card look hung — see that function's own comment).
+	// This wait is paid once per block request, not per retry, so a
+	// generous bound here is cheap regardless of whether it turns out to
+	// matter.
+	//
+	// Waits on INT_STATUS's own Buffer Read Ready bit (SD_INT_DATA_AVAIL),
+	// not just PRESENT_STATE's DATA_AVAILABLE — matching the real vendor
+	// driver's sdhci_transfer_data() (u-boot's generic drivers/mmc/
+	// sdhci.c, read directly during this session's diagnosis).
+	int ready_wait = 0;
+	uint int_status = 0;
+	while (ready_wait < SD_SETUP_WAIT_MAX)
+	{
+		int_status = sd_reg_read(SD_INT_STATUS);
+		if ((int_status & (SD_INT_DATA_AVAIL | SD_INT_ERROR)) != 0) break;
 		ready_wait++;
 	}
-	if ((sd_reg_read(SD_PRESENT_STATE) & ready_bit) == 0) return false;
+	bool ready_ok = (int_status & SD_INT_DATA_AVAIL) != 0;
+	if (!ready_ok)
+	{
+		print("sdd: data-ready TIMED OUT after ");
+		print_hex32((uint)ready_wait);
+		print(" iters, int_status=");
+		print_hex32(int_status);
+		print("\n");
+		return false;
+	}
 
+	// No print() calls, and no SD_INT_STATUS write, between here and the
+	// read loop below — deliberately. This is the actual fix, not a
+	// diagnostic. Root cause: the card's DAT lines start pushing data
+	// almost immediately after CMD17 is accepted, and this SDHCI clone's
+	// PIO FIFO is shallow enough that any delay here costs real, already-
+	// arrived words — a print() is many slow, one-character-at-a-time
+	// UART writes, easily enough to lose the first couple of words before
+	// the host ever looks. Confirmed by elimination, not guessed: several
+	// versions that only reordered/combined/dropped the INT_STATUS
+	// write(s) around this point produced a byte-for-byte IDENTICAL loss
+	// no matter what was tried, which ruled out register-write ordering
+	// entirely; moving every print() to after the read loop (this
+	// version) fixed it outright. See docs/devlog.md's FAT32 entry for
+	// the full elimination trail. Clearing SD_INT_DATA_AVAIL/
+	// SD_INT_RESPONSE isn't needed here either — draining SD_BUFFER
+	// itself de-asserts readiness on a real PIO FIFO, and the
+	// unconditional SD_INT_ALL_MASK clear below (after the whole block is
+	// read) covers cleanup.
+	//
+	// Always a read from here on — is_write already handled above.
 	uint* words = (uint*)data;
 	for (uint i = 0; i < SECTOR_SIZE / 4; i++)
 	{
-		if (is_write)
-		{
-			sd_reg_write(SD_BUFFER, words[i]);
-		}
-		else
-		{
-			words[i] = sd_reg_read(SD_BUFFER);
-		}
+		words[i] = sd_reg_read(SD_BUFFER);
 	}
 
 	int done_wait = 0;
 	uint status = 0;
-	while (done_wait < SD_WAIT_MAX)
+	while (done_wait < SD_SETUP_WAIT_MAX)
 	{
 		status = sd_reg_read(SD_INT_STATUS);
 		if ((status & (SD_INT_DATA_END | SD_INT_ERROR)) != 0) break;
 		done_wait++;
 	}
+	// All the CMD17/ready diagnostics deferred from earlier in this
+	// function (see its own header comment) — safe to print now, the
+	// whole block is already fully drained into `data`.
+	print("sdd: CMD17 ok resp0=");
+	print_hex32(sd_response0);
+	print(" ready after ");
+	print_hex32((uint)ready_wait);
+	print(" iters, int_status=");
+	print_hex32(int_status);
+	print(" transfer-complete status=");
+	print_hex32(status);
+	print(" after ");
+	print_hex32((uint)done_wait);
+	print(" iters\n");
 	sd_reg_write(SD_INT_STATUS, SD_INT_ALL_MASK);
 
 	return (status & SD_INT_DATA_END) != 0;
@@ -727,6 +822,10 @@ fn void main() @export("main")
 		bool is_write = (verb == DISKD_WRITE);
 		uint* sector_ptr = (uint*)&buf;
 		uint sector = *sector_ptr;
+
+		print("sdd: rw sector=");
+		print_hex32(sector);
+		print(is_write ? " write\n" : " read\n");
 
 		char status = 0;
 		if (!sdd_block_rw(&buf[4], sector, is_write))

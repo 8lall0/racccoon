@@ -22,6 +22,7 @@ const int SYS_IPC_POLL   = 10;
 const int SYS_RFORK      = 11;
 const int SYS_NS_UNMOUNT = 12;
 const int SYS_JOIN       = 13;
+const int SYS_FS_PARTITION_INFO = 14;
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -272,6 +273,14 @@ fn int p9_call_path(char* path, uint verb, char* data, int len, char* reply_buf,
 // store actually writes, corrupting whatever's next on diskd's stack.
 fn int diskd_info(uptr* vq_paddr_out, uptr* req_paddr_out) @export("diskd_info") {
     return syscall(SYS_DISKD_INFO, (long)vq_paddr_out, (long)req_paddr_out, 0);
+}
+
+// fsd-only: learns board::FS_PARTITION_START_SECTOR — board is a
+// kernel-only module (see user/sdd.c3's own header comment), so this is
+// fsd's only way to learn this board-specific fact despite being one
+// board-agnostic user binary compiled identically for every target.
+fn int fs_partition_info(uint* start_sector_out) @export("fs_partition_info") {
+    return syscall(SYS_FS_PARTITION_INFO, (long)start_sector_out, 0, 0);
 }
 
 fn void putchar(char ch) @export("putchar") {

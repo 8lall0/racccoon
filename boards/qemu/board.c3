@@ -72,6 +72,12 @@ const bool HAS_BLOCK_DEVICE = true;
 const bool HAS_SD_BLOCK     = false;
 const bool HAS_VIRTIO_BLOCK = true;
 
+// fsd.c3's FAT32 reader adds this to every logical sector number before
+// touching the disk — see boards/duo/board.c3's matching comment. QEMU's
+// own test image (scripts/build.sh) is formatted whole-disk (no MBR/
+// partition table, the simplest thing mkfs.vfat can produce), so 0.
+const uint FS_PARTITION_START_SECTOR = 0;
+
 // process.c3's setup_sdd_mappings references these unconditionally (one
 // kernel source tree, compiled separately per board — see this file's
 // header comment), even though QEMU never actually calls it

@@ -1,12 +1,25 @@
 module user;
 
-// fsd: the tar-based file system, moved out of the trusted kernel into
-// its own user-mode process (microkernel plan phase 5 — see
-// docs/devlog.md). It's a 9P-lite-style client of diskd (phase 4) for
-// raw sector I/O, and a server to everyone else (today just the shell)
-// over the FS_READ/FS_WRITE verbs below. SYS_READFILE/SYS_WRITEFILE are
-// gone from the kernel entirely now — this is the only way to touch a
-// file.
+// fsd: the file system, moved out of the trusted kernel into its own
+// user-mode process (microkernel plan phase 5 — see docs/devlog.md).
+// It's a 9P-lite-style client of diskd/sdd (phase 4) for raw sector I/O,
+// and a server to everyone else (today just the shell) over the
+// FS_READ/FS_WRITE verbs below. SYS_READFILE/SYS_WRITEFILE are gone from
+// the kernel entirely now — this is the only way to touch a file.
+//
+// Reads a real FAT32 filesystem, read-only — not the tar-based format
+// this file used to speak. On the Duo, this is the *same* FAT32
+// partition (see fs_partition_info()/board::FS_PARTITION_START_SECTOR)
+// that already holds this board's own bootable fip.bin — safe to point
+// directly at it specifically because fsd never writes: a parsing bug
+// can misread data, but can't corrupt anything. v1 scope, deliberately
+// limited: root directory only (fsd had no subdirectory concept before
+// this either — not a regression), 8.3 short filenames only (long
+// filename / LFN directory entries are skipped, not parsed), no caching
+// at boot — every FS_READ walks the root directory fresh and follows
+// the matched file's cluster chain on demand, since there's no
+// reasonable fixed-size cache for "however many files happen to be on
+// someone's real SD card." FS_WRITE is rejected outright (see main()).
 //
 // Unlike diskd, fsd is an ordinary IPC participant: nothing it waits for
 // depends on a hardware interrupt firing while it's parked mid-trap, so
@@ -28,92 +41,102 @@ const uint DISKD_WRITE   = 11;
 const uint DISKD_MSG_MAX = 516;
 const uint SECTOR_SIZE   = 512;
 
-// diskd is always pid 3: created third in a fixed boot-time order (idle,
-// echod, diskd, fsd — see kernel.c3), same hardcoded-by-convention
-// approach as echod's pid 2 in shell.c3's "ping". fsd is a fixed,
-// internal-only client of a fixed, internal-only service; fsd's *own*
-// clients (the shell) go through namespace resolution instead, so they
-// never need to know fsd's pid at all — see user.c3's fs_read/fs_write.
+// diskd (or sdd, on the Duo) is always pid 3: created third in a fixed
+// boot-time order (idle, echod, diskd-or-sdd, fsd — see kernel.c3), same
+// hardcoded-by-convention approach as echod's pid 2 in shell.c3's "ping".
+// fsd is a fixed, internal-only client of a fixed, internal-only
+// service; fsd's *own* clients (the shell) go through namespace
+// resolution instead, so they never need to know fsd's pid at all — see
+// user.c3's fs_read/fs_write.
 const int DISKD_PID = 3;
 
-const uint FILES_MAX = 2;
+// --- FAT32 on-disk structures. Standard, stable public spec — offsets
+// below are the well-known FAT32 layout (same one Linux's fs/fat and
+// every other FAT32 reader implements), not vendor-specific or
+// reverse-engineered the way this project's SDHCI register maps were.
 
-struct Tar_header @packed
+// BPB (BIOS Parameter Block) field offsets within the boot sector
+// (sector 0 of the partition).
+const uint BPB_BYTES_PER_SECTOR    = 0x0B; // u16
+const uint BPB_SECTORS_PER_CLUSTER = 0x0D; // u8
+const uint BPB_RESERVED_SECTORS    = 0x0E; // u16
+const uint BPB_NUM_FATS            = 0x10; // u8
+const uint BPB_FAT_SIZE_32         = 0x24; // u32, sectors per FAT
+const uint BPB_ROOT_CLUSTER        = 0x2C; // u32
+const uint BPB_SIGNATURE_OFFSET    = 0x1FE; // u16, must be 0xAA55 (little-endian 0x55,0xAA)
+
+// Directory entry (32 bytes) field offsets.
+const uint DIRENT_SIZE           = 32;
+const uint DIRENT_NAME           = 0x00; // 11 bytes, 8.3 short name, space-padded, uppercase
+const uint DIRENT_ATTR           = 0x0B; // u8
+const uint DIRENT_CLUSTER_HI     = 0x14; // u16
+const uint DIRENT_CLUSTER_LO     = 0x1A; // u16
+const uint DIRENT_FILE_SIZE      = 0x1C; // u32
+
+const char DIRENT_FREE_REST   = (char)0x00; // this entry and all following are unused
+const char DIRENT_DELETED     = (char)0xE5; // this entry is deleted, keep scanning
+const char DIRENT_ATTR_LFN    = (char)0x0F; // long-filename entry, not a real file — skip
+const char DIRENT_ATTR_VOLUME = (char)0x08; // volume label bit — skip, never a real file
+
+const uint FAT_ENTRY_MASK = 0x0FFFFFFF; // low 28 bits significant
+const uint FAT_EOC_MIN    = 0x0FFFFFF8; // cluster values at or above this mean end-of-chain
+
+// Derived layout, computed once by fat32_init() and cached — cheap,
+// board-static-ish facts about the volume, unlike per-file data (which
+// is deliberately never cached — see this file's header comment).
+uint fs_partition_start; // board::FS_PARTITION_START_SECTOR, learned via syscall
+uint fs_fat_start_sector;
+uint fs_data_start_sector;
+uint fs_sectors_per_cluster;
+uint fs_root_cluster;
+
+fn void fs_panic(char* msg)
 {
-	char[100] name;
-	char[8]   mode;
-	char[8]   uid;
-	char[8]   gid;
-	char[12]  size;
-	char[12]  mtime;
-	char[8]   checksum;
-	char      type;
-	char[100] linkname;
-	char[6]   magic;
-	char[2]   version;
-	char[32]  uname;
-	char[32]  gname;
-	char[8]   devmajor;
-	char[8]   devminor;
-	char[155] prefix;
-	char[12]  padding;
+	print("fsd: ");
+	print(msg);
+	print("\n");
+	// Not an empty `for(;;){}` loop — see user/diskd.c3's diskd_panic
+	// comment for why that's a real UB/optimizer hazard, not a
+	// theoretical one, in this exact codebase.
+	exit();
 }
 
-struct File
+fn void print_uint(uint v)
 {
-	bool      in_use;
-	char[100] name;
-	char[1024] data;
-	uint      size;
-}
-
-const uint DISK_MAX_SIZE = (File::size * FILES_MAX + SECTOR_SIZE - 1) & ~(SECTOR_SIZE - 1);
-
-File[FILES_MAX]     files;
-char[DISK_MAX_SIZE] disk;
-
-fn void str_copy(char* dst, char* src, uint max)
-{
-	uint i = 0;
-	while (src[i] != 0 && i < max - 1)
+	char[10] digits @noinit;
+	int n = 0;
+	if (v == 0)
 	{
-		dst[i] = src[i];
-		i++;
+		putchar('0');
+		return;
 	}
-	dst[i] = 0;
-}
-
-fn bool str_eq(char* a, char* b)
-{
-	uint i = 0;
-	while (a[i] != 0 && b[i] != 0)
+	while (v > 0 && n < 10)
 	{
-		if (a[i] != b[i]) return false;
-		i++;
+		digits[n] = (char)('0' + (v % 10));
+		v /= 10;
+		n++;
 	}
-	return a[i] == b[i];
-}
-
-fn int oct2int(char* oct, int len)
-{
-	int dec = 0;
-	for (int i = 0; i < len; i++)
+	while (n > 0)
 	{
-		if (oct[i] < '0' || oct[i] > '7') break;
-		dec = dec * 8 + (oct[i] - '0');
+		n--;
+		putchar(digits[n]);
 	}
-	return dec;
 }
 
-fn uint align_sector(uint n)
+const char[16] HEX_DIGITS = "0123456789abcdef";
+
+fn void print_hex32(uint v)
 {
-	return (n + SECTOR_SIZE - 1) & ~(SECTOR_SIZE - 1);
+	for (int shift = 28; shift >= 0; shift -= 4)
+	{
+		putchar(HEX_DIGITS[(v >> shift) & 0xF]);
+	}
 }
 
 // Same request/reply shape as diskd's own protocol (see user/diskd.c3):
 // byte 0 = status, bytes 4.. = the sector's data (write request / read
-// reply only). Talking to diskd is ordinary blocking IPC here — see this
-// file's header comment for why that's safe, unlike diskd's own
+// reply only). Talking to diskd/sdd is ordinary blocking IPC here — see
+// this file's header comment for why that's safe, unlike diskd's own
 // interrupt-wait.
 fn bool diskd_rw(char* buf, uint sector, bool is_write)
 {
@@ -144,125 +167,203 @@ fn bool diskd_rw(char* buf, uint sector, bool is_write)
 	return status == 0;
 }
 
+// Adds the board's real partition-start offset before every read — see
+// board::FS_PARTITION_START_SECTOR's own comment (boards/*/board.c3) for
+// why this exists and what it's set to per board.
+fn bool fat32_read_sector(uint sector, char* buf)
+{
+	return diskd_rw(buf, fs_partition_start + sector, false);
+}
+
+fn uint cluster_to_sector(uint cluster)
+{
+	return fs_data_start_sector + (cluster - 2) * fs_sectors_per_cluster;
+}
+
+// Reads one 4-byte little-endian FAT entry and returns its low 28 bits —
+// the next cluster in the chain (or a value >= FAT_EOC_MIN at the end).
+// A read failure is treated as end-of-chain rather than propagated: this
+// is a best-effort read-only reader, not a filesystem that needs to
+// distinguish "corrupt" from "empty" for correctness anywhere it's used.
+fn uint fat_next_cluster(uint cluster)
+{
+	uint fat_byte_offset = cluster * 4;
+	uint fat_sector = fs_fat_start_sector + (fat_byte_offset / SECTOR_SIZE);
+	uint entry_offset = fat_byte_offset % SECTOR_SIZE;
+
+	char[SECTOR_SIZE] sector_buf @noinit;
+	if (!fat32_read_sector(fat_sector, &sector_buf)) return FAT_EOC_MIN;
+
+	uint* entry = (uint*)&sector_buf[entry_offset];
+	return *entry & FAT_ENTRY_MASK;
+}
+
+// Converts a plain, null-terminated, lowercase-or-mixed-case filename
+// like "hello.txt" into raw 8.3 short-name form: 11 bytes, space-padded,
+// uppercase, no dot — "HELLO   TXT" — ready to compare byte-for-byte
+// against a directory entry's own DIRENT_NAME field (already stored in
+// exactly this form on disk). Truncates silently past 8 name / 3
+// extension characters — no long-filename support in v1 (see this
+// file's header comment).
+fn void name_to_8_3(char* input, char* out11)
+{
+	for (int i = 0; i < 11; i++) out11[i] = ' ';
+
+	int i = 0;
+	int out_i = 0;
+	while (input[i] != 0 && input[i] != '.' && out_i < 8)
+	{
+		char c = input[i];
+		if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+		out11[out_i] = c;
+		out_i++;
+		i++;
+	}
+	while (input[i] != 0 && input[i] != '.') i++;
+	if (input[i] == '.') i++;
+
+	int ext_i = 8;
+	while (input[i] != 0 && ext_i < 11)
+	{
+		char c = input[i];
+		if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+		out11[ext_i] = c;
+		ext_i++;
+		i++;
+	}
+}
+
+// Walks the root directory's own cluster chain looking for a name11
+// (already in raw 8.3 form — see name_to_8_3) match. Returns true and
+// fills *out_cluster/*out_size on a hit.
+fn bool fat32_find_in_root(char* name11, uint* out_cluster, uint* out_size)
+{
+	uint cluster = fs_root_cluster;
+	char[SECTOR_SIZE] sector_buf @noinit;
+
+	while (cluster != 0 && cluster < FAT_EOC_MIN)
+	{
+		uint sector = cluster_to_sector(cluster);
+		for (uint s = 0; s < fs_sectors_per_cluster; s++)
+		{
+			if (!fat32_read_sector(sector + s, &sector_buf)) return false;
+
+			for (uint e = 0; e < SECTOR_SIZE / DIRENT_SIZE; e++)
+			{
+				char* entry = &sector_buf[e * DIRENT_SIZE];
+				if (entry[0] == DIRENT_FREE_REST) return false; // end of directory
+				if (entry[0] == DIRENT_DELETED) continue;
+
+				char attr = entry[DIRENT_ATTR];
+				if (attr == DIRENT_ATTR_LFN) continue;
+				if ((attr & DIRENT_ATTR_VOLUME) != 0) continue;
+
+				bool match = true;
+				for (uint k = 0; k < 11; k++)
+				{
+					if (entry[DIRENT_NAME + k] != name11[k])
+					{
+						match = false;
+						break;
+					}
+				}
+				if (!match) continue;
+
+				ushort* cluster_hi = (ushort*)&entry[DIRENT_CLUSTER_HI];
+				ushort* cluster_lo = (ushort*)&entry[DIRENT_CLUSTER_LO];
+				uint*   size_field = (uint*)&entry[DIRENT_FILE_SIZE];
+				*out_cluster = ((uint)*cluster_hi << 16) | (uint)*cluster_lo;
+				*out_size    = *size_field;
+				return true;
+			}
+		}
+		cluster = fat_next_cluster(cluster);
+	}
+	return false;
+}
+
+// Follows first_cluster's chain, copying up to `len` bytes (already
+// clamped by the caller against the file's real size — see main()) into
+// dst starting from the beginning of the file. Returns the number of
+// bytes actually copied — normally equal to len, but can come up short
+// (rather than leave dst partially uninitialized) if the chain turns
+// out shorter than the directory entry's own size field claimed.
+fn uint fat32_read_file(uint first_cluster, char* dst, uint len)
+{
+	uint cluster = first_cluster;
+	uint bytes_read = 0;
+	char[SECTOR_SIZE] sector_buf @noinit;
+
+	while (cluster != 0 && cluster < FAT_EOC_MIN && bytes_read < len)
+	{
+		uint sector = cluster_to_sector(cluster);
+		for (uint s = 0; s < fs_sectors_per_cluster && bytes_read < len; s++)
+		{
+			if (!fat32_read_sector(sector + s, &sector_buf)) return bytes_read;
+
+			uint chunk = len - bytes_read;
+			if (chunk > SECTOR_SIZE) chunk = SECTOR_SIZE;
+			for (uint i = 0; i < chunk; i++)
+			{
+				dst[bytes_read + i] = sector_buf[i];
+			}
+			bytes_read += chunk;
+		}
+		cluster = fat_next_cluster(cluster);
+	}
+	return bytes_read;
+}
+
 fn void fs_init()
 {
-	for (uint sector = 0; sector < DISK_MAX_SIZE / SECTOR_SIZE; sector++)
+	if (fs_partition_info(&fs_partition_start) < 0)
 	{
-		diskd_rw(&disk[sector * SECTOR_SIZE], sector, false);
+		fs_panic("failed to get partition info");
 	}
 
-	uint off = 0;
-	for (uint i = 0; i < FILES_MAX; i++)
+	char[SECTOR_SIZE] boot_sector @noinit;
+	if (!fat32_read_sector(0, &boot_sector))
 	{
-		Tar_header* header = (Tar_header*)&disk[off];
-		if (header.name[0] == 0) break;
-		if (!str_eq(&header.magic[0], "ustar")) break;
-
-		int filesz = oct2int(&header.size[0], header.size.len);
-		File* file = &files[i];
-		file.in_use = true;
-		str_copy(&file.name[0], &header.name[0], file.name.len);
-
-		char* src = (char*)header + Tar_header::size;
-		for (int j = 0; j < filesz; j++)
-		{
-			file.data[j] = src[j];
-		}
-		file.size = (uint)filesz;
-
-		off += align_sector((uint)Tar_header::size + (uint)filesz);
+		fs_panic("failed to read boot sector");
 	}
 
-	print("fsd: file: ");
-	print(&files[0].name[0]);
+	ushort* sig = (ushort*)&boot_sector[BPB_SIGNATURE_OFFSET];
+	if (*sig != 0xAA55)
+	{
+		fs_panic("bad FAT32 boot sector signature");
+	}
+
+	ushort* bytes_per_sector = (ushort*)&boot_sector[BPB_BYTES_PER_SECTOR];
+	if (*bytes_per_sector != SECTOR_SIZE)
+	{
+		// Every other part of this project assumes 512-byte sectors —
+		// panic clearly rather than silently mishandle a nonstandard one.
+		fs_panic("FAT32 volume doesn't use 512-byte sectors");
+	}
+
+	char   sectors_per_cluster = boot_sector[BPB_SECTORS_PER_CLUSTER];
+	ushort* reserved_sectors   = (ushort*)&boot_sector[BPB_RESERVED_SECTORS];
+	char   num_fats            = boot_sector[BPB_NUM_FATS];
+	uint*  fat_size_32         = (uint*)&boot_sector[BPB_FAT_SIZE_32];
+	uint*  root_cluster        = (uint*)&boot_sector[BPB_ROOT_CLUSTER];
+
+	// `& 0xFF` rather than a straight (uint) cast: char's signedness in
+	// this dialect isn't relied on elsewhere in this codebase, and
+	// masking gives the correct unsigned byte value either way — a
+	// signed char holding the bit pattern for 255 would otherwise
+	// sign-extend to 0xFFFFFFFF on a plain widening cast.
+	fs_sectors_per_cluster = (uint)sectors_per_cluster & 0xFF;
+	fs_fat_start_sector    = (uint)*reserved_sectors;
+	fs_data_start_sector   = fs_fat_start_sector + ((uint)num_fats & 0xFF) * (*fat_size_32);
+	fs_root_cluster        = *root_cluster;
+
+	print("fsd: FAT32 mounted, partition_start=");
+	print_uint(fs_partition_start);
+	print(" root_cluster=");
+	print_uint(fs_root_cluster);
+	print(" sectors_per_cluster=");
+	print_uint(fs_sectors_per_cluster);
 	print("\n");
-}
-
-fn void fs_flush()
-{
-	for (uint i = 0; i < DISK_MAX_SIZE; i++)
-	{
-		disk[i] = 0;
-	}
-
-	uint off = 0;
-	for (uint file_i = 0; file_i < FILES_MAX; file_i++)
-	{
-		File* file = &files[file_i];
-		if (!file.in_use) continue;
-
-		Tar_header* header = (Tar_header*)&disk[off];
-		str_copy(&header.name[0], &file.name[0], header.name.len);
-		str_copy(&header.mode[0], "000644", header.mode.len);
-		str_copy(&header.magic[0], "ustar", header.magic.len);
-		str_copy(&header.version[0], "00", header.version.len);
-		header.type = '0';
-
-		int filesz = (int)file.size;
-		for (int i = (int)header.size.len; i > 0; i--)
-		{
-			header.size[i - 1] = (char)((filesz % 8) + '0');
-			filesz /= 8;
-		}
-
-		int checksum = ' ' * (int)header.checksum.len;
-		for (uint i = 0; i < Tar_header::size; i++)
-		{
-			checksum += (int)(char)disk[off + i];
-		}
-		for (int i = 5; i >= 0; i--)
-		{
-			header.checksum[i] = (char)((checksum % 8) + '0');
-			checksum /= 8;
-		}
-
-		char* dst = (char*)header + Tar_header::size;
-		for (uint i = 0; i < file.size; i++)
-		{
-			dst[i] = file.data[i];
-		}
-		off += align_sector((uint)Tar_header::size + file.size);
-	}
-
-	for (uint sector = 0; sector < DISK_MAX_SIZE / SECTOR_SIZE; sector++)
-	{
-		diskd_rw(&disk[sector * SECTOR_SIZE], sector, true);
-	}
-
-	print("fsd: wrote ");
-	print_uint(DISK_MAX_SIZE);
-	print(" bytes to disk\n");
-}
-
-fn void print_uint(uint v)
-{
-	char[10] digits @noinit;
-	int n = 0;
-	if (v == 0)
-	{
-		putchar('0');
-		return;
-	}
-	while (v > 0 && n < 10)
-	{
-		digits[n] = (char)('0' + (v % 10));
-		v /= 10;
-		n++;
-	}
-	while (n > 0)
-	{
-		n--;
-		putchar(digits[n]);
-	}
-}
-
-fn File* fs_lookup(char* filename)
-{
-	for (uint i = 0; i < FILES_MAX; i++)
-	{
-		if (str_eq(&files[i].name[0], filename)) return &files[i];
-	}
-	return null;
 }
 
 fn void main() @export("main")
@@ -277,6 +378,18 @@ fn void main() @export("main")
 		if (from <= 0) continue;
 		if (verb != FS_READ && verb != FS_WRITE) continue;
 
+		int* result_len_field = (int*)&buf;
+
+		// Read-only in v1 (see this file's header comment) — reject
+		// immediately, same "nothing to do here" shape a missing file
+		// already gets below, no lookup needed at all.
+		if (verb == FS_WRITE)
+		{
+			*result_len_field = -1;
+			ipc_send(from, verb, &buf, FS_MSG_MAX);
+			continue;
+		}
+
 		// Pull the filename and requested length out before touching buf
 		// again — the reply reuses the same offsets for different things
 		// (result length at 0..3, data at 4..), so anything needed from
@@ -288,67 +401,29 @@ fn void main() @export("main")
 		}
 		uint* len_field = (uint*)&buf[100];
 		int req_len = (int)*len_field;
+		// Untrusted input — clamp rather than trust the caller not to
+		// set the field's high bit. See docs/devlog.md for the same
+		// hardening pass that added this check.
+		if (req_len < 0) req_len = 0;
 
-		File* file = fs_lookup(&filename);
-		int* result_len_field = (int*)&buf;
+		char[11] name11 @noinit;
+		name_to_8_3(&filename, &name11);
 
-		// FS_WRITE creates a new file in the first unused slot if none
-		// with this name exists yet — FS_READ still fails for a missing
-		// file (nothing to read). Previously there was no create path at
-		// all, so a write to a name fsd hadn't already tar-parsed off
-		// disk at boot silently failed; harmless on QEMU (its disk.tar
-		// always pre-seeds hello.txt) but meant writefile could never
-		// actually do anything on a genuinely blank disk — a real SD
-		// card on first use, for instance (see docs/devlog.md).
-		if (!file && verb == FS_WRITE)
-		{
-			for (uint i = 0; i < FILES_MAX; i++)
-			{
-				if (!files[i].in_use)
-				{
-					file = &files[i];
-					file.in_use = true;
-					str_copy(&file.name[0], &filename[0], file.name.len);
-					break;
-				}
-			}
-		}
-
-		if (!file)
+		uint first_cluster;
+		uint file_size;
+		if (!fat32_find_in_root(&name11, &first_cluster, &file_size))
 		{
 			*result_len_field = -1;
 			ipc_send(from, verb, &buf, FS_MSG_MAX);
 			continue;
 		}
 
-		if (verb == FS_WRITE)
-		{
-			int write_len = req_len;
-			if (write_len > (int)file.data.len)
-			{
-				write_len = (int)file.data.len;
-			}
-			for (int i = 0; i < write_len; i++)
-			{
-				file.data[i] = buf[104 + i];
-			}
-			file.size = (uint)write_len;
-			fs_flush();
-			*result_len_field = write_len;
-		}
-		else
-		{
-			int read_len = req_len;
-			if (read_len > (int)file.size)
-			{
-				read_len = (int)file.size;
-			}
-			for (int i = 0; i < read_len; i++)
-			{
-				buf[4 + i] = file.data[i];
-			}
-			*result_len_field = read_len;
-		}
+		int read_len = req_len;
+		if (read_len > (int)file_size) read_len = (int)file_size;
+		if (read_len > (int)(FS_MSG_MAX - 4)) read_len = (int)(FS_MSG_MAX - 4);
+
+		uint actually_read = fat32_read_file(first_cluster, &buf[4], (uint)read_len);
+		*result_len_field = (int)actually_read;
 
 		ipc_send(from, verb, &buf, FS_MSG_MAX);
 	}

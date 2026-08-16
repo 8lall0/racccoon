@@ -4,6 +4,97 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-17 (3) — fsd: real, read-only FAT32 support, and a shallow-FIFO PIO timing bug
+
+**Continuing from this same day's earlier entries.** After a short
+hardening pass (a sector-bounds check in `sdd_block_rw`, a negative-
+length clamp on `fsd`'s untrusted request length), the bigger decision:
+replace `fsd`'s original tar-based backend — always a placeholder, capped
+at `FILES_MAX=2`, full-disk rewrite on every write — with a real FAT32
+reader. Read-only first: on the Duo, `fsd` now points directly at the
+*same* `DUOBOOT` partition that boots the board (`board::
+FS_PARTITION_START_SECTOR = 2048`, `0` on QEMU's whole-disk test image),
+which is only safe because a read-only driver can misparse data but can't
+corrupt it. `user/fsd.c3` was rewritten around real BPB/directory-entry/
+FAT-chain parsing (root directory only, 8.3 names only, no boot-time
+caching — see the file's own header comment for the full v1 scope). A new
+syscall, `SYS_FS_PARTITION_INFO`, mirrors the existing `SYS_DISKD_INFO`
+pattern so `fsd` — one board-agnostic binary — can learn the board-only
+`board::FS_PARTITION_START_SECTOR` constant at runtime. `sdd_block_rw`
+lost its old `DATA_SECTOR_OFFSET`/bounds-check pair (sized for the old
+fsd's small reserved region, and actively wrong once fsd started
+addressing real absolute sectors) in favor of unconditionally rejecting
+writes — there's no longer a well-defined "safe to write" region at this
+layer. QEMU's disk image moved from a hand-rolled tar to a real
+`mkfs.vfat`-built FAT32 image (`scripts/build.sh`, `mtools`/`dosfstools`,
+no root needed).
+
+Confirmed correct on QEMU immediately: byte-for-byte match against a real
+`mkfs.vfat` image, `readfile` returns real file content, `writefile`
+cleanly no-ops. Real hardware was a different story: `fsd: bad FAT32 boot
+sector signature`, even though the SD read itself reported clean success.
+First fix attempt (a wait-budget increase, on a "maybe it just needs more
+polling time" theory) was flagged directly — right call, since the next
+real-hardware run showed the *identical* failure, proving the guess
+wrong. Real diagnosis after that: stage-by-stage prints in
+`sdd_block_rw` caught the actual, first concrete bug — `sd_send_cmd`
+defined `SD_TRNS_READ` (Transfer Mode's read/write direction bit) but
+never set it, so every data command left the controller configured for a
+*write*-direction transfer regardless of which command was issued; CMD17
+(read) was getting a card response but no data. Fixed by inferring
+direction from the command index. That took the SD-protocol layer from
+timing out to completing cleanly — but the *data itself* still wasn't a
+valid boot sector.
+
+What followed was a careful, non-guessing elimination hunt (canary bytes
+pre-filled before every read to rule out a no-op copy loop; a raw read of
+absolute sector 0 to separate "PIO path untrustworthy" from "wrong
+sector"; a same-sector re-read to check determinism; a full 512-byte hex
+dump diffed byte-for-byte against the known-good QEMU reference). That
+diff nailed it precisely: every real-hardware PIO read was losing exactly
+its first 16 bytes and padding the last 16 with zero — confirmed via two
+independent landmarks landing exactly 16 bytes off (the `hidden_sectors`
+BPB field reading back as the real partition's own LBA start, and the
+`0xAA55` signature appearing 16 bytes early). A background research pass
+into the real vendor driver source (`duo-buildroot-sdk`) ruled out the
+PHY RX delay-line registers (`CVI_SDHCI_PHY_TX_RX_DLY` etc. — byte-
+identical to the real driver's own fixed values for this speed mode) and
+pointed at `sd_send_cmd`'s blanket `SD_INT_STATUS` clear, which for a
+data command could wipe the data-ready bits before the data phase ever
+saw them. Narrowing that clear cut the loss from 16 bytes to 8 — real
+progress, but a further experiment (removing the clear entirely, one
+combined write vs. two, different orderings) kept producing a *byte-for-
+byte identical* 8-byte loss no matter what was tried, which ruled out
+register-write sequencing as the actual variable.
+
+What was constant across every still-broken version: several
+`print()`/`print_hex32()` calls — slow, one-character-at-a-time UART
+writes — sitting between CMD17 completing and the first
+`sd_reg_read(SD_BUFFER)`. The card's DAT lines start pushing data almost
+immediately after command acceptance, and this SDHCI clone's PIO FIFO is
+shallow enough that those prints cost real, already-arrived words before
+the host ever looked — deterministically, since the same code path costs
+the same wall-clock time every run. Moving every diagnostic print to
+*after* the full 128-word read loop fixed it outright: real hardware now
+reports genuine wait counts (thousands of iterations, not the "0 iters"
+that had actually meant "already too late") and the boot sector parses
+correctly — `partition_start=2048 root_cluster=2 sectors_per_cluster=64`.
+`readfile` against the real, externally-placed `hello.txt` on the
+physical `DUOBOOT` partition returns its exact real content end to end.
+
+**Files changed:** `user/fsd.c3` (full FAT32 rewrite, replacing the tar
+backend), `user/sdd.c3` (`SD_TRNS_READ` fix, `sd_send_cmd`'s `INT_STATUS`
+clear narrowed and made data-command-aware, `sdd_block_rw`'s data-ready
+wait moved to `INT_STATUS`'s own ready bit, all per-request diagnostics
+deferred until after the buffer is fully drained), `user/user.c3`
+(`fs_partition_info()`), `src/entry.c3` (`SYS_FS_PARTITION_INFO`),
+`boards/duo/board.c3` / `boards/qemu/board.c3`
+(`FS_PARTITION_START_SECTOR`), `scripts/build.sh` /
+`scripts/launch64.sh` (FAT32 test image via `mkfs.vfat`/`mtools`,
+replacing the old tar disk image).
+
+---
+
 ## 2026-08-17 (2) — sdd: real operating-speed clock, confirmed on hardware
 
 **Continuing straight from this same day's earlier entry** (sdd cleanup
