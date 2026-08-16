@@ -10,6 +10,7 @@ import board;
 const USER_BASE = 0x1000000;
 
 char[] __kernel_base @export("__kernel_base");
+char[] __kernel_map_base @export("__kernel_map_base");
 char[] __bss @export("__bss");
 char[] __bss_end @export("__bss_end");
 char[] __stack_top @export("__stack_top");

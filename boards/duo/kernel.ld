@@ -1,15 +1,44 @@
 ENTRY(boot)
 
-/* UNCONFIRMED PLACEHOLDER — do not treat as a real address until Stage
-   0.1/0.2 of the port plan (~/.claude/plans/giggly-prancing-iverson.md)
-   confirm it against a real duo-buildroot-sdk build. Must land somewhere
-   that doesn't collide with OpenSBI's own reserved region near
-   0x80000000 (or anything else fiptool packs into the same fip.bin) —
-   see docs/devlog.md for the research behind this file. */
-__loader2nd_runaddr = 0x80400000;
+/* DRAM_BASE + 2MiB. Confirmed, not guessed: matches the vendor SDK's own
+   committed board memmap for milkv-duo-sd
+   (duo-buildroot-sdk/build/boards/cv180x/cv1800b_milkv_duo_sd/memmap.py —
+   CONFIG_SYS_TEXT_BASE = DRAM_BASE + 2*SIZE_1M), which is where the
+   vendor's own U-Boot runs as the LOADER_2ND/"BL33" payload that racccoon
+   replaces. Leaves ~1.5MB of headroom below it (OpenSBI's MONITOR slot
+   is 512KB, ending at DRAM_BASE + 0x80000), and FSBL's own bounds check
+   (IN_RANGE(runaddr, DRAM_BASE, DRAM_SIZE) in bl2_opt.c) only requires
+   it fall inside the 64MB DRAM window — see docs/devlog.md for the full
+   fiptool/FSBL packaging chain this was traced through. */
+__loader2nd_runaddr = 0x80200000;
+
+/* CV1800B has only 64MB of populated DDR2 total (0x80000000-0x84000000,
+   per the datasheet and memmap.py's DRAM_SIZE) — unlike QEMU virt, which
+   is given far more than it needs, so a flat "64MB after the stack"
+   free_ram region (what src/kernel.ld does for QEMU) would overrun the
+   real DRAM window here by whatever the loader2nd offset + image +
+   stack already consumed. free_ram is sized against the real DRAM end
+   instead. Also reserves the top 768KB (memmap.py's FREERTOS_SIZE), the
+   region the vendor's own firmware treats as the second C906 core's —
+   racccoon is single-hart and never touches that core, but keeping the
+   same boundary costs nothing and avoids ever depending on silicon that
+   isn't confirmed free. */
+__dram_end = 0x80000000 + 64 * 1024 * 1024 - 768 * 1024;
 
 SECTIONS {
     . = __loader2nd_runaddr;
+
+    /* Page-aligned (RUNADDR itself always is — see this file's own
+       RUNADDR comment) start of the kernel-range identity mapping that
+       process.c3's create_process and entry.c3's rfork COW-copy path
+       build with map_page() in PAGE_SIZE steps up to __free_ram_end.
+       Deliberately NOT __kernel_base: that symbol sits 32 bytes higher
+       (past the LOADER_2ND header reserved below), and map_page() panics
+       ("unaligned vaddr") on anything that isn't page-aligned — hit this
+       for real on first hardware boot. src/kernel.ld defines the same
+       symbol equal to __kernel_base there, since QEMU has no header to
+       offset past. */
+    __kernel_map_base = .;
 
     /* fiptool's LOADER_2ND ("BL33") header — JUMP0/MAGIC/CKSUM/SIZE/
        RUNADDR/RESERVED1/RESERVED2, 32 bytes total (see the FSBL source,
@@ -63,6 +92,5 @@ SECTIONS {
 
     . = ALIGN(4096);
     __free_ram = .;
-    . += 64 * 1024 * 1024; /* 64MB — CV1800B's actual populated DDR2, per the datasheet */
-    __free_ram_end = .;
+    __free_ram_end = __dram_end;
 }

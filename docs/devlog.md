@@ -4,6 +4,426 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-16 (5) — Milk-V Duo: full interactive shell, real hardware
+
+**Continuing straight from this same day's "(4)" entry.** Sv39 paging
+worked for the first time (the Accessed/Dirty bit fix), but boot still
+died with a clean, caught page fault inside `map_page()` right after
+"Idle process started" — a second, different bug, `current_pid=0`
+(idle).
+
+**Root cause, found by re-deriving the faulting address by hand from
+disassembly rather than trusting an earlier, unrelated diagnostic dump's
+numbers:** `map_page()`'s own pointer-recovery arithmetic —
+`(table2[vpn2] >> 10) * PAGE_SIZE` to get `table1`'s address, same
+pattern for `table0` — never masked the result down to Sv39's real
+44-bit PPN field. Once `board::PTE_EXTRA_BITS` (bits 60-62, added this
+same day's "(3)"/"(4)" entries) started getting set on *every* level,
+not just leaves, those extra bits survive the `>>10`/`<<12` round trip
+(bit 62 shifts out past bit 63 and is lost, but 60/61 land at 62/63) and
+corrupt every intermediate table pointer computed from a parent entry.
+QEMU never has this problem (`PTE_EXTRA_BITS=0` there), so full
+regression passing there the whole time never caught it. Added
+`PPN_MASK = (1UL<<44)-1` and applied it everywhere a table pointer gets
+recovered from a stored entry — `page.c3`'s own two sites, plus two more
+in `entry.c3` that turned out to duplicate the identical unmasked
+pattern: the process-exit page-table free loop, and the `SYS_RFORK`
+copy-on-write table-copy loop (`grep`ped the whole tree afterward for
+any other `>> 10` occurrences to confirm no fourth copy existed).
+
+**Result: full interactive shell on real Milk-V Duo hardware**, first
+time this whole project. `hello`, `ping`, `p9test`, `nstest`,
+`rforktest`, `sandboxtest`, `racetest` all pass with output matching
+QEMU exactly, module one cosmetic-only exception: `nstest`'s catch-all
+resolve prints `pid /` instead of a number, because `server_pid=0`
+(`fsd` doesn't exist on this board — `HAS_BLOCK_DEVICE` is false, no
+storage driver) is a value QEMU's regression run has literally never
+exercised (QEMU always has a real, nonzero `fsd` pid), so whatever
+quirk existing print-formatting code has for pid 0 has just never been
+seen before. `writefile`/`readfile` still correctly refuse (no block
+device on this board at all — an intentional, already-documented scope
+cut, not a bug).
+
+**Kept from this session's debugging, on purpose:** `current_pid` in
+`entry.c3`'s fatal-trap print (`src/entry.c3`) — genuinely useful,
+essentially free, and it's exactly what pinpointed the second bug's
+context. Everything else debug-only (the lettered `switch_context`
+markers, the CPU-ID SBI query, the nested page-table-walk diagnostic
+that itself triggered a cascading fault) stayed reverted from the "(4)"
+entry.
+
+**Files changed:** `src/page.c3` (`PPN_MASK`, applied at its own two
+pointer-recovery sites), `src/entry.c3` (same mask, two more sites —
+exit free loop, rfork COW copy).
+
+---
+
+## 2026-08-16 (4) — First real Sv39 activation on hardware: the Accessed/Dirty bit hang
+
+**Context:** continuing straight from this same day's "(3)" entry —
+`build/fip_duo.bin` existed and flashed, but the very first hardware
+boot hung completely silently right after "Idle process started",
+with no panic, no trap message, nothing. This entry is the full chase:
+seven wrong turns and the one real fix, run entirely over a live serial
+console with the user physically swapping the SD card between the
+reader and the board for every single test.
+
+**First real signal:** page.c3's `map_page()` was panicking
+(`"unaligned vaddr"`) on the very first hardware boot — `create_process`
+and the rfork COW-copy path both looped `map_page()` from
+`__kernel_base` to `__free_ram_end`, and on Duo `__kernel_base` sits 32
+bytes past the fiptool `LOADER_2ND` header (`RUNADDR + 32`), not
+page-aligned the way QEMU's identical symbol is. Fixed by introducing a
+separate `__kernel_map_base` symbol (page-aligned, equal to
+`__kernel_base` on QEMU, equal to `RUNADDR` on Duo) — see
+`src/kernel.ld`, `boards/duo/kernel.ld`, and the two call sites in
+`process.c3`/`entry.c3`. This got the boot past that panic and to "Idle
+process started" — then straight into a silent hang with **zero**
+further output, not even from the kernel's own direct-SBI console
+prints that had worked perfectly up to that exact point.
+
+**Bisection tool: raw SBI-ecall debug markers inside `@naked` asm,
+since this predates any working syscall path.** Instrumented
+`switch_context` (`process.c3`) with lettered checkpoints (A–E) around
+every instruction — stack save, `sfence.vma`, `csrw satp`, `sfence.vma`,
+`csrw sscratch`, register restore, `ret` — each one a raw
+`li a0,'X'; li a6,0; li a7,1; ecall` sequence (legacy SBI console
+putchar), carefully avoiding clobbering registers still needed later in
+the function. Also added one to the very top of `user_entry` (before
+`sret`). Each round trip: edit → `bash scripts/build.sh` (QEMU
+regression) → `bash scripts/build_duo.sh` →
+`bash scripts/build_duo_fip.sh` → user flashes `build/fip_duo.bin`,
+power-cycles, pastes back the serial log. This bisection was decisive:
+**A and B printed every single time; C never did, in any test this
+whole session.** C sits right after `csrw satp`. Later, stripping
+`switch_context` down to `csrw satp` followed by a bare `nop` before C
+still didn't print — the very *next* instruction fetch after enabling
+Sv39, regardless of what it is, never completes.
+
+**Seven hypotheses, six wrong:**
+1. **PTE attribute bits on leaf entries only** (T-Head C906's MAEE —
+   memory-attribute extended encoding, enabled via the M-mode-only
+   `mxstatus` CSR that FSBL sets to `0xc0638000` before OpenSBI even
+   runs — repurposes Sv39's normally-reserved PTE bits 63:59 as
+   SO/C/B/SH/SEC memory-type fields; leaving them zero reads as
+   Strong-Order/non-cacheable). Added `board::PTE_EXTRA_BITS`
+   (SHARE|CACHE|BUF, bits 60-62, matching this exact SDK's own Linux
+   fork's `pgtable-bits.h`/`PAGE_KERNEL`) to leaf PTEs. **No change.**
+2. **Same bits on intermediate table-pointer entries too** (leaf-only
+   made no observable difference, meaning if this were the mechanism
+   the walk would have to be failing before ever reaching the leaf).
+   **No change.**
+3. **`fence.i`** after the `satp` write, on the theory that real
+   hardware can have stale instruction-cache content across a
+   translation-mode change that QEMU's emulation never models.
+   **No change** — confirmed via disassembly that even a bare `nop`
+   immediately after `csrw satp` never executes, regardless of what
+   follows it.
+4. **Clearing `mxstatus` entirely** from OpenSBI's own M-mode
+   `generic_early_init` (`opensbi/platform/generic/platform.c`, patched
+   directly in the external SDK checkout) — undoing whatever FSBL
+   configured, rather than guessing the right bits to accommodate it.
+   Confirmed via disassembly that `csrw mxstatus,a5` (a5=0) really was
+   the first thing `generic_early_init` did. **No change.**
+5. **The official prebuilt firmware.** The user recalled testing a
+   *pre-built* Milk-V release successfully with real Linux in the past
+   — not anything built from this SDK checkout. Downloaded
+   `milkv-duo-sd-v1.1.4.img.zip` (a URL the user supplied), extracted
+   `fip.bin` from its boot partition, and pulled `BL2`/`MONITOR` back
+   out of it with fiptool.py's own `read_fip()` (confirming, along the
+   way, that this checkout's Kconfig-fixed build already produces
+   byte-identical `MONITOR_RUNADDR`/`BLCP_2ND_RUNADDR`/`RUNADDR` values
+   to the official release). Repackaged racccoon's kernel as
+   `LOADER_2ND` against the *official* BL2+MONITOR. **No change** —
+   ruled out a build regression in this checkout as the cause entirely.
+6. **Explicit D-cache flush of the page table** before pointing `satp`
+   at it, via T-Head's custom `dcache.cipa` instruction (`.long
+   0x02b5000b`, the same one `u-boot-2021.10/arch/riscv/cpu/generic/
+   cache.c` uses) — on the theory that the MMU table walker reads
+   physical memory via a path that doesn't snoop the D-cache, and that
+   FSBL's own `flush_dcache_range()` call for the *loaded kernel image*
+   (`bl2_opt.c`'s `load_loader_2nd`) doesn't cover page tables built at
+   runtime. Verified the raw instruction encoding decoded correctly
+   (`rs1=a0`) before ruling it out. **No change.**
+7. **A full U-Boot-mediated boot**, instead of racccoon replacing
+   U-Boot as `LOADER_2ND` — on the theory that U-Boot's own hardware
+   bring-up (DRAM/MMC/Ethernet init, all visible in its own boot log)
+   established some prerequisite state Linux implicitly relies on that
+   FSBL's minimal init skips. This needed real infrastructure since
+   this exact U-Boot build has almost no shell commands compiled in
+   (`CONFIG_CMD_GO`, `_BOOTI`, `_ELF`, `_SOURCE`, `_LOADB` all
+   `# ... is not set` — only `mmc`/`part`/`fat`/`fs generic`): `go`
+   doesn't exist, `bootm` needs `CONFIG_LEGACY_IMAGE_FORMAT` (also
+   unset, FIT-only) so a legacy `mkimage -T kernel` uImage was rejected
+   outright, and `bootm` itself hard-requires an FDT subimage even
+   though the kernel never reads it (blank placeholder DTS compiled
+   with `dtc` and added to the FIT) — and the first working FIT attempt
+   still needed a non-overlapping staging load address, since loading
+   the container at the same address as its own embedded kernel payload
+   trips U-Boot's "new format image overwritten" self-protection.
+   Ended up with a real, reusable path: `build/racccoon.its`/
+   `mkimage -f` → `.itb` → `fatload mmc 0:1 0x80500000 racccoon.itb` →
+   `bootm 0x80500000`. Booted clean, full U-Boot init included.
+   **Still the exact same hang.** This eliminated *every* environmental/
+   firmware-state theory outright — the bug had to be in racccoon's own
+   Sv39-enable code, independent of how or by what it gets loaded.
+
+**The real fix: Accessed and Dirty bits.** Diffing the leaf PTE
+construction against this exact SDK's own Linux fork's
+`arch/riscv/include/asm/pgtable.h` one more time, bit by bit rather than
+by shape, turned up `_PAGE_KERNEL`/`PAGE_KERNEL_EXEC` always including
+`_PAGE_ACCESSED | _PAGE_DIRTY` (bits 6/7) — which racccoon's `map_page()`
+had never set, on any board, ever. Per the RISC-V privileged spec, a
+core without hardware auto-setting of the A/D bits (no Svade-equivalent)
+is required to fault on any access through a PTE with A=0. This T-Head
+C906 apparently doesn't just fault cleanly on that condition the way the
+spec's normal page-fault path would suggest — it hard-locks the hart on
+the very first instruction fetch through the newly-enabled mapping, no
+trap, nothing recoverable. Added `PAGE_A`/`PAGE_D` (page.c3) to every
+leaf PTE `map_page()` creates. Tested first against a throwaway 1GB
+superpage identity map (bypassing the real ~15,000-entry process page
+table entirely, to isolate content/complexity from the actual
+mechanism) — **A, B, C, D, E, and the `user_entry` marker all printed,
+`sret` into U-mode succeeded, and it cleanly page-faulted at the
+deliberately-unmapped `USER_BASE` with a proper trap message.** Sv39
+paging works on this hardware, for the first time this whole
+investigation.
+
+**Cleaned up for production**: stripped every debug marker/ecall out of
+`switch_context`/`user_entry`/`yield`, removed the CPU-ID SBI query
+(`sbi_get_mvendorid`/`marchid`/`mimpid` — turned up `mvendorid=0x1`,
+`marchid=0x5b7` i.e. `THEAD_VENDOR_ID`, `mimpid=0`; interesting that
+this exact SDK's own Linux fork checks `mvendorid` for its T-Head DMA
+cache-workaround gate, which would never fire on this exact chip
+variant), reverted the `mxstatus`-clear OpenSBI patch (confirmed
+unnecessary), and moved `PAGE_A|PAGE_D` into the real `map_page()` leaf
+construction. Re-verified: full QEMU regression suite
+(hello/ping/p9test/nstest/writefile/readfile/rforktest/sandboxtest/
+racetest, all correct) still passes unchanged, and the *original*
+direct FSBL→racccoon boot path (no U-Boot detour, our own
+`scripts/build_duo_fip.sh`, our own from-source-built OpenSBI/FSBL) —
+the actual production target — was rebuilt clean.
+
+**A second, real bug surfaced immediately after:** once Sv39 actually
+works, boot now gets past "Idle process started" into a *clean, caught*
+page fault (`scause=0xd`, Load Page Fault) inside `map_page()` itself,
+`current_pid=0` (idle). A quick nested diagnostic (walking idle's own
+page table for the fault address from inside the trap handler) itself
+triggered a second fault and a confusing cascading-panic loop — reverted
+that back out rather than chase a re-entrant-fault situation blind.
+Working theory, not yet confirmed: `create_process()`'s kernel-range
+identity-map loop has never been exercised while a page table is
+*already active* — every prior board/timing combination happened to
+finish creating the shell process while `kernel_main` (which *is* the
+idle process's own execution) was still running bare-metal, before its
+first `yield()`. Duo's smaller pre-existing process count (`echod` only,
+no `diskd`/`fsd` — `HAS_BLOCK_DEVICE` is false) apparently changes when
+`shell_running` first goes false relative to `kernel_main`'s own
+yield/resume cycle, so this is plausibly the *first ever* time
+`create_process()` has run under an already-active satp, on any board,
+this entire project. Not yet root-caused.
+
+**Files changed:** `src/kernel.ld`, `boards/duo/kernel.ld` (the
+`__kernel_map_base` alignment fix), `src/page.c3` (`PAGE_A`/`PAGE_D`/
+`PAGE_G` consts, the actual fix), `boards/duo/board.c3`/
+`boards/qemu/board.c3` (`PTE_EXTRA_BITS`), `src/process.c3` (clean
+`switch_context`/`user_entry`/`yield`, no debug residue), `src/kernel.c3`
+(no debug residue), `src/entry.c3` (`current_pid` added to the fatal-trap
+print, kept — genuinely useful, low-risk). Externally, in the
+`duo-buildroot-sdk` checkout (not part of this repo): the Kconfig fix
+from the "(3)" entry remains; the `mxstatus`-clear OpenSBI patch was
+added and then reverted this session.
+
+---
+
+## 2026-08-16 (3) — A real, flashable `fip.bin` — plus two vendor-toolchain bugs that had to die first
+
+**Goal, continuing straight from this same day's "(2)" entry:** actually
+build the SDK components racccoon's own `fip.bin` needs (OpenSBI, FSBL)
+and package `build/kernel_duo.elf` into a real image. Ended up spending
+most of this session on two unrelated toolchain bugs blocking that,
+neither of which had anything to do with racccoon's own code.
+
+**Bug 1 — the vendor SDK's top-level Kconfig has drifted ahead of its
+own bundled kconfig-frontend.** `u-boot-2021.10/Kconfig`'s `CC_IS_GCC`/
+`CC_IS_CLANG` use `def_bool $(success, ...)` — confirmed two separate,
+real problems, not host-toolchain skew (reproduced identically against
+both the system's own gcc 16.2.1 *and* the vendor's own documented
+`milkvtech/milkv-duo` Docker image, gcc 11.4.0/Ubuntu 22.04):
+1. `success` wasn't in `scripts/kconfig/preprocess.c`'s function table
+   at all (only `shell`, `error-if`, `info`, etc.) — added it (runs the
+   command via `popen`, returns "y"/"n" from its exit status, mirroring
+   `do_shell`'s plumbing).
+2. Even patched in, `$(success, ...)` never actually got invoked when
+   used as a `def_bool`'s value — confirmed by instrumenting
+   `do_success()` with a debug `fprintf` that never fired. `default
+   $(shell, ...)` (used a few lines down for `GCC_VERSION`) *does* get
+   invoked. This is a real, narrower gap in this old kconfig-frontend:
+   `default`'s value gets macro-expanded, `def_bool`'s doesn't. Not
+   worth patching the flex/bison grammar for a vendor build script three
+   layers removed from racccoon's own code — instead hardcoded
+   `CC_IS_GCC`/`CC_IS_CLANG`/`GCC_VERSION`/`CLANG_VERSION` to the known-
+   correct values for racccoon's toolchain (GCC only, cross-compiler is
+   `host-tools`' `riscv64-unknown-linux-musl-gcc-10.2.0`).
+
+**Bug 2 — the actual blocker, and much bigger: `host-tools`' entire
+cross-toolchain was 0 bytes.** After the Kconfig fix, u-boot's build got
+much further, then failed with `cc1: unknown register name: gp` (no
+`CROSS_COMPILE`) in manual repros, and separately with silent, no-output,
+exit-0 "successes" from `riscv64-unknown-linux-musl-gcc` in the real
+recipe — no compiler error, no output file, nothing. `file` on the
+binary said `empty`. Checked: **every single binary** in `host-tools/gcc/`
+was 0 bytes (17508 of 31578 tracked files) — `git status` inside that
+checkout showed tens of thousands of files as locally modified/deleted
+relative to its own index. Root cause: that `host-tools` clone was made
+in the *previous* (pre-reboot) session directly into `/tmp`, which is
+RAM-backed `tmpfs` — this session found it still there post-reboot but
+sitting in a tmpfs that was already 6.1GB/7.7GB full (see this same
+day's "(2)" entry, which moved the whole checkout to real disk for that
+reason). The checkout must have hit ENOSPC or gotten OOM-killed mid-
+write, silently leaving thousands of truncated 0-byte files while git's
+own object database (already fully received over the network before
+checkout started) stayed intact. Fixed with `git checkout HEAD -- .`
+inside `host-tools` (re-materializes the working tree from the already-
+valid object database — no re-clone needed); confirmed via `file` that
+`riscv64-unknown-linux-musl-gcc` is now a real 16MB ELF binary.
+
+**Once both were fixed, the real vendor build (OpenSBI + FSBL + U-Boot,
+via `milkvtech/milkv-duo` Docker, `source build/envsetup_milkv.sh
+milkv-duo-sd && build_fsbl`) succeeded outright** and produced a real,
+complete vendor `fip.bin` (317952 bytes, U-Boot as `LOADER_2ND`) — a
+good validation image to flash first and confirm the physical setup
+(SD card, UART adapter, board) works at all, independent of any
+racccoon code. Its packaged header **independently confirmed two
+numbers from this same day's earlier "(2)" entry**, straight from the
+real build rather than static reading: `LOADER_2ND`'s `RUNADDR` really
+is `0x80200000`, and `BLCP_2ND_RUNADDR` (the top-of-DRAM boundary
+reserved for the second C906 core) really is `0x83f40000` — exactly
+matching `boards/duo/kernel.ld`'s `__dram_end` computation.
+
+**Packaged racccoon's own image.** `opensbi/build/platform/generic/
+firmware/fw_dynamic.bin` (OpenSBI, dynamic mode) and `fsbl/build/
+cv1800b_milkv_duo_sd/bl2.bin` (FSBL) from that same build are reusable
+as-is — they're generic, not U-Boot-specific. Wrote
+`scripts/make_loader2nd.py` (prepends fiptool's 32-byte `LOADER_2ND`
+header — `JUMP0`/`MAGIC="BL33"`/`CKSUM`/`SIZE`/`RUNADDR=0x80200000`/
+`RESERVED1`/`RESERVED2` — to a raw kernel binary; `CKSUM`/`SIZE` get
+recomputed by `fiptool.py` itself, only `MAGIC`/`RUNADDR` need to be
+right going in) and `scripts/build_duo_fip.sh` (extracts
+`build/kernel_duo.elf`'s raw binary via `llvm-objcopy`, runs the header
+script, then invokes `fiptool.py genfip` directly with racccoon's
+kernel as `--LOADER_2ND`, the real `--MONITOR`/`--BL2` from the SDK
+build, `--BLCP`/`--BLCP_2ND` pointed at FSBL's own `test/empty.bin`
+skip-file since racccoon doesn't use the fast-image or second-core
+slots, and `--BLCP_2ND_RUNADDR=0` so FSBL's own `if
+(!blcp_2nd_runaddr) skip` cleanly no-ops the second core). Ran it end to
+end: `build/fip_duo.bin`, 528384 bytes, `RUNADDR=0x80200000` confirmed
+in the packaged header. Uncompressed (`--compress` omitted, i.e. plain
+`None`) deliberately, for the first hardware attempt — one less moving
+part (FSBL's LZMA/LZ4 decompress path) to debug blind without a way to
+see real UART output myself if something goes wrong.
+
+**End state:** `DUO_SDK=<path> bash scripts/build_duo_fip.sh` (after
+`bash scripts/build_duo.sh`) reproducibly builds a real
+`build/fip_duo.bin` from current `master`... er, `riscv64` HEAD.
+Not yet tested on real silicon — that's the next step, and needs the
+user (flashing an SD card, watching the UART). `boards/duo/kernel.ld`'s
+`__loader2nd_runaddr` comment and the plan file should get one more
+pass to point at this entry instead of "still needs confirming."
+
+**Files changed this session:** `boards/duo/kernel.ld` (RUNADDR fix,
+carried over from the "(2)" entry), `scripts/make_loader2nd.py` (new),
+`scripts/build_duo_fip.sh` (new). The Kconfig/preprocess.c/host-tools
+fixes all live in the external `duo-buildroot-sdk`/`host-tools`
+checkouts, not in this repo.
+
+---
+
+## 2026-08-16 (2) — Real `RUNADDR`, and the actual fiptool/FSBL packaging chain
+
+**Context:** picked back up after a PC reboot. The previous session's
+plan (Stage 0.1) assumed the next step was booting the *stock* Milk-V
+image first, to validate the physical setup before touching racccoon.
+The user corrected that: the actual prior effort was going straight for
+packaging **racccoon's own kernel** as the board's payload — a
+`duo-buildroot-sdk` checkout already existed at
+`/tmp/duo-fsbl-only/duo-buildroot-sdk` (plus a prebuilt toolchain at
+`/tmp/duo-fsbl-only/host-tools`) from that attempt, survived the reboot
+since `/tmp` wasn't wiped. No fip.bin had been produced yet and no
+Docker container was running — nothing was lost, just not yet acted on.
+
+**Resolved the previously-unconfirmed `RUNADDR`.** The prior session's
+devlog entry assumed the real board-config header was "generated during
+the SDK's own build, not committed." That was wrong — traced it to
+`duo-buildroot-sdk/build/boards/cv180x/cv1800b_milkv_duo_sd/memmap.py`,
+a real committed Python constants file the SDK's own build reads
+(not RTL-generated), with `CONFIG_SYS_TEXT_BASE = DRAM_BASE + 2*SIZE_1M`
+— this is where the vendor's own U-Boot runs as the `LOADER_2ND`/"BL33"
+payload, i.e. exactly the slot racccoon's kernel replaces. `0x80200000`
+(`DRAM_BASE + 2MiB`) is a real, sourced value, not a guess: OpenSBI's
+own `MONITOR` slot is only 512KB (ends at `0x80080000`), leaving ~1.5MB
+of headroom, and FSBL's own bounds check (`IN_RANGE(runaddr, DRAM_BASE,
+DRAM_SIZE)` in `bl2_opt.c`) only requires landing inside the 64MB DRAM
+window at all.
+
+**Traced the full packaging chain through the real build scripts**
+(`duo-buildroot-sdk/build/scripts/fip_v2.mk`,
+`fsbl/make_helpers/fip.mk`, `fsbl/plat/cv180x/fiptool.py`), not just the
+FSBL C source read last session:
+- OpenSBI is built in **dynamic** firmware mode (`fw_dynamic.bin`),
+  *not* `fw_payload.bin` — it does not statically embed the next stage.
+  It's loaded into FIP as the `MONITOR` slot.
+- `LOADER_2ND` (u-boot-raw.bin, in the vendor build) is a **separate**
+  FIP slot, given to `fiptool.py genfip` via `--LOADER_2ND=<path>`.
+  Confirmed by reading `add_loader_2nd()`: it requires the input file's
+  bytes at offset 0 to already carry the `ldr_2nd_hdr` — `JUMP0`(4) +
+  `MAGIC`(4, must literally be `b"BL33"` going in) + `CKSUM`(4) +
+  `SIZE`(4) + `RUNADDR`(8) + `RESERVED1`(4) + `RESERVED2`(4) = 32
+  bytes, matching `boards/duo/kernel.ld`'s existing 32-byte reservation
+  exactly. `CKSUM`/`SIZE` are recomputed by `fiptool.py`'s
+  `_update_ldr_2nd_hdr()` — only `MAGIC` and `RUNADDR` need to be
+  correct going in. There is deliberately no `--LOADER_2ND_RUNADDR` CLI
+  flag; the tool reads `RUNADDR` out of the header we provide, exactly
+  as `load_loader_2nd()` in `bl2_opt.c` does at boot
+  (`loader_2nd_entry = loader_2nd_header->runaddr + sizeof(header)`).
+- No `--BLCP`/`--BLCP_2ND` needed (that's the second C906 core's
+  firmware slot, out of scope per the plan).
+
+**Fixed a real bug this surfaced, not just documentation:**
+`boards/duo/kernel.ld`'s `__free_ram` reserved a flat `64MB` after the
+stack — copied from `src/kernel.ld`'s QEMU version, where it's safe
+because QEMU virt is handed far more RAM than it needs. CV1800B only
+has 64MB of DDR *total* (`0x80000000`-`0x84000000`), and the kernel
+already loads 2MB+ into that window before `__free_ram` even starts —
+the flat-64MB copy would have overrun the real DRAM window by
+whatever the load offset + image + stack consumed. Fixed to size
+`__free_ram_end` against a real `__dram_end` (`DRAM_BASE + 64MB -
+768KB`, the last term reserving the same top-of-DRAM region the
+vendor's own firmware treats as the second core's, matching
+`memmap.py`'s `FREERTOS_SIZE` — racccoon never touches that core, but
+there's no reason to depend on RAM that isn't confirmed free).
+Verified via `llvm-nm`/`llvm-readelf` post-rebuild:
+`__kernel_base = 0x80200020` (= `RUNADDR + 32`, matching the header-skip
+math), `__free_ram` spans `0x802fc000`-`0x83f40000`, safely inside the
+real window.
+
+**Updated `boards/duo/kernel.ld`**: `__loader2nd_runaddr` is now
+`0x80200000` (previously an explicitly-flagged placeholder,
+`0x80400000`), with the sourcing above in-line as a comment.
+`bash scripts/build_duo.sh` builds clean after the change.
+
+**Not done yet — the actual build:** haven't run `opensbi`/`fsbl-build`
+against the real SDK checkout, haven't written the header-prepending
+step for `kernel_duo.elf`'s raw binary, haven't run `fiptool.py genfip`
+for real, no `fip.bin` exists. That's the next concrete step, pending
+the user's go-ahead given it's a real (if scoped-down: just
+opensbi+fsbl+u-boot, not the full Buildroot rootfs/Linux kernel) SDK
+build.
+
+**Files changed this session:** `boards/duo/kernel.ld`.
+
+---
+
 ## 2026-08-16 — Milk-V Duo bring-up, part 1: a `board` abstraction layer
 
 **Goal:** the user has the actual Milk-V Duo board, an SD card, and a

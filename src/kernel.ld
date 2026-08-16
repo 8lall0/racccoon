@@ -2,6 +2,16 @@ ENTRY(boot)
 
 SECTIONS {
     . = 0x80200000;
+    /* Page-aligned start of the kernel-range identity mapping (see
+       process.c3's create_process and entry.c3's rfork COW-copy path,
+       both of which map_page() from here to __free_ram_end in PAGE_SIZE
+       steps). Equal to __kernel_base here, but not on the Duo board,
+       whose kernel.ld reserves a 32-byte fiptool header ahead of
+       __kernel_base — that offset would otherwise fail map_page()'s
+       alignment check on its very first iteration. Kept as a distinct
+       symbol on every board so src/process.c3 and src/entry.c3 never
+       need board-specific cases of their own. */
+    __kernel_map_base = .;
     __kernel_base = .;
 
     .text.boot : {

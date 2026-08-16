@@ -322,7 +322,7 @@ fn Process* create_process(void* image, uint image_size)
 	*(--sp) = (uptr)&user_entry;
 
 	ulong* page_table = (ulong*)alloc_pages(1);
-	for (uptr paddr = (uptr)&__kernel_base; paddr < (uptr)&__free_ram_end; paddr += PAGE_SIZE)
+	for (uptr paddr = (uptr)&__kernel_map_base; paddr < (uptr)&__free_ram_end; paddr += PAGE_SIZE)
 	{
 		map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
 	}

@@ -27,6 +27,11 @@ import sbi;
 // fixed by the hardware spec, independent of hart XLEN.
 const uptr PLIC_BASE = 0x0c000000;
 
+// No T-Head MAEE-style PTE attribute quirk on QEMU's generic SiFive-style
+// core — see boards/duo/board.c3's PTE_EXTRA_BITS for what this is and
+// why it exists at all.
+const ulong PTE_EXTRA_BITS = 0;
+
 // virtio-mmio devices on QEMU's virt board get IRQ N for slot N; we only
 // ever attach one device (bus=virtio-mmio-bus.0, slot 0), so IRQ 1.
 const uint IRQ_VIRTIO_BLK = 1;

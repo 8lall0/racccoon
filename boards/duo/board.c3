@@ -24,6 +24,24 @@ import sbi;
 // this means editing this file, not restructuring the kernel.
 const uptr PLIC_BASE = 0x70000000;
 
+// T-Head C906's MAEE (Memory Attribute Extended Encoding) quirk. FSBL
+// (fsbl/lib/cpu/riscv/bl2_entrypoint.S in duo-buildroot-sdk) sets the
+// M-mode-only mxstatus CSR to 0xc0638000 unconditionally before ever
+// handing off to S-mode — bit 21 of that value is MAEE, and there is no
+// way for S-mode code to turn it back off. Once enabled, the C906
+// repurposes Sv39's normally-reserved PTE bits 63:59 as real memory-
+// attribute fields (SO/C/B/SH/SEC, matching this exact SDK's own Linux
+// fork's arch/riscv/include/asm/pgtable-bits.h) — SHARE|CACHE|BUF
+// (bits 60-62) is the encoding Linux's own PAGE_KERNEL/_PAGE_BASE use
+// for ordinary cacheable memory, applied at every page-table level (see
+// page.c3's map_page). Kept as a correctness measure for cache
+// attributes — NOTE this turned out NOT to be the cause of the real
+// hardware hang chased through most of this board's bring-up (that was
+// missing PAGE_A/PAGE_D — see page.c3's own comment and docs/devlog.md
+// for the full elimination trail); MAEE may still matter for cache
+// coherency even though it wasn't the hang's root cause.
+const ulong PTE_EXTRA_BITS = (1UL << 60) | (1UL << 61) | (1UL << 62);
+
 // No virtio-mmio (or any confirmed IRQ source) wired up for this
 // platform yet — 0 rather than a real vendor IRQ number, matching
 // plic_claim()'s own "0 = nothing pending" sentinel, so the
