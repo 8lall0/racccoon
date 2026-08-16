@@ -628,6 +628,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				map_device_page(child_table, board::PLIC_PRIORITY_PAGE, board::PLIC_PRIORITY_PAGE, PAGE_R | PAGE_W);
 				map_device_page(child_table, board::PLIC_ENABLE_PAGE, board::PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
 				map_device_page(child_table, board::PLIC_CLAIM_PAGE, board::PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
+				map_device_page(child_table, board::PLIC_PENDING_PAGE, board::PLIC_PENDING_PAGE, PAGE_R | PAGE_W);
 
 				ulong* parent_table2 = current_proc.page_table;
 				for (uint vpn2 = 0; vpn2 < 512; vpn2++)
@@ -794,6 +795,7 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 			// spurious claim (nothing pending) — don't complete an IRQ
 			// that wasn't actually claimed.
 			uint irq = board::plic_claim();
+
 			if (irq == board::IRQ_VIRTIO_BLK && diskd_pid != 0)
 			{
 				// Wake diskd specifically, rather than relying on
@@ -817,6 +819,30 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 					if (diskd_proc.state == PROC_BLOCKED)
 					{
 						diskd_proc.state = PROC_RUNNABLE;
+					}
+				}
+			}
+			// Same pattern as diskd above, for sdd (see user/sdd.c3) —
+			// the two are mutually exclusive per board (see
+			// board::HAS_SD_BLOCK/HAS_VIRTIO_BLOCK), so this only ever
+			// matches on the Duo, where diskd_pid stays 0. Reuses
+			// DISKD_IRQ_NOTIFY's sentinel value rather than defining a
+			// second constant: it's an opaque "your IRQ fired" marker to
+			// whichever driver receives it, not a DISKD-specific verb —
+			// sdd interprets it exactly the same way diskd does, by
+			// re-reading its own device's status register, not by
+			// inspecting the notify itself.
+			if (irq == board::IRQ_SDHCI && sdd_pid != 0)
+			{
+				Process* sdd_proc = proc_by_pid(sdd_pid);
+				if (sdd_proc != null)
+				{
+					sdd_proc.msg_from    = 0;
+					sdd_proc.msg_type    = DISKD_IRQ_NOTIFY;
+					sdd_proc.has_message = true;
+					if (sdd_proc.state == PROC_BLOCKED)
+					{
+						sdd_proc.state = PROC_RUNNABLE;
 					}
 				}
 			}

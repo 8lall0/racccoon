@@ -350,6 +350,7 @@ fn Process* create_process(void* image, uint image_size)
 	map_device_page(page_table, board::PLIC_PRIORITY_PAGE, board::PLIC_PRIORITY_PAGE, PAGE_R | PAGE_W);
 	map_device_page(page_table, board::PLIC_ENABLE_PAGE, board::PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
 	map_device_page(page_table, board::PLIC_CLAIM_PAGE, board::PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
+	map_device_page(page_table, board::PLIC_PENDING_PAGE, board::PLIC_PENDING_PAGE, PAGE_R | PAGE_W);
 
 	// Copy the process image into freshly allocated user pages, page by page.
 	char* img = image;

@@ -63,9 +63,17 @@ const uptr PLIC_ENABLE_BASE   = PLIC_BASE + 0x2000 + PLIC_S_CONTEXT * 0x80;
 const uptr PLIC_THRESHOLD     = PLIC_BASE + 0x200000 + PLIC_S_CONTEXT * 0x1000;
 const uptr PLIC_CLAIM         = PLIC_BASE + 0x200004 + PLIC_S_CONTEXT * 0x1000;
 
+// Context-independent, system-wide pending bitmap — unlike CLAIM (which
+// is per-context and consumes/clears as it's read), this just reflects
+// raw hardware pending state for every IRQ source, one bit each. Used
+// only as a diagnostic (entry.c3's handle_trap) while chasing the
+// IRQ_SDHCI claim-storm bug — see docs/devlog.md.
+const uptr PLIC_PENDING_BASE = PLIC_BASE + 0x1000;
+
 const uptr PLIC_PRIORITY_PAGE = PLIC_PRIORITY_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
 const uptr PLIC_ENABLE_PAGE   = PLIC_ENABLE_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
 const uptr PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uptr)~(kernel::PAGE_SIZE - 1);
+const uptr PLIC_PENDING_PAGE  = PLIC_PENDING_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
 
 // SDHCI-compliant SD controller (cvitek,cv180x-sd), sourced from
 // duo-buildroot-sdk's own U-Boot driver (drivers/mmc/cvitek/sdhci-cv180x.c)
@@ -74,9 +82,11 @@ const uptr PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uptr)~(kernel::PAGE_SIZE - 1);
 // that actually owns this (pad/power/clock bring-up, standard SD command
 // sequence, PIO block transfers — no DMA, no PLIC involvement in v1).
 const uptr SD_MMIO_BASE = 0x04310000;
-const uint IRQ_SDHCI    = 36; // unused by v1's busy-poll design; recorded
-                               // now since it's real and already sourced,
-                               // not because anything reads it yet.
+const uint IRQ_SDHCI    = 36; // routed through plic_init()/handle_trap
+                               // (entry.c3) the same way IRQ_VIRTIO_BLK
+                               // is on QEMU — sdd.c3 blocks on it for
+                               // block-transfer completion instead of
+                               // busy-polling INT_STATUS.
 
 // One-time SD pad/power/clock bring-up (see user/sdd.c3's sdd_init) needs
 // three more, separate MMIO pages besides SD_MMIO_BASE itself — none of
@@ -107,10 +117,41 @@ const bool HAS_VIRTIO_BLOCK = false;
 // safe.
 fn void plic_init()
 {
-	uint* priority = (uint*)(PLIC_PRIORITY_BASE + 4 * IRQ_VIRTIO_BLK);
-	mem::store(priority, 1u, 4, true);
+	uint* priority_virtio = (uint*)(PLIC_PRIORITY_BASE + 4 * IRQ_VIRTIO_BLK);
+	mem::store(priority_virtio, 1u, 4, true);
 	uint* enable = (uint*)PLIC_ENABLE_BASE;
 	mem::store(enable, (1u << IRQ_VIRTIO_BLK), 4, true);
+
+	// IRQ_SDHCI (36) falls outside the first 32 IRQs IRQ_VIRTIO_BLK's
+	// own enable word covers — needs its own priority word (still inside
+	// PLIC_PRIORITY_PAGE: priorities are one word per IRQ, and IRQ 36's
+	// offset is well within the first page) and the *second* enable word
+	// (IRQ/32 = 1, i.e. PLIC_ENABLE_BASE+4 — still inside PLIC_ENABLE_PAGE,
+	// just 4 bytes further into the same page).
+	uint* priority_sdhci = (uint*)(PLIC_PRIORITY_BASE + 4 * IRQ_SDHCI);
+	mem::store(priority_sdhci, 1u, 4, true);
+
+	// ISOLATION EXPERIMENT, temporary: every real-hardware test so far
+	// has changed this enable-bit write and user/sdd.c3's own
+	// SIGNAL_ENABLE/INT_ENABLE writes together, every single time — so
+	// every failure so far is equally consistent with "the PLIC enable
+	// bit itself is the problem" and "the device's own interrupt
+	// generation is the problem." Two targeted fixes at the device-status
+	// level (widening what gets cleared, and unconditionally completing
+	// at the PLIC level) both left the storm's exact signature
+	// unchanged (claim()=0 AND the raw pending bitmap=0 on every single
+	// sample, forever), which argues against a device-status-clearing
+	// explanation and toward something at the PLIC/enable level instead
+	// — this line is the one thing that's never been isolated. Leaving
+	// priority_sdhci's write in place (harmless alone: priority without
+	// an enable bit can never deliver anything per PLIC semantics) and
+	// skipping ONLY the enable-bit write, to see whether the storm
+	// requires this bit being set at all, independent of whether the
+	// device ever actually asserts. See docs/devlog.md for the full
+	// elimination trail this session before this test.
+	// uint* enable_word1 = (uint*)(PLIC_ENABLE_BASE + 4);
+	// mem::store(enable_word1, (1u << (IRQ_SDHCI % 32)), 4, true);
+
 	uint* threshold = (uint*)PLIC_THRESHOLD;
 	mem::store(threshold, 0u, 4, true);
 }

@@ -71,10 +71,20 @@ const uint SD_PRESENT_DATA_INHIBIT   = 0x00000002;
 const uint SD_PRESENT_SPACE_AVAIL    = 0x00000400; // buffer write-ready
 const uint SD_PRESENT_DATA_AVAIL     = 0x00000800; // buffer read-ready
 
-const uint SD_INT_RESPONSE  = 0x00000001; // command complete
-const uint SD_INT_DATA_END  = 0x00000002; // transfer complete
-const uint SD_INT_ERROR     = 0x00008000;
-const uint SD_INT_ALL_MASK  = 0xFFFFFFFF; // write-1-to-clear, every bit
+const uint SD_INT_RESPONSE    = 0x00000001; // command complete
+const uint SD_INT_DATA_END    = 0x00000002; // transfer complete
+const uint SD_INT_SPACE_AVAIL = 0x00000010; // buffer write-ready — NOT
+                                             // the same bit position as
+                                             // SD_PRESENT_SPACE_AVAIL
+                                             // above: same name, two
+                                             // different registers
+                                             // (PRESENT_STATE vs
+                                             // INT_STATUS), confirmed
+                                             // against the real header,
+                                             // not assumed from the name.
+const uint SD_INT_DATA_AVAIL  = 0x00000020; // buffer read-ready
+const uint SD_INT_ERROR       = 0x00008000;
+const uint SD_INT_ALL_MASK    = 0xFFFFFFFF; // write-1-to-clear, every bit
 
 // Shared busy-wait bound for the per-command polling loops in sd_send_cmd
 // (used inside the ACMD41 retry loop, so multiplied by both the retry
@@ -261,29 +271,6 @@ fn void sdd_pad_power_clock_init()
 	// is open, let alone able to run a functional clock without clk_sd0.
 	uint clk_en = clock_reg_read(REG_CLK_EN_0);
 	clock_reg_write(REG_CLK_EN_0, clk_en | CLK_EN_AXI4_SD0 | CLK_EN_SD0 | CLK_EN_100K_SD0);
-	print("sdd: clk_en_0 before=");
-	print_hex32(clk_en);
-	print(" after=");
-	print_hex32(clock_reg_read(REG_CLK_EN_0));
-	print("\n");
-
-	// Decisive test, before anything else: does a write to the SDHCI
-	// block's own MMIO page (SD_BASE, 0x04310000) actually take effect
-	// at all? Every register confirmed to stick on write so far
-	// (REG_CLK_EN_0 above, SD_PLL_REG/CLOCK_BYPASS_SELECT_REG) lives on
-	// CLOCK_BASE's page (0x03002000) — a completely different mapping —
-	// not SD_BASE's. present_state has read back bit-for-bit identical
-	// (0x03f70000) across every experiment so far regardless of what's
-	// been tried, which is at least consistent with SD_BASE writes
-	// silently going nowhere. SD_ARGUMENT (offset 0x08) has no hardware
-	// side effects at all per spec — it's just a plain holding register
-	// for the next command's argument — so a write-then-read-back of a
-	// distinctive pattern here is an unambiguous test with no other
-	// explanation for a mismatch.
-	sd_reg_write(SD_ARGUMENT, 0xDEADBEEF);
-	print("sdd: SD_BASE write test: wrote deadbeef, read back ");
-	print_hex32(sd_reg_read(SD_ARGUMENT));
-	print("\n");
 
 	// Function-select: route the physical pins to SDIO0, not GPIO.
 	pinmux_reg_write(PAD_SDIO0_CLK_REG, 0);
@@ -322,77 +309,44 @@ fn void sdd_pad_power_clock_init()
 	uint bypass = clock_reg_read(CLOCK_BYPASS_SELECT_REG);
 	clock_reg_write(CLOCK_BYPASS_SELECT_REG, bypass & ~SD_PLL_INDEX_BIT);
 
-	// Read back what actually landed — clock_stable ended up 0 on the
-	// first real attempt with everything else in this function
-	// structurally matching the sourced vendor values, so the next thing
-	// worth knowing directly is whether these two writes actually stuck
-	// at all (wrong base address / no-op write would look identical to
-	// "correct write, wrong hardware behavior" without this).
-	print("sdd: pll_reg=");
-	print_hex32(clock_reg_read(SD_PLL_REG));
-	print(" bypass_reg=");
-	print_hex32(clock_reg_read(CLOCK_BYPASS_SELECT_REG));
-	print("\n");
-
-	// EXPERIMENT, not the steady-state design: skip SDHCI_SOFTWARE_RESET
-	// and our own clock-divisor reconfiguration entirely, and rely on
-	// whatever clock config BootROM already left running.
-	//
-	// Real evidence from real hardware forced this: a previous version of
-	// this function did issue RST_ALL, and — genuinely informative,
-	// verified via the actual byte-for-byte register readback right
-	// after issuing it and BEFORE touching the clock divider at all —
-	// the *pre-reset* clock-control field already read
-	// INT_EN=1/INT_STABLE=1/CARD_EN=1 (raw=0x010e030f: bytes 1:0 =
-	// 0x030f). That's only possible if BootROM's own SD read (it has to
-	// read this exact card to load FSBL in the first place, on this
-	// SD-boot config) already left the SDHCI IP correctly clocked and
-	// stable. RST_ALL itself then got stuck permanently asserted — never
-	// self-cleared even across a 20-million-iteration wait (see
-	// docs/devlog.md for the timing investigation that ruled out "just
-	// need a bigger busy-loop budget" first) — and this function's own
-	// subsequent divisor write was a *full-word* write to the same
-	// register, which zeroed byte 3 as a side effect, force-clearing
-	// that stuck reset bit without the hardware's own reset FSM ever
-	// having actually finished. That's the likely reason INT_STABLE
-	// could never assert again afterward: the IP was left in whatever
-	// undefined state a software-forced, FSM-incomplete reset leaves
-	// behind, not a clean post-reset state.
-	//
-	// So: don't ask for a reset this IP apparently can't cleanly
-	// complete, and don't clobber a clock configuration that was
-	// demonstrably already working. If this gets enumeration further,
-	// the real fix is narrower than "port U-Boot's probe sequence
-	// verbatim" — something in the RST_ALL path itself needs more
-	// investigation (or genuinely isn't needed at all on this board,
-	// given BootROM/FSBL already do equivalent bring-up before handing
-	// off). If this does NOT get enumeration further, RST_ALL wasn't the
-	// (only) problem and the pre-reset "stable" reading was coincidental
-	// or specific to a state this driver had already disturbed by the
-	// time it's re-tested — worth knowing either way.
-	print("sdd: SKIPPING software reset + clock reconfig (experiment) — using BootROM's existing clock\n");
+	// Deliberately never issuing SDHCI_SOFTWARE_RESET, and never
+	// reconfiguring the clock divisor: this IP comes out of BootROM
+	// already correctly clocked and stable (BootROM has to read this
+	// exact card to load FSBL at all, on this SD-boot board), and
+	// RST_ALL was confirmed, via real hardware bring-up, to get stuck
+	// permanently asserted — never self-clearing even across a
+	// 20-million-iteration wait. A full-word write to reconfigure the
+	// divisor afterward was force-clearing that stuck bit as a side
+	// effect, without the hardware's own reset FSM ever having actually
+	// finished, which is why the clock could never re-stabilize once
+	// this drove that path — see docs/devlog.md's 2026-08-16 "(7)" entry
+	// for the full elimination trail. Simplest fix: don't ask this IP
+	// for a reset it can't cleanly complete, and don't touch a clock
+	// configuration that's already demonstrably working.
 	bool clk_stable = (sd_reg_read(SD_CLOCK_SWRESET) & SD_CLOCK_INT_STABLE) != 0;
 
-	// Internal + bus power on, enable the interrupt-status bits used for
-	// polling below. SD_SIGNAL_ENABLE also set, not left at 0: the
-	// general SDHCI spec text says INT_STATUS latches off INT_ENABLE
-	// alone, with SIGNAL_ENABLE only gating whether the physical IRQ
-	// line actually asserts — but INT_STATUS showed zero activity
-	// whatsoever even for the simplest possible command (CMD0) with a
-	// confirmed-stable clock and an idle bus, which is otherwise hard to
-	// explain. Safe to set regardless of whether this hardware really
-	// needs it: this device's IRQ is never enabled at the PLIC (see
-	// board::IRQ_SDHCI's own comment — v1 is polling-only, no PLIC
-	// routing for this device at all), so even if this does cause a
-	// physical interrupt assertion, nothing forwards it anywhere.
-	uint pwrctrl_before = (sd_reg_read(SD_HOSTCTRL_PWRCTRL) >> 8) & 0xFF;
+	// Internal + bus power on.
 	mmio_clrset8_in32(SD_HOSTCTRL_PWRCTRL, 8, 0xFF, 0x0F);
-	uint pwrctrl_after = (sd_reg_read(SD_HOSTCTRL_PWRCTRL) >> 8) & 0xFF;
-	print("sdd: power_control before=");
-	print_hex32(pwrctrl_before);
-	print(" after=");
-	print_hex32(pwrctrl_after);
-	print("\n");
+
+	// Clear any already-latched INT_STATUS bits *before* enabling
+	// SIGNAL_ENABLE below — found necessary on real hardware: this
+	// driver never issues SDHCI_SOFTWARE_RESET (see this function's own
+	// comment on why), so nothing has ever cleared INT_STATUS since
+	// chip power-on. The instant SIGNAL_ENABLE goes from 0 to
+	// all-enabled, any bit already sitting latched there makes the
+	// device's interrupt line assert immediately — and since
+	// board::IRQ_SDHCI is now routed through the PLIC (see
+	// entry.c3/board.c3), the kernel's own IRQ handler claims and
+	// completes it at the PLIC level but has no reason to touch this
+	// device's own INT_STATUS register (that's this driver's job, not
+	// the kernel's generic IRQ-routing code's). Without this clear, the
+	// line never actually de-asserts, so the PLIC just re-fires the same
+	// interrupt again immediately — a tight storm that starves every
+	// process, including this one, of ever running another instruction.
+	// Confirmed on real hardware: execution stopped dead right after
+	// this function's own final print, exactly where SIGNAL_ENABLE gets
+	// turned on.
+	sd_reg_write(SD_INT_STATUS, SD_INT_ALL_MASK);
 	sd_reg_write(SD_INT_ENABLE, SD_INT_ALL_MASK);
 	sd_reg_write(SD_SIGNAL_ENABLE, SD_INT_ALL_MASK);
 
@@ -410,43 +364,12 @@ fn void sdd_pad_power_clock_init()
 	sd_reg_write(CVI_SDHCI_PHY_TX_RX_DLY, 0x01000100);
 	sd_reg_write(CVI_SDHCI_PHY_CONFIG, 1);
 
-	// The one cheap, early diagnostic that actually distinguishes "clock
-	// never came up" from "clock's fine, something later is wrong":
-	// printed unconditionally, before any card command, not gated behind
-	// a failure path.
+	// The one cheap diagnostic worth keeping unconditionally, before any
+	// card command: distinguishes "clock never came up" from "clock's
+	// fine, something later is wrong" if this ever needs revisiting on a
+	// different card.
 	print("sdd: clock_stable=");
-	print(clk_stable ? "1" : "0");
-	print(" clock_reg=");
-	print_hex32(sd_reg_read(SD_CLOCK_SWRESET));
-	print(" present_state=");
-	print_hex32(sd_reg_read(SD_PRESENT_STATE));
-	print("\n");
-}
-
-// Raises SDCLK from the ~400kHz enumeration rate to a real operating
-// speed once the card is selected — 25MHz default speed, no UHS tuning
-// (v1 scope, see this file's header comment). 375000000 / (2*8) ≈ 23.4MHz.
-//
-// EXPERIMENT, same reasoning as sdd_pad_power_clock_init's skip of its
-// own clock reconfiguration: this function's full-word writes to
-// SD_CLOCK_SWRESET clobber the same register the same clobbering way, so
-// disabled for now — see that function's comment for the actual
-// evidence. Re-enable (with a proper read-modify-write, not a full-word
-// clobber) once basic enumeration is confirmed working at whatever clock
-// BootROM already left running.
-fn void sdd_raise_clock_DISABLED_see_comment()
-{
-	uint clk = sd_reg_read(SD_CLOCK_SWRESET) & 0xFFFF0000; // keep byte3(reset)/timeout, drop clock half
-	sd_reg_write(SD_CLOCK_SWRESET, clk);
-	uint div_25m = 8;
-	uint new_clk = (div_25m << 8) | SD_CLOCK_INT_EN;
-	sd_reg_write(SD_CLOCK_SWRESET, new_clk);
-	int wait = 0;
-	while ((sd_reg_read(SD_CLOCK_SWRESET) & SD_CLOCK_INT_STABLE) == 0 && wait < SD_SETUP_WAIT_MAX)
-	{
-		wait++;
-	}
-	sd_reg_write(SD_CLOCK_SWRESET, new_clk | SD_CLOCK_CARD_EN);
+	print(clk_stable ? "1\n" : "0\n");
 }
 
 uint sd_rca; // relative card address, learned from CMD3
@@ -465,10 +388,9 @@ uint sd_response1;
 uint sd_response2;
 uint sd_response3;
 
-// Last raw SD_INT_STATUS value observed by sd_send_cmd — exposed for
-// verbose diagnostic printing at specific call sites (see sdd_enumerate's
-// CMD0), not meant as a general API; ordinary callers just use the
-// return value + sd_response0..3.
+// Last raw SD_INT_STATUS value observed by sd_send_cmd — not meant as a
+// general API, just exposed for the rare caller (like sdd_block_rw) that
+// needs to know which bit actually completed, not just success/failure.
 uint sd_last_int_status;
 
 fn bool sd_send_cmd(uint index, uint arg, uint resp_flags, bool data)
@@ -507,7 +429,19 @@ fn bool sd_send_cmd(uint index, uint arg, uint resp_flags, bool data)
 		complete_wait++;
 	}
 	sd_last_int_status = status;
-	sd_reg_write(SD_INT_STATUS, status);
+	// Clear the WHOLE status word, not just SD_INT_RESPONSE|SD_INT_ERROR.
+	// SD_INT_ERROR (bit 15) is a *summary* bit over eleven separate
+	// detail bits (TIMEOUT/CRC/END_BIT/INDEX/DATA_TIMEOUT/DATA_CRC/
+	// DATA_END_BIT/BUS_POWER/ACMD12ERR/ADMA_ERROR, bits 16-25 — see the
+	// real header), and clearing only the summary bit while a detail bit
+	// underneath it stays set does nothing lasting — the summary just
+	// re-asserts. Correct practice regardless, even though it turned out
+	// NOT to be the cause of the real interrupt storm chased during this
+	// board's PLIC bring-up — that was a genuine PLIC-level hardware
+	// quirk, isolated and unrelated to this device-side clearing at all
+	// (see docs/devlog.md's 2026-08-17 entry and sdd_block_rw's own
+	// header comment).
+	sd_reg_write(SD_INT_STATUS, SD_INT_ALL_MASK);
 
 	if ((status & SD_INT_RESPONSE) == 0) return false;
 
@@ -526,6 +460,44 @@ fn void print_hex32(uint v)
 	{
 		putchar(HEX_DIGITS[(v >> shift) & 0xF]);
 	}
+}
+
+// Raises SDCLK from whatever slow clock BootROM left running (see
+// sdd_pad_power_clock_init's own comment — deliberately never
+// reconfigured before this point, since a prior version of this exact
+// function broke a working clock by full-word-clobbering this same
+// register) up to a real operating speed, once the card is selected.
+// 375000000 / (2*8) ≈ 23.4MHz — SD default-speed's own ceiling is
+// 25MHz, and this driver never sends CMD6 to negotiate high-speed mode,
+// so this is the right target: no faster mode has actually been agreed
+// with the card.
+//
+// Every step here is read-modify-write, never a full-word write to
+// SD_CLOCK_SWRESET — that exact mistake (clobbering byte 2/3 as a side
+// effect of writing just the low 16 bits) was root-caused as what broke
+// a working clock earlier in this board's bring-up (see docs/devlog.md).
+// Standard SDHCI re-clock sequence: disable the card clock, change the
+// divisor, wait for internal-clock-stable, re-enable the card clock —
+// never touches SDHCI_SOFTWARE_RESET (still confirmed stuck/unusable on
+// this exact IP, same reasoning as sdd_pad_power_clock_init).
+fn void sdd_raise_clock()
+{
+	uint w = sd_reg_read(SD_CLOCK_SWRESET);
+	sd_reg_write(SD_CLOCK_SWRESET, w & ~SD_CLOCK_CARD_EN);
+
+	uint div_25m = 8;
+	w = sd_reg_read(SD_CLOCK_SWRESET);
+	w = (w & 0xFFFF0000) | ((div_25m & 0xFF) << 8) | SD_CLOCK_INT_EN;
+	sd_reg_write(SD_CLOCK_SWRESET, w);
+
+	int wait = 0;
+	while ((sd_reg_read(SD_CLOCK_SWRESET) & SD_CLOCK_INT_STABLE) == 0 && wait < SD_SETUP_WAIT_MAX)
+	{
+		wait++;
+	}
+
+	w = sd_reg_read(SD_CLOCK_SWRESET);
+	sd_reg_write(SD_CLOCK_SWRESET, w | SD_CLOCK_CARD_EN);
 }
 
 // Standard SD Physical Layer enumeration sequence — same command
@@ -549,20 +521,9 @@ fn bool sdd_enumerate()
 	// going in, or the command-complete interrupt itself never fired —
 	// i.e. the clock genuinely isn't toggling — the single most useful
 	// bit to know before spending any more time on ACMD41 below.
-	print("sdd: host_control2=");
-	print_hex32((sd_reg_read(SD_ACMD12ERR_HOSTCTRL2) >> 16) & 0xFFFF);
-	print("\n");
-
 	bool cmd0_ok = sd_send_cmd(0, 0, SD_CMD_RESP_NONE, false);
 	print("sdd: CMD0 ");
-	print(cmd0_ok ? "ok" : "TIMED OUT");
-	print(" xfermode_cmd=");
-	print_hex32(sd_reg_read(SD_XFERMODE_CMD));
-	print(" int_status=");
-	print_hex32(sd_last_int_status);
-	print(" present_state=");
-	print_hex32(sd_reg_read(SD_PRESENT_STATE));
-	print("\n");
+	print(cmd0_ok ? "ok\n" : "TIMED OUT\n");
 
 	// CMD8: SEND_IF_COND — 0x1AA = check pattern 0xAA + 2.7-3.6V range.
 	// A v1.x (pre-SD2.0) card won't respond at all; treated as
@@ -572,16 +533,6 @@ fn bool sdd_enumerate()
 	print("sdd: CMD8 ");
 	print(cmd8_ok ? "responded: " : "no response: ");
 	print_hex32(sd_response0);
-	// Unlike CMD0 (index 0, whose command word can legitimately be all
-	// zero), CMD8's command word is unambiguous — index 8, real flags —
-	// so this readback directly answers "did the write even land" for a
-	// case where the answer can't be confused with "nothing written".
-	print(" xfermode_cmd=");
-	print_hex32(sd_reg_read(SD_XFERMODE_CMD));
-	print(" int_status=");
-	print_hex32(sd_last_int_status);
-	print(" present_state=");
-	print_hex32(sd_reg_read(SD_PRESENT_STATE));
 	print("\n");
 
 	// ACMD41 (CMD55 + CMD41): SD_SEND_OP_COND, busy-polled until the card
@@ -637,8 +588,10 @@ fn bool sdd_enumerate()
 	if (!sd_send_cmd(7, sd_rca, SD_CMD_RESP_SHORT | SD_CMD_CRC_CHECK | SD_CMD_INDEX_CHECK, false)) return false;
 	print("sdd: CMD7 (SELECT_CARD) ok\n");
 
-	// sdd_raise_clock() not called — see its own comment (disabled for
-	// now, same clock-clobbering experiment as sdd_pad_power_clock_init).
+	sdd_raise_clock();
+	print("sdd: raised clock, clock_reg=");
+	print_hex32(sd_reg_read(SD_CLOCK_SWRESET));
+	print("\n");
 
 	// CMD16: SET_BLOCKLEN=512 — SDHC/SDXC cards are fixed at 512 by
 	// spec, but harmless (and required for SDSC cards) to send anyway.
@@ -661,6 +614,27 @@ fn void sdd_panic(char* msg)
 // words through the buffer-data-port register once the present-state
 // ready bit is set, then wait for transfer-complete. `data` is exactly
 // SECTOR_SIZE bytes, already positioned by the caller.
+//
+// Busy-polling, not interrupt-driven — a real attempt at interrupt-
+// driven completion (PLIC IRQ_SDHCI) was made and thoroughly isolated on
+// real hardware: enabling this PLIC's enable-bit for source 36 alone
+// (independent of anything the SDHCI device itself does — confirmed by
+// disabling only that one bit and leaving every device-side
+// interrupt-enable register untouched, which fixed it) reliably wedges
+// the CPU into a permanent external-interrupt storm — claim() and the
+// raw hardware pending bitmap both report nothing pending on every
+// single sample, yet the trap never stops. That's a genuine, real
+// hardware quirk in this exact PLIC for this exact source, not
+// something in this driver's own logic: two independent, correctly-
+// targeted device-level fixes (widening the status-register clear,
+// unconditionally completing at the PLIC level) left the storm's exact
+// signature completely unchanged, and the isolation test proved neither
+// of those was ever the actual cause. See docs/devlog.md's 2026-08-17
+// entry for the full elimination trail. board::IRQ_SDHCI's PLIC
+// enable-bit write is commented out in boards/duo/board.c3's plic_init()
+// to match — leave it that way unless this gets revisited with real
+// hardware debug tooling (logic analyzer on the IRQ line, or vendor
+// engineering support), not just source-reading.
 fn bool sdd_block_rw(char* data, uint sector, bool is_write)
 {
 	sd_reg_write(SD_BLKSIZE_BLKCNT, (1 << 16) | SECTOR_SIZE);
@@ -719,7 +693,7 @@ fn bool sdd_block_rw(char* data, uint sector, bool is_write)
 		if ((status & (SD_INT_DATA_END | SD_INT_ERROR)) != 0) break;
 		done_wait++;
 	}
-	sd_reg_write(SD_INT_STATUS, status);
+	sd_reg_write(SD_INT_STATUS, SD_INT_ALL_MASK);
 
 	return (status & SD_INT_DATA_END) != 0;
 }

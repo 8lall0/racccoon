@@ -4,6 +4,135 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-17 (2) — sdd: real operating-speed clock, confirmed on hardware
+
+**Continuing straight from this same day's earlier entry** (sdd cleanup
++ the PLIC interrupt-storm investigation/revert). Last remaining
+follow-up: `sdd` had been running the whole time — enumeration and
+actual block I/O alike — on whatever slow clock BootROM happened to
+leave active, since raising it was previously disabled after an earlier
+version broke a working clock via a full-word register clobber (see the
+PLIC-storm entry above and the original bring-up entries for that
+history).
+
+Re-added `sdd_raise_clock()`, called once after `CMD7`/`SELECT_CARD`,
+targeting ~23.4MHz (375MHz source / (2×8)) — SD default-speed's own
+25MHz ceiling, appropriate since this driver never sends `CMD6` to
+negotiate high-speed mode. Every step is read-modify-write this time,
+never a full-word write to `SD_CLOCK_SWRESET`: disable the card clock
+(clear only that bit), change the divisor (RMW, preserving the
+timeout-control/reset bytes), wait for internal-clock-stable, re-enable
+the card clock. Confirmed via readback on real hardware:
+`clock_reg=0x000e0807` — divider field `8` (exactly the target),
+`INT_STABLE=1`, `CARD_EN=1` — and `writefile`/`readfile` both still
+round-trip correctly at the new speed.
+
+**Files changed:** `user/sdd.c3` (`sdd_raise_clock()`, called from
+`sdd_enumerate()` after `CMD7`).
+
+---
+
+## 2026-08-17 — sdd cleanup, and a real PLIC hardware quirk found chasing interrupt-driven SD I/O
+
+**Continuing from this same week's SD-storage entries.** Two follow-ups
+requested after the first working `writefile`/`readfile` round trip:
+trim `sdd.c3`'s bring-up-era diagnostics now that the driver works, and
+convert its block I/O from busy-polling to interrupt-driven completion
+(PLIC `IRQ_SDHCI`), matching `diskd`'s existing pattern. The first
+landed cleanly. The second uncovered a genuine, undocumented hardware
+quirk in this board's PLIC and had to be reverted.
+
+**Trim:** removed one-off bring-up diagnostics that had done their job
+(`0xDEADBEEF` MMIO write test, clock-gate/PLL/power-control readback
+dumps, `HOST_CONTROL2` dump, a dead disabled `sdd_raise_clock`
+function), condensed the enumeration stage markers to single lines,
+kept `clock_stable` and the per-command markers — still genuinely
+useful if this ever needs revisiting on a different card.
+
+**Interrupt-driven I/O attempt:** added `board::IRQ_SDHCI` routing
+through `entry.c3`'s `handle_trap` (mirroring `diskd`'s existing
+`IRQ_VIRTIO_BLK` handling exactly) and enabled it in the Duo's own
+`plic_init()` (a second priority + a second enable-word, since IRQ 36
+falls outside `IRQ_VIRTIO_BLK`'s first 32). `sdd_block_rw`'s two
+polling waits (buffer-ready, transfer-complete) became a shared
+`sdd_wait_for_irq()` blocking on `SYS_IPC_POLL`, same shape as
+`diskd`'s own interrupt wait. QEMU regression stayed fully clean
+throughout (`IRQ_SDHCI=0` there, a dead sentinel like `IRQ_VIRTIO_BLK`
+was on the Duo before this).
+
+**Real hardware result: a total, permanent external-interrupt storm.**
+The moment `sdd` turned on its own `SIGNAL_ENABLE`, the CPU started
+taking `SCAUSE_SUPERVISOR_EXTERNAL` traps continuously, forever — but
+PLIC `claim()` at context 1 returned 0 (nothing pending) on every
+single sample, every time, across the whole investigation. Chased
+through several well-reasoned but ultimately wrong theories before
+finding the real cause:
+
+- Ruled out **PLIC context number / register-offset formulas** —
+  independently confirmed correct via three sources: the real
+  devicetree's `interrupts-extended` property, OpenSBI's own parsed
+  `s_cntx_id` (the actual M-mode firmware running on this board), and
+  Linux's `irq-sifive-plic.c`. `PLIC_S_CONTEXT=1` was right all along;
+  this PLIC has exactly two contexts for hart0 (context 0 = M-mode,
+  explicitly marked invalid via the DT's `0xffffffff` sentinel; context
+  1 = S-mode, the real one) — no hidden alternate context, no
+  cvitek-specific offset override anywhere in the SDK.
+- Ruled out **the IRQ number itself** — found and read the official
+  CV1800B/CV1801B preliminary datasheet
+  (github.com/milkv-duo/duo-files), which confirms IRQ 36 = "SD0
+  interrupt" in the real interrupt-source table. Not a typo, not an
+  off-by-one.
+- Ruled out **stale/uncleared `SD_INT_STATUS` bits** two different
+  ways — first by explicitly clearing the whole status register before
+  ever enabling `SIGNAL_ENABLE`, then by widening every status-clear
+  write from "just the bits this call consumed" to the entire register
+  (reasoning: `SD_INT_ERROR` is a summary bit over eleven separate
+  detail bits at bits 16-25 that the narrower mask never touched, a
+  real and independently-worth-fixing bug — just not *this* bug).
+  Neither changed the storm's signature at all.
+- Ruled out **PLIC completion sequencing** — tried unconditionally
+  completing `IRQ_SDHCI` at the PLIC level even on a spurious (0)
+  claim, on the theory this silicon might need it. No change.
+- **Found via direct isolation, not another guess:** every test so far
+  had changed the PLIC's own enable-bit for source 36 and the SDHCI
+  device's own interrupt-enable registers *together*, every time — so
+  every failure was equally consistent with either being the cause.
+  Split them apart: left the device's `SIGNAL_ENABLE`/`INT_ENABLE`
+  writes untouched, but commented out only the PLIC enable-bit write
+  for source 36. Result: enumeration completed perfectly end-to-end
+  (`CMD0` through `CMD7`, "card ready"), zero storm, zero spurious
+  traps. Conclusive: setting this one specific PLIC enable bit alone —
+  independent of whether the device it's associated with ever actually
+  asserts anything — reliably wedges this exact PLIC into a permanent
+  storm. A real, undocumented silicon/PLIC erratum for this source (or
+  possibly this whole context), not anything in this driver's own
+  logic, and not something any of the three independently-checked
+  software sources (DT, OpenSBI, Linux driver) predicted or would
+  likely have caught, since none of them exercise every one of this
+  chip's 101 interrupt sources in practice.
+
+**Reverted:** `sdd_block_rw` back to busy-polling (`SD_PRESENT_STATE`
+for buffer-ready, `SD_INT_STATUS` for transfer-complete) — the exact
+design already proven working end-to-end on real hardware before this
+attempt. `sdd_wait_for_irq()` removed. The Duo's `plic_init()` keeps
+the IRQ_SDHCI enable-bit write in place but commented out, with the
+full reasoning, so a future attempt doesn't have to rediscover this
+from scratch. `entry.c3`'s `IRQ_SDHCI` trap-handler routing and the new
+`board::PLIC_PENDING_BASE`/`PLIC_PENDING_PAGE` infrastructure (added
+for this investigation's own diagnostics) are left in place, unused but
+ready, in case this gets revisited with real hardware debug tooling
+(logic analyzer on the physical IRQ line, or vendor engineering
+support) rather than source-reading alone.
+
+**Files changed:** `user/sdd.c3` (trim, revert to polling, wider
+status-clear kept as a real independent fix), `boards/duo/board.c3` /
+`boards/qemu/board.c3` (`PLIC_PENDING_BASE`/`PAGE`, IRQ_SDHCI enable
+commented out), `src/entry.c3` (`IRQ_SDHCI` routing added and kept,
+temporary diagnostic prints added and removed), `src/process.c3`
+(`PLIC_PENDING_PAGE` mapping).
+
+---
+
 ## 2026-08-16 (7) — Real SD-card storage for the Duo: Stage 4, full working round trip
 
 **Continuing straight from this same day's "(6)" entry.** Stages 1-3
