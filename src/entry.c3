@@ -352,19 +352,19 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				for (uint vpn2 = 0; vpn2 < 512; vpn2++)
 				{
 					if ((exiting_table2[vpn2] & PAGE_V) == 0) continue;
-					ulong* table1 = (ulong*)(uptr)(((exiting_table2[vpn2] >> 10) & PPN_MASK) * PAGE_SIZE);
+					ulong* table1 = (ulong*)pte_to_paddr(exiting_table2[vpn2]);
 
 					for (uint vpn1 = 0; vpn1 < 512; vpn1++)
 					{
 						if ((table1[vpn1] & PAGE_V) == 0) continue;
-						ulong* table0 = (ulong*)(uptr)(((table1[vpn1] >> 10) & PPN_MASK) * PAGE_SIZE);
+						ulong* table0 = (ulong*)pte_to_paddr(table1[vpn1]);
 
 						for (uint vpn0 = 0; vpn0 < 512; vpn0++)
 						{
 							if ((table0[vpn0] & PAGE_V) == 0) continue;
 							if (table0[vpn0] & PAGE_U)
 							{
-								uptr leaf_paddr = (uptr)(((table0[vpn0] >> 10) & PPN_MASK) * PAGE_SIZE);
+								uptr leaf_paddr = pte_to_paddr(table0[vpn0]);
 								free_pages(leaf_paddr, 1);
 							}
 						}
@@ -633,19 +633,19 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				for (uint vpn2 = 0; vpn2 < 512; vpn2++)
 				{
 					if ((parent_table2[vpn2] & PAGE_V) == 0) continue;
-					ulong* parent_table1 = (ulong*)(uptr)(((parent_table2[vpn2] >> 10) & PPN_MASK) * PAGE_SIZE);
+					ulong* parent_table1 = (ulong*)pte_to_paddr(parent_table2[vpn2]);
 
 					for (uint vpn1 = 0; vpn1 < 512; vpn1++)
 					{
 						if ((parent_table1[vpn1] & PAGE_V) == 0) continue;
-						ulong* parent_table0 = (ulong*)(uptr)(((parent_table1[vpn1] >> 10) & PPN_MASK) * PAGE_SIZE);
+						ulong* parent_table0 = (ulong*)pte_to_paddr(parent_table1[vpn1]);
 
 						for (uint vpn0 = 0; vpn0 < 512; vpn0++)
 						{
 							if ((parent_table0[vpn0] & PAGE_V) == 0) continue;
 							if ((parent_table0[vpn0] & PAGE_U) == 0) continue;
 
-							uptr parent_leaf_paddr = (uptr)(((parent_table0[vpn0] >> 10) & PPN_MASK) * PAGE_SIZE);
+							uptr parent_leaf_paddr = pte_to_paddr(parent_table0[vpn0]);
 							uptr child_leaf_paddr  = alloc_pages(1);
 							mem::copy((void*)child_leaf_paddr, (void*)parent_leaf_paddr, (sz)PAGE_SIZE);
 

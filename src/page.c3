@@ -31,12 +31,32 @@ const PAGE_D    = (1 << 7); // Dirty — cores without hardware A/D auto-set
 // this for real: QEMU (PTE_EXTRA_BITS=0) never showed it.
 const ulong PPN_MASK = (1UL << 44) - 1;
 
+// The only two places a PTE's PPN field should ever be built or read
+// back — encoding (paddr_to_ppn_field) and decoding (pte_to_paddr) both
+// used to be repeated inline at every call site instead (three copies
+// of the encode shape in this file alone; the decode shape duplicated
+// again in entry.c3's exit free-loop and its SYS_RFORK copy-on-write
+// walk). That duplication is exactly how the PPN_MASK bug above shipped
+// in three different places before it was fixed in all of them — see
+// docs/devlog.md. Every table pointer recovery and every PTE
+// construction in this codebase should go through one of these two
+// functions, not reimplement the shift/mask by hand.
+fn ulong paddr_to_ppn_field(uptr paddr)
+{
+	return (((ulong)paddr >> 12) & PPN_MASK) << 10;
+}
+
+fn uptr pte_to_paddr(ulong entry)
+{
+	return (uptr)(((entry >> 10) & PPN_MASK) * PAGE_SIZE);
+}
+
 // Sv39 is 3-level (VPN2[38:30], VPN1[29:21], VPN0[20:12], each 9 bits,
 // 12-bit offset) where Sv32 was 2-level (VPN1[31:22], VPN0[21:12], each
 // 10 bits) — a real structural difference, not just wider fields. The
 // PTE encoding itself carries over unchanged in shape: low bits 0-4 are
-// still V/R/W/X/U, and `(paddr >> 12) << 10 | flags | PAGE_V` is still
-// the right formula — only the PPN field is wider (44 bits vs 22),
+// still V/R/W/X/U, and `paddr_to_ppn_field(paddr) | flags | PAGE_V` is
+// still the right formula — only the PPN field is wider (44 bits vs 22),
 // which a 64-bit table entry (`ulong`, not `uint`) naturally
 // accommodates. Each level's table is still exactly one page, holding
 // 512 entries now (4096 / 8 bytes per PTE) instead of 1024.
@@ -63,18 +83,18 @@ fn void map_page(ulong* table2, uptr vaddr, uptr paddr, uint flags)
 	{
 		// Create the 2nd level page table if it doesn't exist.
 		uptr pt_paddr = alloc_pages(1);
-		table2[vpn2] = ((pt_paddr >> 12) << 10) | PAGE_V | board::PTE_EXTRA_BITS;
+		table2[vpn2] = paddr_to_ppn_field(pt_paddr) | PAGE_V | board::PTE_EXTRA_BITS;
 	}
-	ulong* table1 = (ulong*)(uptr)(((table2[vpn2] >> 10) & PPN_MASK) * PAGE_SIZE);
+	ulong* table1 = (ulong*)pte_to_paddr(table2[vpn2]);
 
 	uint vpn1 = (uint)((vaddr >> 21) & 0x1ff);
 	if ((table1[vpn1] & PAGE_V) == 0)
 	{
 		// Create the 1st level page table if it doesn't exist.
 		uptr pt_paddr = alloc_pages(1);
-		table1[vpn1] = ((pt_paddr >> 12) << 10) | PAGE_V | board::PTE_EXTRA_BITS;
+		table1[vpn1] = paddr_to_ppn_field(pt_paddr) | PAGE_V | board::PTE_EXTRA_BITS;
 	}
-	ulong* table0 = (ulong*)(uptr)(((table1[vpn1] >> 10) & PPN_MASK) * PAGE_SIZE);
+	ulong* table0 = (ulong*)pte_to_paddr(table1[vpn1]);
 
 	// Set the leaf (3rd level) page table entry to map the physical page.
 	//
@@ -99,5 +119,5 @@ fn void map_page(ulong* table2, uptr vaddr, uptr paddr, uint flags)
 	// correctness measure for cache attributes even though it wasn't
 	// what fixed the hang itself (tested and ruled out in isolation).
 	uint vpn0 = (uint)((vaddr >> 12) & 0x1ff);
-	table0[vpn0] = ((paddr >> 12) << 10) | (ulong)flags | PAGE_V | PAGE_A | PAGE_D | board::PTE_EXTRA_BITS;
+	table0[vpn0] = paddr_to_ppn_field(paddr) | (ulong)flags | PAGE_V | PAGE_A | PAGE_D | board::PTE_EXTRA_BITS;
 }
