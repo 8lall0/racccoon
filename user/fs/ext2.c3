@@ -5,7 +5,7 @@ module user;
 // original ext2 on-disk format, unchanged by ext3/ext4's later journal/
 // extent additions) — not reverse-engineered.
 //
-// v1 scope, deliberately limited, read-only:
+// v1 scope, deliberately limited — applies to both read and write:
 //   - Root directory only (inode 2, a format constant — always the root,
 //     regardless of what the superblock says), same as FAT32's own v1
 //     scope.

@@ -72,10 +72,13 @@ const bool HAS_BLOCK_DEVICE = true;
 const bool HAS_SD_BLOCK     = false;
 const bool HAS_VIRTIO_BLOCK = true;
 
-// fsd.c3's FAT32 reader adds this to every logical sector number before
-// touching the disk — see boards/duo/board.c3's matching comment. QEMU's
-// own test image (scripts/build.sh) is formatted whole-disk (no MBR/
-// partition table, the simplest thing mkfs.vfat can produce), so 0.
+// fsd.c3 (see its own header comment) adds this to every logical sector
+// number before touching the disk — see boards/duo/board.c3's matching
+// comment. QEMU's own default test image (scripts/build.sh's disk.img)
+// is formatted whole-disk (no MBR/partition table, the simplest thing
+// mkfs.vfat can produce), so 0. A separate disk_ext2.img (also whole-
+// disk) is used for ext2 testing instead of a second partition on this
+// same image — see scripts/launch64_ext2.sh.
 const uint FS_PARTITION_START_SECTOR = 0;
 
 // process.c3's setup_sdd_mappings references these unconditionally (one

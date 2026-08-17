@@ -112,13 +112,17 @@ const bool HAS_BLOCK_DEVICE = true;
 const bool HAS_SD_BLOCK     = true;
 const bool HAS_VIRTIO_BLOCK = false;
 
-// fsd.c3's FAT32 reader adds this to every logical sector number before
-// touching the card — the real, physical start sector of the DUOBOOT FAT32
-// partition (confirmed via `sfdisk`/`lsblk` against the actual card this
-// board was bring-up-tested on: a single partition spanning nearly the
-// whole disk, starting right after the MBR). fsd reads this *same*
-// partition directly, the one holding this board's own bootable fip.bin —
-// safe only because fsd is read-only; see user/fsd.c3's own header.
+// fsd.c3 (see its own header comment) adds this to every logical sector
+// number before touching the card — the real, physical start sector of
+// the DUOBOOT FAT32 partition, confirmed via `sfdisk`/`lsblk` against
+// the actual card. fsd mounts this *same* partition, the one holding
+// this board's own bootable fip.bin — safe even though fsd now supports
+// writes because of the structural reserved-sector-range protection
+// fs_mount() builds at startup (see user/fsd.c3's own header comment),
+// not because reading is the only thing fsd can do anymore. Repartitioned
+// to a smaller 1GiB (unchanged start sector) during real-hardware ext2
+// verification — see docs/devlog.md — to make room for a second, ext2
+// EXT2TEST partition later in the disk, currently unused by any code.
 const uint FS_PARTITION_START_SECTOR = 2048;
 
 // Same register formulas as boards/qemu/board.c3 — see this file's own
