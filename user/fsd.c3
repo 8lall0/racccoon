@@ -28,25 +28,26 @@ module user;
 // (fsd had no subdirectory concept before FAT32 support either — not a
 // regression), no caching at boot — every FS_READ/FS_WRITE walks the
 // root directory fresh, since there's no reasonable fixed-size cache for
-// "however many files happen to be on someone's real SD card." Only
-// FAT32 has write support; an ext2-mounted volume rejects every write.
+// "however many files happen to be on someone's real SD card." Both
+// FAT32 and ext2 support create/overwrite/grow writes now.
 //
 // Write support (create, overwrite, grow — see fs/fat32.c3's
-// fat32_write()) started read-only-only and was extended deliberately:
-// a parsing bug can misread data, but a write bug can corrupt the very
-// partition that boots this board. The safety net isn't just "don't
-// write to fip.bin by name" — it's structural: fs_mount() has each
-// backend look up its own protected file's directory entry and its
-// ENTIRE data chain once at mount time, recording every sector it
-// occupies (see fs_reserve_sector_range()/fs_reserved_ranges), and
-// diskd_rw() — the ONE function every write in this process funnels
-// through, whether it's file data, a FAT-table update, or a directory
-// entry — refuses any write that would land on one of those sectors.
-// That means a bug in a backend's allocator or directory code can't
-// reach a protected file either, not just a filename check that a
-// different code path could bypass. See docs/devlog.md for the FAT32
-// entries covering the read-only, write-support, and this abstraction
-// work.
+// fat32_write()/fs/ext2.c3's ext2_write()) started read-only-only and
+// was extended deliberately: a parsing bug can misread data, but a
+// write bug can corrupt the very partition that boots this board. The
+// safety net isn't just "don't write to fip.bin by name" — it's
+// structural: fs_mount() has each backend look up its own protected
+// file's directory entry and its ENTIRE data chain once at mount time,
+// recording every sector it occupies (see
+// fs_reserve_sector_range()/fs_reserved_ranges), and diskd_rw() — the
+// ONE function every write in this process funnels through, whether
+// it's file data, a bitmap/FAT-table update, or a directory entry —
+// refuses any write that would land on one of those sectors. That means
+// a bug in a backend's allocator or directory code can't reach a
+// protected file either, not just a filename check that a different
+// code path could bypass. See docs/devlog.md for the entries covering
+// FAT32's read-only and write-support work, the filesystem-abstraction
+// split, and ext2's own read and write support.
 //
 // Unlike diskd, fsd is an ordinary IPC participant: nothing it waits for
 // depends on a hardware interrupt firing while it's parked mid-trap, so
@@ -304,6 +305,20 @@ fn bool fs_write_sector(uint sector, char* buf)
 
 // --- Mount-time backend dispatch --------------------------------------
 
+// Prints the reservation-list outcome after a backend's own
+// *_reserve_protected() call — identical for every backend (there's
+// nothing filesystem-specific about "how many sector ranges got
+// reserved"), so shared here rather than duplicated in fs_mount()'s
+// per-backend branches below.
+fn void fs_reserve_protection_summary()
+{
+	print("fsd: write-protected ");
+	print_uint(fs_reserved_count);
+	print(" sector range(s)");
+	if (fs_write_disabled) print(" — writes DISABLED");
+	print("\n");
+}
+
 fn void fs_mount()
 {
 	if (fs_partition_info(&fs_partition_start) < 0)
@@ -320,25 +335,24 @@ fn void fs_mount()
 	{
 		fs_type = FS_TYPE_EXT2;
 		ext2_mount();
+		// Write protection: build the reserved-range allowlist before
+		// ever allowing a write — fs_write_disabled starts true (see
+		// its own comment) and only comes down once this succeeds
+		// without overflow. Same sequence as the FAT32 branch below —
+		// see fs_reserve_protection_summary()'s own comment for why
+		// it's shared rather than duplicated per backend.
+		fs_write_disabled = false;
+		ext2_reserve_protected(&FS_PROTECTED_NAME);
+		fs_reserve_protection_summary();
 		return;
 	}
 	if (fat32_probe())
 	{
 		fs_type = FS_TYPE_FAT32;
 		fat32_mount();
-		// Write protection: build the reserved-range allowlist before
-		// ever allowing a write — fs_write_disabled starts true (see
-		// its own comment) and only comes down once this succeeds
-		// without overflow. ext2 has no write support in this pass, so
-		// nothing to reserve there — every write against an ext2-
-		// mounted volume is rejected unconditionally in main() below.
 		fs_write_disabled = false;
 		fat32_reserve_protected(&FS_PROTECTED_NAME);
-		print("fsd: write-protected ");
-		print_uint(fs_reserved_count);
-		print(" sector range(s)");
-		if (fs_write_disabled) print(" — writes DISABLED");
-		print("\n");
+		fs_reserve_protection_summary();
 		return;
 	}
 
@@ -389,13 +403,18 @@ fn void main() @export("main")
 			// checked before any backend even sees the request;
 			// diskd_rw()'s reserved-sector check (see this file's
 			// header comment) is the real backstop if this one is ever
-			// bypassed. An ext2-mounted volume has no write function at
-			// all to dispatch to in this pass — every write against it
-			// is rejected unconditionally.
+			// bypassed.
 			int result = -1;
-			if (!fs_is_protected_name(&filename) && fs_type == FS_TYPE_FAT32)
+			if (!fs_is_protected_name(&filename))
 			{
-				result = fat32_write(&filename, &buf[104], (uint)req_len);
+				if (fs_type == FS_TYPE_FAT32)
+				{
+					result = fat32_write(&filename, &buf[104], (uint)req_len);
+				}
+				else if (fs_type == FS_TYPE_EXT2)
+				{
+					result = ext2_write(&filename, &buf[104], (uint)req_len);
+				}
 			}
 			*result_len_field = result;
 			ipc_send(from, verb, &buf, FS_MSG_MAX);

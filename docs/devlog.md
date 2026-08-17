@@ -4,6 +4,60 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-17 (7) — ext2 write support
+
+**Continuing from this same day's ext2-verification entry.** Brought
+`user/fs/ext2.c3` up to the same level FAT32 has: create, overwrite,
+grow. Reused `fsd.c3`'s generic write-protection machinery verbatim —
+`fs_reserve_sector_range()`, `fs_set_protected_entry()`/
+`fs_is_protected_entry()`, enforcement in `fs_write_sector()` — nothing
+new needed there, which was the actual point of building the
+abstraction earlier today.
+
+What's structurally different from FAT32's write path, and where all
+the new code went: ext2 allocates space via **bitmaps** (one bit per
+block/inode in a group — `ext2_alloc_block()`/`ext2_alloc_inode()`), not
+a linked list like the FAT table, and needs a genuinely separate
+allocation step for **inodes** (a fixed-size, pre-allocated table —
+FAT32 has no equivalent; creating a file there only ever needed a free
+cluster + a free directory slot). Directory entries are variable-length
+records, but v1 sidesteps splitting an existing entry's trailing
+`rec_len` (a real ext2 allocator technique) — creating a file always
+appends a fresh directory block containing just that one entry, a
+documented inefficiency parallel to FAT32 write's own "shrinking doesn't
+free the now-excess clusters" gap. Free-space bookkeeping
+(`bg_free_blocks_count`/`s_free_blocks_count` and their inode
+counterparts) is deliberately not maintained — a real `e2fsck` would
+flag the mismatch and offer to fix it, but nothing about it corrupts
+data or blocks a real ext2 driver from reading the volume; accepted,
+documented gap. Directory `i_size` *is* kept correct when a directory
+gains a block, since real ext2 readers use it to know how far to scan —
+unlike the free-count fields, getting this wrong could make a real
+Linux box's `ls` misbehave.
+
+**Worked correctly on the very first real-hardware attempt** — no bugs
+found this time, unlike `newfile`'s first real-hardware run during
+FAT32 write support (the shared-root-directory-cluster reservation bug)
+or the SD read-data-loss bug earlier today. Verified in order, on both
+QEMU (`scripts/launch64_ext2.sh`) and real hardware (the same temporary
+`FS_PARTITION_START_SECTOR`-swap procedure used for read verification,
+reverted afterward): `writefile` (overwrite), `readfile` (confirms it),
+`newfile` (genuinely new inode + directory entry, confirmed via its own
+readback), `protectedwrite` (correctly rejected — exercises the generic
+filename check same as FAT32's does). Full existing FAT32 regression
+suite re-run on QEMU too, unaffected.
+
+**Files changed:** `user/fs/ext2.c3` (bitmap allocation, inode read-
+modify-write, directory-entry creation, `ext2_write()`,
+`ext2_reserve_protected()`), `user/fsd.c3` (`fs_mount()`'s
+`FS_TYPE_EXT2` branch gains write-protection setup via a new shared
+`fs_reserve_protection_summary()` helper; `main()`'s `FS_WRITE` dispatch
+gains an `ext2_write()` branch). No shell/wire-protocol changes needed —
+`writefile`/`newfile`/`protectedwrite` already worked against whichever
+backend was mounted.
+
+---
+
 ## 2026-08-17 (6) — ext2 verified on real Duo hardware
 
 **Continuing from this same day's filesystem-abstraction entry.**
