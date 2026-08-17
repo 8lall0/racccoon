@@ -4,6 +4,66 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-17 (4) — fsd: full FAT32 write support, structurally blocked from ever touching fip.bin
+
+**Continuing from this same day's read-only FAT32 entry.** The ask:
+real write support (create new files, grow existing ones — not just
+overwrite-in-place), with a guarantee stronger than "don't write to
+fip.bin by name" — a bug in the new allocator/directory code shouldn't
+be able to reach the file that boots this board either.
+
+**Design**: `fs_init()` looks up `fip.bin`'s real directory entry and
+walks its entire cluster chain once at mount time, recording every data
+cluster it occupies in a small reserved-cluster allowlist. `diskd_rw()`
+— the one function every write in `fsd.c3` funnels through, whether it's
+file data, a FAT-table update, or a directory entry — refuses any write
+landing on a reserved cluster; `fs_write_disabled` starts `true` and
+fails the whole write path closed if the reservation ever can't be built
+completely (list overflow, a read failure mid-chain-walk), rather than
+risk protecting only part of the file. A separate, fast filename check
+(`fs_is_protected_name`) rejects `fip.bin` by name before any lookup at
+all — belt-and-suspenders, not the only line of defense.
+
+**Real bug found on the very first real-hardware write attempt**: `newfile`
+(a new shell command added specifically to exercise directory-entry
+creation, since `writefile` only ever overwrote the pre-existing
+`hello.txt`) failed silently — no error, no console output, nothing.
+Root cause: the first version reserved fip.bin's directory-entry
+*cluster*, not just its exact 32-byte entry — but in FAT32 the root
+directory is itself just an ordinary cluster chain, shared by *every*
+file's entry. Reserving "the cluster containing fip.bin's entry"
+reserved the whole shared root-directory cluster, silently blocking any
+new file's directory entry from ever being written there too — a subtle
+but real design bug caught immediately by testing on the real card, not
+by review. Fixed by tracking the protected entry's exact
+`(sector, offset)` separately from the coarser cluster-level allowlist
+(safe at that granularity precisely because file *data* clusters, unlike
+the directory, are never shared between files), checked explicitly by
+the two functions that ever write directory-entry bytes.
+
+**`sdd.c3`**: implemented the write half of `sdd_block_rw` (CMD24,
+symmetric to the already-working CMD17 read path) — same "no `print()`
+calls between the ready-check and the buffer loop" fix that resolved the
+read-side data-loss bug earlier today, applied here on the same
+reasoning before it could bite on the write side too.
+
+**Verified on real hardware, in order**: boot-time reservation confirms
+fip.bin's real cluster count gets found and reserved; `newfile` creates
+a genuinely new file and reads its exact content back; `writefile` still
+round-trips against `hello.txt`; `protectedwrite` (new shell command)
+deliberately attempts `fs_write("fip.bin", ...)` and gets rejected; a
+full power-cycle afterward boots cleanly end to end — the strongest
+proof available that `fip.bin` survived every step of this session's
+testing completely intact.
+
+**Files changed:** `user/fsd.c3` (reserved-cluster tracking and
+enforcement, cluster allocation, FAT-entry writes mirrored across both
+copies, directory-entry creation/update, `fs_do_write()`), `user/sdd.c3`
+(`sdd_block_rw`'s write path), `user/shell.c3` (`newfile`,
+`protectedwrite` test commands).
+
+---
+
 ## 2026-08-17 (3) — fsd: real, read-only FAT32 support, and a shallow-FIFO PIO timing bug
 
 **Continuing from this same day's earlier entries.** After a short

@@ -86,6 +86,37 @@ fn void main() @export("main") {
             }
         } else if (strcmp(cmd, "writefile") == 0) {
             fs_write("hello.txt", "Hello from shell!\n", 19);
+        } else if (strcmp(cmd, "newfile") == 0) {
+            // Exercises directory-entry creation specifically (writefile
+            // above only ever overwrites the already-existing hello.txt)
+            // — write, then read back through the same fs_read() path
+            // readfile uses, to confirm the new file is genuinely
+            // findable and correct, not just that the write call
+            // returned success.
+            fs_write("newtest.txt", "Created by newfile test\n", 25);
+            char[128] buf @noinit;
+            int len = fs_read("newtest.txt", &buf, 128);
+            if (len >= 0) {
+                buf[len] = 0;
+                print(&buf);
+            } else {
+                print("newfile: readback failed\n");
+            }
+        } else if (strcmp(cmd, "protectedwrite") == 0) {
+            // Deliberately attempts to write the one file fsd is
+            // supposed to refuse no matter what (see user/fsd.c3's
+            // header comment) — the actual point of the write-
+            // protection work, not a hypothetical. -1 (rejected) is the
+            // only correct result on the real board; on QEMU's
+            // disposable test image, fip.bin doesn't exist at all, so
+            // this exercises the "create a new file" path instead —
+            // still harmless there, just not the real test.
+            int result = fs_write("fip.bin", "should never land\n", 18);
+            if (result < 0) {
+                print("protectedwrite: rejected (correct)\n");
+            } else {
+                print("protectedwrite: WARNING: write was ACCEPTED\n");
+            }
         } else if (strcmp(cmd, "ping") == 0) {
             // echod is always the first process spawned after idle (see
             // kernel.c3), so it's always pid 2 — a placeholder until

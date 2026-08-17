@@ -671,23 +671,19 @@ fn void sdd_panic(char* msg)
 // engineering support), not just source-reading.
 fn bool sdd_block_rw(char* data, uint sector, bool is_write)
 {
-	// Writes rejected entirely, for now. fsd (the only real client) is
-	// read-only (see docs/devlog.md's FAT32 entry) and, unlike the old
-	// tar-based fsd this replaced, addresses real, absolute sectors on
-	// the actual DUOBOOT partition (via board::FS_PARTITION_START_SECTOR)
-	// — the same partition holding this board's own bootable fip.bin —
-	// not an offset relative to a small reserved-and-bounds-checked gap.
-	// A prior version of this function kept exactly that kind of gap
-	// (DATA_SECTOR_OFFSET) with its own bounds check, sized for the old
-	// fsd's small, safely-isolated data region; removed once it started
-	// actively rejecting the new fsd's own legitimate reads of the real
-	// partition — the two designs used the same `sector` parameter to
-	// mean genuinely different things. There's no longer a well-defined
-	// "safe to write" region here at all, and nothing currently sends a
-	// write. Real write support, whenever it's built, needs its own
-	// design at this layer — not a resurrection of this one.
-	if (is_write) return false;
-
+	// Write support: fsd's own reserved-cluster allowlist (see
+	// user/fsd.c3's header comment) is the thing that decides WHICH
+	// sectors are safe to write — this layer just moves bytes for
+	// whatever sector it's asked to touch, symmetric to the read path
+	// below in every respect. A prior version of this function kept a
+	// small offset-relative bounds check (DATA_SECTOR_OFFSET) sized for
+	// the old tar-based fsd's own small, isolated data region; removed
+	// once fsd started addressing real, absolute sectors on the actual
+	// DUOBOOT partition, and unconditionally rejected all writes for a
+	// while after that since there was no longer a well-defined "safe to
+	// write" region at THIS layer. There still isn't — the safety now
+	// lives entirely in fsd, which is the layer that actually understands
+	// FAT32 structure well enough to know what's safe.
 	sd_reg_write(SD_BLKSIZE_BLKCNT, (1 << 16) | SECTOR_SIZE);
 
 	// SDHC/SDXC: block addressing, argument = block number directly.
@@ -695,14 +691,17 @@ fn bool sdd_block_rw(char* data, uint sector, bool is_write)
 	uint arg = sd_high_capacity ? sector : (sector * SECTOR_SIZE);
 
 	uint resp = SD_CMD_RESP_SHORT | SD_CMD_CRC_CHECK | SD_CMD_INDEX_CHECK;
-	bool cmd17_ok = sd_send_cmd(17, arg, resp, true);
-	if (!cmd17_ok)
+	uint cmd_index = is_write ? 24 : 17; // WRITE_BLOCK / READ_SINGLE_BLOCK
+	bool cmd_ok = sd_send_cmd(cmd_index, arg, resp, true);
+	if (!cmd_ok)
 	{
 		// Aborting anyway — nothing left to race against, safe to print
 		// here (see this function's own header comment on why every
-		// print() between CMD17 completing and the buffer-drain loop was
-		// removed from the success path).
-		print("sdd: CMD17 TIMED OUT resp0=");
+		// print() between the command completing and the buffer-drain
+		// loop was removed from the success path).
+		print("sdd: CMD");
+		print_hex32(cmd_index);
+		print(" TIMED OUT resp0=");
 		print_hex32(sd_response0);
 		print("\n");
 		return false;
@@ -717,22 +716,27 @@ fn bool sdd_block_rw(char* data, uint sector, bool is_write)
 	// generous bound here is cheap regardless of whether it turns out to
 	// matter.
 	//
-	// Waits on INT_STATUS's own Buffer Read Ready bit (SD_INT_DATA_AVAIL),
-	// not just PRESENT_STATE's DATA_AVAILABLE — matching the real vendor
-	// driver's sdhci_transfer_data() (u-boot's generic drivers/mmc/
-	// sdhci.c, read directly during this session's diagnosis).
+	// Waits on INT_STATUS's own ready bit — SD_INT_DATA_AVAIL for a read,
+	// SD_INT_SPACE_AVAIL for a write — not PRESENT_STATE's equivalent
+	// bits, matching the real vendor driver's sdhci_transfer_data()
+	// (u-boot's generic drivers/mmc/sdhci.c, read directly during this
+	// session's read-side diagnosis; the same pattern applies
+	// symmetrically here).
+	uint ready_bit = is_write ? SD_INT_SPACE_AVAIL : SD_INT_DATA_AVAIL;
 	int ready_wait = 0;
 	uint int_status = 0;
 	while (ready_wait < SD_SETUP_WAIT_MAX)
 	{
 		int_status = sd_reg_read(SD_INT_STATUS);
-		if ((int_status & (SD_INT_DATA_AVAIL | SD_INT_ERROR)) != 0) break;
+		if ((int_status & (ready_bit | SD_INT_ERROR)) != 0) break;
 		ready_wait++;
 	}
-	bool ready_ok = (int_status & SD_INT_DATA_AVAIL) != 0;
+	bool ready_ok = (int_status & ready_bit) != 0;
 	if (!ready_ok)
 	{
-		print("sdd: data-ready TIMED OUT after ");
+		print("sdd: ");
+		print(is_write ? "space" : "data");
+		print("-ready TIMED OUT after ");
 		print_hex32((uint)ready_wait);
 		print(" iters, int_status=");
 		print_hex32(int_status);
@@ -741,29 +745,27 @@ fn bool sdd_block_rw(char* data, uint sector, bool is_write)
 	}
 
 	// No print() calls, and no SD_INT_STATUS write, between here and the
-	// read loop below — deliberately. This is the actual fix, not a
-	// diagnostic. Root cause: the card's DAT lines start pushing data
-	// almost immediately after CMD17 is accepted, and this SDHCI clone's
-	// PIO FIFO is shallow enough that any delay here costs real, already-
-	// arrived words — a print() is many slow, one-character-at-a-time
-	// UART writes, easily enough to lose the first couple of words before
-	// the host ever looks. Confirmed by elimination, not guessed: several
-	// versions that only reordered/combined/dropped the INT_STATUS
-	// write(s) around this point produced a byte-for-byte IDENTICAL loss
-	// no matter what was tried, which ruled out register-write ordering
-	// entirely; moving every print() to after the read loop (this
-	// version) fixed it outright. See docs/devlog.md's FAT32 entry for
-	// the full elimination trail. Clearing SD_INT_DATA_AVAIL/
-	// SD_INT_RESPONSE isn't needed here either — draining SD_BUFFER
-	// itself de-asserts readiness on a real PIO FIFO, and the
-	// unconditional SD_INT_ALL_MASK clear below (after the whole block is
-	// read) covers cleanup.
-	//
-	// Always a read from here on — is_write already handled above.
+	// buffer loop below — deliberately, in both directions. This is the
+	// actual fix for a real, measured bug on the read side (see
+	// docs/devlog.md's FAT32 entry for the full elimination trail: the
+	// card's DAT lines start pushing/pulling data almost immediately
+	// after the command is accepted, and this SDHCI clone's PIO FIFO is
+	// shallow enough that any delay here — a print() is many slow, one-
+	// character-at-a-time UART writes — costs real data). Applied here
+	// symmetrically for writes on the same reasoning, not yet separately
+	// proven broken without it — there's no reason to believe this
+	// controller's write-side FIFO is less shallow than its read-side one.
 	uint* words = (uint*)data;
 	for (uint i = 0; i < SECTOR_SIZE / 4; i++)
 	{
-		words[i] = sd_reg_read(SD_BUFFER);
+		if (is_write)
+		{
+			sd_reg_write(SD_BUFFER, words[i]);
+		}
+		else
+		{
+			words[i] = sd_reg_read(SD_BUFFER);
+		}
 	}
 
 	int done_wait = 0;
@@ -774,10 +776,12 @@ fn bool sdd_block_rw(char* data, uint sector, bool is_write)
 		if ((status & (SD_INT_DATA_END | SD_INT_ERROR)) != 0) break;
 		done_wait++;
 	}
-	// All the CMD17/ready diagnostics deferred from earlier in this
-	// function (see its own header comment) — safe to print now, the
-	// whole block is already fully drained into `data`.
-	print("sdd: CMD17 ok resp0=");
+	// All the command/ready diagnostics deferred from earlier in this
+	// function (see this function's own header comment) — safe to print
+	// now, the whole block is already fully transferred.
+	print("sdd: CMD");
+	print_hex32(cmd_index);
+	print(" ok resp0=");
 	print_hex32(sd_response0);
 	print(" ready after ");
 	print_hex32((uint)ready_wait);
