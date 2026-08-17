@@ -4,6 +4,56 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-17 (6) — ext2 verified on real Duo hardware
+
+**Continuing from this same day's filesystem-abstraction entry.**
+`user/fs/ext2.c3` had only ever run on QEMU; this confirmed it on the
+real board. The catch: the Duo's only SD card is also what boots it —
+BootROM reads `fip.bin` directly off the FAT32 `DUOBOOT` partition (the
+whole session's own flashing workflow already proved this: mount FAT32,
+copy a file literally named `fip.bin` onto it, unmount, boot), so a
+card without that file findable on a FAT32 partition can't boot this
+board at all. Swapping in a second, dedicated SD card was ruled out for
+exactly that reason — the board only has one slot.
+
+**Repartitioned the boot card** instead: shrunk the FAT32 partition (a
+full reformat, not a resize — `fatresize` isn't installed, and shrinking
+only the MBR table entry without also shrinking the FAT32 filesystem's
+own internal structures would leave it believing it's larger than its
+new boundary, a real corruption risk; only 736K was actually in use, so
+reformat-and-restore was both simpler and safer) to 1GiB at its
+original start sector (2048, unchanged — so
+`board::FS_PARTITION_START_SECTOR` needed no permanent code change), and
+added a second 1GiB ext2 partition right after it. The user ran the
+actual `sfdisk`/`mkfs.vfat`/`mke2fs` commands (root-only, and this
+session's sandbox has no root at all — confirmed, `sudo` needs a
+password); everything else — restoring `fip.bin`/`hello.txt` onto the
+reformatted boot partition, seeding the ext2 partition via `debugfs -w`
+directly on the block device (the mounted ext2 filesystem itself is
+root-owned by default, unlike FAT's no-real-ownership model, so a
+regular mount + copy hit a permission error; writing straight to the
+device — the same approach already used for the QEMU test image —
+sidesteps that) — needed no elevated privileges.
+
+Temporarily pointed `board::FS_PARTITION_START_SECTOR` at the new ext2
+partition's start sector, rebuilt, reflashed `fip.bin` (still onto the
+FAT32 partition — that's what BootROM reads regardless of which
+partition `fsd` itself mounts), and confirmed on the real console:
+`fsd: ext2 mounted, block_size=4096 inode_table_block=67` (4096, not the
+1024 QEMU's smaller test image used — a genuinely different block size,
+still within `EXT2_MAX_BLOCK_SIZE`), and `readfile` returned the real,
+correct `Hello from ext2!` content. Reverted the constant back to
+`2048`, rebuilt, reflashed, and confirmed the board returned to its
+normal FAT32-mounted state — the same `Hello from disk!` content as
+always. The ext2 test partition is left in place on the card afterward,
+inert and harmless.
+
+**Files changed:** none permanently — `boards/duo/board.c3`'s
+`FS_PARTITION_START_SECTOR` edit was temporary and reverted to its
+committed value before this entry was written.
+
+---
+
 ## 2026-08-17 (5) — fsd: filesystem backend abstraction, plus a real ext2 read-only backend
 
 **Continuing from this same day's FAT32 write-support entry.** The ask:
