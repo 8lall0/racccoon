@@ -1,4 +1,4 @@
-module libc @if(env::CUSTOM_LIBC);
+module libc @feat(CUSTOM_LIBC);
 
 import sbi;
 

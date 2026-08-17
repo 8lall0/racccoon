@@ -1,4 +1,4 @@
-module io_native @if(env::CUSTOM_LIBC);
+module io_native @feat(CUSTOM_LIBC);
 import sbi;
 import std::io;
 

@@ -1,4 +1,4 @@
-module std::core::mem @if(env::CUSTOM_LIBC);
+module std::core::mem @feat(CUSTOM_LIBC);
 
 fn CInt __memcmp(void* s1, void* s2, usz n) @weak @export("memcmp")
 {

@@ -1,4 +1,4 @@
-module std::core::mem::allocator @if(env::CUSTOM_LIBC);
+module std::core::mem::allocator @feat(CUSTOM_LIBC);
 import std::math, libc, std::bits;
 import std::core::mem;
 import std::core::env;

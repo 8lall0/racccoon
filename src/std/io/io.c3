@@ -1,4 +1,4 @@
-module std::io @if(env::CUSTOM_LIBC);
+module std::io @feat(CUSTOM_LIBC);
 import libc;
 
 fn bool File.isatty(File* self)
