@@ -4,6 +4,78 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-17 (5) — fsd: filesystem backend abstraction, plus a real ext2 read-only backend
+
+**Continuing from this same day's FAT32 write-support entry.** The ask:
+real ext2 support, with "a good file structure, interface and
+abstraction" prepared first — `fsd` only ever spoke one on-disk format,
+and `user/fsd.c3` mixed the IPC/wire protocol, the filesystem-agnostic
+sector-I/O + write-protection machinery, and FAT32-specific structure
+parsing all in one file. Adding ext2 the way FAT32 was added would have
+either duplicated the generic parts or tangled two unrelated formats
+together.
+
+**Split into three files**, all still `module user;` (matching every
+other user-mode file — `c3c compile-only` already takes an explicit
+source-file list per binary, so this needed no new build machinery,
+just adding files to `scripts/build_user.sh`'s existing `fsd` line):
+`user/fsd.c3` (generic core — IPC loop, sector I/O, write protection,
+mount-time backend dispatch), `user/fs/fat32.c3` (the existing FAT32
+logic, moved and renamed to a consistent interface —
+`fat32_probe`/`fat32_mount`/`fat32_read`/`fat32_write`/
+`fat32_reserve_protected` — otherwise unchanged), `user/fs/ext2.c3`
+(new). No function-pointer/vtable dispatch — checked this codebase for
+precedent first (structs here are plain data: `Process`/`Mount` in
+`src/process.c3`, `@packed` wire layouts like `Virtio_blk_req`) and
+found none, so `fsd.c3` just holds an `fs_type` global and dispatches
+through a couple of `if`s.
+
+**Write protection generalized** from FAT32-specific clusters to plain
+absolute sector ranges (`fs_reserve_sector_range()`/
+`fs_sector_is_reserved()`, replacing the old cluster-number allowlist) —
+each backend now computes its own protected file's ranges in whatever
+unit is natural to it and hands `fsd.c3` sector numbers; `fsd.c3` itself
+never needs to know what a "cluster" or "block" is. The exact-entry
+protected-slot check was already sector+offset based, so it moved over
+unchanged, just via a new `fs_set_protected_entry()` setter instead of
+backends touching `fsd.c3`'s globals directly.
+
+**ext2 backend, read-only, root directory only** (matching FAT32's own
+first pass): superblock at the fixed byte offset 1024 (magic `0xEF53`),
+block group 0's descriptor for the inode table location, direct block
+pointers only (`i_block[0..11]` — no indirect blocks in this pass), and
+variable-length directory-entry records (unlike FAT32's fixed 32-byte
+entries, ext2 names aren't padded/fixed-width, so no 8.3-style
+conversion is needed at all — matching by exact length + bytes instead).
+Probed first in `fs_mount()`'s dispatch, ahead of FAT32: its magic is a
+specific 16-bit value at a fixed offset, a much more unambiguous
+signal than FAT32's `0xAA55` (shared with plain MBRs and every other
+x86-bootable format).
+
+**Verified on QEMU**: the full existing regression suite
+(`readfile`/`writefile`/`newfile`/`protectedwrite`/`hello`/`ping`/
+`p9test`/`nstest`/`rforktest`/`sandboxtest`/`racetest`) against the
+refactored FAT32 path — byte-for-byte identical output to before the
+split. A new, additional test image (`build/disk_ext2.img`, built via
+`mke2fs`/seeded via `debugfs -w` — no root needed, same spirit as how
+`mtools` seeded the FAT32 image) and `scripts/launch64_ext2.sh` (a
+near-duplicate of `launch64.sh` pointing at the ext2 image instead)
+confirm `ext2_probe()` picks the right backend and `readfile` returns
+the real, correct content of a file seeded directly into the ext2 image.
+Also confirmed the Duo cross-build (`build_duo.sh`/`build_duo_fip.sh`)
+compiles cleanly against the new multi-file layout — **not yet flashed
+or verified on real hardware**, since that needs someone physically
+power-cycling the board and reading back the console.
+
+**Files changed:** `user/fsd.c3` (rewritten as the generic core),
+`user/fs/fat32.c3` (new — moved from the old `fsd.c3`),
+`user/fs/ext2.c3` (new), `scripts/build_user.sh` (new source files for
+the `fsd` binary), `scripts/build.sh` (additional `disk_ext2.img` build
+step), `scripts/launch64_ext2.sh` (new), `disk-ext2/hello.txt` (new
+ext2 test-image seed file).
+
+---
+
 ## 2026-08-17 (4) — fsd: full FAT32 write support, structurally blocked from ever touching fip.bin
 
 **Continuing from this same day's read-only FAT32 entry.** The ask:

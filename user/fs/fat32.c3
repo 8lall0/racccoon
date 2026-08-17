@@ -1,0 +1,583 @@
+module user;
+
+// FAT32 backend for fsd (see user/fsd.c3's own header comment for the
+// generic core / backend split). Standard, stable public spec — offsets
+// below are the well-known FAT32 layout (same one Linux's fs/fat and
+// every other FAT32 reader implements), not vendor-specific or
+// reverse-engineered the way this project's SDHCI register maps were.
+//
+// v1 scope, deliberately limited: root directory only (fsd had no
+// subdirectory concept before this either — not a regression), 8.3
+// short filenames only (long filename / LFN directory entries are
+// skipped, not parsed), no caching — every call walks the root
+// directory fresh and follows the matched file's cluster chain on
+// demand, since there's no reasonable fixed-size cache for "however
+// many files happen to be on someone's real SD card."
+//
+// Write support (create, overwrite, grow — see fat32_write()) started
+// read-only-only and was extended deliberately — see user/fsd.c3's own
+// header comment for the full write-protection rationale (the reserved-
+// sector-range allowlist and exact protected-entry check this backend
+// populates but doesn't enforce itself; enforcement lives in fsd.c3's
+// diskd_rw(), the one function every write here funnels through via
+// fs_write_sector()).
+
+// BPB (BIOS Parameter Block) field offsets within the boot sector
+// (sector 0 of the partition).
+const uint BPB_BYTES_PER_SECTOR    = 0x0B; // u16
+const uint BPB_SECTORS_PER_CLUSTER = 0x0D; // u8
+const uint BPB_RESERVED_SECTORS    = 0x0E; // u16
+const uint BPB_NUM_FATS            = 0x10; // u8
+const uint BPB_TOTAL_SECTORS_32    = 0x20; // u32, the only valid total-volume-size field in FAT32 (the u16 field @0x13 is always 0)
+const uint BPB_FAT_SIZE_32         = 0x24; // u32, sectors per FAT
+const uint BPB_ROOT_CLUSTER        = 0x2C; // u32
+const uint BPB_SIGNATURE_OFFSET    = 0x1FE; // u16, must be 0xAA55 (little-endian 0x55,0xAA)
+
+// Directory entry (32 bytes) field offsets.
+const uint DIRENT_SIZE           = 32;
+const uint DIRENT_NAME           = 0x00; // 11 bytes, 8.3 short name, space-padded, uppercase
+const uint DIRENT_ATTR           = 0x0B; // u8
+const uint DIRENT_CLUSTER_HI     = 0x14; // u16
+const uint DIRENT_CLUSTER_LO     = 0x1A; // u16
+const uint DIRENT_FILE_SIZE      = 0x1C; // u32
+
+const char DIRENT_FREE_REST   = (char)0x00; // this entry and all following are unused
+const char DIRENT_DELETED     = (char)0xE5; // this entry is deleted, keep scanning
+const char DIRENT_ATTR_LFN    = (char)0x0F; // long-filename entry, not a real file — skip
+const char DIRENT_ATTR_VOLUME = (char)0x08; // volume label bit — skip, never a real file
+
+const uint FAT_ENTRY_MASK = 0x0FFFFFFF; // low 28 bits significant
+const uint FAT_EOC_MIN    = 0x0FFFFFF8; // cluster values at or above this mean end-of-chain
+
+// Derived layout, computed once by fat32_mount() and cached — cheap,
+// board-static-ish facts about the volume, unlike per-file data (which
+// is deliberately never cached — see this file's header comment).
+uint fs_fat_start_sector;
+uint fs_data_start_sector;
+uint fs_sectors_per_cluster;
+uint fs_root_cluster;
+uint fs_num_fats;      // needed by the write path to mirror every FAT update across all copies
+uint fs_fat_size_32;   // sectors per FAT copy — same
+uint fs_total_clusters; // upper bound for fat32_alloc_cluster()'s scan
+
+fn bool fat32_probe()
+{
+	char[SECTOR_SIZE] boot_sector @noinit;
+	if (!fs_read_sector(0, &boot_sector)) return false;
+	ushort* sig = (ushort*)&boot_sector[BPB_SIGNATURE_OFFSET];
+	return *sig == 0xAA55;
+}
+
+fn uint cluster_to_sector(uint cluster)
+{
+	return fs_data_start_sector + (cluster - 2) * fs_sectors_per_cluster;
+}
+
+// Reads one 4-byte little-endian FAT entry and returns its low 28 bits —
+// the next cluster in the chain (or a value >= FAT_EOC_MIN at the end).
+// A read failure is treated as end-of-chain rather than propagated: this
+// is a best-effort reader, not a filesystem that needs to distinguish
+// "corrupt" from "empty" for correctness anywhere it's used.
+fn uint fat_next_cluster(uint cluster)
+{
+	uint fat_byte_offset = cluster * 4;
+	uint fat_sector = fs_fat_start_sector + (fat_byte_offset / SECTOR_SIZE);
+	uint entry_offset = fat_byte_offset % SECTOR_SIZE;
+
+	char[SECTOR_SIZE] sector_buf @noinit;
+	if (!fs_read_sector(fat_sector, &sector_buf)) return FAT_EOC_MIN;
+
+	uint* entry = (uint*)&sector_buf[entry_offset];
+	return *entry & FAT_ENTRY_MASK;
+}
+
+// Converts a plain, null-terminated, lowercase-or-mixed-case filename
+// like "hello.txt" into raw 8.3 short-name form: 11 bytes, space-padded,
+// uppercase, no dot — "HELLO   TXT" — ready to compare byte-for-byte
+// against a directory entry's own DIRENT_NAME field (already stored in
+// exactly this form on disk). Truncates silently past 8 name / 3
+// extension characters — no long-filename support in v1 (see this
+// file's header comment).
+fn void name_to_8_3(char* input, char* out11)
+{
+	for (int i = 0; i < 11; i++) out11[i] = ' ';
+
+	int i = 0;
+	int out_i = 0;
+	while (input[i] != 0 && input[i] != '.' && out_i < 8)
+	{
+		char c = input[i];
+		if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+		out11[out_i] = c;
+		out_i++;
+		i++;
+	}
+	while (input[i] != 0 && input[i] != '.') i++;
+	if (input[i] == '.') i++;
+
+	int ext_i = 8;
+	while (input[i] != 0 && ext_i < 11)
+	{
+		char c = input[i];
+		if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+		out11[ext_i] = c;
+		ext_i++;
+		i++;
+	}
+}
+
+// Walks the root directory's own cluster chain looking for a name11
+// (already in raw 8.3 form — see name_to_8_3) match. Returns true and
+// fills *out_cluster/*out_size/*out_entry_sector/*out_entry_offset on a
+// hit — the latter two (the entry's own location, not the file's data)
+// are needed by the write path (updating file_size in place) and by
+// fat32_reserve_protected() (protecting the entry itself, not just the
+// file's data clusters); the read path just ignores them.
+fn bool fat32_find_in_root(char* name11, uint* out_cluster, uint* out_size, uint* out_entry_sector, uint* out_entry_offset)
+{
+	uint cluster = fs_root_cluster;
+	char[SECTOR_SIZE] sector_buf @noinit;
+
+	while (cluster != 0 && cluster < FAT_EOC_MIN)
+	{
+		uint sector = cluster_to_sector(cluster);
+		for (uint s = 0; s < fs_sectors_per_cluster; s++)
+		{
+			if (!fs_read_sector(sector + s, &sector_buf)) return false;
+
+			for (uint e = 0; e < SECTOR_SIZE / DIRENT_SIZE; e++)
+			{
+				char* entry = &sector_buf[e * DIRENT_SIZE];
+				if (entry[0] == DIRENT_FREE_REST) return false; // end of directory
+				if (entry[0] == DIRENT_DELETED) continue;
+
+				char attr = entry[DIRENT_ATTR];
+				if (attr == DIRENT_ATTR_LFN) continue;
+				if ((attr & DIRENT_ATTR_VOLUME) != 0) continue;
+
+				bool match = true;
+				for (uint k = 0; k < 11; k++)
+				{
+					if (entry[DIRENT_NAME + k] != name11[k])
+					{
+						match = false;
+						break;
+					}
+				}
+				if (!match) continue;
+
+				ushort* cluster_hi = (ushort*)&entry[DIRENT_CLUSTER_HI];
+				ushort* cluster_lo = (ushort*)&entry[DIRENT_CLUSTER_LO];
+				uint*   size_field = (uint*)&entry[DIRENT_FILE_SIZE];
+				*out_cluster = ((uint)*cluster_hi << 16) | (uint)*cluster_lo;
+				*out_size    = *size_field;
+				*out_entry_sector = sector + s;
+				*out_entry_offset = e * DIRENT_SIZE;
+				return true;
+			}
+		}
+		cluster = fat_next_cluster(cluster);
+	}
+	return false;
+}
+
+// Follows first_cluster's chain, copying up to `len` bytes (already
+// clamped by the caller against the file's real size) into dst starting
+// from the beginning of the file. Returns the number of bytes actually
+// copied — normally equal to len, but can come up short (rather than
+// leave dst partially uninitialized) if the chain turns out shorter than
+// the directory entry's own size field claimed.
+fn uint fat32_read_file(uint first_cluster, char* dst, uint len)
+{
+	uint cluster = first_cluster;
+	uint bytes_read = 0;
+	char[SECTOR_SIZE] sector_buf @noinit;
+
+	while (cluster != 0 && cluster < FAT_EOC_MIN && bytes_read < len)
+	{
+		uint sector = cluster_to_sector(cluster);
+		for (uint s = 0; s < fs_sectors_per_cluster && bytes_read < len; s++)
+		{
+			if (!fs_read_sector(sector + s, &sector_buf)) return bytes_read;
+
+			uint chunk = len - bytes_read;
+			if (chunk > SECTOR_SIZE) chunk = SECTOR_SIZE;
+			for (uint i = 0; i < chunk; i++)
+			{
+				dst[bytes_read + i] = sector_buf[i];
+			}
+			bytes_read += chunk;
+		}
+		cluster = fat_next_cluster(cluster);
+	}
+	return bytes_read;
+}
+
+// Entry point dispatched from fsd.c3's main() for FS_READ. `name` is a
+// plain, null-terminated filename — 8.3 conversion happens here, not in
+// the caller. Returns -1 if not found, else bytes actually read
+// (already clamped to the file's real size).
+fn int fat32_read(char* name, char* dst, uint len)
+{
+	char[11] name11 @noinit;
+	name_to_8_3(name, &name11);
+
+	uint first_cluster;
+	uint file_size;
+	uint entry_sector;
+	uint entry_offset;
+	if (!fat32_find_in_root(&name11, &first_cluster, &file_size, &entry_sector, &entry_offset))
+	{
+		return -1;
+	}
+
+	uint read_len = len;
+	if (read_len > file_size) read_len = file_size;
+
+	return (int)fat32_read_file(first_cluster, dst, read_len);
+}
+
+// --- Write path -------------------------------------------------------
+
+// Writes one 4-byte little-endian FAT entry (low 28 bits of `value`,
+// preserving whatever's in the top 4 reserved bits) to EVERY FAT copy
+// (fs_num_fats of them, each fs_fat_size_32 sectors apart) — a real
+// FAT32 reader is free to trust either copy, so leaving them out of sync
+// is a real, if usually low-severity, corruption. Read-modify-write per
+// copy since sectors are the smallest unit fs_write_sector can touch.
+fn bool fat32_write_fat_entry(uint cluster, uint value)
+{
+	uint fat_byte_offset = cluster * 4;
+	uint fat_sector_rel = fat_byte_offset / SECTOR_SIZE;
+	uint entry_offset = fat_byte_offset % SECTOR_SIZE;
+
+	for (uint copy = 0; copy < fs_num_fats; copy++)
+	{
+		uint fat_sector = fs_fat_start_sector + copy * fs_fat_size_32 + fat_sector_rel;
+		char[SECTOR_SIZE] sector_buf @noinit;
+		if (!fs_read_sector(fat_sector, &sector_buf)) return false;
+		uint* entry = (uint*)&sector_buf[entry_offset];
+		*entry = (*entry & ~FAT_ENTRY_MASK) | (value & FAT_ENTRY_MASK);
+		if (!fs_write_sector(fat_sector, &sector_buf)) return false;
+	}
+	return true;
+}
+
+// Looks up a protected file (plain name, e.g. "fip.bin" — 8.3 conversion
+// happens here) and: records its directory entry's exact (sector,
+// offset) via fs_set_protected_entry() — see that function's own
+// comment in fsd.c3 for why that's checked separately rather than
+// folded into the range allowlist — and reserves every cluster in its
+// DATA chain at the coarser, range-granular level (safe there: unlike
+// the shared root directory, one cluster only ever belongs to one
+// file's data). A file that isn't found (QEMU's disposable test image
+// has no fip.bin) is simply nothing to protect — logged so it's
+// visible, not silently skipped.
+fn void fat32_reserve_protected(char* name)
+{
+	char[11] name11 @noinit;
+	name_to_8_3(name, &name11);
+
+	uint cluster;
+	uint size;
+	uint entry_sector;
+	uint entry_offset;
+	if (!fat32_find_in_root(&name11, &cluster, &size, &entry_sector, &entry_offset))
+	{
+		print("fsd: protected file not found, nothing to reserve for it\n");
+		return;
+	}
+
+	fs_set_protected_entry(entry_sector, entry_offset);
+
+	while (cluster != 0 && cluster < FAT_EOC_MIN)
+	{
+		if (!fs_reserve_sector_range(cluster_to_sector(cluster), fs_sectors_per_cluster)) return;
+		cluster = fat_next_cluster(cluster);
+	}
+}
+
+// Linear scan for a free (FAT entry == 0) cluster, starting at 2 (the
+// first real cluster number). Marks it FAT_EOC_MIN in every FAT copy
+// immediately, before returning it, closing the window where a second
+// allocation later in the same request could pick the same cluster
+// twice. Returns 0 (never a valid cluster number) on "no free space" or
+// any read failure along the way. Doesn't separately skip reserved
+// clusters here: a correctly maintained FAT never marks a reserved
+// cluster free, and fs_write_sector's own reserved-sector check (via
+// fat32_write_fat_entry below) would refuse the marking write anyway if
+// it somehow did — the allowlist's enforcement point is deliberately
+// singular (see fsd.c3's header comment), not duplicated per caller.
+fn uint fat32_alloc_cluster()
+{
+	for (uint cluster = 2; cluster < fs_total_clusters + 2; cluster++)
+	{
+		if (fat_next_cluster(cluster) == 0)
+		{
+			if (!fat32_write_fat_entry(cluster, FAT_EOC_MIN)) return 0;
+			return cluster;
+		}
+	}
+	return 0;
+}
+
+// Walks the root directory looking for a reusable entry slot (first byte
+// 0x00 "free, and everything after" or 0xE5 "deleted"). Always fills
+// *out_last_cluster with the final cluster of the root chain as it
+// walks — needed by the caller to extend the chain if no free slot
+// turns up, and harmless to compute even when one is found. Returns
+// false (chain needs extending) only after scanning the whole chain
+// without finding a slot.
+fn bool fat32_find_free_dirent(uint* out_entry_sector, uint* out_entry_offset, uint* out_last_cluster)
+{
+	uint cluster = fs_root_cluster;
+	char[SECTOR_SIZE] sector_buf @noinit;
+
+	while (cluster != 0 && cluster < FAT_EOC_MIN)
+	{
+		*out_last_cluster = cluster;
+		uint sector = cluster_to_sector(cluster);
+		for (uint s = 0; s < fs_sectors_per_cluster; s++)
+		{
+			if (!fs_read_sector(sector + s, &sector_buf)) return false;
+
+			for (uint e = 0; e < SECTOR_SIZE / DIRENT_SIZE; e++)
+			{
+				char* entry = &sector_buf[e * DIRENT_SIZE];
+				if (entry[0] == DIRENT_FREE_REST || entry[0] == DIRENT_DELETED)
+				{
+					*out_entry_sector = sector + s;
+					*out_entry_offset = e * DIRENT_SIZE;
+					return true;
+				}
+			}
+		}
+		cluster = fat_next_cluster(cluster);
+	}
+	return false;
+}
+
+// Creates a new, empty (zero-size) directory entry for name11 and
+// allocates its first data cluster. Extends the root directory's own
+// chain with a freshly zero-filled cluster if it has no free slot — a
+// directory cluster's bytes are always interpreted as entries (unlike
+// file data past the declared size, which is never exposed to a
+// reader), so unlike fat32_write_file below, this really does need
+// zero-filling for correctness, not just tidiness.
+fn bool fat32_create_file(char* name11, uint* out_first_cluster)
+{
+	uint first_cluster = fat32_alloc_cluster();
+	if (first_cluster == 0) return false;
+
+	uint entry_sector;
+	uint entry_offset;
+	uint last_dir_cluster;
+	if (!fat32_find_free_dirent(&entry_sector, &entry_offset, &last_dir_cluster))
+	{
+		uint new_dir_cluster = fat32_alloc_cluster();
+		if (new_dir_cluster == 0) return false;
+
+		char[SECTOR_SIZE] zero_buf @noinit;
+		for (uint i = 0; i < SECTOR_SIZE; i++) zero_buf[i] = 0;
+		for (uint s = 0; s < fs_sectors_per_cluster; s++)
+		{
+			if (!fs_write_sector(cluster_to_sector(new_dir_cluster) + s, &zero_buf)) return false;
+		}
+
+		if (!fat32_write_fat_entry(last_dir_cluster, new_dir_cluster)) return false;
+		if (!fat32_write_fat_entry(new_dir_cluster, FAT_EOC_MIN)) return false;
+
+		entry_sector = cluster_to_sector(new_dir_cluster);
+		entry_offset = 0;
+	}
+
+	// Defense in depth — see fs_is_protected_entry's own comment in
+	// fsd.c3. Structurally unreachable in practice: fat32_find_free_dirent
+	// only ever returns a free/deleted slot, and a protected file's real
+	// entry is neither, so this would require a bug in that scan to ever
+	// fire.
+	if (fs_is_protected_entry(entry_sector, entry_offset)) return false;
+
+	char[SECTOR_SIZE] sector_buf @noinit;
+	if (!fs_read_sector(entry_sector, &sector_buf)) return false;
+
+	char* entry = &sector_buf[entry_offset];
+	for (uint i = 0; i < 11; i++) entry[DIRENT_NAME + i] = name11[i];
+	entry[DIRENT_ATTR] = (char)0x20; // ARCHIVE — an ordinary file
+	// Reserved/create-time/create-date/last-access-date fields (bytes
+	// 0x0C-0x13, between ATTR and cluster-hi) — zeroed explicitly rather
+	// than left as whatever a reused 0xE5 (deleted) slot's old file had
+	// in them. Every FAT32 reader tolerates an all-zero date (shows as
+	// 1980-01-01), so this is a real correctness cleanup, not required
+	// for safety.
+	for (uint i = 0x0C; i < 0x14; i++) entry[i] = 0;
+	ushort* cluster_hi = (ushort*)&entry[DIRENT_CLUSTER_HI];
+	ushort* cluster_lo = (ushort*)&entry[DIRENT_CLUSTER_LO];
+	uint*   size_field  = (uint*)&entry[DIRENT_FILE_SIZE];
+	*cluster_hi = (ushort)(first_cluster >> 16);
+	*cluster_lo = (ushort)(first_cluster & 0xFFFF);
+	*size_field = 0;
+
+	if (!fs_write_sector(entry_sector, &sector_buf)) return false;
+
+	*out_first_cluster = first_cluster;
+	return true;
+}
+
+// Writes `len` bytes from `src` into first_cluster's chain, starting
+// from the beginning of the file, extending the chain (allocating new
+// clusters, one at a time, as needed) if `len` needs more space than the
+// chain currently has. Returns the number of bytes actually written —
+// short only on a genuine failure (out of space, a reserved-sector
+// refusal, an I/O error) partway through, in which case the file is left
+// with whatever prefix did get written; the caller updates the
+// directory entry's size field to match what actually happened, not
+// what was requested (see fat32_write()).
+fn uint fat32_write_file(uint first_cluster, char* src, uint len)
+{
+	uint cluster = first_cluster;
+	uint bytes_written = 0;
+	char[SECTOR_SIZE] sector_buf @noinit;
+
+	while (bytes_written < len)
+	{
+		uint sector = cluster_to_sector(cluster);
+		for (uint s = 0; s < fs_sectors_per_cluster && bytes_written < len; s++)
+		{
+			uint chunk = len - bytes_written;
+			if (chunk > SECTOR_SIZE) chunk = SECTOR_SIZE;
+			// Partial-sector write: read the real, existing content
+			// first so bytes beyond `chunk` in this sector (if any)
+			// keep their current on-disk value instead of being
+			// clobbered — matches fat32_read_file's own read-what's-
+			// really-there discipline.
+			if (chunk < SECTOR_SIZE)
+			{
+				if (!fs_read_sector(sector + s, &sector_buf)) return bytes_written;
+			}
+			for (uint i = 0; i < chunk; i++)
+			{
+				sector_buf[i] = src[bytes_written + i];
+			}
+			if (!fs_write_sector(sector + s, &sector_buf)) return bytes_written;
+			bytes_written += chunk;
+		}
+
+		if (bytes_written >= len) break;
+
+		uint next = fat_next_cluster(cluster);
+		if (next >= FAT_EOC_MIN)
+		{
+			next = fat32_alloc_cluster();
+			if (next == 0) return bytes_written;
+			if (!fat32_write_fat_entry(cluster, next)) return bytes_written;
+			if (!fat32_write_fat_entry(next, FAT_EOC_MIN)) return bytes_written;
+		}
+		cluster = next;
+	}
+	return bytes_written;
+}
+
+fn bool fat32_update_entry_size(uint entry_sector, uint entry_offset, uint new_size)
+{
+	// Real backstop here, unlike fat32_create_file's — fsd.c3's
+	// fs_is_protected_name() already rejects the literal protected name
+	// before this backend is ever called for a write, but this check
+	// doesn't depend on that string comparison staying correct or every
+	// future caller remembering to check it first.
+	if (fs_is_protected_entry(entry_sector, entry_offset)) return false;
+
+	char[SECTOR_SIZE] sector_buf @noinit;
+	if (!fs_read_sector(entry_sector, &sector_buf)) return false;
+	uint* size_field = (uint*)&sector_buf[entry_offset + DIRENT_FILE_SIZE];
+	*size_field = new_size;
+	return fs_write_sector(entry_sector, &sector_buf);
+}
+
+// Entry point dispatched from fsd.c3's main() for FS_WRITE — only ever
+// called once fsd.c3's own fs_is_protected_name() check has already
+// passed, so no protected-name check here; fs_write_disabled and the
+// reserved-sector-range check are enforced even lower, in fs_write_sector
+// (via diskd_rw), so not duplicated here either. `name` is a plain,
+// null-terminated filename — 8.3 conversion happens here. Creates the
+// file if it doesn't exist yet, writes the data (extending its chain as
+// needed), then re-locates its directory entry to update the size field
+// — done as a fresh lookup rather than threading the entry's location
+// through the create-vs-overwrite paths separately, simpler and more
+// robust.
+fn int fat32_write(char* name, char* src, uint len)
+{
+	char[11] name11 @noinit;
+	name_to_8_3(name, &name11);
+
+	uint cluster;
+	uint size;
+	uint entry_sector;
+	uint entry_offset;
+	bool exists = fat32_find_in_root(&name11, &cluster, &size, &entry_sector, &entry_offset);
+
+	if (!exists)
+	{
+		if (!fat32_create_file(&name11, &cluster)) return -1;
+	}
+
+	uint written = fat32_write_file(cluster, src, len);
+
+	uint final_cluster;
+	uint final_size;
+	if (!fat32_find_in_root(&name11, &final_cluster, &final_size, &entry_sector, &entry_offset))
+	{
+		return -1; // should be unreachable — don't claim success if it is
+	}
+	if (!fat32_update_entry_size(entry_sector, entry_offset, written)) return -1;
+
+	return (int)written;
+}
+
+fn void fat32_mount()
+{
+	char[SECTOR_SIZE] boot_sector @noinit;
+	if (!fs_read_sector(0, &boot_sector))
+	{
+		fs_panic("failed to read boot sector");
+	}
+
+	// Signature already confirmed by fat32_probe() (fs_mount() only
+	// calls this after that returned true) — not re-checked here.
+
+	ushort* bytes_per_sector = (ushort*)&boot_sector[BPB_BYTES_PER_SECTOR];
+	if (*bytes_per_sector != SECTOR_SIZE)
+	{
+		// Every other part of this project assumes 512-byte sectors —
+		// panic clearly rather than silently mishandle a nonstandard one.
+		fs_panic("FAT32 volume doesn't use 512-byte sectors");
+	}
+
+	char   sectors_per_cluster = boot_sector[BPB_SECTORS_PER_CLUSTER];
+	ushort* reserved_sectors   = (ushort*)&boot_sector[BPB_RESERVED_SECTORS];
+	char   num_fats            = boot_sector[BPB_NUM_FATS];
+	uint*  fat_size_32         = (uint*)&boot_sector[BPB_FAT_SIZE_32];
+	uint*  root_cluster        = (uint*)&boot_sector[BPB_ROOT_CLUSTER];
+	uint*  total_sectors_32    = (uint*)&boot_sector[BPB_TOTAL_SECTORS_32];
+
+	// `& 0xFF` rather than a straight (uint) cast: char's signedness in
+	// this dialect isn't relied on elsewhere in this codebase, and
+	// masking gives the correct unsigned byte value either way — a
+	// signed char holding the bit pattern for 255 would otherwise
+	// sign-extend to 0xFFFFFFFF on a plain widening cast.
+	fs_sectors_per_cluster = (uint)sectors_per_cluster & 0xFF;
+	fs_fat_start_sector    = (uint)*reserved_sectors;
+	fs_num_fats            = (uint)num_fats & 0xFF;
+	fs_fat_size_32         = *fat_size_32;
+	fs_data_start_sector   = fs_fat_start_sector + fs_num_fats * fs_fat_size_32;
+	fs_root_cluster        = *root_cluster;
+	fs_total_clusters      = (*total_sectors_32 - fs_data_start_sector) / fs_sectors_per_cluster;
+
+	print("fsd: FAT32 mounted, partition_start=");
+	print_uint(fs_partition_start);
+	print(" root_cluster=");
+	print_uint(fs_root_cluster);
+	print(" sectors_per_cluster=");
+	print_uint(fs_sectors_per_cluster);
+	print("\n");
+}

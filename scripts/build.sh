@@ -25,6 +25,24 @@ LLC=${LLC:-llc}
   mkfs.vfat -F 32 build/disk.img > /dev/null
   mcopy -i build/disk.img disk/*.txt ::
 
+  echo "==> Building disk image (ext2, for scripts/launch64_ext2.sh)..."
+  # Additional, not a replacement — build/disk.img (FAT32) above stays
+  # the default image every other script/test uses. This one exists
+  # purely to exercise user/fs/ext2.c3 on QEMU (see docs/devlog.md's
+  # filesystem-abstraction entry): a whole-disk ext2 volume (no MBR,
+  # same reasoning as the FAT32 image above), seeded via `debugfs -w`
+  # (part of e2fsprogs) rather than a loop-mount, so this needs no root
+  # either. `-b 1024` keeps the block size comfortably under
+  # user/fs/ext2.c3's own EXT2_MAX_BLOCK_SIZE — not required for
+  # correctness on a small image (mke2fs would pick 1024 by default
+  # here anyway), just explicit. Reuses the name "hello.txt" (with
+  # distinct content from disk/hello.txt) so the shell's existing
+  # readfile command exercises either filesystem unchanged.
+  rm -f build/disk_ext2.img
+  dd if=/dev/zero of=build/disk_ext2.img bs=1M count=16 status=none
+  mke2fs -q -F -b 1024 build/disk_ext2.img
+  debugfs -w -R "write disk-ext2/hello.txt hello.txt" build/disk_ext2.img > /dev/null
+
   echo "==> Compiling kernel to LLVM IR..."
   rm -rf build/obj build/llvm build/obj_medany build/kernel.*
   c3c build racccoon --no-entry --safe=no --riscv-cpu=rvimac --emit-llvm
