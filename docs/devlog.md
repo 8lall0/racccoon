@@ -4,6 +4,46 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-19 (3) — ext2 free-count bookkeeping: not just cosmetic after all
+
+`user/fs/ext2.c3`'s own header comment had accepted, since the original
+write-support work, that `s_free_blocks_count`/`s_free_inodes_count`
+(and their group-0 `bg_free_*` copies) going stale after a write was a
+harmless, e2fsck-only cosmetic gap. Trying to `mkdir` a test directory
+on the real card's `EXT2TEST` partition (to test write-into-
+subdirectory on real hardware) showed that's wrong: Linux's own ext2
+driver checks this at *mount* time and, seeing the volume "has errors"
+(the exact same mismatch `e2fsck` flags), auto-remounts it read-only
+(`errors=remount-ro`) — a real, practical consequence blocking any
+further write access from the Linux side after a single kernel-driven
+write, not just a dry-run complaint.
+
+**Fix**: `ext2_alloc_block()`/`ext2_alloc_inode()` now each call a new
+`ext2_dec_free_blocks()`/`ext2_dec_free_inodes()` right after
+successfully marking their own bitmap bit — decrements both the
+superblock's copy (fixed sector 2, alongside every other superblock
+field this driver already reads) and group 0's own copy in the block
+group descriptor (same block `ext2_mount()` already reads at
+`ext2_first_data_block + 1`). No corresponding increment path exists
+because there's no delete/unlink in this driver at all (v1 scope) —
+allocation is the only direction free counts ever need to move.
+
+**Verified**: `e2fsck -n -f` on a fresh `disk_ext2.img` after
+`writefile`+`newfile` (2 new allocations) came back completely clean —
+no errors of *any* kind, not even the previously-accepted mismatch.
+Repeated with `newsubfile`/`newsubfile2`/`newfile2` together on
+`disk_dual.img`'s ext2 half (4 allocations across two directories):
+same, fully clean result. Full regression suite unaffected, `racetest`
+still `a=1 b=1`.
+
+**Files changed:** `user/fs/ext2.c3` (`EXT2_SB_FREE_BLOCKS_COUNT`/
+`EXT2_SB_FREE_INODES_COUNT`/`EXT2_BGD_FREE_BLOCKS_COUNT`/
+`EXT2_BGD_FREE_INODES_COUNT` offsets, `ext2_dec_free_blocks`/
+`ext2_dec_free_inodes`, wired into `ext2_alloc_block`/
+`ext2_alloc_inode`; removed the now-inaccurate "accepted gap" comment).
+
+---
+
 ## 2026-08-19 (2) — Write-into-subdirectory support for both fsd backends
 
 The deliberately-deferred half of subdirectory support (see the

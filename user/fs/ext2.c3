@@ -35,12 +35,6 @@ module user;
 // fixed-size, pre-allocated table — FAT32 has no equivalent; creating a
 // file there only ever needed a free cluster + a free directory slot).
 // v1 write scope, explicit:
-//   - Free-space bookkeeping (bg_free_blocks_count/bg_free_inodes_count
-//     in the block group descriptor, the matching s_free_* superblock
-//     fields) is NOT maintained — a real e2fsck would flag the mismatch
-//     and offer to fix it, but nothing about it corrupts data or blocks
-//     a real ext2 driver from reading the volume correctly. Accepted,
-//     documented gap, not solved here.
 //   - Creating a file always appends a fresh directory block containing
 //     just that one entry, rather than splitting an existing entry's
 //     trailing rec_len (a common real ext2 allocator technique) — a
@@ -55,21 +49,34 @@ module user;
 // start regardless of block size — sector 2 for this project's fixed
 // 512-byte sectors (byte 1024 = sector 2 * 512). Field offsets below are
 // relative to the superblock's own start (i.e. byte 1024 + offset).
-const uint EXT2_SUPERBLOCK_SECTOR   = 2;
-const uint EXT2_SB_LOG_BLOCK_SIZE   = 24; // u32
-const uint EXT2_SB_BLOCKS_PER_GROUP = 32; // u32
-const uint EXT2_SB_INODES_PER_GROUP = 40; // u32
-const uint EXT2_SB_FIRST_DATA_BLOCK = 20; // u32
-const uint EXT2_SB_MAGIC            = 56; // u16, must be 0xEF53
-const uint EXT2_SB_REV_LEVEL        = 76; // u32, 0 = original (fixed 128-byte inodes), >=1 = dynamic
-const uint EXT2_SB_INODE_SIZE       = 88; // u16, only meaningful if rev_level >= 1
+const uint EXT2_SUPERBLOCK_SECTOR    = 2;
+const uint EXT2_SB_LOG_BLOCK_SIZE    = 24; // u32
+const uint EXT2_SB_BLOCKS_PER_GROUP  = 32; // u32
+const uint EXT2_SB_INODES_PER_GROUP  = 40; // u32
+const uint EXT2_SB_FIRST_DATA_BLOCK  = 20; // u32
+const uint EXT2_SB_FREE_BLOCKS_COUNT = 12; // u32 — real hardware consequence found
+                                             // this session, not just cosmetic: a
+                                             // stale free-count makes a real Linux
+                                             // box's own ext2 driver see "errors on
+                                             // this volume" at mount time and
+                                             // auto-remount read-only
+                                             // (errors=remount-ro), blocking any
+                                             // further writes from that side until
+                                             // e2fsck -y clears it. See
+                                             // ext2_dec_free_blocks/inodes below.
+const uint EXT2_SB_FREE_INODES_COUNT = 16; // u32, same reasoning
+const uint EXT2_SB_MAGIC             = 56; // u16, must be 0xEF53
+const uint EXT2_SB_REV_LEVEL         = 76; // u32, 0 = original (fixed 128-byte inodes), >=1 = dynamic
+const uint EXT2_SB_INODE_SIZE        = 88; // u16, only meaningful if rev_level >= 1
 
 // Block group descriptor (32 bytes), starting in the block immediately
 // after the superblock's own block. v1 only ever reads group 0's
 // descriptor, the first one in the table.
-const uint EXT2_BGD_BLOCK_BITMAP = 0; // u32, block holding this group's block-allocation bitmap
-const uint EXT2_BGD_INODE_BITMAP = 4; // u32, block holding this group's inode-allocation bitmap
-const uint EXT2_BGD_INODE_TABLE  = 8; // u32, starting block of this group's inode table
+const uint EXT2_BGD_BLOCK_BITMAP       = 0;  // u32, block holding this group's block-allocation bitmap
+const uint EXT2_BGD_INODE_BITMAP       = 4;  // u32, block holding this group's inode-allocation bitmap
+const uint EXT2_BGD_INODE_TABLE        = 8;  // u32, starting block of this group's inode table
+const uint EXT2_BGD_FREE_BLOCKS_COUNT  = 12; // u16 — group-0 copy of EXT2_SB_FREE_BLOCKS_COUNT, see its comment
+const uint EXT2_BGD_FREE_INODES_COUNT  = 14; // u16 — group-0 copy of EXT2_SB_FREE_INODES_COUNT, see its comment
 
 // Inode field offsets, relative to the inode's own start.
 const uint EXT2_INODE_MODE        = 0;  // u16
@@ -514,6 +521,49 @@ fn void ext2_mount()
 
 // --- Write path -------------------------------------------------------
 
+// Decrements both copies of the free-block count (superblock's
+// s_free_blocks_count, group 0's own bg_free_blocks_count in the block
+// group descriptor) by one — called once per successful ext2_alloc_
+// block(). See EXT2_SB_FREE_BLOCKS_COUNT's own comment for why this
+// isn't just a cosmetic e2fsck complaint: a real Linux box's ext2
+// driver checks this at mount time and auto-remounts read-only if it's
+// wrong, found the hard way while testing on the actual boot card this
+// session. Two separate sector/block writes (superblock lives in a
+// fixed sector, the BGDT in a block) — same "each copy independently
+// read-modify-written" shape as fat32_write_fat_entry's multiple FAT
+// copies.
+fn bool ext2_dec_free_blocks()
+{
+	char[SECTOR_SIZE] sb_sector @noinit;
+	if (!fs_read_sector(EXT2_SUPERBLOCK_SECTOR, &sb_sector)) return false;
+	uint* sb_free = (uint*)&sb_sector[EXT2_SB_FREE_BLOCKS_COUNT];
+	*sb_free -= 1;
+	if (!fs_write_sector(EXT2_SUPERBLOCK_SECTOR, &sb_sector)) return false;
+
+	char[EXT2_MAX_BLOCK_SIZE] bgdt_buf @noinit;
+	if (!ext2_read_block(ext2_first_data_block + 1, &bgdt_buf)) return false;
+	ushort* bg_free = (ushort*)&bgdt_buf[EXT2_BGD_FREE_BLOCKS_COUNT];
+	*bg_free -= 1;
+	return ext2_write_block(ext2_first_data_block + 1, &bgdt_buf);
+}
+
+// Same shape as ext2_dec_free_blocks(), for inodes — called once per
+// successful ext2_alloc_inode().
+fn bool ext2_dec_free_inodes()
+{
+	char[SECTOR_SIZE] sb_sector @noinit;
+	if (!fs_read_sector(EXT2_SUPERBLOCK_SECTOR, &sb_sector)) return false;
+	uint* sb_free = (uint*)&sb_sector[EXT2_SB_FREE_INODES_COUNT];
+	*sb_free -= 1;
+	if (!fs_write_sector(EXT2_SUPERBLOCK_SECTOR, &sb_sector)) return false;
+
+	char[EXT2_MAX_BLOCK_SIZE] bgdt_buf @noinit;
+	if (!ext2_read_block(ext2_first_data_block + 1, &bgdt_buf)) return false;
+	ushort* bg_free = (ushort*)&bgdt_buf[EXT2_BGD_FREE_INODES_COUNT];
+	*bg_free -= 1;
+	return ext2_write_block(ext2_first_data_block + 1, &bgdt_buf);
+}
+
 // Linear scan of group 0's block bitmap for a clear bit. Marks it set
 // immediately, before returning it, closing the window where a second
 // allocation later in the same request could pick the same block twice
@@ -535,6 +585,7 @@ fn uint ext2_alloc_block()
 		{
 			bitmap_buf[byte_i] = (char)(b | (1 << bit_i));
 			if (!ext2_write_block(ext2_block_bitmap_block, &bitmap_buf)) return 0;
+			if (!ext2_dec_free_blocks()) return 0;
 			return ext2_first_data_block + i;
 		}
 	}
@@ -560,17 +611,19 @@ fn uint ext2_alloc_inode()
 		{
 			bitmap_buf[byte_i] = (char)(b | (1 << bit_i));
 			if (!ext2_write_block(ext2_inode_bitmap_block, &bitmap_buf)) return 0;
+			if (!ext2_dec_free_inodes()) return 0;
 			return i + 1;
 		}
 	}
 	return 0;
 }
 
-// Patches mode/size/block[] into inode_num's existing on-disk record —
-// read-modify-write, like fat32_write_fat_entry. Leaves every other
-// field (timestamps, links_count, etc.) as whatever was already there;
-// for a freshly allocated inode, the caller runs ext2_zero_inode() first
-// so there's nothing stale left in those fields.
+// Patches mode/size/links_count/blocks/block[] into inode_num's
+// existing on-disk record — read-modify-write, like
+// fat32_write_fat_entry. Leaves every other field (timestamps, etc.)
+// as whatever was already there; for a freshly allocated inode, the
+// caller runs ext2_zero_inode() first so there's nothing stale left
+// in those fields.
 fn bool ext2_write_inode(uint inode_num, Ext2_inode_info* info)
 {
 	if (inode_num == 0 || inode_num > ext2_inodes_per_group) return false;
