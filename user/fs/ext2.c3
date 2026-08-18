@@ -72,9 +72,25 @@ const uint EXT2_BGD_INODE_BITMAP = 4; // u32, block holding this group's inode-a
 const uint EXT2_BGD_INODE_TABLE  = 8; // u32, starting block of this group's inode table
 
 // Inode field offsets, relative to the inode's own start.
-const uint EXT2_INODE_MODE  = 0;  // u16
-const uint EXT2_INODE_SIZE  = 4;  // u32 (low 32 bits — large-file high bits not read, v1)
-const uint EXT2_INODE_BLOCK = 40; // u32 x 15 (i_block[0..14]) — v1 only reads [0..11]
+const uint EXT2_INODE_MODE        = 0;  // u16
+const uint EXT2_INODE_SIZE        = 4;  // u32 (low 32 bits — large-file high bits not read, v1)
+const uint EXT2_INODE_LINKS_COUNT = 26; // u16 — real hardware bug found here (see
+                                          // ext2_create_file's own comment): a
+                                          // newly created inode left this at 0
+                                          // (zeroed by ext2_zero_inode, never set
+                                          // afterward), which a real ext2 reader
+                                          // treats as "not actually a live file"
+                                          // even though a directory entry points
+                                          // at it — e2fsck flagged it as a
+                                          // "deleted inode with zero dtime".
+const uint EXT2_INODE_BLOCKS      = 28; // u32 — count of 512-byte sectors this
+                                          // inode's data occupies (standard ext2
+                                          // unit, NOT ext2_block_size blocks).
+                                          // Same real-hardware bug: never updated
+                                          // when a file/directory gained a block,
+                                          // caught by e2fsck as "i_blocks is 8,
+                                          // should be 24" on the root directory.
+const uint EXT2_INODE_BLOCK       = 40; // u32 x 15 (i_block[0..14]) — v1 only reads [0..11]
 
 const uint EXT2_S_IFREG = 0x8000; // regular file bit in i_mode
 const uint EXT2_S_IFDIR = 0x4000; // directory bit in i_mode
@@ -109,6 +125,8 @@ struct Ext2_inode_info
 {
 	uint mode;
 	uint size;
+	uint links_count; // see EXT2_INODE_LINKS_COUNT's own comment
+	uint blocks;       // see EXT2_INODE_BLOCKS's own comment — 512-byte sectors, not ext2_block_size blocks
 	uint[12] block; // direct block pointers only — see this file's header comment
 }
 
@@ -165,10 +183,14 @@ fn bool ext2_read_inode(uint inode_num, Ext2_inode_info* out)
 	if (!ext2_read_block(ext2_inode_table_block + block_offset, &block_buf)) return false;
 
 	char* inode_bytes = &block_buf[offset_in_block];
-	ushort* mode_field = (ushort*)&inode_bytes[EXT2_INODE_MODE];
-	uint*   size_field = (uint*)&inode_bytes[EXT2_INODE_SIZE];
-	out.mode = (uint)*mode_field;
-	out.size = *size_field;
+	ushort* mode_field        = (ushort*)&inode_bytes[EXT2_INODE_MODE];
+	uint*   size_field        = (uint*)&inode_bytes[EXT2_INODE_SIZE];
+	ushort* links_count_field = (ushort*)&inode_bytes[EXT2_INODE_LINKS_COUNT];
+	uint*   blocks_field      = (uint*)&inode_bytes[EXT2_INODE_BLOCKS];
+	out.mode        = (uint)*mode_field;
+	out.size        = *size_field;
+	out.links_count = (uint)*links_count_field;
+	out.blocks      = *blocks_field;
 	uint* block_ptrs = (uint*)&inode_bytes[EXT2_INODE_BLOCK];
 	for (uint i = 0; i < 12; i++) out.block[i] = block_ptrs[i];
 	return true;
@@ -552,10 +574,14 @@ fn bool ext2_write_inode(uint inode_num, Ext2_inode_info* info)
 	if (!ext2_read_block(ext2_inode_table_block + block_offset, &block_buf)) return false;
 
 	char* inode_bytes = &block_buf[offset_in_block];
-	ushort* mode_field = (ushort*)&inode_bytes[EXT2_INODE_MODE];
-	uint*   size_field = (uint*)&inode_bytes[EXT2_INODE_SIZE];
-	*mode_field = (ushort)info.mode;
-	*size_field = info.size;
+	ushort* mode_field        = (ushort*)&inode_bytes[EXT2_INODE_MODE];
+	uint*   size_field        = (uint*)&inode_bytes[EXT2_INODE_SIZE];
+	ushort* links_count_field = (ushort*)&inode_bytes[EXT2_INODE_LINKS_COUNT];
+	uint*   blocks_field      = (uint*)&inode_bytes[EXT2_INODE_BLOCKS];
+	*mode_field        = (ushort)info.mode;
+	*size_field        = info.size;
+	*links_count_field = (ushort)info.links_count;
+	*blocks_field      = info.blocks;
 	uint* block_ptrs = (uint*)&inode_bytes[EXT2_INODE_BLOCK];
 	for (uint i = 0; i < 12; i++) block_ptrs[i] = info.block[i];
 
@@ -597,6 +623,14 @@ fn bool ext2_create_file(char* name, uint* out_inode_num)
 	Ext2_inode_info new_inode;
 	new_inode.mode = EXT2_S_IFREG | 0x1A4; // 0644 permissions
 	new_inode.size = 0;
+	// Real hardware bug, found and fixed this session (see
+	// EXT2_INODE_LINKS_COUNT's own comment): a freshly zeroed inode has
+	// links_count 0, which is what dtime-0-but-unreferenced-looking
+	// means to a real ext2 reader — this is what actually makes the
+	// inode a live, referenced file rather than a mode/size/blocks
+	// record that happens to have a directory entry pointing at it.
+	new_inode.links_count = 1;
+	new_inode.blocks = 0; // freshly created, no data blocks yet
 	for (uint i = 0; i < 12; i++) new_inode.block[i] = 0;
 	if (!ext2_write_inode(inode_num, &new_inode)) return false;
 
@@ -625,6 +659,12 @@ fn bool ext2_create_file(char* name, uint* out_inode_num)
 
 	root.block[slot] = new_block;
 	root.size += ext2_block_size; // kept correct — real ext2 readers use a directory's own size to know how far to scan its blocks
+	// Second real-hardware bug fixed alongside links_count above:
+	// i_blocks (512-byte sectors, a separate field from i_size — see
+	// EXT2_INODE_BLOCKS's own comment) was never bumped when root
+	// gained this new directory block, caught by e2fsck as a real
+	// inconsistency on the actual boot card.
+	root.blocks += ext2_block_size / SECTOR_SIZE;
 	if (!ext2_write_inode(EXT2_ROOT_INODE, &root)) return false;
 
 	*out_inode_num = inode_num;
@@ -652,6 +692,11 @@ fn uint ext2_write_file(Ext2_inode_info* inode, char* src, uint len)
 			block = ext2_alloc_block();
 			if (block == 0) break;
 			inode.block[b] = block;
+			// Same real-hardware i_blocks bug fixed in ext2_create_file
+			// (see EXT2_INODE_BLOCKS's own comment) — only for a
+			// genuinely new block, not one already counted from a
+			// previous write that's merely being overwritten in place.
+			inode.blocks += ext2_block_size / SECTOR_SIZE;
 		}
 
 		uint chunk = len - bytes_written;

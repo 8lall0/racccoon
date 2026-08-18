@@ -3,6 +3,78 @@
 Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
+
+## 2026-08-19 — Real ext2 write-path corruption, found by looking at the card from Linux's own side
+
+Flashing the previous session's fip.bin surfaced something none of this
+project's own ext2 write-path testing had ever caught: `ls -la` on the
+real card's `EXT2TEST` partition showed `newtest.txt`/`newtest2.txt`
+(created earlier via `fsd`'s `newfile`/`newfile2` commands) as
+`???????????`, unreadable, "structure needs cleaning" — even though
+`fsd`'s own read-back had reported them correct at the time. First
+time this session's testing looked at a real-hardware write from
+Linux's own side rather than trusting `fsd`'s self-consistency check.
+
+`sudo e2fsck -n -f /dev/sdc2` (read-only, no repairs — run by hand in a
+real terminal, `sudo` needs an interactive password this session can't
+supply) found two real, distinct bugs in `user/fs/ext2.c3`'s write
+path, both pre-existing from last week's "ext2 write support" work, not
+introduced by anything since:
+
+1. **`i_links_count` never set.** `ext2_create_file()` calls
+   `ext2_zero_inode()` (zeroes the whole raw inode record) then
+   `ext2_write_inode()`, which only ever wrote `mode`/`size`/`block[]`
+   — `i_links_count` stayed 0 forever. A real ext2 reader treats
+   link-count 0 + dtime 0 as "not actually a live file", regardless of
+   a directory entry pointing at it with real content — exactly
+   `e2fsck`'s "deleted inode has dtime zero" / "directory element
+   references deleted/unused inode" findings. Not a bitmap-allocation
+   bug (initially suspected, then ruled out by reading `ext2_alloc_
+   inode()`'s code directly — it does set its bitmap bit correctly).
+2. **`i_blocks` never maintained.** Separate from `i_size` (which
+   *was* kept correct, per the file's own existing header comment) —
+   `Ext2_inode_info` didn't even model this field, so it stayed at
+   whatever `mke2fs` initially wrote regardless of how many blocks a
+   file or directory actually gained afterward. Caught as "i_blocks is
+   8, should be 24" on the root directory (grew by 2 blocks from the
+   two `newfile`/`newfile2` real-hardware tests, count never updated).
+
+**Fix**: `Ext2_inode_info` gained `links_count`/`blocks` fields;
+`ext2_read_inode`/`ext2_write_inode` now round-trip both (offsets 26/28
+in the standard inode layout, alongside the already-read `mode`/`size`).
+`ext2_create_file()` sets `links_count = 1` on every newly created
+inode and bumps `root.blocks` when appending a directory block;
+`ext2_write_file()` bumps the file's own `.blocks` when allocating a
+genuinely new block (not a partial rewrite of an existing one). The
+free-block/inode *count* fields (`s_free_blocks_count` etc.) remain
+deliberately unmaintained — that's the file's own pre-existing,
+documented scope decision, not part of this bug, and `e2fsck` still
+correctly (harmlessly) flags that mismatch alone after the fix.
+
+**Verified rigorously**, differently from every previous ext2 session:
+QEMU's `disk_ext2.img`/`disk_dual.img` are plain files, so `e2fsck -n
+-f` could run directly on them (and on a `dd`-extracted copy of
+`disk_dual.img`'s ext2 half) with no root needed — a real correctness
+oracle this project's ext2 work never had before. Before the fix:
+`writefile`+`newfile` on a fresh `disk_ext2.img` reproduced the exact
+same "deleted inode" / "i_blocks wrong" errors seen on the real card.
+After the fix: those are gone entirely, only the pre-existing
+free-count cosmetic mismatch remains, on both `disk_ext2.img` and
+`disk_dual.img`. Full regression suite (both single- and dual-mount
+images) otherwise unaffected, `racetest` still `a=1 b=1`. Reflashed
+`build/fip_duo.bin` with the fix and confirmed on real hardware
+(`newfile2` created and read back correctly through fsd2's own ext2
+write path). The two already-corrupted legacy files on the real card
+predated this fix; cleaned up separately via `sudo e2fsck -y -f
+/dev/sdc2` (run by hand), confirmed clean afterward.
+
+**Files changed:** `user/fs/ext2.c3` (`EXT2_INODE_LINKS_COUNT`/
+`EXT2_INODE_BLOCKS` offsets, `Ext2_inode_info.links_count`/`.blocks`,
+`ext2_read_inode`/`ext2_write_inode` round-trip both,
+`ext2_create_file`/`ext2_write_file` maintain them correctly).
+
+---
+
 ## 2026-08-18 (4) — Read-only subdirectory support for both fsd backends
 
 Third of three requested follow-ups from the multi-mount work. Both
