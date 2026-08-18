@@ -223,8 +223,12 @@ fn int p9_call(int dest_pid, uint verb, char* data, int len, char* reply_buf, in
 // own per-process mount table (src/process.c3's Process.namespace,
 // resolved kernel-side since user code can't read another process's
 // memory). -1 means no mount matched.
-fn int ns_resolve(char* path) @export("ns_resolve") {
-    return syscall(SYS_NS_RESOLVE, (long)path, 0, 0);
+// out_prefix_len (optional, null means don't care) gets the length of
+// the matched mount's own prefix — callers that need to strip it before
+// building a request to whatever server matched (see fs_read/fs_write
+// below) don't have to re-derive it themselves.
+fn int ns_resolve(char* path, uint* out_prefix_len) @export("ns_resolve") {
+    return syscall(SYS_NS_RESOLVE, (long)path, (long)out_prefix_len, 0);
 }
 
 // Removes one of *this process's own* namespace mounts, matched by
@@ -258,7 +262,7 @@ fn int join(int pid, uint generation) @export("join") {
 // caller's namespace) instead of a raw pid — the whole point of having a
 // namespace: callers stop hardcoding server pids.
 fn int p9_call_path(char* path, uint verb, char* data, int len, char* reply_buf, int reply_len, uint* reply_verb) {
-    int pid = ns_resolve(path);
+    int pid = ns_resolve(path, null);
     if (pid < 0) return pid;
     return p9_call(pid, verb, data, len, reply_buf, reply_len, reply_verb);
 }
@@ -339,13 +343,23 @@ const uint FS_WRITE = 21;
 const uint FS_MSG_MAX = 1128;
 
 fn int fs_read(char* filename, char* buf, int len) @export("fs_read") {
-    int fsd_pid = ns_resolve(filename);
+    uint prefix_len = 0;
+    int fsd_pid = ns_resolve(filename, &prefix_len);
     if (fsd_pid < 0) return -1;
+    // Strip the matched mount's own prefix before it ever reaches the
+    // wire — the "" catch-all's own prefix length is always 0 (a no-op
+    // here, same behavior as before this existed), but a non-empty
+    // prefix like the second fsd's "/2/" (src/process.c3) would
+    // otherwise leak into the plain, bare filename fsd.c3's backends
+    // expect (see user/fsd.c3's own header comment — every backend only
+    // ever deals in bare names, this is the one place that guarantee
+    // gets upheld).
+    char* stripped = &filename[prefix_len];
 
     char[FS_MSG_MAX] req @noinit;
     int i = 0;
-    while (filename[i] != 0 && i < 99) {
-        req[i] = filename[i];
+    while (stripped[i] != 0 && i < 99) {
+        req[i] = stripped[i];
         i++;
     }
     req[i] = 0;
@@ -367,13 +381,16 @@ fn int fs_read(char* filename, char* buf, int len) @export("fs_read") {
 }
 
 fn int fs_write(char* filename, char* buf, int len) @export("fs_write") {
-    int fsd_pid = ns_resolve(filename);
+    uint prefix_len = 0;
+    int fsd_pid = ns_resolve(filename, &prefix_len);
     if (fsd_pid < 0) return -1;
+    // See fs_read's own comment on why this strips the matched prefix.
+    char* stripped = &filename[prefix_len];
 
     char[FS_MSG_MAX] req @noinit;
     int i = 0;
-    while (filename[i] != 0 && i < 99) {
-        req[i] = filename[i];
+    while (stripped[i] != 0 && i < 99) {
+        req[i] = stripped[i];
         i++;
     }
     req[i] = 0;

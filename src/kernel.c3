@@ -137,8 +137,27 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		// idle/echod/the storage driver, created before this line, don't
 		// and don't need to (see process.c3's create_process).
 		Process* fsd_proc = create_process((void*)&_binary_fsd_bin_start, (uint)((uptr)&_binary_fsd_bin_end - (uptr)&_binary_fsd_bin_start));
+		setup_fsd_mappings(fsd_proc, board::FS_PARTITION_START_SECTOR);
 		fsd_pid = fsd_proc.pid;
 		io::print("fsd created\n");
+
+		// A second, simultaneously-mounted fsd instance, reachable under
+		// the "/2/" prefix (see fsd2_pid's own comment in process.c3) —
+		// spawned from the *same* fsd binary, just pointed at a different
+		// partition. Exactly two static mounts, not a general N; see
+		// docs/devlog.md for why that's the right scope for the actual
+		// problem this solves (testing FAT32 and ext2 simultaneously,
+		// without physically swapping FS_PARTITION_START_SECTOR and
+		// reflashing). Same "must be set before any later create_process
+		// call populates a default namespace" ordering constraint as
+		// fsd_pid above.
+		if (board::HAS_SECOND_FS_PARTITION)
+		{
+			Process* fsd2_proc = create_process((void*)&_binary_fsd_bin_start, (uint)((uptr)&_binary_fsd_bin_end - (uptr)&_binary_fsd_bin_start));
+			setup_fsd_mappings(fsd2_proc, board::FS_PARTITION_2_START_SECTOR);
+			fsd2_pid = fsd2_proc.pid;
+			io::print("fsd2 created\n");
+		}
 	}
 
 	// Single call site for create_process(shell), used for both the

@@ -43,6 +43,33 @@ LLC=${LLC:-llc}
   mke2fs -q -F -b 1024 build/disk_ext2.img
   debugfs -w -R "write disk-ext2/hello.txt hello.txt" build/disk_ext2.img > /dev/null
 
+  echo "==> Building disk image (dual FAT32+ext2, for scripts/launch64_dual.sh)..."
+  # Third test image — exercises fsd/fsd2 mounting two filesystems at once
+  # (see docs/devlog.md's multi-mount entry, src/kernel.c3's conditional
+  # fsd2 spawn gated on board::HAS_SECOND_FS_PARTITION). One flat image,
+  # two independent filesystems at fixed byte offsets, no MBR/partition
+  # table — mirrors how the Duo reads two real partitions off one card
+  # with no partition-table parsing in fsd.c3 either way. The FAT32 half
+  # MUST start at sector 0, not some other offset: fsd's own
+  # FS_PARTITION_START_SECTOR (boards/qemu/board.c3) is one fixed constant
+  # shared with the default disk.img above, which is whole-disk FAT32 from
+  # sector 0 — a different offset here would just mean the first fsd finds
+  # nothing (confirmed the hard way while building this image: an earlier
+  # attempt put FAT32 at sector 2048 and got exactly that). ext2 goes at
+  # sector 18432, matching FS_PARTITION_2_START_SECTOR. 9MiB FAT32 (sized
+  # so it never writes past sector 18432) + 8MiB ext2, 20MiB file total.
+  # The ext2 half is built in a scratch file first (mke2fs has no
+  # offset option) then `dd`'d into place at sector 18432.
+  rm -f build/disk_dual.img build/disk_dual_ext2_part.img
+  dd if=/dev/zero of=build/disk_dual.img bs=1M count=20 status=none
+  mkfs.vfat -F 32 build/disk_dual.img 9216 > /dev/null
+  mcopy -i build/disk_dual.img disk/*.txt ::
+  dd if=/dev/zero of=build/disk_dual_ext2_part.img bs=1M count=8 status=none
+  mke2fs -q -F -b 1024 build/disk_dual_ext2_part.img
+  debugfs -w -R "write disk-ext2/hello.txt hello.txt" build/disk_dual_ext2_part.img > /dev/null
+  dd if=build/disk_dual_ext2_part.img of=build/disk_dual.img bs=512 seek=18432 conv=notrunc status=none
+  rm -f build/disk_dual_ext2_part.img
+
   echo "==> Compiling kernel to LLVM IR..."
   rm -rf build/obj build/llvm build/obj_medany build/kernel.*
   c3c build racccoon --no-entry --safe=no --riscv-cpu=rvimac --emit-llvm

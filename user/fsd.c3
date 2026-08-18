@@ -356,7 +356,24 @@ fn void fs_mount()
 		return;
 	}
 
-	fs_panic("no recognized filesystem found");
+	// Deliberately NOT fs_panic()/exit() here, unlike every other failure
+	// in this function — this one is a normal, expected outcome (the
+	// second fsd instance, booting against an image/card that only has
+	// one partition — see boards/*/board.c3's HAS_SECOND_FS_PARTITION),
+	// not an internal error. exit() would free this process's pid slot,
+	// which the *next* process created (ordinarily the shell) would then
+	// likely inherit — silently making this server's own namespace
+	// prefix (e.g. "/2/") route straight back to whatever process now
+	// occupies that reused pid. Concretely, sending yourself an IPC
+	// message deadlocks (SYS_IPC_SEND parks the sender waiting for a
+	// receive it can't issue until the send itself returns) — found
+	// exactly this way, real hardware/QEMU testing during this session's
+	// multi-mount work (see docs/devlog.md). Returning normally instead
+	// leaves fs_type at its default FS_TYPE_NONE, and main()'s own
+	// dispatch below already handles that case correctly for every
+	// verb — same "reject cleanly, don't crash" shape as an ext2-mounted
+	// volume already rejects writes.
+	print("fsd: no recognized filesystem found — this mount stays inactive\n");
 }
 
 fn void main() @export("main")

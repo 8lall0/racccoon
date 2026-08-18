@@ -50,8 +50,18 @@ int sdd_pid = 0;
 // not a hardcoded pid — see the "" catch-all mount below.
 int fsd_pid = 0;
 
-const NS_MOUNTS_MAX = 4;   // Small fixed table — two real entries today
-                            // ("/" -> echod, "" -> fsd), room to grow.
+// A second, simultaneously-mounted fsd instance (see kernel.c3's own
+// spawn code, gated on board::HAS_SECOND_FS_PARTITION) — reachable under
+// the "/2/" prefix instead of fsd_pid's "" catch-all. Exactly two static
+// mounts, not a general N — see docs/devlog.md for why a fully dynamic
+// runtime mount syscall wasn't needed to solve the actual problem this
+// was built for (testing FAT32 and ext2 simultaneously without
+// physically swapping board::FS_PARTITION_START_SECTOR and reflashing).
+int fsd2_pid = 0;
+
+const NS_MOUNTS_MAX = 4;   // Small fixed table — three real entries now
+                            // ("/" -> echod, "" -> fsd, "/2/" -> fsd2),
+                            // one spare.
 const NS_PREFIX_MAX = 32;  // Longest path prefix a mount entry can match.
 
 // One binding in a process's namespace: any path starting with `prefix`
@@ -110,6 +120,16 @@ struct Process
 	// struct, not a global, so a future sandboxed process can get a
 	// restricted view later without a redesign.
 	Mount[NS_MOUNTS_MAX] namespace;
+
+	// fsd-only: which partition SYS_FS_PARTITION_INFO (entry.c3) hands
+	// back to *this specific* process. Per-process, not a plain kernel
+	// global the way diskd_vq_paddr etc. are — those stay globals because
+	// there's only ever one diskd; now that two fsd instances can exist
+	// simultaneously, each needs its own answer to the same syscall. Set
+	// by setup_fsd_mappings() right after create_process() spawns an fsd,
+	// same "extra per-process setup after the generic call" pattern as
+	// setup_diskd_mappings()/setup_sdd_mappings() below.
+	uint fs_partition_start;
 
 	char[STACK_SIZE] stack; // Kernel stack
 }
@@ -390,12 +410,33 @@ fn Process* create_process(void* image, uint image_size)
 	str_copy(&proc.namespace[1].prefix[0], "", NS_PREFIX_MAX);
 	proc.namespace[1].server_pid = fsd_pid;
 
-	for (int m = 2; m < NS_MOUNTS_MAX; m++)
+	// "/2/" — the second, simultaneously-mounted fsd instance (see
+	// fsd2_pid's own comment above). Same "harmless 0 for any process
+	// created before it exists" pattern as namespace[1] — SYS_NS_RESOLVE
+	// (entry.c3) already skips any mount with server_pid == 0.
+	str_copy(&proc.namespace[2].prefix[0], "/2/", NS_PREFIX_MAX);
+	proc.namespace[2].server_pid = fsd2_pid;
+
+	for (int m = 3; m < NS_MOUNTS_MAX; m++)
 	{
 		proc.namespace[m].server_pid = 0;
 	}
 
+	proc.fs_partition_start = 0; // meaningful only once setup_fsd_mappings() sets it
+
 	return proc;
+}
+
+// Called once, right after create_process() spawns an fsd instance (see
+// kernel.c3 — called for both the first and, if board::
+// HAS_SECOND_FS_PARTITION, the second), to tell it which partition it
+// owns. No MMIO/paging work needed here, unlike setup_diskd_mappings/
+// setup_sdd_mappings below — fsd never touches hardware directly, it
+// only needs this one fact, handed back via SYS_FS_PARTITION_INFO
+// (entry.c3) reading current_proc.fs_partition_start.
+fn void setup_fsd_mappings(Process* proc, uint partition_start)
+{
+	proc.fs_partition_start = partition_start;
 }
 
 // Called once, right after create_process() spawns diskd (see kernel.c3),

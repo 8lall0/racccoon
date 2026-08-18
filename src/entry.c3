@@ -44,11 +44,16 @@ const SYS_IPC_POLL   = 10; // non-blocking SYS_IPC_RECV, see its case below
 const SYS_RFORK       = 11;
 const SYS_NS_UNMOUNT  = 12; // remove one of the caller's own namespace mounts by exact prefix
 const SYS_JOIN        = 13; // block until the given pid no longer exists — see its case below
-const SYS_FS_PARTITION_INFO = 14; // fsd-only: returns board::FS_PARTITION_START_SECTOR —
+const SYS_FS_PARTITION_INFO = 14; // fsd-only: returns current_proc.fs_partition_start —
                                     // board is a kernel-only module (see user/sdd.c3's own
                                     // header comment), so this is fsd.c3's only way to learn
                                     // a board-specific fact despite being one board-agnostic
-                                    // user binary, same shape as SYS_DISKD_INFO above.
+                                    // user binary, same shape as SYS_DISKD_INFO above. Reads
+                                    // the CALLER's own per-process field, not a single shared
+                                    // board constant directly — see process.c3's
+                                    // setup_fsd_mappings()/fs_partition_start comments for why:
+                                    // two fsd instances can be mounted simultaneously now, each
+                                    // needing a different answer to this same syscall.
 
 // rfork flags — Plan 9 names, this kernel's own subset. RFPROC is
 // required (rfork() without it returns -1 in this v1: real Plan 9 uses
@@ -416,6 +421,27 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			int ipc_len      = (int)f.a4;
 			int ipc_copy_len = ipc_len > MSG_MAX ? MSG_MAX : ipc_len;
 			if (ipc_copy_len < 0) ipc_copy_len = 0;
+			// KNOWN GAP, not fixed here: proc_by_pid checks the target
+			// slot's CURRENT pid/state, but a namespace entry (Mount.
+			// server_pid, process.c3) is a plain pid snapshotted once at
+			// the resolving process's own creation time, never updated.
+			// If that original target process later exits and its slot
+			// gets reused (create_process's own first-free-slot scan —
+			// nothing pins a slot against reuse just because some other
+			// process's stale namespace still names its old pid), a
+			// namespace entry can start silently resolving to whatever
+			// unrelated process now occupies that slot — worst case, the
+			// resolving process's own pid, which deadlocks right here
+			// (a process waiting on msg_acked for a receive only it
+			// could issue, which it can't until this call returns).
+			// Found exactly this way while building a second,
+			// simultaneously-mounted fsd instance (see docs/devlog.md) —
+			// worked around there by having that specific server never
+			// exit on its one expected failure mode, not fixed in
+			// general. A real fix needs namespace entries to carry a
+			// generation alongside the pid (SYS_JOIN already has exactly
+			// that distinction for its own, different purpose — see
+			// Process.generation's own comment) and check it here too.
 			Process* ipc_target = proc_by_pid(ipc_dest_pid);
 			if (!ipc_target)
 			{
@@ -578,6 +604,23 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				}
 			}
 			f.a0 = (ulong)(iptr)ns_result;
+
+			// Optional out-pointer (a1), same "null means don't care"
+			// convention as SYS_RFORK's generation out-pointer above —
+			// lets the caller strip the matched prefix itself (see
+			// user/user.c3's fs_read/fs_write) before building a wire-
+			// format request, so a server mounted under a non-empty
+			// prefix (e.g. the second fsd, under "/2/") still only ever
+			// sees the bare remainder, exactly like the "" catch-all
+			// mount already did by construction (its own prefix length
+			// is always 0). 0 when nothing matched — the caller already
+			// has -1 in f.a0 to detect that case, this just avoids
+			// leaving the out-pointer's target uninitialized.
+			uint* ns_prefix_len_out = (uint*)(uptr)f.a1;
+			if (ns_prefix_len_out != null)
+			{
+				*ns_prefix_len_out = (uint)(ns_best_len < 0 ? 0 : ns_best_len);
+			}
 		case SYS_DISKD_INFO:
 			// diskd-only, called once at its own startup — see
 			// setup_diskd_mappings in process.c3 for why these addresses
@@ -591,8 +634,14 @@ fn void handle_syscall(Trap_frame* f) @noinline
 		case SYS_FS_PARTITION_INFO:
 			// fsd-only, called once at its own startup — a0 is an
 			// out-pointer, same convention as SYS_DISKD_INFO above.
+			// Reads the CALLER's own current_proc.fs_partition_start
+			// (set by process.c3's setup_fsd_mappings() at spawn time),
+			// not board::FS_PARTITION_START_SECTOR directly — see that
+			// field's own comment for why: two fsd instances can be
+			// mounted simultaneously now, so a single shared board
+			// constant can't answer this the same way for both.
 			uint* fs_partition_out = (uint*)(uptr)f.a0;
-			*fs_partition_out = (uint)board::FS_PARTITION_START_SECTOR;
+			*fs_partition_out = current_proc.fs_partition_start;
 		case SYS_RFORK:
 			// Inline for the same reason as every other case in this
 			// switch — see SYS_EXIT's comment. See process.c3's

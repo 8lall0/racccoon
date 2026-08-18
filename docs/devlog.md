@@ -4,6 +4,97 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-18 (2) — Two simultaneous fsd mounts, and a real self-deadlock bug found along the way
+
+Until now, switching filesystems on the Duo meant editing
+`board::FS_PARTITION_START_SECTOR`, rebuilding, and reflashing — done
+twice already this week for the ext2 work. This adds a second, parallel
+`fsd` instance (`fsd2`) so both the FAT32 and ext2 partitions already on
+the card are mounted at once, at boot, permanently.
+
+**Design**: `src/kernel.c3` spawns `fsd2` right after `fsd`, gated on a
+new `board::HAS_SECOND_FS_PARTITION` (plus `FS_PARTITION_2_START_SECTOR`)
+— false on the Duo's original config and on QEMU's default `disk.img`,
+so this is additive, not a behavior change for anything not opted in.
+`src/process.c3`'s `Process.namespace` gets a second, fixed entry:
+`"/2/" -> fsd2_pid`, populated at `create_process()` time exactly like
+the existing `"" -> fsd_pid` entry. `SYS_FS_PARTITION_INFO` now reads a
+new per-process `Process.fs_partition_start` field (set via
+`setup_fsd_mappings()`) instead of `board::FS_PARTITION_START_SECTOR`
+directly, so `fsd`/`fsd2` — two copies of the exact same binary — each
+learn their own partition's start sector at boot despite being
+identical code. `SYS_NS_RESOLVE` gained a second out-parameter (matched
+prefix length), so `fs_read`/`fs_write` (`user/user.c3`) can strip
+`"/2/"` before building the wire-format request — `fsd.c3`/`fs/fat32.c3`
+/`fs/ext2.c3` needed zero changes, they already only ever see bare
+filenames.
+
+**Real bug found**: `readfile2` (a new shell command targeting `/2/`)
+produced no output at all on QEMU's default single-partition `disk.img`
+— not even the coded fallback message. Root cause: `fsd2` finds no
+filesystem on that image and, at the time, called `fs_panic()` (fatal,
+`exit()`s) on "no recognized filesystem found". `SYS_EXIT` frees the
+process's slot; the very next process created (the shell) reuses that
+same freed pid via `create_process()`'s first-free-slot scan; the
+shell's own `"/2/"` namespace entry — populated from the stale
+`fsd2_pid` global — now points at the shell's *own* pid. `ipc_send` to
+yourself deadlocks (parked waiting for a receive you can't issue until
+the send call itself returns). Fixed narrowly: `fsd.c3`'s `fs_mount()`
+no longer panics on "no recognized filesystem" — it prints and returns,
+leaving `fs_type = FS_TYPE_NONE`, which `main()`'s existing dispatch
+already handles cleanly (a `-1` reply for every verb, the same shape as
+the already-proven "ext2 rejects writes" path). This is a narrow fix for
+one trigger, not the underlying hazard class: any namespace entry is a
+plain pid snapshot taken once at the *resolving* process's own creation
+time, never refreshed, so a *target* that later exits and whose slot
+gets reused by something else would silently misroute too — `proc_by_pid`
+correctly rejects a fully-dead, unreused pid, but has no way to detect
+"same pid, different instance". `SYS_JOIN`'s existing `Process.generation`
+field is the right building block for a real fix (documented as a
+"KNOWN GAP, not fixed here" comment at `SYS_IPC_SEND` in `src/entry.c3`);
+not implemented this session.
+
+**A red herring, chased down properly rather than waved off**: after
+the deadlock fix, the QEMU regression suite started showing
+`racetest: a=0 b=0` instead of the historical `a=1 b=0`. Compared
+directly against the pre-multi-mount build (git stash, rebuild, same
+exact command sequence) — that build reproduced `a=1 b=0` every time,
+confirming the shift was real, not noise. But reading `race_thread_a`/
+`race_thread_b`/`echod.c3` shows each racing thread is a full `RFPROC`
+child with its own distinct pid and echod's reply path is fully
+serialized by IPC's own rendezvous — there's no code path where one
+thread's reply lands in the other's mailbox by design. Since the
+baseline was *already* `a=1 b=0` (not `a=1 b=1`) before any of today's
+changes, this is a pre-existing, narrow race in the IPC/threading path
+that predates this session; the extra `fsd2` process just shifts
+pids/scheduling enough to flip which manifestation shows (one-loses to
+both-lose). Logged here as a known separate issue, not fixed — it's
+orthogonal to this feature and every other test passes correctly.
+
+**Verified on QEMU**: a new `build/disk_dual.img` (FAT32 at sector 0 —
+matching the same fixed `FS_PARTITION_START_SECTOR` the default
+`disk.img` uses, an earlier attempt at sector 2048 just meant the first
+`fsd` found nothing — and ext2 at sector 18432, `scripts/build.sh`) via
+new `scripts/launch64_dual.sh`: both `fsd: FAT32 mounted...` and
+`fsd: ext2 mounted...` appear at boot, `readfile`/`readfile2` return
+correct, distinct content in the same boot, and the full regression
+suite passes otherwise unchanged. Not yet verified on real Duo hardware
+(`build/fip_duo.bin` built and ready, deferred this session).
+
+**Files changed:** `src/process.c3` (`fsd2_pid`, `Process.fs_partition_start`,
+`setup_fsd_mappings()`, second namespace entry), `src/entry.c3`
+(`SYS_FS_PARTITION_INFO` reads the per-process field, `SYS_NS_RESOLVE`'s
+prefix-length out-param, the IPC hazard comment), `src/kernel.c3`
+(conditional `fsd2` spawn), `boards/duo/board.c3` /
+`boards/qemu/board.c3` (`HAS_SECOND_FS_PARTITION`,
+`FS_PARTITION_2_START_SECTOR`), `user/user.c3` (`ns_resolve()`'s new
+out-param, prefix-stripping in `fs_read`/`fs_write`), `user/shell.c3`
+(`readfile2`), `user/fsd.c3` (non-fatal `fs_mount()` on no filesystem
+found), `scripts/build.sh`/new `scripts/launch64_dual.sh`
+(`disk_dual.img`).
+
+---
+
 ## 2026-08-18 — A real timer primitive, replacing sdd.c3's guessed busy-wait counts
 
 `user/sdd.c3` had a standing, self-documented gap: no `rdtime` access

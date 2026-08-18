@@ -84,6 +84,22 @@ fn void main() @export("main") {
                 print(&buf);
                 print("\n");
             }
+        } else if (strcmp(cmd, "readfile2") == 0) {
+            // Exercises the second, simultaneously-mounted fsd instance
+            // (see src/process.c3's fsd2_pid/docs/devlog.md) — same
+            // "/2/" prefix ns_resolve()/fs_read() strip before the
+            // request ever reaches the wire, so this is otherwise
+            // identical to readfile above, just against whatever
+            // partition board::FS_PARTITION_2_START_SECTOR names.
+            char[128] buf2 @noinit;
+            int len2 = fs_read("/2/hello.txt", &buf2, 128);
+            if (len2 >= 0) {
+                buf2[len2] = 0;
+                print(&buf2);
+                print("\n");
+            } else {
+                print("readfile2: not found (no second fsd mounted?)\n");
+            }
         } else if (strcmp(cmd, "writefile") == 0) {
             fs_write("hello.txt", "Hello from shell!\n", 19);
         } else if (strcmp(cmd, "newfile") == 0) {
@@ -165,12 +181,12 @@ fn void main() @export("main") {
             // create_process): "/" -> echod (pid 2), and a "" catch-all
             // -> fsd (pid 4) for anything that doesn't start with "/" —
             // which is every plain filename, "nope" included.
-            int pid_root = ns_resolve("/anything");
+            int pid_root = ns_resolve("/anything", null);
             print("resolve /anything -> pid ");
             putchar((char)('0' + pid_root));
             print("\n");
 
-            int pid_fallback = ns_resolve("nope");
+            int pid_fallback = ns_resolve("nope", null);
             print("resolve nope -> pid ");
             putchar((char)('0' + pid_fallback));
             print(" (catch-all)\n");

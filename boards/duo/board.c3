@@ -121,9 +121,19 @@ const bool HAS_VIRTIO_BLOCK = false;
 // fs_mount() builds at startup (see user/fsd.c3's own header comment),
 // not because reading is the only thing fsd can do anymore. Repartitioned
 // to a smaller 1GiB (unchanged start sector) during real-hardware ext2
-// verification — see docs/devlog.md — to make room for a second, ext2
-// EXT2TEST partition later in the disk, currently unused by any code.
+// verification — see docs/devlog.md — to make room for the second, ext2
+// EXT2TEST partition below, now actually used by a second, simultaneously
+// mounted fsd instance (see kernel.c3's own spawn code).
 const uint FS_PARTITION_START_SECTOR = 2048;
+
+// The real EXT2TEST partition created alongside DUOBOOT during the same
+// repartition — see FS_PARTITION_START_SECTOR's own comment. Confirmed
+// via the same `sfdisk`/`lsblk` session, not assumed. HAS_SECOND_FS_
+// PARTITION gates kernel.c3's second create_process() call the same way
+// HAS_BLOCK_DEVICE gates the first storage driver + fsd — see
+// docs/devlog.md for why exactly two static mounts, not a general N.
+const bool HAS_SECOND_FS_PARTITION = true;
+const uint FS_PARTITION_2_START_SECTOR = 2099200;
 
 // Same register formulas as boards/qemu/board.c3 — see this file's own
 // PLIC_BASE comment for why these are unverified rather than assumed

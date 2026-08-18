@@ -76,10 +76,27 @@ const bool HAS_VIRTIO_BLOCK = true;
 // number before touching the disk — see boards/duo/board.c3's matching
 // comment. QEMU's own default test image (scripts/build.sh's disk.img)
 // is formatted whole-disk (no MBR/partition table, the simplest thing
-// mkfs.vfat can produce), so 0. A separate disk_ext2.img (also whole-
-// disk) is used for ext2 testing instead of a second partition on this
-// same image — see scripts/launch64_ext2.sh.
+// mkfs.vfat can produce), so 0. Two other, separate test images exist
+// for other purposes: disk_ext2.img (whole-disk ext2, scripts/
+// launch64_ext2.sh) and disk_dual.img (both partitions at once,
+// scripts/launch64_dual.sh, matching the two sector numbers below) —
+// neither is the default `disk.img` this constant describes.
 const uint FS_PARTITION_START_SECTOR = 0;
+
+// disk_dual.img's own layout (scripts/build.sh): FAT32 at sector 0 (same
+// as the default disk.img above — FS_PARTITION_START_SECTOR is one
+// constant shared by both images) and ext2 at sector 18432. Confirmed by
+// actually building the image and booting it, not assumed — an earlier
+// attempt put FAT32 at sector 2048 instead and the first fsd correctly,
+// harmlessly found nothing there (see FS_PARTITION_START_SECTOR's own
+// value, unaffected by this constant). Only meaningful when booting
+// against that specific image; booting the default `disk.img` (a single,
+// whole-disk FAT32 volume, no second partition to find at all) with this
+// flag on just means the second fsd instance finds nothing and stays
+// inactive — see kernel.c3's own spawn code and docs/devlog.md for why
+// that's an accepted, harmless side effect, not a bug.
+const bool HAS_SECOND_FS_PARTITION = true;
+const uint FS_PARTITION_2_START_SECTOR = 18432;
 
 // process.c3's setup_sdd_mappings references these unconditionally (one
 // kernel source tree, compiled separately per board — see this file's
