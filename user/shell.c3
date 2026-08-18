@@ -118,6 +118,20 @@ fn void main() @export("main") {
             } else {
                 print("newfile: readback failed\n");
             }
+        } else if (strcmp(cmd, "newfile2") == 0) {
+            // Same as newfile above, but through the "/2/" mount — proves
+            // fsd2's write path specifically (readfile2 only ever proves
+            // reads), routed through the same ns_resolve() prefix-strip
+            // as every other "/2/" request.
+            fs_write("/2/newtest2.txt", "Created by newfile2 test\n", 26);
+            char[128] buf2 @noinit;
+            int len2 = fs_read("/2/newtest2.txt", &buf2, 128);
+            if (len2 >= 0) {
+                buf2[len2] = 0;
+                print(&buf2);
+            } else {
+                print("newfile2: readback failed\n");
+            }
         } else if (strcmp(cmd, "protectedwrite") == 0) {
             // Deliberately attempts to write the one file fsd is
             // supposed to refuse no matter what (see user/fsd.c3's

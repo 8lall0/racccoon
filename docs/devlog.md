@@ -78,8 +78,26 @@ matching the same fixed `FS_PARTITION_START_SECTOR` the default
 new `scripts/launch64_dual.sh`: both `fsd: FAT32 mounted...` and
 `fsd: ext2 mounted...` appear at boot, `readfile`/`readfile2` return
 correct, distinct content in the same boot, and the full regression
-suite passes otherwise unchanged. Not yet verified on real Duo hardware
-(`build/fip_duo.bin` built and ready, deferred this session).
+suite passes otherwise unchanged.
+
+**Verified on real Duo hardware**, both partitions already on the card
+from earlier sessions, no board.c3 edits needed: `readfile` (mount 1,
+FAT32) returned `Hello from disk!`; `readfile2` (mount 2, ext2) returned
+`Hello from shell!` — surprising at first (not the `Hello from ext2!`
+recorded in the ext2-verification entry above), until traced to the
+`ext2 write support` entry's own real-hardware `writefile` test, which
+overwrote that exact file and was never reverted (only the temporary
+`FS_PARTITION_START_SECTOR` swap was). Confirmed this was real,
+correctly-routed ext2 data and not a routing bug by checking the
+console's own `sdd: rw sector=...` lines: mount 2's reads land at
+absolute sector ≈2,103,884, well inside the ext2 partition (starting at
+2,099,200) and nowhere near mount 1's much lower sector range — two
+distinct mounts, two distinct real files, same boot. Added a `newfile2`
+shell command (mirrors `newfile`, routed through `/2/`) for an
+unambiguous write-path check independent of that stale-data question:
+creates a new file on the ext2 mount and reads it back —
+`Created by newfile2 test`, correct, with I/O sectors again confirmed
+inside the ext2 partition range.
 
 **Files changed:** `src/process.c3` (`fsd2_pid`, `Process.fs_partition_start`,
 `setup_fsd_mappings()`, second namespace entry), `src/entry.c3`
@@ -89,8 +107,8 @@ prefix-length out-param, the IPC hazard comment), `src/kernel.c3`
 `boards/qemu/board.c3` (`HAS_SECOND_FS_PARTITION`,
 `FS_PARTITION_2_START_SECTOR`), `user/user.c3` (`ns_resolve()`'s new
 out-param, prefix-stripping in `fs_read`/`fs_write`), `user/shell.c3`
-(`readfile2`), `user/fsd.c3` (non-fatal `fs_mount()` on no filesystem
-found), `scripts/build.sh`/new `scripts/launch64_dual.sh`
+(`readfile2`, `newfile2`), `user/fsd.c3` (non-fatal `fs_mount()` on no
+filesystem found), `scripts/build.sh`/new `scripts/launch64_dual.sh`
 (`disk_dual.img`).
 
 ---
