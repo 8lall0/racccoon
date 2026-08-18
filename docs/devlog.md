@@ -4,6 +4,68 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-19 (2) — Write-into-subdirectory support for both fsd backends
+
+The deliberately-deferred half of subdirectory support (see the
+read-only entry below) — create/overwrite/grow a file inside a
+subdirectory, not just the root. Higher-stakes than the read side (a
+write bug can corrupt real data, per every other write-path entry in
+this log), so built and verified carefully, right after fixing a real
+write-path corruption bug in the same files.
+
+**Design, same shape in both backends, mirroring the read-only
+generalization**: every write-path function that was hardcoded to the
+root now takes the containing directory (cluster/inode) as a
+parameter, resolved once via the existing `fat32_resolve_dir`/
+`ext2_resolve_dir` — no new directory-walking logic, reusing exactly
+what the read path already proved.
+
+- `user/fs/fat32.c3`: `fat32_find_in_dir` gained entry_sector/
+  entry_offset out-params (needed for the protected-entry check and
+  size updates, which the read-only version never needed);
+  `fat32_find_free_dirent`/`fat32_create_file` both gained a
+  `dir_cluster` parameter; `fat32_write` resolves the directory first,
+  then does everything else the same way it always did, just against
+  that cluster instead of always the root.
+- `user/fs/ext2.c3`: same shape — `ext2_find_in_dir` gained entry_
+  sector/entry_offset, `ext2_create_file` gained a `dir_inode_num`
+  parameter (its body's `root` local simply renamed `dir`, no logic
+  change), `ext2_write` resolves the directory first. Reuses the exact
+  same, already-fixed inode-creation code from this session's earlier
+  corruption fix (`links_count = 1`, `i_blocks` maintained) — nothing
+  new to get wrong there.
+
+`fat32_find_in_root`/`ext2_find_in_root` and their own root-only
+caller (`*_reserve_protected`, looking up `fip.bin`) are completely
+untouched — that file only ever lives in the root regardless of what
+this feature does.
+
+**Verified rigorously**: new `newsubfile`/`newsubfile2` shell commands
+(create-then-readback inside `subdir/`, mirroring `newfile`/`newfile2`'s
+own pattern) on both single- and dual-mount QEMU images. For ext2
+specifically, ran the same `e2fsck -n -f` oracle this session's
+corruption fix introduced on the resulting image — only the
+pre-existing, already-accepted free-count cosmetic mismatch showed up,
+confirming the subdirectory write path doesn't reintroduce that bug
+(expected, since it reuses the already-fixed code, but confirmed
+rather than assumed). For FAT32, independently confirmed via `mdir`
+(mtools, not `fsd`'s own read-back) that the new directory entry is
+real and correct. Also confirmed: overwriting an already-created
+subdirectory file reuses its entry correctly (doesn't duplicate or
+corrupt), and a write into a nonexistent directory fails cleanly (the
+identical `resolve_dir` the read path already relies on, not new logic
+to break). Full regression suite otherwise unaffected, `racetest`
+still `a=1 b=1`.
+
+**Files changed:** `user/fs/fat32.c3` (`fat32_find_in_dir`'s new
+out-params, `fat32_find_free_dirent`/`fat32_create_file`'s
+`dir_cluster` parameter, `fat32_write` updated), `user/fs/ext2.c3`
+(same shape: `ext2_find_in_dir`'s new out-params, `ext2_create_file`'s
+`dir_inode_num` parameter, `ext2_write` updated), `user/shell.c3`
+(`newsubfile`/`newsubfile2`).
+
+---
+
 ## 2026-08-19 — Real ext2 write-path corruption, found by looking at the card from Linux's own side
 
 Flashing the previous session's fip.bin surfaced something none of this

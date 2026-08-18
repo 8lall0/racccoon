@@ -277,7 +277,11 @@ fn bool ext2_find_in_root(char* name, uint* out_inode, uint* out_entry_sector, u
 // blocks, not just the root — and reports the matched entry's inode
 // mode too, so a caller can tell a subdirectory from a regular file
 // before deciding what to do with the inode it points at.
-fn bool ext2_find_in_dir(uint dir_inode_num, char* name, uint* out_inode, uint* out_mode)
+// out_entry_sector/out_entry_offset are the entry's own location, same
+// shape as ext2_find_in_root's — needed by the write path (the
+// protected-entry check); ext2_resolve_dir's own directory-walking use
+// just discards them into local dummies.
+fn bool ext2_find_in_dir(uint dir_inode_num, char* name, uint* out_inode, uint* out_entry_sector, uint* out_entry_offset, uint* out_mode)
 {
 	Ext2_inode_info dir;
 	if (!ext2_read_inode(dir_inode_num, &dir)) return false;
@@ -316,8 +320,10 @@ fn bool ext2_find_in_dir(uint dir_inode_num, char* name, uint* out_inode, uint* 
 				{
 					Ext2_inode_info matched;
 					if (!ext2_read_inode(*entry_inode, &matched)) return false;
-					*out_inode = *entry_inode;
-					*out_mode  = matched.mode;
+					*out_inode        = *entry_inode;
+					*out_entry_sector = block * ext2_sectors_per_block + (offset / SECTOR_SIZE);
+					*out_entry_offset = offset % SECTOR_SIZE;
+					*out_mode         = matched.mode;
 					return true;
 				}
 			}
@@ -358,8 +364,10 @@ fn bool ext2_resolve_dir(char* path, uint* out_dir_inode)
 			seg_buf[copy_len] = 0;
 
 			uint next_inode;
+			uint dummy_sector;
+			uint dummy_offset;
 			uint mode;
-			if (!ext2_find_in_dir(dir_inode, &seg_buf, &next_inode, &mode)) return false;
+			if (!ext2_find_in_dir(dir_inode, &seg_buf, &next_inode, &dummy_sector, &dummy_offset, &mode)) return false;
 			if ((mode & EXT2_S_IFDIR) == 0) return false;
 			dir_inode = next_inode;
 		}
@@ -397,8 +405,10 @@ fn int ext2_read(char* name, char* dst, uint len)
 	char* leaf = ext2_leaf_name(name);
 
 	uint inode_num;
+	uint dummy_sector;
+	uint dummy_offset;
 	uint mode;
-	if (!ext2_find_in_dir(dir_inode, leaf, &inode_num, &mode)) return -1;
+	if (!ext2_find_in_dir(dir_inode, leaf, &inode_num, &dummy_sector, &dummy_offset, &mode)) return -1;
 	// A directory isn't file content — refuse rather than hand back
 	// whatever bytes its own directory-entry blocks happen to hold.
 	if ((mode & EXT2_S_IFDIR) != 0) return -1;
@@ -614,7 +624,10 @@ fn bool ext2_zero_inode(uint inode_num)
 // are already all in use — a real v1 limit (see this file's header
 // comment), not silently worked around by splitting an existing entry's
 // trailing space.
-fn bool ext2_create_file(char* name, uint* out_inode_num)
+// dir_inode_num is the containing directory (root or a subdirectory —
+// see ext2_write's own comment on write-into-subdirectory support), not
+// always EXT2_ROOT_INODE anymore.
+fn bool ext2_create_file(uint dir_inode_num, char* name, uint* out_inode_num)
 {
 	uint inode_num = ext2_alloc_inode();
 	if (inode_num == 0) return false;
@@ -634,12 +647,12 @@ fn bool ext2_create_file(char* name, uint* out_inode_num)
 	for (uint i = 0; i < 12; i++) new_inode.block[i] = 0;
 	if (!ext2_write_inode(inode_num, &new_inode)) return false;
 
-	Ext2_inode_info root;
-	if (!ext2_read_inode(EXT2_ROOT_INODE, &root)) return false;
+	Ext2_inode_info dir;
+	if (!ext2_read_inode(dir_inode_num, &dir)) return false;
 
 	uint slot = 0;
-	while (slot < 12 && root.block[slot] != 0) slot++;
-	if (slot >= 12) return false; // root directory's 12 direct blocks are full
+	while (slot < 12 && dir.block[slot] != 0) slot++;
+	if (slot >= 12) return false; // this directory's 12 direct blocks are full
 
 	uint new_block = ext2_alloc_block();
 	if (new_block == 0) return false;
@@ -657,15 +670,15 @@ fn bool ext2_create_file(char* name, uint* out_inode_num)
 
 	if (!ext2_write_block(new_block, &block_buf)) return false;
 
-	root.block[slot] = new_block;
-	root.size += ext2_block_size; // kept correct — real ext2 readers use a directory's own size to know how far to scan its blocks
+	dir.block[slot] = new_block;
+	dir.size += ext2_block_size; // kept correct — real ext2 readers use a directory's own size to know how far to scan its blocks
 	// Second real-hardware bug fixed alongside links_count above:
 	// i_blocks (512-byte sectors, a separate field from i_size — see
-	// EXT2_INODE_BLOCKS's own comment) was never bumped when root
-	// gained this new directory block, caught by e2fsck as a real
+	// EXT2_INODE_BLOCKS's own comment) was never bumped when a
+	// directory gained a new block, caught by e2fsck as a real
 	// inconsistency on the actual boot card.
-	root.blocks += ext2_block_size / SECTOR_SIZE;
-	if (!ext2_write_inode(EXT2_ROOT_INODE, &root)) return false;
+	dir.blocks += ext2_block_size / SECTOR_SIZE;
+	if (!ext2_write_inode(dir_inode_num, &dir)) return false;
 
 	*out_inode_num = inode_num;
 	return true;
@@ -731,17 +744,31 @@ fn uint ext2_write_file(Ext2_inode_info* inode, char* src, uint len)
 // inode write. fs_write_disabled and the reserved-sector-range check
 // are enforced even lower, in fs_write_sector (via diskd_rw), so not
 // duplicated here either.
+// Write-into-subdirectory: resolves the containing directory the same
+// way ext2_read does (ext2_resolve_dir/ext2_leaf_name), then does
+// everything else — existence check, create — against that directory's
+// inode instead of always the root. ext2_find_in_root/its own root-only
+// callers below (ext2_reserve_protected) are untouched: the one file
+// that ever needs protecting (fip.bin) is always in the root.
 fn int ext2_write(char* name, char* src, uint len)
 {
+	uint dir_inode;
+	if (!ext2_resolve_dir(name, &dir_inode)) return -1;
+	char* leaf = ext2_leaf_name(name);
+
 	uint inode_num;
 	uint entry_sector;
 	uint entry_offset;
-	bool exists = ext2_find_in_root(name, &inode_num, &entry_sector, &entry_offset);
+	uint mode;
+	bool exists = ext2_find_in_dir(dir_inode, leaf, &inode_num, &entry_sector, &entry_offset, &mode);
+	// A directory isn't file content — refuse rather than overwrite
+	// whatever it points at, same refusal ext2_read gives.
+	if (exists && (mode & EXT2_S_IFDIR) != 0) return -1;
 
 	if (!exists)
 	{
-		if (!ext2_create_file(name, &inode_num)) return -1;
-		if (!ext2_find_in_root(name, &inode_num, &entry_sector, &entry_offset)) return -1;
+		if (!ext2_create_file(dir_inode, leaf, &inode_num)) return -1;
+		if (!ext2_find_in_dir(dir_inode, leaf, &inode_num, &entry_sector, &entry_offset, &mode)) return -1;
 	}
 
 	if (fs_is_protected_entry(entry_sector, entry_offset)) return -1;

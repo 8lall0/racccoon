@@ -165,6 +165,31 @@ fn void main() @export("main") {
             } else {
                 print("newfile2: readback failed\n");
             }
+        } else if (strcmp(cmd, "newsubfile") == 0) {
+            // Same as newfile, but inside subdir/ — proves the write-
+            // into-subdirectory support (fat32_write/ext2_write's own
+            // fat32_resolve_dir/ext2_resolve_dir use) on mount 1.
+            fs_write("subdir/newtest_sub.txt", "Created by newsubfile test\n", 28);
+            char[128] buf5 @noinit;
+            int len5 = fs_read("subdir/newtest_sub.txt", &buf5, 128);
+            if (len5 >= 0) {
+                buf5[len5] = 0;
+                print(&buf5);
+            } else {
+                print("newsubfile: readback failed\n");
+            }
+        } else if (strcmp(cmd, "newsubfile2") == 0) {
+            // Same as newsubfile, through the "/2/" mount — proves
+            // write-into-subdirectory on the ext2 backend too.
+            fs_write("/2/subdir/newtest_sub2.txt", "Created by newsubfile2 test\n", 29);
+            char[128] buf6 @noinit;
+            int len6 = fs_read("/2/subdir/newtest_sub2.txt", &buf6, 128);
+            if (len6 >= 0) {
+                buf6[len6] = 0;
+                print(&buf6);
+            } else {
+                print("newsubfile2: readback failed (no second fsd mounted?)\n");
+            }
         } else if (strcmp(cmd, "protectedwrite") == 0) {
             // Deliberately attempts to write the one file fsd is
             // supposed to refuse no matter what (see user/fsd.c3's

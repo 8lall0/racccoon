@@ -200,7 +200,11 @@ fn bool fat32_find_in_root(char* name11, uint* out_cluster, uint* out_size, uint
 // chain, not just the root — and reports the matched entry's attribute
 // byte too, so a caller can tell a subdirectory entry from a regular
 // file before deciding what to do with the cluster it points at.
-fn bool fat32_find_in_dir(uint dir_cluster, char* name11, uint* out_cluster, uint* out_size, char* out_attr)
+// out_entry_sector/out_entry_offset are the entry's own location (same
+// as fat32_find_in_root's), needed by the write path (updating
+// file_size in place, the protected-entry check) — fat32_resolve_dir's
+// own directory-walking use just discards them into local dummies.
+fn bool fat32_find_in_dir(uint dir_cluster, char* name11, uint* out_cluster, uint* out_size, uint* out_entry_sector, uint* out_entry_offset, char* out_attr)
 {
 	uint cluster = dir_cluster;
 	char[SECTOR_SIZE] sector_buf @noinit;
@@ -236,9 +240,11 @@ fn bool fat32_find_in_dir(uint dir_cluster, char* name11, uint* out_cluster, uin
 				ushort* cluster_hi = (ushort*)&entry[FAT32_DIRENT_CLUSTER_HI];
 				ushort* cluster_lo = (ushort*)&entry[FAT32_DIRENT_CLUSTER_LO];
 				uint*   size_field = (uint*)&entry[FAT32_DIRENT_FILE_SIZE];
-				*out_cluster = ((uint)*cluster_hi << 16) | (uint)*cluster_lo;
-				*out_size    = *size_field;
-				*out_attr    = attr;
+				*out_cluster      = ((uint)*cluster_hi << 16) | (uint)*cluster_lo;
+				*out_size         = *size_field;
+				*out_entry_sector = sector + s;
+				*out_entry_offset = e * FAT32_DIRENT_SIZE;
+				*out_attr         = attr;
 				return true;
 			}
 		}
@@ -281,8 +287,10 @@ fn bool fat32_resolve_dir(char* path, uint* out_dir_cluster)
 
 			uint next_cluster;
 			uint dummy_size;
+			uint dummy_sector;
+			uint dummy_offset;
 			char attr;
-			if (!fat32_find_in_dir(dir_cluster, &seg11, &next_cluster, &dummy_size, &attr)) return false;
+			if (!fat32_find_in_dir(dir_cluster, &seg11, &next_cluster, &dummy_size, &dummy_sector, &dummy_offset, &attr)) return false;
 			if ((attr & FAT32_DIRENT_ATTR_DIRECTORY) == 0) return false;
 			dir_cluster = next_cluster;
 		}
@@ -356,8 +364,10 @@ fn int fat32_read(char* name, char* dst, uint len)
 
 	uint first_cluster;
 	uint file_size;
+	uint dummy_sector;
+	uint dummy_offset;
 	char attr;
-	if (!fat32_find_in_dir(dir_cluster, &name11, &first_cluster, &file_size, &attr))
+	if (!fat32_find_in_dir(dir_cluster, &name11, &first_cluster, &file_size, &dummy_sector, &dummy_offset, &attr))
 	{
 		return -1;
 	}
@@ -455,16 +465,17 @@ fn uint fat32_alloc_cluster()
 	return 0;
 }
 
-// Walks the root directory looking for a reusable entry slot (first byte
-// 0x00 "free, and everything after" or 0xE5 "deleted"). Always fills
-// *out_last_cluster with the final cluster of the root chain as it
-// walks — needed by the caller to extend the chain if no free slot
-// turns up, and harmless to compute even when one is found. Returns
-// false (chain needs extending) only after scanning the whole chain
-// without finding a slot.
-fn bool fat32_find_free_dirent(uint* out_entry_sector, uint* out_entry_offset, uint* out_last_cluster)
+// Walks dir_cluster's own chain (root or a subdirectory — see
+// fat32_write's own comment on write-into-subdirectory support) looking
+// for a reusable entry slot (first byte 0x00 "free, and everything
+// after" or 0xE5 "deleted"). Always fills *out_last_cluster with the
+// final cluster of that chain as it walks — needed by the caller to
+// extend the chain if no free slot turns up, and harmless to compute
+// even when one is found. Returns false (chain needs extending) only
+// after scanning the whole chain without finding a slot.
+fn bool fat32_find_free_dirent(uint dir_cluster, uint* out_entry_sector, uint* out_entry_offset, uint* out_last_cluster)
 {
-	uint cluster = fat32_root_cluster;
+	uint cluster = dir_cluster;
 	char[SECTOR_SIZE] sector_buf @noinit;
 
 	while (cluster != 0 && cluster < FAT32_EOC_MIN)
@@ -491,14 +502,15 @@ fn bool fat32_find_free_dirent(uint* out_entry_sector, uint* out_entry_offset, u
 	return false;
 }
 
-// Creates a new, empty (zero-size) directory entry for name11 and
-// allocates its first data cluster. Extends the root directory's own
-// chain with a freshly zero-filled cluster if it has no free slot — a
-// directory cluster's bytes are always interpreted as entries (unlike
-// file data past the declared size, which is never exposed to a
-// reader), so unlike fat32_write_file below, this really does need
-// zero-filling for correctness, not just tidiness.
-fn bool fat32_create_file(char* name11, uint* out_first_cluster)
+// Creates a new, empty (zero-size) directory entry for name11 inside
+// dir_cluster (root or a subdirectory) and allocates its first data
+// cluster. Extends dir_cluster's own chain with a freshly zero-filled
+// cluster if it has no free slot — a directory cluster's bytes are
+// always interpreted as entries (unlike file data past the declared
+// size, which is never exposed to a reader), so unlike
+// fat32_write_file below, this really does need zero-filling for
+// correctness, not just tidiness.
+fn bool fat32_create_file(uint dir_cluster, char* name11, uint* out_first_cluster)
 {
 	uint first_cluster = fat32_alloc_cluster();
 	if (first_cluster == 0) return false;
@@ -506,7 +518,7 @@ fn bool fat32_create_file(char* name11, uint* out_first_cluster)
 	uint entry_sector;
 	uint entry_offset;
 	uint last_dir_cluster;
-	if (!fat32_find_free_dirent(&entry_sector, &entry_offset, &last_dir_cluster))
+	if (!fat32_find_free_dirent(dir_cluster, &entry_sector, &entry_offset, &last_dir_cluster))
 	{
 		uint new_dir_cluster = fat32_alloc_cluster();
 		if (new_dir_cluster == 0) return false;
@@ -639,27 +651,45 @@ fn bool fat32_update_entry_size(uint entry_sector, uint entry_offset, uint new_s
 // — done as a fresh lookup rather than threading the entry's location
 // through the create-vs-overwrite paths separately, simpler and more
 // robust.
+//
+// Write-into-subdirectory: resolves the containing directory the same
+// way fat32_read does (fat32_resolve_dir/fat32_leaf_name), then does
+// everything else — existence check, create, find-free-slot, chain
+// extension — against that directory's cluster instead of always the
+// root. fat32_find_in_root/its own root-only fat32_reserve_protected
+// caller are untouched: the one file that ever needs protecting
+// (fip.bin) is always in the root, found and reserved once at mount
+// time regardless of what this function does afterward.
 fn int fat32_write(char* name, char* src, uint len)
 {
+	uint dir_cluster;
+	if (!fat32_resolve_dir(name, &dir_cluster)) return -1;
+	char* leaf = fat32_leaf_name(name);
+
 	char[11] name11 @noinit;
-	fat32_name_to_8_3(name, &name11);
+	fat32_name_to_8_3(leaf, &name11);
 
 	uint cluster;
 	uint size;
 	uint entry_sector;
 	uint entry_offset;
-	bool exists = fat32_find_in_root(&name11, &cluster, &size, &entry_sector, &entry_offset);
+	char attr;
+	bool exists = fat32_find_in_dir(dir_cluster, &name11, &cluster, &size, &entry_sector, &entry_offset, &attr);
+	// A directory isn't file content — refuse rather than overwrite
+	// whatever it points at, same refusal fat32_read gives.
+	if (exists && (attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0) return -1;
 
 	if (!exists)
 	{
-		if (!fat32_create_file(&name11, &cluster)) return -1;
+		if (!fat32_create_file(dir_cluster, &name11, &cluster)) return -1;
 	}
 
 	uint written = fat32_write_file(cluster, src, len);
 
 	uint final_cluster;
 	uint final_size;
-	if (!fat32_find_in_root(&name11, &final_cluster, &final_size, &entry_sector, &entry_offset))
+	char final_attr;
+	if (!fat32_find_in_dir(dir_cluster, &name11, &final_cluster, &final_size, &entry_sector, &entry_offset, &final_attr))
 	{
 		return -1; // should be unreachable — don't claim success if it is
 	}
