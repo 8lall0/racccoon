@@ -240,16 +240,146 @@ fn bool ext2_find_in_root(char* name, uint* out_inode, uint* out_entry_sector, u
 	return false;
 }
 
+// --- Subdirectory support (read path only) ------------------------------
+//
+// v1 scope, deliberately limited to reads — same boundary as FAT32's own
+// (see user/fs/fat32.c3's matching comment): ext2_find_in_root and every
+// write-path function below are untouched, so create/overwrite/grow
+// still only ever operates on the root directory. A subdirectory is
+// just an inode with EXT2_S_IFDIR set whose own data blocks hold more
+// directory entries — the exact same shape as the root directory's own
+// blocks — so ext2_find_in_dir is ext2_find_in_root generalized to any
+// starting inode, not new logic.
+
+// Same walk as ext2_find_in_root, but over any directory inode's direct
+// blocks, not just the root — and reports the matched entry's inode
+// mode too, so a caller can tell a subdirectory from a regular file
+// before deciding what to do with the inode it points at.
+fn bool ext2_find_in_dir(uint dir_inode_num, char* name, uint* out_inode, uint* out_mode)
+{
+	Ext2_inode_info dir;
+	if (!ext2_read_inode(dir_inode_num, &dir)) return false;
+	if ((dir.mode & EXT2_S_IFDIR) == 0) return false;
+
+	uint name_len = ext2_strlen(name);
+
+	for (uint b = 0; b < 12; b++)
+	{
+		uint block = dir.block[b];
+		if (block == 0) continue;
+
+		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
+		if (!ext2_read_block(block, &block_buf)) return false;
+
+		uint offset = 0;
+		while (offset < ext2_block_size)
+		{
+			char* entry = &block_buf[offset];
+			uint*  entry_inode    = (uint*)&entry[EXT2_DIRENT_INODE];
+			ushort* rec_len_field = (ushort*)&entry[EXT2_DIRENT_REC_LEN];
+			char   name_len_byte  = entry[EXT2_DIRENT_NAME_LEN];
+
+			uint rec_len = (uint)*rec_len_field;
+			if (rec_len == 0) break;
+
+			uint entry_name_len = (uint)name_len_byte & 0xFF;
+			if (*entry_inode != 0 && entry_name_len == name_len)
+			{
+				bool match = true;
+				for (uint k = 0; k < name_len; k++)
+				{
+					if (entry[EXT2_DIRENT_NAME + k] != name[k]) { match = false; break; }
+				}
+				if (match)
+				{
+					Ext2_inode_info matched;
+					if (!ext2_read_inode(*entry_inode, &matched)) return false;
+					*out_inode = *entry_inode;
+					*out_mode  = matched.mode;
+					return true;
+				}
+			}
+
+			offset += rec_len;
+		}
+	}
+	return false;
+}
+
+// Splits `path` on '/' and walks from the root inode through every
+// directory component but the last, requiring each to actually be a
+// directory (EXT2_S_IFDIR) — a component that matches a regular file
+// instead fails the resolve, same as one that doesn't match anything. A
+// bare filename with no '/' resolves trivially to the root inode,
+// unchanged from every existing single-level caller. Empty segments (a
+// leading '/', a doubled '//') are skipped rather than treated as a
+// lookup failure.
+fn bool ext2_resolve_dir(char* path, uint* out_dir_inode)
+{
+	uint dir_inode = EXT2_ROOT_INODE;
+	uint seg_start = 0;
+	uint i = 0;
+	for (;;)
+	{
+		if (path[i] != '/' && path[i] != 0)
+		{
+			i++;
+			continue;
+		}
+
+		uint seg_len = i - seg_start;
+		if (seg_len > 0 && path[i] == '/')
+		{
+			char[256] seg_buf @noinit;
+			uint copy_len = seg_len < 255 ? seg_len : 255;
+			for (uint k = 0; k < copy_len; k++) seg_buf[k] = path[seg_start + k];
+			seg_buf[copy_len] = 0;
+
+			uint next_inode;
+			uint mode;
+			if (!ext2_find_in_dir(dir_inode, &seg_buf, &next_inode, &mode)) return false;
+			if ((mode & EXT2_S_IFDIR) == 0) return false;
+			dir_inode = next_inode;
+		}
+
+		if (path[i] == 0) break;
+		seg_start = i + 1;
+		i++;
+	}
+	*out_dir_inode = dir_inode;
+	return true;
+}
+
+// The final path component (after the last '/', or the whole string if
+// there's none) — a pointer into `path` itself, no copy.
+fn char* ext2_leaf_name(char* path)
+{
+	char* leaf = path;
+	uint i = 0;
+	while (path[i] != 0)
+	{
+		if (path[i] == '/') leaf = &path[i + 1];
+		i++;
+	}
+	return leaf;
+}
+
 // Entry point dispatched from fsd.c3's main() for FS_READ. Returns -1
 // if not found, else bytes actually read (already clamped to the file's
 // real size and to what the direct blocks can reach — see this file's
 // header comment).
 fn int ext2_read(char* name, char* dst, uint len)
 {
+	uint dir_inode;
+	if (!ext2_resolve_dir(name, &dir_inode)) return -1;
+	char* leaf = ext2_leaf_name(name);
+
 	uint inode_num;
-	uint entry_sector;
-	uint entry_offset;
-	if (!ext2_find_in_root(name, &inode_num, &entry_sector, &entry_offset)) return -1;
+	uint mode;
+	if (!ext2_find_in_dir(dir_inode, leaf, &inode_num, &mode)) return -1;
+	// A directory isn't file content — refuse rather than hand back
+	// whatever bytes its own directory-entry blocks happen to hold.
+	if ((mode & EXT2_S_IFDIR) != 0) return -1;
 
 	Ext2_inode_info inode;
 	if (!ext2_read_inode(inode_num, &inode)) return -1;

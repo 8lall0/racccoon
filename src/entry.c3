@@ -421,27 +421,18 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			int ipc_len      = (int)f.a4;
 			int ipc_copy_len = ipc_len > MSG_MAX ? MSG_MAX : ipc_len;
 			if (ipc_copy_len < 0) ipc_copy_len = 0;
-			// KNOWN GAP, not fixed here: proc_by_pid checks the target
-			// slot's CURRENT pid/state, but a namespace entry (Mount.
-			// server_pid, process.c3) is a plain pid snapshotted once at
-			// the resolving process's own creation time, never updated.
-			// If that original target process later exits and its slot
-			// gets reused (create_process's own first-free-slot scan —
-			// nothing pins a slot against reuse just because some other
-			// process's stale namespace still names its old pid), a
-			// namespace entry can start silently resolving to whatever
-			// unrelated process now occupies that slot — worst case, the
-			// resolving process's own pid, which deadlocks right here
-			// (a process waiting on msg_acked for a receive only it
-			// could issue, which it can't until this call returns).
-			// Found exactly this way while building a second,
-			// simultaneously-mounted fsd instance (see docs/devlog.md) —
-			// worked around there by having that specific server never
-			// exit on its one expected failure mode, not fixed in
-			// general. A real fix needs namespace entries to carry a
-			// generation alongside the pid (SYS_JOIN already has exactly
-			// that distinction for its own, different purpose — see
-			// Process.generation's own comment) and check it here too.
+			// proc_by_pid here only ever guards against a plain dead/
+			// never-existed pid (e.g. a stale hardcoded pid like echod's
+			// or diskd's, if one of those ever exited). The stale-
+			// namespace-pid hazard this comment used to describe — a
+			// Mount entry silently resolving to an unrelated process that
+			// reused a dead target's slot, found while building the
+			// second, simultaneously-mounted fsd (docs/devlog.md) — is
+			// now closed one layer up, in SYS_NS_RESOLVE's own generation
+			// check (see Mount.server_generation's comment, process.c3):
+			// a caller can never obtain a hijacked pid through namespace
+			// resolution in the first place, so this check doesn't need
+			// to re-derive that distinction itself.
 			Process* ipc_target = proc_by_pid(ipc_dest_pid);
 			if (!ipc_target)
 			{
@@ -592,6 +583,16 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			for (int m = 0; m < NS_MOUNTS_MAX; m++)
 			{
 				if (current_proc.namespace[m].server_pid == 0) continue;
+				// Generation check closes the stale-pid hazard documented
+				// on Mount.server_generation (process.c3): if the process
+				// that originally held this pid has since exited and the
+				// slot was reused (or never got this far at all), either
+				// proc_by_pid returns null or its live generation won't
+				// match what was recorded when this entry was bound —
+				// either way, treat it exactly like server_pid == 0 rather
+				// than resolve to the wrong, unrelated process.
+				Process* ns_target = proc_by_pid(current_proc.namespace[m].server_pid);
+				if (!ns_target || ns_target.generation != current_proc.namespace[m].server_generation) continue;
 				char* ns_prefix = &current_proc.namespace[m].prefix[0];
 				if (!str_starts_with(ns_path, ns_prefix)) continue;
 

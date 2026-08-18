@@ -45,6 +45,7 @@ const char FAT32_DIRENT_FREE_REST   = (char)0x00; // this entry and all followin
 const char FAT32_DIRENT_DELETED     = (char)0xE5; // this entry is deleted, keep scanning
 const char FAT32_DIRENT_ATTR_LFN    = (char)0x0F; // long-filename entry, not a real file — skip
 const char FAT32_DIRENT_ATTR_VOLUME = (char)0x08; // volume label bit — skip, never a real file
+const char FAT32_DIRENT_ATTR_DIRECTORY = (char)0x10; // subdirectory, not a regular file — see fat32_find_in_dir
 
 const uint FAT32_ENTRY_MASK = 0x0FFFFFFF; // low 28 bits significant
 const uint FAT32_EOC_MIN    = 0x0FFFFFF8; // cluster values at or above this mean end-of-chain
@@ -181,6 +182,133 @@ fn bool fat32_find_in_root(char* name11, uint* out_cluster, uint* out_size, uint
 	return false;
 }
 
+// --- Subdirectory support (read path only) -----------------------------
+//
+// v1 scope, deliberately limited to reads: fat32_find_in_root and every
+// write-path caller above are untouched — write support only ever
+// creates/overwrites/grows a file in the root directory, same as
+// before. These three functions exist purely so fat32_read (below) can
+// walk into a subdirectory to find a file to read; nothing here can
+// write anything. Real filesystem, standard on-disk format: a
+// subdirectory is just an ordinary directory entry (FAT32_DIRENT_ATTR_
+// DIRECTORY set) whose own cluster chain holds more directory entries,
+// same shape as the root directory itself — so fat32_find_in_dir is
+// fat32_find_in_root generalized to take any starting cluster, not new
+// logic.
+
+// Same walk as fat32_find_in_root, but over any directory's cluster
+// chain, not just the root — and reports the matched entry's attribute
+// byte too, so a caller can tell a subdirectory entry from a regular
+// file before deciding what to do with the cluster it points at.
+fn bool fat32_find_in_dir(uint dir_cluster, char* name11, uint* out_cluster, uint* out_size, char* out_attr)
+{
+	uint cluster = dir_cluster;
+	char[SECTOR_SIZE] sector_buf @noinit;
+
+	while (cluster != 0 && cluster < FAT32_EOC_MIN)
+	{
+		uint sector = fat32_cluster_to_sector(cluster);
+		for (uint s = 0; s < fat32_sectors_per_cluster; s++)
+		{
+			if (!fs_read_sector(sector + s, &sector_buf)) return false;
+
+			for (uint e = 0; e < SECTOR_SIZE / FAT32_DIRENT_SIZE; e++)
+			{
+				char* entry = &sector_buf[e * FAT32_DIRENT_SIZE];
+				if (entry[0] == FAT32_DIRENT_FREE_REST) return false;
+				if (entry[0] == FAT32_DIRENT_DELETED) continue;
+
+				char attr = entry[FAT32_DIRENT_ATTR];
+				if (attr == FAT32_DIRENT_ATTR_LFN) continue;
+				if ((attr & FAT32_DIRENT_ATTR_VOLUME) != 0) continue;
+
+				bool match = true;
+				for (uint k = 0; k < 11; k++)
+				{
+					if (entry[FAT32_DIRENT_NAME + k] != name11[k])
+					{
+						match = false;
+						break;
+					}
+				}
+				if (!match) continue;
+
+				ushort* cluster_hi = (ushort*)&entry[FAT32_DIRENT_CLUSTER_HI];
+				ushort* cluster_lo = (ushort*)&entry[FAT32_DIRENT_CLUSTER_LO];
+				uint*   size_field = (uint*)&entry[FAT32_DIRENT_FILE_SIZE];
+				*out_cluster = ((uint)*cluster_hi << 16) | (uint)*cluster_lo;
+				*out_size    = *size_field;
+				*out_attr    = attr;
+				return true;
+			}
+		}
+		cluster = fat32_next_cluster(cluster);
+	}
+	return false;
+}
+
+// Splits `path` on '/' and walks from the root through every directory
+// component but the last, requiring each to actually be a directory
+// (FAT32_DIRENT_ATTR_DIRECTORY) — a path component that matches a
+// regular file instead fails the resolve, same as one that doesn't
+// match anything. A bare filename with no '/' at all resolves trivially
+// to the root, unchanged from every existing single-level caller.
+// Empty segments (a leading '/', a doubled '//') are skipped rather
+// than treated as a lookup failure.
+fn bool fat32_resolve_dir(char* path, uint* out_dir_cluster)
+{
+	uint dir_cluster = fat32_root_cluster;
+	uint seg_start = 0;
+	uint i = 0;
+	for (;;)
+	{
+		if (path[i] != '/' && path[i] != 0)
+		{
+			i++;
+			continue;
+		}
+
+		uint seg_len = i - seg_start;
+		if (seg_len > 0 && path[i] == '/')
+		{
+			char[64] seg_buf @noinit;
+			uint copy_len = seg_len < 63 ? seg_len : 63;
+			for (uint k = 0; k < copy_len; k++) seg_buf[k] = path[seg_start + k];
+			seg_buf[copy_len] = 0;
+
+			char[11] seg11 @noinit;
+			fat32_name_to_8_3(&seg_buf, &seg11);
+
+			uint next_cluster;
+			uint dummy_size;
+			char attr;
+			if (!fat32_find_in_dir(dir_cluster, &seg11, &next_cluster, &dummy_size, &attr)) return false;
+			if ((attr & FAT32_DIRENT_ATTR_DIRECTORY) == 0) return false;
+			dir_cluster = next_cluster;
+		}
+
+		if (path[i] == 0) break;
+		seg_start = i + 1;
+		i++;
+	}
+	*out_dir_cluster = dir_cluster;
+	return true;
+}
+
+// The final path component (after the last '/', or the whole string if
+// there's none) — a pointer into `path` itself, no copy.
+fn char* fat32_leaf_name(char* path)
+{
+	char* leaf = path;
+	uint i = 0;
+	while (path[i] != 0)
+	{
+		if (path[i] == '/') leaf = &path[i + 1];
+		i++;
+	}
+	return leaf;
+}
+
 // Follows first_cluster's chain, copying up to `len` bytes (already
 // clamped by the caller against the file's real size) into dst starting
 // from the beginning of the file. Returns the number of bytes actually
@@ -219,17 +347,23 @@ fn uint fat32_read_file(uint first_cluster, char* dst, uint len)
 // (already clamped to the file's real size).
 fn int fat32_read(char* name, char* dst, uint len)
 {
+	uint dir_cluster;
+	if (!fat32_resolve_dir(name, &dir_cluster)) return -1;
+	char* leaf = fat32_leaf_name(name);
+
 	char[11] name11 @noinit;
-	fat32_name_to_8_3(name, &name11);
+	fat32_name_to_8_3(leaf, &name11);
 
 	uint first_cluster;
 	uint file_size;
-	uint entry_sector;
-	uint entry_offset;
-	if (!fat32_find_in_root(&name11, &first_cluster, &file_size, &entry_sector, &entry_offset))
+	char attr;
+	if (!fat32_find_in_dir(dir_cluster, &name11, &first_cluster, &file_size, &attr))
 	{
 		return -1;
 	}
+	// A directory isn't file content — refuse rather than hand back
+	// whatever bytes its own directory-entry cluster happens to hold.
+	if ((attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0) return -1;
 
 	uint read_len = len;
 	if (read_len > file_size) read_len = file_size;

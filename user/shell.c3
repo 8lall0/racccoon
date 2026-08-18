@@ -24,6 +24,13 @@ fn void thread_body(void* arg) {
 // actually looks like when it goes wrong: one reply comes back matching
 // the *other* thread's payload instead of its own, or a thread hangs
 // forever waiting for a reply to a message echod never actually saw.
+//
+// A misleading "a=0 b=0" result was chased down once (docs/devlog.md)
+// and turned out to be neither of those — process.c3's PROCS_MAX was
+// too small, so threadcreate() below silently failed for one or both
+// threads and they never ran at all. See the threadcreate-failure check
+// below for how that's now reported distinctly instead of looking like
+// IPC corruption.
 char[4096] race_stack_a;
 char[4096] race_stack_b;
 char[16] race_reply_a;
@@ -99,6 +106,32 @@ fn void main() @export("main") {
                 print("\n");
             } else {
                 print("readfile2: not found (no second fsd mounted?)\n");
+            }
+        } else if (strcmp(cmd, "readsubfile") == 0) {
+            // Exercises fsd's new read-only subdirectory support (see
+            // docs/devlog.md) against mount 1 (whichever backend is
+            // mounted there — disk/subdir/nested.txt on FAT32).
+            char[128] buf3 @noinit;
+            int len3 = fs_read("subdir/nested.txt", &buf3, 128);
+            if (len3 >= 0) {
+                buf3[len3] = 0;
+                print(&buf3);
+                print("\n");
+            } else {
+                print("readsubfile: not found\n");
+            }
+        } else if (strcmp(cmd, "readsubfile2") == 0) {
+            // Same as readsubfile, against mount 2 (disk-ext2/subdir/
+            // nested.txt on ext2) — proves subdirectory support works
+            // through both backends and through the "/2/" prefix-strip.
+            char[128] buf4 @noinit;
+            int len4 = fs_read("/2/subdir/nested.txt", &buf4, 128);
+            if (len4 >= 0) {
+                buf4[len4] = 0;
+                print(&buf4);
+                print("\n");
+            } else {
+                print("readsubfile2: not found (no second fsd mounted?)\n");
             }
         } else if (strcmp(cmd, "writefile") == 0) {
             fs_write("hello.txt", "Hello from shell!\n", 19);
@@ -383,13 +416,24 @@ fn void main() @export("main") {
             uint gen_b = 0;
             int tid_a = threadcreate(&race_thread_a, null, stack_a_top, &gen_a);
             int tid_b = threadcreate(&race_thread_b, null, stack_b_top, &gen_b);
-            join(tid_a, gen_a);
-            join(tid_b, gen_b);
-            print("racetest: a=");
-            putchar((char)('0' + race_ok_a));
-            print(" b=");
-            putchar((char)('0' + race_ok_b));
-            print(" (1=correct reply, 0=corrupted or lost)\n");
+            // threadcreate() can fail (no free process slot — see
+            // process.c3's PROCS_MAX comment for a real case this caught:
+            // a silent -1 here used to masquerade as "corrupted or lost"
+            // below, since join() on a pid that was never created returns
+            // immediately and race_ok_a/b are left at their reset value).
+            // Reported distinctly so a future PROCS_MAX-exhaustion regression
+            // is never confused with an actual IPC/rendezvous bug again.
+            if (tid_a < 0 || tid_b < 0) {
+                print("racetest: threadcreate failed (no free process slot) — inconclusive\n");
+            } else {
+                join(tid_a, gen_a);
+                join(tid_b, gen_b);
+                print("racetest: a=");
+                putchar((char)('0' + race_ok_a));
+                print(" b=");
+                putchar((char)('0' + race_ok_b));
+                print(" (1=correct reply, 0=corrupted or lost)\n");
+            }
         } else {
             print("unknown command: ");
             print(cmd);

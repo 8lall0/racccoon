@@ -3,6 +3,134 @@
 Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
+## 2026-08-18 (4) — Read-only subdirectory support for both fsd backends
+
+Third of three requested follow-ups from the multi-mount work. Both
+FAT32 and ext2 were deliberately root-directory-only in v1 (each
+backend's own header comment). Scoped this pass to reads only — write
+support (create/overwrite/grow *inside* a subdirectory, as opposed to
+the existing root-only write path) is real, separate work with real
+data-corruption stakes on a live boot partition, and wasn't attempted
+unsupervised.
+
+**Design, same shape in both backends**: a subdirectory is just an
+ordinary directory entry/inode whose own data holds more directory
+entries — the same layout the root directory already uses — so the new
+code is the existing root-walking function generalized to take any
+starting point, not new logic. `fat32_find_in_root`/`ext2_find_in_root`
+and every write-path caller of either are completely untouched.
+
+- `user/fs/fat32.c3`: `fat32_find_in_dir(dir_cluster, ...)` (generalizes
+  `fat32_find_in_root`, also reports the matched entry's attribute byte
+  so a caller can tell a subdirectory from a file via the newly-added
+  `FAT32_DIRENT_ATTR_DIRECTORY` bit), `fat32_resolve_dir()` (splits a
+  path on `/`, walks each directory component, requiring
+  `ATTR_DIRECTORY` at each step), `fat32_leaf_name()`. `fat32_read`
+  resolves the containing directory first, then looks up the leaf there
+  instead of always in the root, and refuses to "read" a directory as
+  file content.
+- `user/fs/ext2.c3`: `ext2_find_in_dir(dir_inode_num, ...)` (same
+  generalization, reports the matched entry's inode mode —
+  `EXT2_S_IFDIR` already existed as a format constant, unused until
+  now), `ext2_resolve_dir()`, `ext2_leaf_name()`. `ext2_read` updated
+  the same way.
+
+Both resolve functions support arbitrary nesting depth (not just one
+level) for free — the path-splitting loop doesn't care how many `/`s it
+crosses — and skip empty segments (a leading `/`, a doubled `//`)
+rather than failing on them.
+
+**Verified on QEMU**, both single- and dual-mount images: new
+`disk/subdir/nested.txt` and `disk-ext2/subdir/nested.txt` test fixtures
+(`scripts/build.sh`, seeded via `mmd`/`mcopy` for FAT32 and `debugfs`'s
+own `mkdir` for ext2), new `readsubfile`/`readsubfile2` shell commands.
+Both backends correctly resolve into their subdirectory and return the
+right, distinct content through both mounts simultaneously; full
+existing regression suite (including `racetest`, now consistently
+`a=1 b=1` after this session's `PROCS_MAX` fix above) unaffected.
+
+**Files changed:** `user/fs/fat32.c3` (`FAT32_DIRENT_ATTR_DIRECTORY`,
+`fat32_find_in_dir`/`fat32_resolve_dir`/`fat32_leaf_name`, `fat32_read`
+updated), `user/fs/ext2.c3` (`ext2_find_in_dir`/`ext2_resolve_dir`/
+`ext2_leaf_name`, `ext2_read` updated), `user/shell.c3`
+(`readsubfile`/`readsubfile2`), `scripts/build.sh` (subdirectory test
+fixtures in all three QEMU test images), new `disk/subdir/nested.txt` /
+`disk-ext2/subdir/nested.txt`.
+
+---
+
+## 2026-08-18 (3) — Closing the stale-namespace-pid gap, and the real racetest culprit: PROCS_MAX, not IPC
+
+Two follow-ups from the multi-mount entry below, both requested
+explicitly rather than found by accident this time.
+
+**1. The documented `SYS_IPC_SEND` "KNOWN GAP"**: a namespace entry
+(`Mount.server_pid`) was a plain pid snapshot taken once at the
+resolving process's own creation time, never refreshed — if the
+original target exited and its slot got reused, the entry could
+silently start resolving to an unrelated process. Fixed the way the
+gap comment itself suggested: `Mount` gained a `server_generation`
+field, populated via a new `mount_generation()` helper (`proc_by_pid`
++ `.generation`, 0 if the target doesn't currently exist) at the exact
+three call sites `create_process()` already populates `server_pid` at.
+`SYS_NS_RESOLVE` (`src/entry.c3`) now requires a live match on *both*
+pid and generation before handing a mount's `server_pid` back — the
+same "this exact instance, not a reused slot" distinction `SYS_JOIN`
+already relies on for its own purpose. Fixed one layer up from where
+the old comment sat (`SYS_IPC_SEND`'s `proc_by_pid` check): a caller
+can now never *obtain* a hijacked pid through namespace resolution in
+the first place, so `SYS_IPC_SEND` itself needs no new logic — its
+existing `proc_by_pid` null-check still does its original, narrower
+job (guarding against a genuinely dead/never-existed pid). The exact
+original trigger (fsd2 panicking and freeing its slot) no longer
+exists to re-run live, since that path was already made non-fatal in
+the multi-mount work — verified instead by full QEMU regression
+(single- and dual-mount images), confirming no behavior change in any
+working case, and by code-level comparison against `SYS_JOIN`'s
+already-proven pattern.
+
+**2. `racetest`'s `a=0 b=0`**, chased for real this time instead of
+being logged as a known-orthogonal issue. Static tracing of the
+send/recv rendezvous mechanism through several interleavings turned up
+nothing — the mechanism is genuinely serialized, no clobbering possible
+by construction. Added temporary debug prints (raw reply bytes, sender
+pid, `threadcreate()`'s own return values) rather than keep
+speculating. The very first data point broke the case open:
+`threadcreate()` was returning `-1` for *both* racing threads — never
+even creating them, let alone corrupting a reply. Root cause:
+`process.c3`'s `PROCS_MAX` was 8, and by the time `racetest` runs in
+the full regression sequence, all 8 slots are already spoken for (idle,
+echod, diskd-or-sdd, fsd, fsd2, shell, rforktest's child, sandboxtest's
+child) — zero left for racetest's own two `threadcreate()` calls.
+`join()` on a pid that was never actually created returns immediately
+(`proc_by_pid` correctly says "gone"), so `race_ok_a`/`race_ok_b` are
+read back at their reset value of 0 before the (nonexistent) threads
+ever run. This also fully explains the *original* `a=1 b=0` baseline,
+long before any of this week's changes: even at 7 permanent+child
+processes, only one spare slot existed — thread A got it, thread B's
+`threadcreate()` failed the same way. Never an IPC bug at any point.
+
+Fixed by raising `PROCS_MAX` to 16 (real headroom over the 6 permanent
+boot processes plus concurrent test children/threads; costs an extra
+512KB of static kernel memory, negligible against the 64MB DRAM budget
+on both QEMU and the Duo — confirmed via each board's own `kernel.ld`
+that the free-RAM pool either has fixed generous headroom already
+(QEMU) or self-sizes against whatever's left (Duo), not a fixed window
+that could overflow). Also hardened `racetest` itself
+(`user/shell.c3`) to check `threadcreate()`'s return value and report
+"threadcreate failed (no free process slot) — inconclusive" distinctly,
+so a future `PROCS_MAX`-exhaustion regression can never again be
+mistaken for IPC/rendezvous corruption. Verified: `racetest: a=1 b=1`,
+reproducible across repeated runs on both the single- and dual-mount
+QEMU images, full regression suite otherwise unaffected.
+
+**Files changed:** `src/process.c3` (`Mount.server_generation`,
+`mount_generation()`, `PROCS_MAX` 8→16), `src/entry.c3`
+(`SYS_NS_RESOLVE`'s generation check, `SYS_IPC_SEND`'s comment
+updated), `user/shell.c3` (`racetest`'s `threadcreate()` failure
+check and updated comment).
+
+---
 
 ## 2026-08-18 (2) — Two simultaneous fsd mounts, and a real self-deadlock bug found along the way
 

@@ -5,7 +5,22 @@ import libc;
 import std::io;
 import board;
 
-const PROCS_MAX     = 8; // Maximum number of processes
+// Was 8 — too tight even before the second fsd instance: 6 permanent
+// boot processes (idle/echod/diskd-or-sdd/fsd/fsd2/shell) left only 2
+// spare for every test command's own children/threads combined, and
+// racetest alone needs 2 (its two racing threadcreate() threads) on top
+// of whatever rforktest/sandboxtest's own still-live children are
+// already holding. Root-caused a misleading "racetest: a=0 b=0" result
+// (looked like IPC/rendezvous corruption, wasn't) to exactly this: no
+// free slots left meant threadcreate() silently returned -1 for both
+// threads, and join() on a pid that never existed returns immediately —
+// see docs/devlog.md. 16 gives real headroom: the 6 permanent processes
+// plus up to 10 concurrent test/child/thread slots, costing an extra
+// 8 * STACK_SIZE (512KB) of static kernel memory — negligible against
+// the 64MB DRAM budget on both QEMU and the Duo (whose own linker
+// script already sizes free_ram against whatever's left over, so it
+// self-adjusts rather than risking an overflow).
+const PROCS_MAX     = 16; // Maximum number of processes
 const PROC_UNUSED   = 0; // Unused process control structure
 const PROC_RUNNABLE = 1; // Runnable process
 const PROC_BLOCKED  = 2; // Waiting on SYS_IPC_RECV for a message to arrive
@@ -66,10 +81,26 @@ const NS_PREFIX_MAX = 32;  // Longest path prefix a mount entry can match.
 
 // One binding in a process's namespace: any path starting with `prefix`
 // resolves to `server_pid`. A zero server_pid marks an unused slot.
+//
+// server_generation closes a real hazard found while building the
+// second, simultaneously-mounted fsd (docs/devlog.md): server_pid alone
+// is a plain pid snapshot taken once at the resolving process's own
+// creation time, never refreshed. If the original target process later
+// exits and its slot gets reused (create_process's own first-free-slot
+// scan doesn't pin a slot against reuse just because some other
+// process's stale namespace still names its old pid), server_pid can
+// start silently matching whatever unrelated process now occupies that
+// slot — worst case, the resolving process's own pid, which deadlocks
+// SYS_IPC_SEND. server_generation records the target's Process.generation
+// at the moment this entry was bound; SYS_NS_RESOLVE (entry.c3) requires
+// a live match on both pid and generation before handing server_pid
+// back, the same "this exact instance, not a reused slot" distinction
+// SYS_JOIN already relies on for its own, different purpose.
 struct Mount
 {
 	char[NS_PREFIX_MAX] prefix;
 	int                 server_pid;
+	uint                server_generation;
 }
 // 8192 was enough for the syscall-only trap path (getchar/putchar), but the
 // file-system call chain (handle_syscall -> fs_lookup/fs_flush ->
@@ -321,6 +352,18 @@ fn void fork_entry() @naked @noinline @noreturn
 
 Process[PROCS_MAX] procs; // All process control structures.
 
+// Mount.server_generation's own value at namespace-population time — see
+// that field's comment. 0 for a pid that doesn't currently exist (0
+// itself, or a slot that's PROC_UNUSED), matching server_pid's existing
+// "0 means nothing bound here" convention: SYS_NS_RESOLVE already skips
+// server_pid == 0 first, so this value is never actually consulted in
+// that case.
+fn uint mount_generation(int pid)
+{
+	Process* p = proc_by_pid(pid);
+	return p ? p.generation : 0;
+}
+
 fn Process* create_process(void* image, uint image_size)
 {
 	// Find an unused process control structure.
@@ -398,6 +441,7 @@ fn Process* create_process(void* image, uint image_size)
 	// per-process kernel lookup instead.
 	str_copy(&proc.namespace[0].prefix[0], "/", NS_PREFIX_MAX);
 	proc.namespace[0].server_pid = 2;
+	proc.namespace[0].server_generation = mount_generation(2);
 
 	// "" is a catch-all — str_starts_with treats an empty prefix as
 	// matching everything, and its zero length always loses a longest-
@@ -409,6 +453,7 @@ fn Process* create_process(void* image, uint image_size)
 	// none of which ever need this).
 	str_copy(&proc.namespace[1].prefix[0], "", NS_PREFIX_MAX);
 	proc.namespace[1].server_pid = fsd_pid;
+	proc.namespace[1].server_generation = mount_generation(fsd_pid);
 
 	// "/2/" — the second, simultaneously-mounted fsd instance (see
 	// fsd2_pid's own comment above). Same "harmless 0 for any process
@@ -416,6 +461,7 @@ fn Process* create_process(void* image, uint image_size)
 	// (entry.c3) already skips any mount with server_pid == 0.
 	str_copy(&proc.namespace[2].prefix[0], "/2/", NS_PREFIX_MAX);
 	proc.namespace[2].server_pid = fsd2_pid;
+	proc.namespace[2].server_generation = mount_generation(fsd2_pid);
 
 	for (int m = 3; m < NS_MOUNTS_MAX; m++)
 	{
