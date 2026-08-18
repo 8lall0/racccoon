@@ -79,27 +79,47 @@ const uint SD_INT_DATA_AVAIL  = 0x00000020; // buffer read-ready
 const uint SD_INT_ERROR       = 0x00008000;
 const uint SD_INT_ALL_MASK    = 0xFFFFFFFF; // write-1-to-clear, every bit
 
-// Shared busy-wait bound for the per-command polling loops in sd_send_cmd
-// (used inside the ACMD41 retry loop, so multiplied by both the retry
-// count and two commands per retry — has to stay small enough that a
-// genuinely non-responding card fails within a few seconds, not minutes).
-const int SD_WAIT_MAX = 50000;
+// Real, wall-clock-bounded wait budgets — this driver used to have no
+// timer/delay primitive at all (no rdtime access from user mode —
+// scounteren.TM was never enabled — see docs/devlog.md), so every wait
+// here used to be a raw iteration-count busy loop with genuinely unknown
+// correspondence to real time (SD_WAIT_MAX/SD_SETUP_WAIT_MAX, both blunt
+// instruments chosen by trial, not real timeouts). Now that
+// user/user.c3's rdtime() exists, every wait below is bounded in real
+// microseconds instead. SD_TIMEBASE_HZ is the Duo's real timebase-
+// frequency, confirmed directly from the real devicetree shipped in
+// duo-buildroot-sdk (build/boards/default/dts/cv180x_riscv/
+// cv180x_base_riscv.dtsi: `timebase-frequency = 25000000`), not assumed.
+const uint SD_TIMEBASE_HZ = 25000000;
 
-// Separate, much larger bound for the two ONE-TIME setup waits in
-// sdd_pad_power_clock_init (software reset self-clear, internal clock
-// stable) — each runs exactly once, so a generous bound here is cheap.
-// This codebase has no timer/delay primitive at all (no rdtime access
-// from user mode — scounteren.TM is never enabled — see the kernel-side
-// TODO this raised), so every wait here is a raw iteration-count busy
-// loop with genuinely unknown correspondence to wall-clock time. U-Boot's
-// own generic sdhci_reset() (drivers/mmc/sdhci.c) waits up to 100ms of
-// *real time* via udelay(1000) x100 for the exact same self-clearing
-// reset bit — SD_WAIT_MAX (50000 raw loop iterations, no delay) may well
-// be nowhere near 100ms of real time on this core, which would make a
-// reset that's genuinely still completing look identical to one that
-// never will. This is a blunt instrument to test that theory directly,
-// not a considered choice — 400x SD_WAIT_MAX, only paid once each.
-const int SD_SETUP_WAIT_MAX = SD_WAIT_MAX * 400;
+fn ulong sd_us_to_ticks(ulong us)
+{
+	return us * SD_TIMEBASE_HZ / 1000000;
+}
+
+// Real timeout values below, not invented: sourced from the real U-Boot
+// generic SDHCI driver (duo-buildroot-sdk/u-boot-2021.10/drivers/mmc/
+// sdhci.c), the same file already read once this session for the
+// SDHCI_TRNS_READ direction-bit bug and the RST_ALL-stuck elimination
+// trail.
+//   - SD_CMD_INHIBIT_US: sdhci_send_command()'s own CMD/DATA-inhibit
+//     wait, SDHCI_CMD_DEFAULT_TIMEOUT = 100ms.
+//   - SD_CMD_COMPLETE_US: the same function's post-command wait for
+//     SDHCI_INT_RESPONSE, SDHCI_READ_STATUS_TIMEOUT = 1000ms.
+//   - SD_CLOCK_STABLE_US: sdhci_set_clock()'s internal-clock-stable
+//     wait, literally "wait max 20 ms" in the real source.
+//   - SD_DATA_READY_US/SD_XFER_DONE_US: sdhci_transfer_data()'s own
+//     combined ready+transfer+DATA_END loop budgets 10 real seconds
+//     (timeout=1000000, udelay(10)) for a *whole*, potentially multi-
+//     block transfer; this driver only ever moves one block per call
+//     and splits ready-wait from completion-wait into two separate
+//     steps, so each gets a smaller, still-generous 1000ms slice of
+//     that same real envelope rather than the full 10s each.
+const ulong SD_CMD_INHIBIT_US   = 100000;
+const ulong SD_CMD_COMPLETE_US  = 1000000;
+const ulong SD_CLOCK_STABLE_US  = 20000;
+const ulong SD_DATA_READY_US    = 1000000;
+const ulong SD_XFER_DONE_US     = 1000000;
 
 const uint SD_CLOCK_INT_EN     = 0x0001;
 const uint SD_CLOCK_INT_STABLE = 0x0002;
@@ -388,11 +408,11 @@ uint sd_last_int_status;
 
 fn bool sd_send_cmd(uint index, uint arg, uint resp_flags, bool data)
 {
-	int inhibit_wait = 0;
+	ulong inhibit_start = rdtime();
+	ulong inhibit_budget = sd_us_to_ticks(SD_CMD_INHIBIT_US);
 	uint inhibit_mask = data ? (SD_PRESENT_CMD_INHIBIT | SD_PRESENT_DATA_INHIBIT) : SD_PRESENT_CMD_INHIBIT;
-	while ((sd_reg_read(SD_PRESENT_STATE) & inhibit_mask) != 0 && inhibit_wait < SD_WAIT_MAX)
+	while ((sd_reg_read(SD_PRESENT_STATE) & inhibit_mask) != 0 && rdtime() - inhibit_start < inhibit_budget)
 	{
-		inhibit_wait++;
 	}
 
 	sd_reg_write(SD_ARGUMENT, arg);
@@ -432,13 +452,13 @@ fn bool sd_send_cmd(uint index, uint arg, uint resp_flags, bool data)
 	uint cmd_word = ((index & 0x3F) << 24) | ((flags & 0xFF) << 16) | xfer;
 	sd_reg_write(SD_XFERMODE_CMD, cmd_word);
 
-	int complete_wait = 0;
+	ulong complete_start = rdtime();
+	ulong complete_budget = sd_us_to_ticks(SD_CMD_COMPLETE_US);
 	uint status = 0;
-	while (complete_wait < SD_WAIT_MAX)
+	while (rdtime() - complete_start < complete_budget)
 	{
 		status = sd_reg_read(SD_INT_STATUS);
 		if ((status & (SD_INT_RESPONSE | SD_INT_ERROR)) != 0) break;
-		complete_wait++;
 	}
 	sd_last_int_status = status;
 	// On error, clear the WHOLE status word, not just SD_INT_RESPONSE|
@@ -496,6 +516,28 @@ fn void print_hex32(uint v)
 	}
 }
 
+fn void print_uint(uint v)
+{
+	char[10] digits @noinit;
+	int n = 0;
+	if (v == 0)
+	{
+		putchar('0');
+		return;
+	}
+	while (v > 0 && n < 10)
+	{
+		digits[n] = (char)('0' + (v % 10));
+		v /= 10;
+		n++;
+	}
+	while (n > 0)
+	{
+		n--;
+		putchar(digits[n]);
+	}
+}
+
 // Raises SDCLK from whatever slow clock BootROM left running (see
 // sdd_pad_power_clock_init's own comment — deliberately never
 // reconfigured before this point, since a prior version of this exact
@@ -524,10 +566,10 @@ fn void sdd_raise_clock()
 	w = (w & 0xFFFF0000) | ((div_25m & 0xFF) << 8) | SD_CLOCK_INT_EN;
 	sd_reg_write(SD_CLOCK_SWRESET, w);
 
-	int wait = 0;
-	while ((sd_reg_read(SD_CLOCK_SWRESET) & SD_CLOCK_INT_STABLE) == 0 && wait < SD_SETUP_WAIT_MAX)
+	ulong stable_start = rdtime();
+	ulong stable_budget = sd_us_to_ticks(SD_CLOCK_STABLE_US);
+	while ((sd_reg_read(SD_CLOCK_SWRESET) & SD_CLOCK_INT_STABLE) == 0 && rdtime() - stable_start < stable_budget)
 	{
-		wait++;
 	}
 
 	w = sd_reg_read(SD_CLOCK_SWRESET);
@@ -574,8 +616,9 @@ fn bool sdd_enumerate()
 	// argument) requests high-capacity support. 200 tries, not the
 	// original 2000 (itself already cut down from 100000) — SD Physical
 	// Layer spec's own recommended ACMD41 polling timeout is ~1 second,
-	// and each try costs up to two commands' worth of SD_WAIT_MAX-bounded
-	// busy-waits, so even 2000 tries of a genuinely non-responding card
+	// and each try costs up to two commands' worth of SD_CMD_INHIBIT_US/
+	// SD_CMD_COMPLETE_US-bounded busy-waits, so even 2000 tries of a
+	// genuinely non-responding card
 	// took long enough on real hardware to be indistinguishable from a
 	// hang from the console alone (confirmed: sat with no new output for
 	// a long time on the first real attempt). A '.' printed every 20
@@ -707,38 +750,39 @@ fn bool sdd_block_rw(char* data, uint sector, bool is_write)
 		return false;
 	}
 
-	// SD_SETUP_WAIT_MAX (400x SD_WAIT_MAX), not SD_WAIT_MAX, for both
-	// waits below — deliberately different from sd_send_cmd's own
-	// command-level wait, which stays tight since it's paid repeatedly
-	// during ACMD41's retry loop (a slow bound there makes a genuinely
-	// non-responding card look hung — see that function's own comment).
-	// This wait is paid once per block request, not per retry, so a
-	// generous bound here is cheap regardless of whether it turns out to
-	// matter.
+	// A real, wall-clock-bounded wait now (see SD_DATA_READY_US's own
+	// comment) — deliberately different from sd_send_cmd's own command-
+	// level wait, which stays tight since it's paid repeatedly during
+	// ACMD41's retry loop (a slow bound there makes a genuinely non-
+	// responding card look hung — see that function's own comment). This
+	// wait is paid once per block request, not per retry, so a generous
+	// bound here is cheap regardless of whether it turns out to matter.
 	//
 	// Waits on INT_STATUS's own ready bit — SD_INT_DATA_AVAIL for a read,
 	// SD_INT_SPACE_AVAIL for a write — not PRESENT_STATE's equivalent
 	// bits, matching the real vendor driver's sdhci_transfer_data()
 	// (u-boot's generic drivers/mmc/sdhci.c, read directly during this
 	// session's read-side diagnosis; the same pattern applies
-	// symmetrically here).
+	// symmetrically here). rdtime() itself is a handful of instructions
+	// (csrr + a memory bridge, no UART involved) — nowhere near the
+	// print()-call overhead that was the actual root cause of the real
+	// data-loss bug documented below, so calling it here doesn't
+	// reintroduce that hazard.
 	uint ready_bit = is_write ? SD_INT_SPACE_AVAIL : SD_INT_DATA_AVAIL;
-	int ready_wait = 0;
+	ulong ready_start = rdtime();
+	ulong ready_budget = sd_us_to_ticks(SD_DATA_READY_US);
 	uint int_status = 0;
-	while (ready_wait < SD_SETUP_WAIT_MAX)
+	while (rdtime() - ready_start < ready_budget)
 	{
 		int_status = sd_reg_read(SD_INT_STATUS);
 		if ((int_status & (ready_bit | SD_INT_ERROR)) != 0) break;
-		ready_wait++;
 	}
 	bool ready_ok = (int_status & ready_bit) != 0;
 	if (!ready_ok)
 	{
 		print("sdd: ");
 		print(is_write ? "space" : "data");
-		print("-ready TIMED OUT after ");
-		print_hex32((uint)ready_wait);
-		print(" iters, int_status=");
+		print("-ready TIMED OUT, int_status=");
 		print_hex32(int_status);
 		print("\n");
 		return false;
@@ -768,30 +812,34 @@ fn bool sdd_block_rw(char* data, uint sector, bool is_write)
 		}
 	}
 
-	int done_wait = 0;
+	ulong done_start = rdtime();
+	ulong done_budget = sd_us_to_ticks(SD_XFER_DONE_US);
 	uint status = 0;
-	while (done_wait < SD_SETUP_WAIT_MAX)
+	while (rdtime() - done_start < done_budget)
 	{
 		status = sd_reg_read(SD_INT_STATUS);
 		if ((status & (SD_INT_DATA_END | SD_INT_ERROR)) != 0) break;
-		done_wait++;
 	}
 	// All the command/ready diagnostics deferred from earlier in this
 	// function (see this function's own header comment) — safe to print
-	// now, the whole block is already fully transferred.
+	// now, the whole block is already fully transferred. Elapsed
+	// microseconds, not raw iteration counts — genuinely meaningful now
+	// that rdtime() exists, unlike the old "N iters" figures.
+	uint ready_us = (uint)((rdtime() - ready_start) * 1000000 / SD_TIMEBASE_HZ);
+	uint done_us = (uint)((rdtime() - done_start) * 1000000 / SD_TIMEBASE_HZ);
 	print("sdd: CMD");
 	print_hex32(cmd_index);
 	print(" ok resp0=");
 	print_hex32(sd_response0);
 	print(" ready after ");
-	print_hex32((uint)ready_wait);
-	print(" iters, int_status=");
+	print_uint(ready_us);
+	print("us, int_status=");
 	print_hex32(int_status);
 	print(" transfer-complete status=");
 	print_hex32(status);
 	print(" after ");
-	print_hex32((uint)done_wait);
-	print(" iters\n");
+	print_uint(done_us);
+	print("us\n");
 	sd_reg_write(SD_INT_STATUS, SD_INT_ALL_MASK);
 
 	return (status & SD_INT_DATA_END) != 0;

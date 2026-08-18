@@ -283,6 +283,33 @@ fn int fs_partition_info(uint* start_sector_out) @export("fs_partition_info") {
     return syscall(SYS_FS_PARTITION_INFO, (long)start_sector_out, 0, 0);
 }
 
+ulong rdtime_tmp @export("rdtime_tmp");
+
+// Direct CSR read, no syscall — trap-free as long as the kernel has set
+// scounteren.TM (see src/entry.c3's enable_user_timer_access(), called
+// once at boot). Generic across any RISC-V hart (QEMU included), unlike
+// board-specific facts like a real timebase frequency to convert ticks
+// into real time — those stay wherever they're actually needed (e.g.
+// user/sdd.c3's own SD_TIMEBASE_HZ), not here.
+//
+// Bridged through a memory temp, not returned straight out of a0 — the
+// structured `asm { }` block form doesn't recognize `rdtime`/`csrr` as
+// instructions at all (compile error), and src/entry.c3's read_reg
+// macro already found the more direct fix (raw a0 via opaque asm()) to
+// be a real hazard: the compiler can't see the side effect, so it can
+// silently clobber a value it still thinks is live in a0. Same opaque-
+// string asm() + memory-bridge pattern as that macro, not the
+// structured block form sdd.c3's own mmio_read32 uses for plain
+// loads/stores.
+fn ulong rdtime() @export("rdtime") {
+    asm(`
+        csrr t0, time
+        la t1, rdtime_tmp
+        sd t0, 0(t1)
+    `);
+    return rdtime_tmp;
+}
+
 fn void putchar(char ch) @export("putchar") {
     syscall(SYS_PUTCHAR, (int)ch, 0, 0);
 }

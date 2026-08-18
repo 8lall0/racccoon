@@ -74,6 +74,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 
 	board::plic_init();
 	enable_external_interrupts();
+	enable_user_timer_access();
 
 	io::print("2: Trap handler set\n");
 

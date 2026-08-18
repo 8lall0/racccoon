@@ -135,11 +135,25 @@ macro write_csr(String $reg, value)
 
 const SIE_SEIE     = (1 << 9);  // sie: supervisor external interrupt enable
 const SSTATUS_SIE  = (1 << 1);  // sstatus: global supervisor interrupt enable
+const SCOUNTEREN_TM = (1 << 1); // scounteren: lets U-mode execute rdtime without trapping
 
 fn void enable_external_interrupts()
 {
 	write_csr("sie", read_reg("sie") | SIE_SEIE);
 	write_csr("sstatus", read_reg("sstatus") | SSTATUS_SIE);
+}
+
+// mcounteren.TM (M-mode -> S-mode) is expected to already be enabled by
+// OpenSBI — standard practice, needed for any S-mode OS to read `time`
+// at all — so nothing to do for this kernel's own S-mode access.
+// scounteren.TM (S-mode -> U-mode) is this kernel's own responsibility,
+// and was never set before this: any user-mode `rdtime` would have
+// trapped. See user/sdd.c3's own real-time wait budgets (docs/devlog.md)
+// for the actual motivation — busy-wait loops there used to be raw
+// iteration counts with no real correspondence to wall-clock time.
+fn void enable_user_timer_access()
+{
+	write_csr("scounteren", read_reg("scounteren") | SCOUNTEREN_TM);
 }
 
 // For the standard check-condition-then-wfi race: if the completion

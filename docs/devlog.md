@@ -4,6 +4,68 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-18 — A real timer primitive, replacing sdd.c3's guessed busy-wait counts
+
+`user/sdd.c3` had a standing, self-documented gap: no `rdtime` access
+from user mode (`scounteren.TM` never enabled), so every wait loop —
+command-complete, data-ready, transfer-complete, the one-time clock/
+reset waits — was a raw iteration count (`SD_WAIT_MAX`/
+`SD_SETUP_WAIT_MAX`) with no real correspondence to wall-clock time.
+
+**Real values confirmed, not guessed**, same discipline as this
+project's SDHCI register maps: Duo's real `timebase-frequency` (25MHz)
+read directly from the real devicetree in `duo-buildroot-sdk`; QEMU
+`virt`'s (10MHz) extracted directly from the actual
+`qemu-system-riscv64` binary via `-machine virt,dumpdtb=...` + `dtc`,
+not assumed from general RISC-V/QEMU folklore. Real per-wait timeout
+budgets (100ms command-inhibit, 1000ms command-complete, 20ms clock-
+stable, 1000ms each for data-ready/transfer-complete) sourced from the
+real U-Boot generic SDHCI driver, the same file already read once
+earlier this session for the SDHCI_TRNS_READ bug.
+
+**Kernel**: `enable_user_timer_access()` (`src/entry.c3`) sets
+`scounteren.TM`, called once at boot next to the existing
+`enable_external_interrupts()`. **User-mode**: `rdtime()`
+(`user/user.c3`) — direct CSR read via the opaque-string `asm()` form
+bridged through a memory temp, not the structured `asm {}` block (which
+doesn't recognize `rdtime`/`csrr` at all) and not raw a0 (a real hazard
+already found once in this exact codebase, in `entry.c3`'s own
+`read_reg` macro — the compiler can silently clobber a value it still
+thinks is live in a0). Every one of `sdd.c3`'s five wait loops converted
+to `rdtime()`-bounded real time; `SD_WAIT_MAX`/`SD_SETUP_WAIT_MAX`
+removed entirely.
+
+Verified on QEMU (full regression suite — `sdd.c3` isn't even spawned
+there, confirms the kernel-side change doesn't regress anything else)
+and real Duo hardware: every wait now reports genuine, sensible
+microsecond figures (`ready after 251us`, not a meaningless iteration
+count) with `readfile`/`newfile`/`writefile` all still correct.
+
+Also noticed, while reading the real-hardware output, that
+`fip.bin`'s write-protected cluster count had jumped from ~19 to 150 —
+initially concerning, but the real, benign explanation: the FAT32
+partition was resized much smaller during yesterday's ext2 work, and
+`mkfs.vfat` auto-selects cluster size by volume size (4KB clusters on
+the new 1GiB partition vs. the original 32KB on the 58GB card) — same
+file, proportionally more (smaller) clusters. Confirmed via
+`610816 ÷ 150 ≈ 4072 bytes`, essentially exactly 4096, and independently
+by `readfile`/`newfile` both still returning correct real content — not
+a regression from this session's own changes.
+
+**Explicitly out of scope**: `sstc`/`stimecmp` timer *interrupts* (real
+preemptive sleep/scheduling) — `sdd.c3`'s actual problem was an
+inaccurate busy-wait bound, not a need to yield the CPU while waiting; a
+plain elapsed-ticks read solves that completely. Timer interrupts are a
+separate, larger feature (touches the scheduler, not just one driver).
+
+**Files changed:** `src/entry.c3` (`enable_user_timer_access()`),
+`src/kernel.c3` (call it), `user/user.c3` (`rdtime()`), `user/sdd.c3`
+(`SD_TIMEBASE_HZ`, real per-wait timeout constants, every wait loop
+converted, `print_uint()` added, `SD_WAIT_MAX`/`SD_SETUP_WAIT_MAX`
+removed).
+
+---
+
 ## 2026-08-17 (7) — ext2 write support
 
 **Continuing from this same day's ext2-verification entry.** Brought
