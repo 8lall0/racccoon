@@ -57,6 +57,16 @@ identical `resolve_dir` the read path already relies on, not new logic
 to break). Full regression suite otherwise unaffected, `racetest`
 still `a=1 b=1`.
 
+**Confirmed on real Duo hardware** too (FAT32 side — `subdir/nested.txt`
+seeded onto the real `DUOBOOT` partition for this; the ext2 side's own
+subdirectory support stays QEMU-only for now, same call made for the
+read-only entry below, reasonable here too since its write logic is
+identical to `newfile2`'s already hardware-confirmed-fixed path):
+`readsubfile` correctly read `nested.txt`, and `newsubfile` correctly
+wrote and read back a new file inside `subdir/` — a real `CMD00000018`
+(write) visible in the console trace, not just a successful-looking
+readback.
+
 **Files changed:** `user/fs/fat32.c3` (`fat32_find_in_dir`'s new
 out-params, `fat32_find_free_dirent`/`fat32_create_file`'s
 `dir_cluster` parameter, `fat32_write` updated), `user/fs/ext2.c3`
