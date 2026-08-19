@@ -4,6 +4,62 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-19 (13) — Real preemption's first prerequisite: sepc needed to become per-process state
+
+First real design step toward actual preemptive scheduling (the
+deliberately-deferred half of the timer-interrupt work). Found by
+reading the existing trap-return path closely rather than assuming it
+would just work: a genuine, foundational correctness bug that
+preemption would trigger on its very first tick, not a rare race.
+
+**The invariant that made the old code correct without a per-process
+`sepc`**: `sepc` is a single, non-banked hardware CSR. `write_sepc()`
+(or, for interrupts, hardware's own already-correct value) was always
+set *immediately before* an uninterrupted `sret` — no `yield()` ever
+happened in between, for any existing code path. `Process`/
+`switch_context()` never needed a `sepc` field because nothing ever
+relied on the hardware register surviving across a context switch —
+every blocking-syscall loop (`SYS_GETCHAR`, `SYS_IPC_RECV`, `SYS_JOIN`)
+only writes `sepc` *after* its own loop finishes, right before
+returning.
+
+**Why preemption breaks it**: calling `yield()` from inside the timer
+interrupt means some *other* process's own `write_sepc()`+`sret`
+sequence can run before the preempted process resumes — overwriting
+`sepc` in between. By the time the preempted process is rescheduled,
+`sepc` holds someone else's return address, not its own.
+
+**Fix**: `Process` gained `saved_sepc`. `handle_trap` now captures it
+once at entry (correct as-is for interrupts, overwritten with the
+post-ecall address for ecalls, unaffected by any `yield()`s that
+happen via `switch_context`'s own stack-swap, which — confirmed by
+reading it — always resumes a process's own call chain exactly where
+it left off) and writes the real `sepc` CSR exactly once, always, right
+before `handle_trap` returns — restoring the same "write immediately
+before an uninterrupted `sret`" invariant, just sourced from
+per-process state instead of assuming the shared register survived
+untouched. `fork_entry()` (the `rfork` child's own first resume) needed
+no change — it's a separate, fully self-contained naked-asm sequence
+(its own `csrw sepc` immediately followed by `sret`, no C3 call, no
+`yield()` possible in between) that was never subject to this hazard.
+`sstatus`/`SPIE` didn't need the same treatment: every process always
+runs with interrupts enabled, so that saved value is the same constant
+regardless of which process's trap entry most recently wrote it.
+
+**Verified as rigorously as the concern warranted**: full regression
+suite (both QEMU images), `racetest` specifically run 4 times in a row
+(the test most likely to expose exactly this class of bug, since it
+genuinely interleaves two threads via real concurrent `yield()`s) —
+`a=1 b=1` every time. `threadjointest` (properly `join()`-synchronized)
+also correct. No context switch happens from the timer interrupt yet —
+this is groundwork, not preemption itself.
+
+**Files changed:** `src/process.c3` (`Process.saved_sepc`),
+`src/entry.c3` (`handle_trap` captures/restores it instead of writing
+`sepc` directly mid-function).
+
+---
+
 ## 2026-08-19 (12) — Real timer interrupts, actually working on real hardware now
 
 Fixes the previous entry's real-hardware regression: switched

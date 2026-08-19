@@ -116,6 +116,18 @@ struct Process
 	uptr sp; // Stack pointer
 	ulong* page_table; // Sv39 top-level (root) table — see page.c3
 
+	// This process's own correct resume address, restored into the real
+	// sepc CSR right before handle_trap (entry.c3) returns — not relied
+	// on to survive untouched in the single, non-banked hardware sepc
+	// register across any yield() a trap's own handling might call.
+	// Needed for real preemption (a timer interrupt calling yield() mid-
+	// handling): before this field existed, sepc was only ever written
+	// once, immediately before an *uninterrupted* sret (no yield()
+	// between the write and the sret, true of every existing blocking-
+	// syscall yield() loop) — a real correctness bug waiting to happen
+	// the moment that stopped being true. See docs/devlog.md.
+	ulong saved_sepc;
+
 	// Bumped every time this slot is (re)used — never reset, persists
 	// across a slot's unused periods. Exists purely so SYS_JOIN
 	// (entry.c3) can tell "the process I was waiting for exited" apart

@@ -930,6 +930,15 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 	ulong scause  = read_reg("scause");
 	ulong stval   = read_reg("stval");
 	ulong user_pc = read_reg("sepc");
+	// Captured here, restored (via write_sepc) right before this
+	// function returns — see Process.saved_sepc's own comment for why
+	// this needs to be per-process state now, not just this shared
+	// hardware register left to survive a trap's own handling
+	// untouched. Correct as-is for every existing case (hardware
+	// already points sepc at the right resume address for an
+	// interrupt); the ecall branch below overwrites it with the
+	// post-ecall address once it knows that's needed.
+	current_proc.saved_sepc = user_pc;
 
 	if (scause & SCAUSE_INTERRUPT_BIT)
 	{
@@ -1016,11 +1025,30 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 	else if (scause == SCAUSE_ECALL)
 	{
 		handle_syscall(f);
-		write_sepc(user_pc + 4);
+		// current_proc, not necessarily the same process that entered
+		// this trap: any of the blocking syscalls above (SYS_GETCHAR,
+		// SYS_IPC_RECV, SYS_JOIN's poll loop) can yield() through many
+		// other processes before finally returning here — but by the
+		// time handle_syscall returns, execution has unwound back onto
+		// *this* process's own kernel stack (switch_context is a plain
+		// stack swap; a process's own call chain, including this exact
+		// frame, only ever resumes where it left off), so current_proc
+		// is correctly this process again. user_pc is this same
+		// process's own local copy from trap entry, untouched by
+		// anything that happened to other processes in between.
+		current_proc.saved_sepc = user_pc + 4;
 	}
 	else
 	{
 		io::printfn("unexpected trap scause=%x, stval=%x, sepc=%x, current_pid=%d\n", scause, stval, user_pc, current_proc.pid);
 		panic::panic("it's a trap!");
 	}
+
+	// The one place the real sepc CSR actually gets written, always
+	// immediately before this function returns (and so, immediately
+	// before kernel_entry's own tail-end sret, with nothing able to run
+	// in between) — see Process.saved_sepc's own comment for why this
+	// needs to read per-process state rather than just trust the
+	// hardware register survived whatever this trap's own handling did.
+	write_sepc(current_proc.saved_sepc);
 }
