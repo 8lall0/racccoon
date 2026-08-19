@@ -328,6 +328,26 @@ fn void main() @export("main") {
             } else {
                 print("rmdirnonempty2: WARNING: non-empty directory was deleted\n");
             }
+        } else if (strcmp(cmd, "rmrtest") == 0) {
+            // nestdir/ (seeded at build time — scripts/build.sh) has
+            // a file directly inside it plus a further nested
+            // subdirectory (innerdir/) with its own file — two real
+            // levels of recursion, not just "one directory with one
+            // file," so this actually exercises
+            // fat32_delete_recursive/ext2_delete_recursive recursing
+            // into a subdirectory, not just walking one level of
+            // entries. plain fs_delete (non-recursive) on the same
+            // target should still be refused first — proves the
+            // recursive path is opt-in, not a silent behavior change
+            // to the existing rmdir semantics.
+            int refused = fs_delete("nestdir");
+            int del1 = fs_delete_recursive("nestdir");
+            int del2 = fs_delete_recursive("nestdir");
+            if (refused < 0 && del1 == 0 && del2 < 0) {
+                print("rmrtest: ok\n");
+            } else {
+                print("rmrtest: FAILED\n");
+            }
         } else if (strcmp(cmd, "protectedwrite") == 0) {
             // Deliberately attempts to write the one file fsd is
             // supposed to refuse no matter what (see user/fsd.c3's

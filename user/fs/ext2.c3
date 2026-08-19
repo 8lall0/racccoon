@@ -1154,6 +1154,167 @@ fn int ext2_delete(char* name)
 	return 0;
 }
 
+// Defense-in-depth bound on ext2_delete_dir_contents' own recursion —
+// see fat32_delete_dir_contents' matching constant for the full
+// reasoning (not reachable through a well-formed ext2 tree, but
+// nothing on-disk actually prevents a corrupted or adversarial image
+// from containing a directory cycle anyway).
+const int EXT2_MAX_DELETE_DEPTH = 32;
+
+// Empties a directory's own data blocks by deleting everything inside
+// it — files freed directly, subdirectories recursed into first —
+// walking raw directory entries the same way ext2_dir_is_empty already
+// does. Unlike FAT32, ext2 dirents here carry no file-type byte (see
+// ext2_find_in_dir's own comment), so telling a file from a
+// subdirectory means reading each child's own inode. dir_inode_num is
+// *this* directory's own inode number — needed to patch its
+// links_count down by one for every subdirectory removed from inside
+// it (undoing that child's own ".." link to it — the same accounting
+// ext2_delete's non-recursive path already does for the single
+// directory it removes, done here once per removed subdirectory
+// instead of once total). depth is the same recursion bound
+// fat32_delete_dir_contents uses.
+fn bool ext2_delete_dir_contents(uint dir_inode_num, int depth)
+{
+	if (depth >= EXT2_MAX_DELETE_DEPTH) return false;
+
+	Ext2_inode_info dir;
+	if (!ext2_read_inode(dir_inode_num, &dir)) return false;
+
+	for (uint b = 0; b < 12; b++)
+	{
+		uint block = dir.block[b];
+		if (block == 0) continue;
+
+		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
+		if (!ext2_read_block(block, &block_buf)) return false;
+
+		bool block_modified = false;
+		uint offset = 0;
+		while (offset < ext2_block_size)
+		{
+			char* entry = &block_buf[offset];
+			uint*   entry_inode   = (uint*)&entry[EXT2_DIRENT_INODE];
+			ushort* rec_len_field = (ushort*)&entry[EXT2_DIRENT_REC_LEN];
+			char    name_len_byte = entry[EXT2_DIRENT_NAME_LEN];
+
+			uint rec_len = (uint)*rec_len_field;
+			if (rec_len == 0) break;
+
+			uint entry_name_len  = (uint)name_len_byte & 0xFF;
+			uint child_inode_num = *entry_inode;
+			if (child_inode_num != 0)
+			{
+				bool is_dot    = entry_name_len == 1 && entry[EXT2_DIRENT_NAME] == '.';
+				bool is_dotdot = entry_name_len == 2 && entry[EXT2_DIRENT_NAME] == '.' && entry[EXT2_DIRENT_NAME + 1] == '.';
+				if (!is_dot && !is_dotdot)
+				{
+					uint entry_sector = block * ext2_sectors_per_block + (offset / SECTOR_SIZE);
+					uint entry_offset = offset % SECTOR_SIZE;
+					if (fs_is_protected_entry(entry_sector, entry_offset)) return false;
+
+					Ext2_inode_info child;
+					if (!ext2_read_inode(child_inode_num, &child)) return false;
+					bool child_is_dir = (child.mode & EXT2_S_IFDIR) != 0;
+
+					if (child_is_dir)
+					{
+						if (!ext2_delete_dir_contents(child_inode_num, depth + 1)) return false;
+
+						// child.block[] (read above, before recursing)
+						// stays accurate: the recursive call only ever
+						// rewrites child_inode_num's own links_count and
+						// the *contents* of its data blocks, never which
+						// blocks are allocated to it — no re-read needed
+						// before freeing those blocks below.
+						if (dir.links_count > 0) dir.links_count -= 1;
+						if (!ext2_dec_used_dirs((child_inode_num - 1) / ext2_inodes_per_group)) return false;
+					}
+
+					if (!ext2_zero_inode(child_inode_num)) return false;
+					for (uint cb = 0; cb < 12; cb++)
+					{
+						if (child.block[cb] == 0) continue;
+						if (!ext2_free_block(child.block[cb])) return false;
+					}
+					if (!ext2_free_inode(child_inode_num)) return false;
+
+					*entry_inode = 0;
+					block_modified = true;
+				}
+			}
+
+			offset += rec_len;
+		}
+		if (block_modified)
+		{
+			if (!ext2_write_block(block, &block_buf)) return false;
+		}
+	}
+
+	return ext2_write_inode(dir_inode_num, &dir);
+}
+
+// Same as ext2_delete, but a non-empty directory is emptied first
+// (ext2_delete_dir_contents, above) instead of refused — the real,
+// separate, genuinely destructive operation ext2_delete's own comment
+// deliberately deferred. A protected entry anywhere in the subtree
+// (checked by ext2_delete_dir_contents for every child, and here for
+// the target itself) aborts the whole operation before anything is
+// freed — never a partial delete that silently skips just the
+// protected part.
+fn int ext2_delete_recursive(char* name)
+{
+	uint dir_inode;
+	if (!ext2_resolve_dir(name, &dir_inode)) return -1;
+	char* leaf = ext2_leaf_name(name);
+
+	uint inode_num;
+	uint entry_sector;
+	uint entry_offset;
+	uint mode;
+	if (!ext2_find_in_dir(dir_inode, leaf, &inode_num, &entry_sector, &entry_offset, &mode)) return -1;
+	if (fs_is_protected_entry(entry_sector, entry_offset)) return -1;
+
+	Ext2_inode_info inode;
+	if (!ext2_read_inode(inode_num, &inode)) return -1;
+
+	bool is_dir = (mode & EXT2_S_IFDIR) != 0;
+	if (is_dir)
+	{
+		// inode.block[] (read above) stays accurate across this call —
+		// see ext2_delete_dir_contents' own matching comment.
+		if (!ext2_delete_dir_contents(inode_num, 0)) return -1;
+	}
+
+	char[SECTOR_SIZE] sector_buf @noinit;
+	if (!fs_read_sector(entry_sector, &sector_buf)) return -1;
+	uint* entry_inode_field = (uint*)&sector_buf[entry_offset + EXT2_DIRENT_INODE];
+	*entry_inode_field = 0;
+	if (!fs_write_sector(entry_sector, &sector_buf)) return -1;
+
+	if (is_dir)
+	{
+		Ext2_inode_info parent;
+		if (!ext2_read_inode(dir_inode, &parent)) return -1;
+		if (parent.links_count > 0) parent.links_count -= 1;
+		if (!ext2_write_inode(dir_inode, &parent)) return -1;
+
+		if (!ext2_dec_used_dirs((inode_num - 1) / ext2_inodes_per_group)) return -1;
+	}
+
+	if (!ext2_zero_inode(inode_num)) return -1;
+
+	for (uint b = 0; b < 12; b++)
+	{
+		if (inode.block[b] == 0) continue;
+		if (!ext2_free_block(inode.block[b])) return -1;
+	}
+	if (!ext2_free_inode(inode_num)) return -1;
+
+	return 0;
+}
+
 // Looks up a protected file (plain name, e.g. "fip.bin") and: records
 // its directory entry's exact (sector, offset) via
 // fs_set_protected_entry() — see that function's own comment in fsd.c3

@@ -423,8 +423,10 @@ fn void print_uint(uint n) @export("print_uint") {
 // filenames like "hello.txt" never start with "/", so they fall
 // through to it) rather than needing to know fsd's pid. Wire format
 // (kept in sync by hand with user/fsd.c3): byte 0..99 = filename,
-// 100..103 = length (uint, FS_READ/FS_WRITE only — FS_DELETE has
-// nothing else to send), 104.. = file data — reply reuses 0..3 for
+// 100..103 = length (uint, FS_READ/FS_WRITE) or recursive flag
+// (uint, 0 or 1, FS_DELETE only — a non-empty directory is emptied
+// first instead of refused when set; see fat32_delete_recursive/
+// ext2_delete_recursive), 104.. = file data — reply reuses 0..3 for
 // the result (FS_READ/FS_WRITE: length or -1; FS_DELETE: 0 or -1) and,
 // for a read, 4.. for the data.
 const uint FS_READ   = 20;
@@ -501,7 +503,7 @@ fn int fs_write(char* filename, char* buf, int len) @export("fs_write") {
     return *result_len_field;
 }
 
-fn int fs_delete(char* filename) @export("fs_delete") {
+fn int fs_delete_impl(char* filename, uint recursive) {
     uint prefix_len = 0;
     int fsd_pid = ns_resolve(filename, &prefix_len);
     if (fsd_pid < 0) return -1;
@@ -515,6 +517,12 @@ fn int fs_delete(char* filename) @export("fs_delete") {
         i++;
     }
     req[i] = 0;
+    // Explicit, not left @noinit: fsd.c3 now reads this byte as the
+    // recursive flag (see the wire-format comment above) — garbage
+    // here would risk a plain fs_delete() being silently treated as
+    // recursive.
+    uint* recursive_field = (uint*)&req[100];
+    *recursive_field = recursive;
 
     uint reply_verb = 0;
     int from = p9_call(fsd_pid, FS_DELETE, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
@@ -522,6 +530,18 @@ fn int fs_delete(char* filename) @export("fs_delete") {
 
     int* result_field = (int*)&req;
     return *result_field;
+}
+
+fn int fs_delete(char* filename) @export("fs_delete") {
+    return fs_delete_impl(filename, 0);
+}
+
+// Same as fs_delete, but a non-empty directory is emptied first
+// instead of refused — see fat32_delete_recursive/ext2_delete_recursive
+// (user/fs/*.c3) for what that actually does. Real, separate,
+// genuinely destructive from here on: no confirmation prompt, no undo.
+fn int fs_delete_recursive(char* filename) @export("fs_delete_recursive") {
+    return fs_delete_impl(filename, 1);
 }
 
 fn int strcmp(char* a, char* b) {

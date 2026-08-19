@@ -398,16 +398,22 @@ fn void main() @export("main")
 			// entry() check (matching the exact sector/offset reserved
 			// at mount time), this is just an obvious, cheap first
 			// refusal before either backend even runs.
+			//
+			// req_len doubles as the recursive flag here (see user.c3's
+			// wire-format comment) — FS_DELETE has no length of its own
+			// to send, and this byte range is already read and clamped
+			// above for FS_READ/FS_WRITE's sake.
+			bool recursive = req_len != 0;
 			int result = -1;
 			if (!fs_is_protected_name(&filename))
 			{
 				if (fs_type == FS_TYPE_FAT32)
 				{
-					result = fat32_delete(&filename);
+					result = recursive ? fat32_delete_recursive(&filename) : fat32_delete(&filename);
 				}
 				else if (fs_type == FS_TYPE_EXT2)
 				{
-					result = ext2_delete(&filename);
+					result = recursive ? ext2_delete_recursive(&filename) : ext2_delete(&filename);
 				}
 			}
 			*result_len_field = result;

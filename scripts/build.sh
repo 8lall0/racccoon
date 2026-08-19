@@ -35,6 +35,14 @@ LLC=${LLC:-llc}
   # succeeds) needs a real, pre-seeded empty directory; the negative
   # case (refuses a non-empty one) is already covered by subdir itself.
   mmd -i build/disk.img ::emptydir
+  # disk's own nestdir/ (a file plus a nested subdirectory, itself
+  # containing a file) exercises fat32_delete_recursive()'s actual
+  # recursion — emptydir above only proves the empty-directory case,
+  # already covered by the plain (non-recursive) fat32_delete().
+  mmd -i build/disk.img ::nestdir
+  mcopy -i build/disk.img disk/subdir/nested.txt ::nestdir/inner.txt
+  mmd -i build/disk.img ::nestdir/innerdir
+  mcopy -i build/disk.img disk/subdir/nested.txt ::nestdir/innerdir/inner2.txt
 
   echo "==> Building disk image (ext2, for scripts/launch64_ext2.sh)..."
   # Additional, not a replacement — build/disk.img (FAT32) above stays
@@ -60,6 +68,12 @@ LLC=${LLC:-llc}
   # disk_ext2's own emptydir/ — same rmdir-testing purpose as disk.img's
   # own emptydir/ above.
   debugfs -w -R "mkdir emptydir" build/disk_ext2.img > /dev/null
+  # disk-ext2's own nestdir/ — same recursive-delete-testing purpose
+  # as disk.img's own nestdir/ above.
+  debugfs -w -R "mkdir nestdir" build/disk_ext2.img > /dev/null
+  debugfs -w -R "write disk-ext2/subdir/nested.txt nestdir/inner.txt" build/disk_ext2.img > /dev/null
+  debugfs -w -R "mkdir nestdir/innerdir" build/disk_ext2.img > /dev/null
+  debugfs -w -R "write disk-ext2/subdir/nested.txt nestdir/innerdir/inner2.txt" build/disk_ext2.img > /dev/null
 
   echo "==> Building disk image (dual FAT32+ext2, for scripts/launch64_dual.sh)..."
   # Third test image — exercises fsd/fsd2 mounting two filesystems at once

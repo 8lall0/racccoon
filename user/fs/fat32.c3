@@ -816,6 +816,120 @@ fn int fat32_delete(char* name)
 	return fat32_free_cluster_chain(cluster) ? 0 : -1;
 }
 
+// Defense-in-depth bound on fat32_delete_dir_contents' own recursion —
+// not reachable through any well-formed FAT32 tree (a directory's
+// cluster chain can only ever point at its *children*, never back at
+// an ancestor), but nothing on-disk actually prevents a corrupted or
+// adversarially crafted image from containing one anyway, and a real
+// cycle would otherwise recurse forever and eventually blow this
+// process's own stack instead of failing cleanly. 32 comfortably covers
+// any real directory tree a human would actually create.
+const int FAT32_MAX_DELETE_DEPTH = 32;
+
+// Empties a directory's cluster chain by deleting everything inside it
+// — files freed directly, subdirectories recursed into first — walking
+// raw directory entries by cluster/sector/offset the same way
+// fat32_dir_is_empty already does, rather than reconstructing 8.3 names
+// into path strings and going back through fat32_find_in_dir/
+// fat32_delete for each child (this driver has no long-filename
+// support to round-trip through anyway, and every name it would need
+// is already right here in the raw entry). Leaves dir_cluster's own
+// chain allocated — freeing *that* is the caller's job, same as
+// fat32_delete_recursive frees the top-level target's own chain once
+// this returns.
+fn bool fat32_delete_dir_contents(uint dir_cluster, int depth)
+{
+	if (depth >= FAT32_MAX_DELETE_DEPTH) return false;
+
+	uint cluster = dir_cluster;
+	while (cluster != 0 && cluster < FAT32_EOC_MIN)
+	{
+		uint sector = fat32_cluster_to_sector(cluster);
+		for (uint s = 0; s < fat32_sectors_per_cluster; s++)
+		{
+			char[SECTOR_SIZE] sector_buf @noinit;
+			if (!fs_read_sector(sector + s, &sector_buf)) return false;
+
+			bool sector_modified = false;
+			for (uint e = 0; e < SECTOR_SIZE / FAT32_DIRENT_SIZE; e++)
+			{
+				char* entry = &sector_buf[e * FAT32_DIRENT_SIZE];
+				if (entry[0] == FAT32_DIRENT_FREE_REST) break;
+				if (entry[0] == FAT32_DIRENT_DELETED) continue;
+
+				char attr = entry[FAT32_DIRENT_ATTR];
+				if (attr == FAT32_DIRENT_ATTR_LFN) continue;
+				if ((attr & FAT32_DIRENT_ATTR_VOLUME) != 0) continue;
+
+				bool is_dot    = entry[FAT32_DIRENT_NAME] == '.' && entry[FAT32_DIRENT_NAME + 1] == ' ';
+				bool is_dotdot = entry[FAT32_DIRENT_NAME] == '.' && entry[FAT32_DIRENT_NAME + 1] == '.' && entry[FAT32_DIRENT_NAME + 2] == ' ';
+				if (is_dot || is_dotdot) continue;
+
+				uint entry_sector = sector + s;
+				uint entry_offset = e * FAT32_DIRENT_SIZE;
+				if (fs_is_protected_entry(entry_sector, entry_offset)) return false;
+
+				ushort* child_cluster_hi = (ushort*)&entry[FAT32_DIRENT_CLUSTER_HI];
+				ushort* child_cluster_lo = (ushort*)&entry[FAT32_DIRENT_CLUSTER_LO];
+				uint child_cluster = ((uint)*child_cluster_hi << 16) | (uint)*child_cluster_lo;
+
+				if ((attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0)
+				{
+					if (!fat32_delete_dir_contents(child_cluster, depth + 1)) return false;
+				}
+
+				entry[0] = FAT32_DIRENT_DELETED;
+				sector_modified = true;
+
+				if (!fat32_free_cluster_chain(child_cluster)) return false;
+			}
+			if (sector_modified)
+			{
+				if (!fs_write_sector(sector + s, &sector_buf)) return false;
+			}
+		}
+		cluster = fat32_next_cluster(cluster);
+	}
+	return true;
+}
+
+// Same as fat32_delete, but a non-empty directory is emptied first
+// (fat32_delete_dir_contents, above) instead of refused — the real,
+// separate, genuinely destructive operation fat32_delete's own comment
+// deliberately deferred. A protected entry anywhere in the subtree
+// (checked by fat32_delete_dir_contents for every child, and here for
+// the target itself) aborts the whole operation before anything is
+// freed — never a partial delete that silently skips just the
+// protected part.
+fn int fat32_delete_recursive(char* name)
+{
+	uint dir_cluster;
+	if (!fat32_resolve_dir(name, &dir_cluster)) return -1;
+	char* leaf = fat32_leaf_name(name);
+
+	char[11] name11 @noinit;
+	fat32_name_to_8_3(leaf, &name11);
+
+	uint cluster;
+	uint size;
+	uint entry_sector;
+	uint entry_offset;
+	char attr;
+	if (!fat32_find_in_dir(dir_cluster, &name11, &cluster, &size, &entry_sector, &entry_offset, &attr)) return -1;
+	if (fs_is_protected_entry(entry_sector, entry_offset)) return -1;
+	if ((attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0)
+	{
+		if (!fat32_delete_dir_contents(cluster, 0)) return -1;
+	}
+
+	char[SECTOR_SIZE] sector_buf2 @noinit;
+	if (!fs_read_sector(entry_sector, &sector_buf2)) return -1;
+	sector_buf2[entry_offset] = FAT32_DIRENT_DELETED;
+	if (!fs_write_sector(entry_sector, &sector_buf2)) return -1;
+
+	return fat32_free_cluster_chain(cluster) ? 0 : -1;
+}
+
 fn void fat32_mount()
 {
 	char[SECTOR_SIZE] boot_sector @noinit;

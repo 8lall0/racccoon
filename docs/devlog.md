@@ -4,11 +4,83 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-19 (16) — Recursive delete
+
+The other half of this session's work (see the previous entry for the
+synchronization primitive) — independent of it, just landed in the
+same session.
+
+`fat32_delete_recursive`/`ext2_delete_recursive` (`user/fs/*.c3`): the
+non-empty-directory case `fat32_delete`/`ext2_delete` always refused,
+now actually handled instead of deferred, reusing the existing
+`FS_DELETE` wire verb rather than a new one — byte 100 (already sent,
+previously unused/ignored by `FS_DELETE`) is now a `recursive` flag,
+so plain `fs_delete()` stays byte-for-byte non-recursive and only
+`fs_delete_recursive()` opts in. Both backends walk raw directory
+entries directly (cluster/sector/offset, same as their own
+`*_dir_is_empty`) rather than reconstructing names into path strings
+and going back through the normal lookup path for each child — FAT32
+has no long-filename support to round-trip through, and ext2's dirents
+don't carry a file-type byte at all (its own `ext2_find_in_dir` already
+reads each child's inode to get `mode`, same thing this does). Both
+cap recursion depth at 32 — not reachable through any well-formed tree
+on either filesystem, but nothing on-disk actually prevents a corrupted
+or adversarial image from containing a cycle, and a real one would
+otherwise recurse forever and blow this process's own stack instead of
+failing cleanly.
+
+A protected entry anywhere in the subtree aborts the whole operation
+before anything is freed (checked for every child during the walk, and
+for the target itself) — never a partial delete that silently skips
+just the protected part.
+
+**Test fixture found the hard way**: `scripts/build.sh` seeds a new
+`nestdir/` (a file plus a nested `innerdir/` with its own file) on both
+the FAT32 and ext2 test images. First attempt named it `nesteddir` —
+worked on ext2, silently failed to even be *found* on FAT32. Root
+cause: `fat32_name_to_8_3()` does a naive 8-character truncation with
+no numeric-tail scheme, while `mtools`' `mmd` generates a real
+Windows-style short name (`NESTED~1`) for anything over 8 characters —
+confirmed directly via a hex dump of the image. Not a bug introduced
+here, a pre-existing limitation of a driver with no long-filename
+support at all; the fix for this specific fixture was simply picking a
+name (`nestdir`, matching `emptydir`/`subdir`'s own already-short
+names) that never needs truncating in the first place.
+
+**Also found while verifying**: `rmrtest` genuinely deletes
+`nestdir` — running it more than once against the *same*, un-rebuilt
+`disk.img` (e.g. in a multi-boot stress loop over one image file, the
+way this session's own stress scripts drive QEMU) fails from the
+second boot on, correctly — the fixture is really gone, same as any
+real filesystem delete would behave. Not a bug; just means this
+specific test isn't safe to include in a same-image repeat-boot stress
+loop the way `racetest`/`mutextest` (neither of which touch persistent
+state) are.
+
+**Verified**: full regression suite on both `disk.img` (FAT32) and
+`disk_ext2.img` (ext2), `rmrtest` (delete refused non-recursively,
+succeeds recursively, second call correctly fails "not found") on
+both, confirmed repeatable across several fresh rebuilds of each
+image, `fsck.vfat -n`/`e2fsck -n -f` afterward as the established
+correctness oracle for each backend — ext2 fully clean; FAT32's own
+"free cluster summary" mismatch confirmed pre-existing (reproduces
+identically from a plain `newfile` on a completely fresh image,
+unrelated to this session's changes — this driver has never maintained
+the FSInfo sector's cached free-count).
+
+**Files changed:** `user/fs/fat32.c3` (`fat32_delete_recursive`),
+`user/fs/ext2.c3` (`ext2_delete_recursive`), `user/fsd.c3` (dispatches
+on the new recursive flag), `user/user.c3` (`fs_delete_recursive`, the
+wire-format comment), `user/shell.c3` (`rmrtest`), `scripts/build.sh`
+(`nestdir/` test fixture on both test images).
+
+---
+
 ## 2026-08-19 (15) — A real synchronization primitive: futex + Mutex
 
-Explicitly enabled by real preemption existing now (previous entry):
-user code can genuinely race on shared memory for the first time, so
-it needs a real way to protect it.
+Explicitly enabled by real preemption existing now (previous-previous
+entry): user code can genuinely race on shared memory for the first
+time, so it needs a real way to protect it.
 
 **Adapted, not reinvented, from the real c3 stdlib's `std::atomic`** —
 `user/atomic.c3` is a trimmed, self-contained port of
