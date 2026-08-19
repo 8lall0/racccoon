@@ -4,6 +4,54 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-19 (5) — ext2 multi-group reads: closing the gap the real hardware exposed twice now
+
+The "block group 0 only" limitation bit twice in one session (see the
+entry below): a real Linux `mkdir` on the actual boot card put a new
+directory in group 1, which this driver refused entirely. Scoped
+carefully rather than a full rewrite: extending *reading and updating*
+an existing inode to work across any group is a bounded, low-risk
+index-math change; extending *allocation* (new inodes/blocks) to scan
+and update other groups' bitmaps and free-counts is real, separate,
+higher-risk work — this session already found two real corruption bugs
+in the allocator's neighborhood, so it stayed untouched.
+
+**Design**: `ext2_mount()` now computes `ext2_group_count` (from the
+superblock's total inode count) and reads the *entire* block group
+descriptor table — not just group 0's own 32-byte entry — into a new
+`ext2_inode_table_blocks[]` array (looping over however many BGDT
+blocks that actually takes, not assuming one block is always enough).
+`ext2_read_inode`/`ext2_write_inode` now compute `group = (inode_num -
+1) / ext2_inodes_per_group` and index into that array instead of
+always using the flat, group-0-only `ext2_inode_table_block` global —
+which `ext2_alloc_inode()`/`ext2_zero_inode()` still use unchanged,
+since new inodes are still only ever allocated in group 0.
+
+**Verified properly, not just trusted**: debugfs alone doesn't
+naturally scatter files across groups on a small test image (its own
+allocator stays in group 0 for anything this project's test fixtures
+need), so confirming this needed *actually* forcing a multi-group
+scenario — built a scratch ext2 image with `mke2fs -g 512` (small
+groups on purpose), filled group 0's inodes with 130 dummy files via
+`debugfs`, then created `subdir` — landed at inode 143, genuinely in
+group 1 (`(143-1)/128 = 1`). `readsubfile2` against it initially
+worked (confirming the read side), but `newsubfile2` initially failed
+— traced with temporary debug prints to `ext2_alloc_inode()` itself
+returning "no free inode", which turned out to be a test-setup
+artifact (the 130 dummy files had exhausted group 0's own inode pool,
+not a bug) — freed some of them back up and the write succeeded
+cleanly. `e2fsck -n -f` on the result: completely clean, no errors of
+any kind. Full regression suite (both QEMU images) unaffected,
+`racetest` still `a=1 b=1`.
+
+**Files changed:** `user/fs/ext2.c3` (`EXT2_SB_INODES_COUNT`,
+`EXT2_MAX_GROUPS`/`EXT2_BGD_SIZE`, `ext2_group_count`/
+`ext2_inode_table_blocks[]`, `ext2_mount()`'s BGDT-table read,
+`ext2_read_inode`/`ext2_write_inode` made group-aware, header comment
+updated).
+
+---
+
 ## 2026-08-19 (4) — ext2 subdirectory support on real hardware: a real trigger for the documented "block group 0 only" limit
 
 Testing write-into-subdirectory support on the real card's `EXT2TEST`

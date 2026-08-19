@@ -14,10 +14,16 @@ module user;
 //     than 12 blocks' worth of data reads back short, same "return
 //     however many bytes were actually reachable" discipline
 //     fat32_read_file uses for a broken chain, not an error.
-//   - Block group 0 only — an inode number beyond group 0's own inode
-//     count isn't just slow to resolve, it needs group-index math this
-//     driver doesn't implement at all; treated as not-found rather than
-//     read from the wrong location (see ext2_read_inode's own check).
+//   - Reading/updating an inode works across any block group (see
+//     ext2_read_inode/ext2_write_inode's own comments) — found a real
+//     need for this on actual hardware: a real Linux `mkdir` spread a
+//     new directory into group 1, which this driver used to refuse
+//     entirely. *Allocating* a new inode or block (ext2_alloc_inode/
+//     ext2_alloc_block) still only ever looks in group 0 — this
+//     driver's own writes have never needed more than that, and
+//     extending allocation itself to scan/update other groups' bitmaps
+//     and free-counts is real, separate, higher-risk work not
+//     attempted here.
 //   - No directory-entry file-type filtering: the on-disk file_type byte
 //     (only populated if the volume has that optional feature flag) is
 //     never consulted, so a directory sharing a requested file's name
@@ -51,6 +57,9 @@ module user;
 // relative to the superblock's own start (i.e. byte 1024 + offset).
 const uint EXT2_SUPERBLOCK_SECTOR    = 2;
 const uint EXT2_SB_LOG_BLOCK_SIZE    = 24; // u32
+const uint EXT2_SB_INODES_COUNT      = 0;  // u32 — total inodes on the volume, used to
+                                             // compute how many block groups exist (see
+                                             // ext2_group_count's own comment)
 const uint EXT2_SB_BLOCKS_PER_GROUP  = 32; // u32
 const uint EXT2_SB_INODES_PER_GROUP  = 40; // u32
 const uint EXT2_SB_FIRST_DATA_BLOCK  = 20; // u32
@@ -118,15 +127,34 @@ const uint EXT2_DIRENT_NAME     = 8; // name_len bytes, NOT null-terminated
 // truncation.
 const uint EXT2_MAX_BLOCK_SIZE = 4096;
 
+// Real hardware bug found and fixed this session: this driver used to
+// only ever know group 0's inode table, so any inode belonging to a
+// different group (real Linux tools spread new files/directories
+// across groups; this driver's own allocator never did) was silently
+// treated as not-found — see ext2_read_inode/ext2_write_inode's own
+// comments and docs/devlog.md. ext2_alloc_block()/ext2_alloc_inode()
+// deliberately stay group-0-only (see their own comments) — only
+// reading/updating an *existing* inode needed to grow past group 0,
+// not allocating new ones, keeping the write path's own risk profile
+// unchanged. 64 groups is generous for this project's real hardware
+// (a 1GB partition needs about 8); a volume needing more just can't
+// fully interoperate past group 63 — ext2_read_inode/ext2_write_inode
+// already fail closed (treated as not-found) for anything beyond what
+// ext2_group_count/this array actually cover.
+const uint EXT2_MAX_GROUPS = 64;
+const uint EXT2_BGD_SIZE   = 32; // bytes per block group descriptor, standard fixed size
+
 uint ext2_block_size;
 uint ext2_sectors_per_block;
 uint ext2_inode_size;
 uint ext2_inodes_per_group;
 uint ext2_blocks_per_group; // write-path only: ext2_alloc_block()'s scan bound
-uint ext2_inode_table_block;
+uint ext2_inode_table_block; // group 0's inode table — still the only one ext2_alloc_inode/ext2_zero_inode ever touch
 uint ext2_block_bitmap_block; // write-path only
 uint ext2_inode_bitmap_block; // write-path only
 uint ext2_first_data_block; // write-path only: ext2_alloc_block()'s base for converting a bitmap bit index into a block number
+uint ext2_group_count;
+uint[EXT2_MAX_GROUPS] ext2_inode_table_blocks; // every group's own inode table block, for ext2_read_inode/ext2_write_inode
 
 struct Ext2_inode_info
 {
@@ -179,15 +207,23 @@ fn bool ext2_write_block(uint block, char* buf)
 // real v1 limit, not a bug.
 fn bool ext2_read_inode(uint inode_num, Ext2_inode_info* out)
 {
-	if (inode_num == 0 || inode_num > ext2_inodes_per_group) return false;
+	if (inode_num == 0) return false;
 
-	uint index = inode_num - 1;
-	uint byte_offset_in_table = index * ext2_inode_size;
+	// Group-aware, not group-0-only: a real ext2 allocator (Linux's own
+	// mkdir, found the hard way on real hardware — see EXT2_MAX_GROUPS's
+	// own comment) can put an inode in any group. Fails closed (treated
+	// as not-found, same as an out-of-range inode_num always has) for a
+	// group beyond what ext2_mount() actually cached.
+	uint group = (inode_num - 1) / ext2_inodes_per_group;
+	if (group >= ext2_group_count) return false;
+	uint index_in_group = (inode_num - 1) % ext2_inodes_per_group;
+
+	uint byte_offset_in_table = index_in_group * ext2_inode_size;
 	uint block_offset = byte_offset_in_table / ext2_block_size;
 	uint offset_in_block = byte_offset_in_table % ext2_block_size;
 
 	char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
-	if (!ext2_read_block(ext2_inode_table_block + block_offset, &block_buf)) return false;
+	if (!ext2_read_block(ext2_inode_table_blocks[group] + block_offset, &block_buf)) return false;
 
 	char* inode_bytes = &block_buf[offset_in_block];
 	ushort* mode_field        = (ushort*)&inode_bytes[EXT2_INODE_MODE];
@@ -502,13 +538,41 @@ fn void ext2_mount()
 	ext2_inode_bitmap_block = *inode_bitmap;
 	ext2_inode_table_block  = *inode_table;
 
+	// Every group's own inode table block, so ext2_read_inode/
+	// ext2_write_inode can resolve an inode belonging to *any* group —
+	// see EXT2_MAX_GROUPS's own comment for why (a real Linux `mkdir`
+	// on the real Duo card allocated a new directory in group 1, which
+	// this driver used to treat as not-found entirely). The descriptor
+	// table can itself span more than one block once there are enough
+	// groups (descriptors_per_block each), unlike the single-block read
+	// above, which only ever needed group 0's own entry.
+	uint* inodes_count_field = (uint*)&sb_sector[EXT2_SB_INODES_COUNT];
+	ext2_group_count = (*inodes_count_field + ext2_inodes_per_group - 1) / ext2_inodes_per_group;
+	if (ext2_group_count > EXT2_MAX_GROUPS) ext2_group_count = EXT2_MAX_GROUPS;
+
+	uint descriptors_per_block = ext2_block_size / EXT2_BGD_SIZE;
+	uint bgdt_blocks_needed = (ext2_group_count + descriptors_per_block - 1) / descriptors_per_block;
+	for (uint bb = 0; bb < bgdt_blocks_needed; bb++)
+	{
+		char[EXT2_MAX_BLOCK_SIZE] bgdt_scan_buf @noinit;
+		if (!ext2_read_block(ext2_first_data_block + 1 + bb, &bgdt_scan_buf))
+		{
+			fs_panic("failed to read ext2 block group descriptor");
+		}
+		for (uint d = 0; d < descriptors_per_block; d++)
+		{
+			uint g = bb * descriptors_per_block + d;
+			if (g >= ext2_group_count) break;
+			uint* group_inode_table = (uint*)&bgdt_scan_buf[d * EXT2_BGD_SIZE + EXT2_BGD_INODE_TABLE];
+			ext2_inode_table_blocks[g] = *group_inode_table;
+		}
+	}
+
 	Ext2_inode_info root;
 	if (!ext2_read_inode(EXT2_ROOT_INODE, &root) || (root.mode & EXT2_S_IFDIR) == 0)
 	{
-		// Root not being a directory means either a corrupt volume or a
-		// real limitation of this driver (e.g. the root inode isn't in
-		// group 0 on an unusually small inodes-per-group configuration)
-		// — panic clearly either way.
+		// Root (inode 2, always in group 0 by format convention) not
+		// being a directory means a corrupt volume — panic clearly.
 		fs_panic("ext2 root inode is not a directory");
 	}
 
@@ -626,15 +690,22 @@ fn uint ext2_alloc_inode()
 // in those fields.
 fn bool ext2_write_inode(uint inode_num, Ext2_inode_info* info)
 {
-	if (inode_num == 0 || inode_num > ext2_inodes_per_group) return false;
+	if (inode_num == 0) return false;
 
-	uint index = inode_num - 1;
-	uint byte_offset_in_table = index * ext2_inode_size;
+	// Same group-aware lookup as ext2_read_inode — see its own comment.
+	// Updating an *existing* inode's fields (e.g. overwriting a file's
+	// content) needs to reach whatever group it's really in, even
+	// though new allocations (ext2_alloc_inode) stay group-0-only.
+	uint group = (inode_num - 1) / ext2_inodes_per_group;
+	if (group >= ext2_group_count) return false;
+	uint index_in_group = (inode_num - 1) % ext2_inodes_per_group;
+
+	uint byte_offset_in_table = index_in_group * ext2_inode_size;
 	uint block_offset = byte_offset_in_table / ext2_block_size;
 	uint offset_in_block = byte_offset_in_table % ext2_block_size;
 
 	char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
-	if (!ext2_read_block(ext2_inode_table_block + block_offset, &block_buf)) return false;
+	if (!ext2_read_block(ext2_inode_table_blocks[group] + block_offset, &block_buf)) return false;
 
 	char* inode_bytes = &block_buf[offset_in_block];
 	ushort* mode_field        = (ushort*)&inode_bytes[EXT2_INODE_MODE];
@@ -648,7 +719,7 @@ fn bool ext2_write_inode(uint inode_num, Ext2_inode_info* info)
 	uint* block_ptrs = (uint*)&inode_bytes[EXT2_INODE_BLOCK];
 	for (uint i = 0; i < 12; i++) block_ptrs[i] = info.block[i];
 
-	return ext2_write_block(ext2_inode_table_block + block_offset, &block_buf);
+	return ext2_write_block(ext2_inode_table_blocks[group] + block_offset, &block_buf);
 }
 
 // Zeroes a freshly allocated inode's ENTIRE on-disk record (all
