@@ -52,6 +52,60 @@ fn void race_thread_b(void* arg) {
     exit();
 }
 
+// mutextest: two threads increment the same shared counter through
+// user.c3's Mutex — unlike racetest (which proves the *kernel's* own
+// IPC rendezvous can't be corrupted by concurrent senders), this proves
+// user.c3's own Mutex genuinely serializes access, including the actual
+// futex_wait/futex_wake path, not just the uncontended CAS fast path.
+//
+// Found the hard way while writing this test: creating both threads
+// and just incrementing in a tight loop, even for millions of
+// iterations, essentially never exercises real contention. Neither
+// thread has any other reason to yield mid-loop, so with nothing
+// forcing an interleave, one thread runs to completion (or close to
+// it) before the other gets meaningful CPU time — confirmed directly
+// by temporarily removing the lock/unlock calls entirely and still
+// getting a fully correct count, which would only happen if the two
+// threads' increments essentially never actually landed at the same
+// moment. A stray real timer interrupt (~once/second — see
+// enable_timer_interrupts()'s own comment) can preempt mid-loop, but
+// the vulnerable window in a bare "counter = counter + 1" is only 1-2
+// instructions wide out of the thousands executed between ticks — far
+// too narrow a target to hit reliably.
+//
+// Fixed by deliberately *widening the gap between the read and the
+// write themselves* — the standard technique for reliably demonstrating
+// this class of race (see e.g. any textbook "read, sleep, write" data-
+// race demo), not just delaying before an otherwise-still-adjacent
+// read-modify-write. Each iteration reads mutex_test_counter into a
+// local, spins for a real, fixed slice of wall-clock time (using
+// rdtime() the same way sdd.c3 already does for its own real-time
+// budgets — not a raw instruction count, so this holds for comparable
+// real time on both boards despite their different TIMEBASE_HZ), *then*
+// writes local+1 back. With that gap spanning a meaningful fraction of
+// a preemption tick (~once/second — see enable_timer_interrupts()'s own
+// comment) and several iterations for a tick to land somewhere inside
+// it, the other thread reliably gets a real chance to read the same
+// stale value in between — exactly what the lock exists to prevent.
+const ulong MUTEX_TEST_GAP_TICKS = 2000000; // ~0.2s at 10MHz (QEMU), ~0.08s at 25MHz (Duo)
+const int MUTEX_TEST_ITERS = 8;
+char[4096] mutex_stack_a;
+char[4096] mutex_stack_b;
+Mutex mutex_test_lock;
+int mutex_test_counter = 0;
+
+fn void mutex_thread_body(void* arg) {
+    for (int i = 0; i < MUTEX_TEST_ITERS; i++) {
+        mutex_test_lock.lock();
+        int tmp = mutex_test_counter;
+        ulong gap_start = rdtime();
+        while (rdtime() - gap_start < MUTEX_TEST_GAP_TICKS) {}
+        mutex_test_counter = tmp + 1;
+        mutex_test_lock.unlock();
+    }
+    exit();
+}
+
 fn void main() @export("main") {
     for (;;) {
         print("> ");
@@ -542,6 +596,26 @@ fn void main() @export("main") {
                 print(" b=");
                 putchar((char)('0' + race_ok_b));
                 print(" (1=correct reply, 0=corrupted or lost)\n");
+            }
+        } else if (strcmp(cmd, "mutextest") == 0) {
+            mutex_test_counter = 0;
+            mutex_test_lock.locked.store(0);
+            char* mstack_a_top = (char*)&mutex_stack_a + mutex_stack_a.len;
+            char* mstack_b_top = (char*)&mutex_stack_b + mutex_stack_b.len;
+            uint mgen_a = 0;
+            uint mgen_b = 0;
+            int mtid_a = threadcreate(&mutex_thread_body, null, mstack_a_top, &mgen_a);
+            int mtid_b = threadcreate(&mutex_thread_body, null, mstack_b_top, &mgen_b);
+            if (mtid_a < 0 || mtid_b < 0) {
+                print("mutextest: threadcreate failed (no free process slot) — inconclusive\n");
+            } else {
+                join(mtid_a, mgen_a);
+                join(mtid_b, mgen_b);
+                print("mutextest: counter = ");
+                print_uint((uint)mutex_test_counter);
+                print(" (expected ");
+                print_uint((uint)(MUTEX_TEST_ITERS * 2));
+                print(")\n");
             }
         } else {
             print("unknown command: ");

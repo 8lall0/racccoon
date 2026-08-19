@@ -516,28 +516,6 @@ fn void print_hex32(uint v)
 	}
 }
 
-fn void print_uint(uint v)
-{
-	char[10] digits @noinit;
-	int n = 0;
-	if (v == 0)
-	{
-		putchar('0');
-		return;
-	}
-	while (v > 0 && n < 10)
-	{
-		digits[n] = (char)('0' + (v % 10));
-		v /= 10;
-		n++;
-	}
-	while (n > 0)
-	{
-		n--;
-		putchar(digits[n]);
-	}
-}
-
 // Raises SDCLK from whatever slow clock BootROM left running (see
 // sdd_pad_power_clock_init's own comment — deliberately never
 // reconfigured before this point, since a prior version of this exact

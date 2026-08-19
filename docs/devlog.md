@@ -4,6 +4,77 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-19 (15) — A real synchronization primitive: futex + Mutex
+
+Explicitly enabled by real preemption existing now (previous entry):
+user code can genuinely race on shared memory for the first time, so
+it needs a real way to protect it.
+
+**Adapted, not reinvented, from the real c3 stdlib's `std::atomic`** —
+`user/atomic.c3` is a trimmed, self-contained port of
+`/usr/lib/c3c/lib/std/atomic.c3`'s `Atomic<Type>` (`load`/`store`/
+`compare_exchange`/`add`), same module names, same API shape, same
+`AtomicOrdering` enum copied verbatim so `.ordinal` still matches what
+the `$$atomic_*` compiler builtins expect. Necessarily a port rather
+than a straight `import`: user-mode binaries build with
+`--use-stdlib=no` (`scripts/build_user.sh`), so the real module — and
+what it itself depends on (`std::core::mem`'s atomic support,
+`std::core::types`, `std::math`) — isn't reachable at all. Confirmed by
+direct `llvm-objdump` inspection that this still lowers to real RV64
+`A`-extension instructions (`lr.w.aqrl`/`sc.w.rl` for compare_exchange,
+`amoadd.w.aqrl` for add), not a libcall this freestanding build has
+nothing to link against.
+
+**Kernel side**: two new syscalls, `SYS_FUTEX_WAIT`/`SYS_FUTEX_WAKE`
+(15/16, `src/entry.c3`). WAIT checks `*addr == expected` and, if still
+true, sets `PROC_BLOCKED` and yields; the check-then-block sequence is
+atomic with respect to any concurrent WAKE for free, because kernel-mode
+code is never preempted (see the previous entry) — no wake can land in
+the gap between the read and the block. WAKE scans for blocked waiters
+matching both the address *and* `page_table` — page_table equality is
+the same "genuinely shares memory" test `SYS_EXIT`'s own table-teardown
+skip already uses (RFMEM siblings share the literal pointer, never a
+copy), so two unrelated processes' coincidentally-equal user-space
+addresses can't cross-wake each other. `Process` gained `futex_addr`
+to track this — 0 unless genuinely blocked inside `SYS_FUTEX_WAIT`,
+cleared the instant `SYS_FUTEX_WAKE` wakes it.
+
+**User side** (`user/user.c3`): `Mutex` — `lock()` is a single
+uncontended `compare_exchange` (0→1), falling back to `futex_wait` only
+when actually contended; `unlock()` stores 0 and `futex_wake`s. Also
+added `print_uint()` (decimal, no leading zeros) since mutextest's own
+counter needed more than the two-digit `'0'+n/10` unrolling every
+existing test command uses — and de-duplicated three near-identical
+private copies of exactly this helper already sitting in `diskd.c3`/
+`fsd.c3`/`sdd.c3`, now all calling the one in `user.c3` instead.
+
+**mutextest, and a real methodology finding while building it**: two
+threads increment a shared counter through `Mutex`. First attempt used
+a tight loop for a fixed iteration count — and passed identically
+whether or not the lock/unlock calls were even present, which is wrong:
+confirmed by deliberately checking, the two threads simply never
+overlapped in time at all (nothing forces an interleave without a
+blocking syscall or a lucky preemption landing in a 1-2 instruction
+window out of thousands). Fixed using the standard "read, sleep,
+write" technique for reliably demonstrating this class of race: each
+iteration reads the counter into a local, spins for a real, fixed
+slice of wall-clock time (`rdtime()`-based, not a raw instruction
+count — holds for comparable real time on both boards despite their
+10MHz/25MHz difference), *then* writes back. Confirmed the test is now
+meaningful in both directions: with the lock removed, the count came
+up short (12-13 of an expected 16) every time; with it restored, 16/16
+every time, repeated 5 times in a row plus 30 more calls across a
+10-boot stress batch (alongside `racetest`/`rforktest`/`sandboxtest`/
+`threadjointest`, none of which touch persistent state, so safe to
+repeat across the same boot loop unlike the next entry's `rmrtest`).
+
+**Files changed:** `user/atomic.c3` (new), `user/user.c3` (futex
+syscalls, `Mutex`, `print_uint`), `src/entry.c3` (`SYS_FUTEX_WAIT`/
+`SYS_FUTEX_WAKE`), `src/process.c3` (`Process.futex_addr`),
+`user/diskd.c3`/`user/fsd.c3`/`user/sdd.c3` (local `print_uint` copies
+removed in favor of `user.c3`'s), `user/shell.c3` (`mutextest`),
+`scripts/build_user.sh` (`atomic.c3` added to every binary's sources).
+
 ## 2026-08-19 (14) — Real preemptive scheduling
 
 Built directly on the `sepc`-per-process fix (previous entry): the

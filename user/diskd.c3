@@ -225,28 +225,6 @@ fn void diskd_init()
 	print(" sectors\n");
 }
 
-fn void print_uint(uint v)
-{
-	char[10] digits @noinit;
-	int n = 0;
-	if (v == 0)
-	{
-		putchar('0');
-		return;
-	}
-	while (v > 0 && n < 10)
-	{
-		digits[n] = (char)('0' + (v % 10));
-		v /= 10;
-		n++;
-	}
-	while (n > 0)
-	{
-		n--;
-		putchar(digits[n]);
-	}
-}
-
 fn void virtq_kick(int desc_index)
 {
 	vq.avail.ring[vq.avail.index % VIRTQ_ENTRY_NUM] = (ushort)desc_index;

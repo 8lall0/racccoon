@@ -1,5 +1,7 @@
 module user;
 
+import std::atomic::types;
+
 // Linker script symbol - declared as extern so C3 knows about it,
 // @cname ensures no mangling
 extern char[] __stack_top @cname("__stack_top");
@@ -23,6 +25,8 @@ const int SYS_RFORK      = 11;
 const int SYS_NS_UNMOUNT = 12;
 const int SYS_JOIN       = 13;
 const int SYS_FS_PARTITION_INFO = 14;
+const int SYS_FUTEX_WAIT = 15; // block while *addr == expected — see src/entry.c3's case
+const int SYS_FUTEX_WAKE = 16; // wake every waiter blocked on addr in this address space
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -258,6 +262,66 @@ fn int join(int pid, uint generation) @export("join") {
     return syscall(SYS_JOIN, pid, (long)generation, 0);
 }
 
+// Blocks while *addr == expected, atomically with respect to any
+// concurrent futex_wake on the same address (see src/entry.c3's
+// SYS_FUTEX_WAIT case — the check-then-block sequence happens inside a
+// single, non-preemptible trap, so no wake can be lost between the
+// value check and actually parking this process). Returns immediately,
+// without blocking, if *addr != expected — the caller re-checks
+// whatever condition it was waiting on either way, same as a standard
+// futex; this never claims to have "seen" the value change.
+fn int futex_wait(int* addr, int expected) @export("futex_wait") {
+    return syscall(SYS_FUTEX_WAIT, (long)addr, expected, 0);
+}
+
+// Wakes every process currently blocked (via futex_wait) on addr
+// within this same address space (kernel matches by page_table, not
+// just the numeric address — see src/entry.c3). Never fails, doesn't
+// report how many were woken: callers don't need to know, same as a
+// condition-variable broadcast.
+fn int futex_wake(int* addr) @export("futex_wake") {
+    return syscall(SYS_FUTEX_WAKE, (long)addr, 0, 0);
+}
+
+// A basic mutex: uncontended lock/unlock never leaves user mode (a
+// single compare_exchange, lowering to a real lr.w/sc.w pair — see
+// atomic.c3), matching the whole point of futexes over always trapping
+// into the kernel. Only falls back to futex_wait when actually
+// contended. locked is 0 (free) or 1 (held) — plain int, not bool:
+// futex_wait/wake's own `int*` signature (matching the SYS_FUTEX_WAIT
+// wire convention above) needs a 4-byte value to compare, and Atomic
+// {int} is what atomic.c3 already provides tested lowering for.
+struct Mutex
+{
+    Atomic{int} locked;
+}
+
+fn void Mutex.lock(&self) @export("mutex_lock") {
+    int expected = 0;
+    if (self.locked.compare_exchange(&expected, 1)) return;
+    for (;;) {
+        // The literal 1 here (not `expected`) is safe specifically
+        // because locked only ever holds 0 or 1: reaching this line
+        // means the compare_exchange below just failed to CAS 0->1,
+        // which is only possible if the current value is the other
+        // state, 1. futex_wait itself re-checks *addr == expected
+        // right before blocking (see src/entry.c3), so a concurrent
+        // unlock() between that failed compare_exchange and
+        // futex_wait's own check can't be missed — it just makes
+        // futex_wait return immediately instead of actually parking
+        // this process, and the loop retries the compare_exchange
+        // right away.
+        futex_wait(&self.locked.data, 1);
+        expected = 0;
+        if (self.locked.compare_exchange(&expected, 1)) return;
+    }
+}
+
+fn void Mutex.unlock(&self) @export("mutex_unlock") {
+    self.locked.store(0);
+    futex_wake(&self.locked.data);
+}
+
 // Same as p9_call, but addresses the server by path (resolved through the
 // caller's namespace) instead of a raw pid — the whole point of having a
 // namespace: callers stop hardcoding server pids.
@@ -326,6 +390,29 @@ fn void print(char* s) {
     while (*s != 0) {
         putchar(*s);
         s++;
+    }
+}
+
+// Decimal, no leading zeros (except "0" itself) — every existing test
+// command hand-unrolls two-digit printing instead (`'0' + n/10`,
+// `'0' + n%10`), fine for values that never exceed 99, but not
+// something worth repeating for mutextest's own counter, which needs
+// more than two digits.
+fn void print_uint(uint n) @export("print_uint") {
+    if (n == 0) {
+        putchar('0');
+        return;
+    }
+    char[10] digits @noinit; // uint::max is 10 digits
+    int count = 0;
+    while (n > 0) {
+        digits[count] = (char)('0' + n % 10);
+        n /= 10;
+        count++;
+    }
+    while (count > 0) {
+        count--;
+        putchar(digits[count]);
     }
 }
 

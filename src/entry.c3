@@ -56,6 +56,8 @@ const SYS_FS_PARTITION_INFO = 14; // fsd-only: returns current_proc.fs_partition
                                     // setup_fsd_mappings()/fs_partition_start comments for why:
                                     // two fsd instances can be mounted simultaneously now, each
                                     // needing a different answer to this same syscall.
+const SYS_FUTEX_WAIT = 15; // block while *addr == expected — see its case below
+const SYS_FUTEX_WAKE = 16; // wake every waiter blocked on addr in this address space
 
 // rfork flags — Plan 9 names, this kernel's own subset. RFPROC is
 // required (rfork() without it returns -1 in this v1: real Plan 9 uses
@@ -931,6 +933,59 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				if (join_target == null) break;
 				if (join_target.generation != join_generation) break;
 				yield();
+			}
+			f.a0 = 0;
+		case SYS_FUTEX_WAIT:
+			// Blocks while the user-space word at addr still equals
+			// expected. The check-then-block sequence below is atomic
+			// with respect to any concurrent SYS_FUTEX_WAKE precisely
+			// because kernel-mode code is never preempted (see
+			// enable_timer_interrupts()'s own comment above arm_timer)
+			// — no other process's SYS_FUTEX_WAKE can run between this
+			// read and setting PROC_BLOCKED, so a wake can never be
+			// lost in that window. Returns immediately (no block, no
+			// yield) if the value already differs — same as any real
+			// futex, the caller (user/user.c3's Mutex.lock) always
+			// re-checks its own condition either way, spuriously or
+			// not.
+			int* futex_addr     = (int*)(uptr)f.a0;
+			int futex_expected  = (int)f.a1;
+			if (*futex_addr != futex_expected)
+			{
+				f.a0 = 0;
+				break;
+			}
+			current_proc.futex_addr = (uptr)futex_addr;
+			for (;;)
+			{
+				// PROC_BLOCKED, not PROC_RUNNABLE the way SYS_JOIN
+				// stays above: unlike a join, something always does
+				// explicitly clear this — SYS_FUTEX_WAKE below, the
+				// only other place futex_addr is ever touched.
+				current_proc.state = PROC_BLOCKED;
+				yield();
+				if (current_proc.futex_addr == 0) break;
+			}
+			f.a0 = 0;
+		case SYS_FUTEX_WAKE:
+			// Wakes every process currently blocked on this exact
+			// address *within the same address space* — page_table
+			// equality is the same "genuinely shares memory" test
+			// SYS_EXIT's own table-teardown skip already uses above:
+			// RFMEM siblings share the literal page_table pointer,
+			// never just a copy, and every ordinary process gets its
+			// own fresh one, so this can't mistake two unrelated
+			// processes' coincidentally-equal user-space addresses for
+			// the same futex.
+			uptr wake_addr = (uptr)f.a0;
+			for (int wake_i = 0; wake_i < PROCS_MAX; wake_i++)
+			{
+				Process* waiter = &procs[wake_i];
+				if (waiter.state != PROC_BLOCKED) continue;
+				if (waiter.futex_addr != wake_addr) continue;
+				if (waiter.page_table != current_proc.page_table) continue;
+				waiter.futex_addr = 0;
+				waiter.state = PROC_RUNNABLE;
 			}
 			f.a0 = 0;
 		default:

@@ -106,28 +106,6 @@ fn void fs_panic(char* msg)
 	exit();
 }
 
-fn void print_uint(uint v)
-{
-	char[10] digits @noinit;
-	int n = 0;
-	if (v == 0)
-	{
-		putchar('0');
-		return;
-	}
-	while (v > 0 && n < 10)
-	{
-		digits[n] = (char)('0' + (v % 10));
-		v /= 10;
-		n++;
-	}
-	while (n > 0)
-	{
-		n--;
-		putchar(digits[n]);
-	}
-}
-
 // --- Write protection ---------------------------------------------
 
 // A reserved-sector-range allowlist, enforced in diskd_rw() — see this

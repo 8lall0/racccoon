@@ -128,6 +128,13 @@ struct Process
 	// the moment that stopped being true. See docs/devlog.md.
 	ulong saved_sepc;
 
+	// Set (to the user-space futex word's address) while this process is
+	// PROC_BLOCKED inside SYS_FUTEX_WAIT, cleared back to 0 the instant
+	// SYS_FUTEX_WAKE wakes it — see src/entry.c3's own cases for both.
+	// 0 the rest of the time (every other PROC_BLOCKED reason, e.g.
+	// SYS_IPC_RECV, leaves this untouched at its reset value).
+	uptr futex_addr;
+
 	// Bumped every time this slot is (re)used — never reset, persists
 	// across a slot's unused periods. Exists purely so SYS_JOIN
 	// (entry.c3) can tell "the process I was waiting for exited" apart
