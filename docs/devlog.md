@@ -4,6 +4,47 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-19 (11) — Real hardware correction: stimecmp hangs the real Duo, QEMU only proved half the story
+
+The previous entry's QEMU verification wasn't wrong, but it wasn't the
+whole story either — flashing `enable_timer_interrupts()` to the real
+board hung it silently, right at boot, before even reaching "2: Trap
+handler set". Immediately disabled the call (commit right after) to
+get the board back to a known-working boot, then investigated properly
+rather than just leaving it off.
+
+**Isolated with two narrow, single-variable real-hardware tests**
+(temporary debug prints, each confirmed working on QEMU first before
+spending a real-hardware round trip): `read_reg("time")` alone —
+boots cleanly all the way to the shell prompt, no issue. Adding
+`write_csr("stimecmp", ...)` right after — boot stops *exactly* at the
+print immediately before that write, every time. Confirmed
+definitively: reading `time` works fine on the real T-Head C906 core;
+writing `stimecmp` is what hangs it, silently, with no trap or panic
+message reaching this kernel's own handler at all — meaning the trap
+either isn't being delivered to S-mode the way QEMU's OpenSBI delivers
+it, or something worse is happening at the M-mode/firmware level.
+Most likely explanation, not yet confirmed: `menvcfg.STCE` (the
+M-mode-only bit that permits S-mode `stimecmp` access at all) isn't
+set by the real Duo's own FSBL/OpenSBI build, unlike QEMU's — but this
+wasn't chased further once the real, actionable fix path was clear.
+
+**Path forward, not yet implemented**: switch to the SBI legacy timer
+extension (`sbi_set_timer()`, an ecall trapping straight to M-mode
+firmware — no S-mode CSR access, no menvcfg.STCE dependency at all)
+instead of direct `stimecmp` CSR access. Both platforms' own boot
+banners already confirm the SBI "time" extension is present
+(`Standard SBI Extensions: ...,time,...`), and this project already
+has real precedent for SBI ecall bindings (`sbi::__putchar`/
+`sbi::__getchar` in `boards/*/board.c3`). `enable_timer_interrupts()`
+stays disabled (commented out in `src/kernel.c3`, real hardware
+confirmed back to a normal boot) until that switch is made.
+
+**Files changed:** `src/kernel.c3` (updated comment with the confirmed
+root cause and the real fix direction).
+
+---
+
 ## 2026-08-19 (10) — Real timer interrupts: the mechanism itself, and a real interrupt-latency finding
 
 Deliberately narrow first slice of preemptive-scheduling support,

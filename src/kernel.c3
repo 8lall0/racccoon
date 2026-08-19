@@ -75,10 +75,13 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	board::plic_init();
 	enable_external_interrupts();
 	enable_user_timer_access();
-	// TEMPORARILY DISABLED: hung the real Duo (T-Head C906) silently
-	// right here at boot — worked fine on QEMU. Re-enable once the real
-	// cause is understood (see docs/devlog.md); leaving this off
-	// restores a known-working boot on real hardware in the meantime.
+	// TEMPORARILY DISABLED: writing stimecmp hangs the real Duo
+	// (T-Head C906) silently — confirmed directly (read_reg("time")
+	// works fine, the hang is exactly at the write_csr("stimecmp", ...)
+	// call), worked fine on QEMU. Likely menvcfg.STCE not set by the
+	// real Duo's own firmware (unlike QEMU's OpenSBI) — see
+	// docs/devlog.md. Re-enable once switched to the portable SBI-based
+	// timer mechanism instead of direct CSR access.
 	// enable_timer_interrupts();
 
 	io::print("2: Trap handler set\n");
