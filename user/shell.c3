@@ -229,12 +229,12 @@ fn void main() @export("main") {
             // the same boot. Exercises the new directory for real (write
             // a file into it, read it back), not just "mkdir succeeded
             // and nothing else."
-            int made = fs_mkdir("mkdirtest_dir");
-            int made_again = fs_mkdir("mkdirtest_dir"); // must refuse: already exists
-            int wrote = fs_write("mkdirtest_dir/inner.txt", "made by mkdirtest\n", 19);
+            int made = fs_mkdir("tmp/mkdirtest_dir");
+            int made_again = fs_mkdir("tmp/mkdirtest_dir"); // must refuse: already exists
+            int wrote = fs_write("tmp/mkdirtest_dir/inner.txt", "made by mkdirtest\n", 19);
             char[32] mkdir_buf @noinit;
-            int len = fs_read("mkdirtest_dir/inner.txt", &mkdir_buf, 32);
-            int deleted = fs_delete_recursive("mkdirtest_dir");
+            int len = fs_read("tmp/mkdirtest_dir/inner.txt", &mkdir_buf, 32);
+            int deleted = fs_delete_recursive("tmp/mkdirtest_dir");
             if (made == 0 && made_again < 0 && wrote >= 0 && len >= 0 && deleted == 0) {
                 print("mkdirtest: ok\n");
             } else {
@@ -251,12 +251,12 @@ fn void main() @export("main") {
             // of mistake nestdir/nesteddir's own comment already
             // documents (scripts/build.sh), made again here before
             // being caught by this test itself failing.
-            fs_write("ren_a.txt", "renamed content\n", 17);
-            int renamed = fs_rename("ren_a.txt", "ren_b.txt");
+            fs_write("tmp/ren_a.txt", "renamed content\n", 17);
+            int renamed = fs_rename("tmp/ren_a.txt", "tmp/ren_b.txt");
             char[32] ren_buf @noinit;
-            int len_new = fs_read("ren_b.txt", &ren_buf, 32);
-            int old_gone = fs_read("ren_a.txt", &ren_buf, 32); // must now fail
-            int cleanup = fs_delete("ren_b.txt");
+            int len_new = fs_read("tmp/ren_b.txt", &ren_buf, 32);
+            int old_gone = fs_read("tmp/ren_a.txt", &ren_buf, 32); // must now fail
+            int cleanup = fs_delete("tmp/ren_b.txt");
             if (renamed == 0 && len_new >= 0 && old_gone < 0 && cleanup == 0) {
                 print("renametest: ok\n");
             } else {
@@ -270,14 +270,14 @@ fn void main() @export("main") {
             // in the first and moved into the second; both cleaned up
             // recursively at the end regardless of which step failed.
             // Same short-name discipline as renametest above.
-            fs_mkdir("mv_a");
-            fs_mkdir("mv_b");
-            fs_write("mv_a/f.txt", "moved content\n", 15);
-            int moved = fs_rename("mv_a/f.txt", "mv_b/f.txt");
+            fs_mkdir("tmp/mv_a");
+            fs_mkdir("tmp/mv_b");
+            fs_write("tmp/mv_a/f.txt", "moved content\n", 15);
+            int moved = fs_rename("tmp/mv_a/f.txt", "tmp/mv_b/f.txt");
             char[32] mv_buf @noinit;
-            int len_moved = fs_read("mv_b/f.txt", &mv_buf, 32);
-            int cleanup_a = fs_delete_recursive("mv_a");
-            int cleanup_b = fs_delete_recursive("mv_b");
+            int len_moved = fs_read("tmp/mv_b/f.txt", &mv_buf, 32);
+            int cleanup_a = fs_delete_recursive("tmp/mv_a");
+            int cleanup_b = fs_delete_recursive("tmp/mv_b");
             if (moved == 0 && len_moved >= 0 && cleanup_a == 0 && cleanup_b == 0) {
                 print("movetest: ok\n");
             } else {
@@ -292,9 +292,9 @@ fn void main() @export("main") {
             // readfile uses, to confirm the new file is genuinely
             // findable and correct, not just that the write call
             // returned success.
-            fs_write("newtest.txt", "Created by newfile test\n", 25);
+            fs_write("tmp/newtest.txt", "Created by newfile test\n", 25);
             char[128] buf @noinit;
-            int len = fs_read("newtest.txt", &buf, 128);
+            int len = fs_read("tmp/newtest.txt", &buf, 128);
             if (len >= 0) {
                 buf[len] = 0;
                 print(&buf);
@@ -343,11 +343,11 @@ fn void main() @export("main") {
         } else if (strcmp(cmd, "deletetest") == 0) {
             // Create a file, confirm it's there, delete it, confirm
             // it's genuinely gone — mount 1.
-            fs_write("deletetest.txt", "temporary\n", 10);
+            fs_write("tmp/deletetest.txt", "temporary\n", 10);
             char[16] buf7 @noinit;
-            int before = fs_read("deletetest.txt", &buf7, 16);
-            int del = fs_delete("deletetest.txt");
-            int after = fs_read("deletetest.txt", &buf7, 16);
+            int before = fs_read("tmp/deletetest.txt", &buf7, 16);
+            int del = fs_delete("tmp/deletetest.txt");
+            int after = fs_read("tmp/deletetest.txt", &buf7, 16);
             if (before >= 0 && del == 0 && after < 0) {
                 print("deletetest: ok\n");
             } else {
@@ -460,11 +460,13 @@ fn void main() @export("main") {
                 print("protectedwrite: WARNING: write was ACCEPTED\n");
             }
         } else if (strcmp(cmd, "ping") == 0) {
-            // echod is always the first process spawned after idle (see
-            // kernel.c3), so it's always pid 2 — a placeholder until
-            // there's a real name -> pid lookup (namespace work, not this
-            // first IPC slice).
-            ipc_send(2, 0, "hello echod", 12);
+            // Resolved through the namespace now — "/srv/echo/" is where
+            // echod is named (src/process.c3's default mount table),
+            // finally landing on the "real name -> pid lookup" this
+            // command's own comment used to say was still just a
+            // placeholder.
+            int echo_pid = ns_resolve("/srv/echo/", null);
+            ipc_send(echo_pid, 0, "hello echod", 12);
             char[64] reply @noinit;
             int from = ipc_recv(&reply, 64);
             if (from > 0) {
@@ -477,14 +479,14 @@ fn void main() @export("main") {
                 print("ping: no reply\n");
             }
         } else if (strcmp(cmd, "p9test") == 0) {
-            // No hardcoded pid anymore: "/some/path" is resolved through
+            // No hardcoded pid: "/srv/echo/some/path" is resolved through
             // this process's own namespace (src/process.c3's default
-            // mount table, "/" -> echod) to find the server, over the
-            // 9P-lite verbs (user.c3's p9_call_path).
+            // mount table, "/srv/echo/" -> echod) to find the server,
+            // over the 9P-lite verbs (user.c3's p9_call_path).
             char[64] reply @noinit;
             uint reply_verb = 0;
 
-            int from_walk = p9_call_path("/some/path", P9_TWALK, "some/path", 10, &reply, 64, &reply_verb);
+            int from_walk = p9_call_path("/srv/echo/some/path", P9_TWALK, "some/path", 10, &reply, 64, &reply_verb);
             if (from_walk > 0 && reply_verb == P9_TWALK) {
                 print("walk ack: ");
                 print(&reply);
@@ -493,7 +495,7 @@ fn void main() @export("main") {
                 print("walk failed\n");
             }
 
-            int from_read = p9_call_path("/", P9_TREAD, null, 0, &reply, 64, &reply_verb);
+            int from_read = p9_call_path("/srv/echo/", P9_TREAD, null, 0, &reply, 64, &reply_verb);
             if (from_read > 0 && reply_verb == P9_TREAD) {
                 print("read: ");
                 print(&reply);
@@ -503,12 +505,13 @@ fn void main() @export("main") {
         } else if (strcmp(cmd, "nstest") == 0) {
             // Direct namespace-resolution smoke test: prove ns_resolve
             // itself works, independent of the 9P-lite/fsd layers built
-            // on top of it. Two mounts today (src/process.c3's
-            // create_process): "/" -> echod (pid 2), and a "" catch-all
-            // -> fsd (pid 4) for anything that doesn't start with "/" —
-            // which is every plain filename, "nope" included.
-            int pid_root = ns_resolve("/anything", null);
-            print("resolve /anything -> pid ");
+            // on top of it. Four mounts today (src/process.c3's
+            // create_process): "/srv/echo/" -> echod (pid 2), "" -> fsd
+            // (catch-all for anything that doesn't start with "/" —
+            // which is every plain filename, "nope" included), "/2/" ->
+            // fsd2, "/proc/" -> procd.
+            int pid_root = ns_resolve("/srv/echo/anything", null);
+            print("resolve /srv/echo/anything -> pid ");
             putchar((char)('0' + pid_root));
             print("\n");
 
@@ -516,6 +519,50 @@ fn void main() @export("main") {
             print("resolve nope -> pid ");
             putchar((char)('0' + pid_fallback));
             print(" (catch-all)\n");
+        } else if (strcmp(cmd, "pstest") == 0) {
+            // /proc: process info as files (user/procd.c3), a real Plan
+            // 9 idea — reads through the exact same fs_read() every
+            // fsd-backed command already uses; procd is just another
+            // process answering the same FS_READ verb with synthesized
+            // content instead of disk sectors. pid 2 = echod, always
+            // alive, so this always has something real to read.
+            char[128] ps_buf @noinit;
+            int ps_len = fs_read("/proc/2/status", &ps_buf, 128);
+            if (ps_len >= 0) {
+                ps_buf[ps_len] = 0;
+                print(&ps_buf);
+            } else {
+                print("pstest: failed\n");
+            }
+        } else if (strcmp(cmd, "lsproc") == 0) {
+            // Same as ls/lssub, against /proc — proves fs_list() works
+            // against a *synthetic* server exactly the same way it does
+            // against a disk-backed one, the actual point of building
+            // procd on top of the existing FS_READ/FS_LIST protocol
+            // instead of a new one.
+            char[576] proc_listbuf @noinit;
+            // Trailing slash matters: ns_resolve matches by
+            // str_starts_with against the mount's own "/proc/" prefix
+            // (src/process.c3) — "/proc" alone (no slash) doesn't
+            // contain that whole prefix, so it would silently fall
+            // through to the "" catch-all (fsd) instead, and fail there
+            // since "/proc" isn't a real fsd directory. Found exactly
+            // this way: fsd's own -1 looked identical to procd's own
+            // "not found" until traced back to which server actually
+            // received the request.
+            int proc_count = fs_list("/proc/", &proc_listbuf, 16);
+            if (proc_count < 0) {
+                print("lsproc: failed\n");
+            } else {
+                for (int pi = 0; pi < proc_count; pi++) {
+                    char* rec = &proc_listbuf[pi * 36];
+                    print(rec);
+                    if (rec[32] != 0) {
+                        print("/");
+                    }
+                    print("\n");
+                }
+            }
         } else if (strcmp(cmd, "rforktest") == 0) {
             // Plain rfork(RFPROC): the child gets an independent copy of
             // this process's address space (src/entry.c3's SYS_RFORK,

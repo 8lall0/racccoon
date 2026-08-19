@@ -67,3 +67,4 @@ build_user_program echod user/user.c3 user/atomic.c3 user/echod.c3
 build_user_program diskd user/user.c3 user/atomic.c3 user/diskd.c3
 build_user_program sdd user/user.c3 user/atomic.c3 user/sdd.c3
 build_user_program fsd user/user.c3 user/atomic.c3 user/fsd.c3 user/fs/fat32.c3 user/fs/ext2.c3
+build_user_program procd user/user.c3 user/atomic.c3 user/procd.c3

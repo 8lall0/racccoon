@@ -58,6 +58,7 @@ const SYS_FS_PARTITION_INFO = 14; // fsd-only: returns current_proc.fs_partition
                                     // needing a different answer to this same syscall.
 const SYS_FUTEX_WAIT = 15; // block while *addr == expected — see its case below
 const SYS_FUTEX_WAKE = 16; // wake every waiter blocked on addr in this address space
+const SYS_PROC_INFO  = 17; // procd-only in practice, but open to any caller — see its case below
 
 // rfork flags — Plan 9 names, this kernel's own subset. RFPROC is
 // required (rfork() without it returns -1 in this v1: real Plan 9 uses
@@ -987,6 +988,26 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				waiter.futex_addr = 0;
 				waiter.state = PROC_RUNNABLE;
 			}
+			f.a0 = 0;
+		case SYS_PROC_INFO:
+			// Read-only, no permission check — process existence/state
+			// isn't sensitive in this kernel's threat model (no
+			// user/permission concept at all), the same way an
+			// unprivileged `ps` is fine on a real Unix. Built for
+			// procd (user/procd.c3), the "/proc/" server, but open to
+			// any caller — there's no reason to restrict it further
+			// than that.
+			int query_pid = (int)f.a0;
+			Process* queried = proc_by_pid(query_pid);
+			if (queried == null)
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			uint* state_out = (uint*)(uptr)f.a1;
+			uint* generation_out = (uint*)(uptr)f.a2;
+			if (state_out != null) *state_out = (uint)queried.state;
+			if (generation_out != null) *generation_out = queried.generation;
 			f.a0 = 0;
 		default:
 			panic::panic("unexpected syscall");

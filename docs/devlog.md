@@ -4,6 +4,75 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (19) — A Plan-9-style structure: /srv, /tmp, /proc
+
+Verifying this work is what actually turned up the previous entry's
+ext2 bug: moving `mkdirtest`/`renametest`/`movetest` under the new
+`/tmp` and running them repeatedly is exactly the kind of sustained
+create/delete churn against one directory that had never been
+exercised before.
+
+### /srv, /tmp, /proc
+
+**`/srv/echo/` replaces bare `"/"` for echod** (`process.c3`'s default
+namespace, slot 0). The old `"/" -> echod` mount was confirmed, from
+the phase-3 devlog entry, to be a pure artifact — it existed only
+because `ping`/`p9test` already hardcoded pid 2 before the namespace
+system existed, not from any "echod owns the root" design. `/srv` is
+the real Plan 9 convention for where server processes get *named*.
+Pure data + call-site change (`ping`, `p9test`, `nstest` in
+`shell.c3`) — confirmed via `p9_call_path()` that a mount's prefix is
+only ever used to resolve the pid, never sent over the wire. The `""`
+catch-all needed no change: once nothing claims bare `/`, it
+transparently catches absolute paths too.
+
+**`/tmp`, self-created by fsd** (`fs_mount()`, both backends) rather
+than baked into a disk image — `fat32_mkdir("tmp")`/`ext2_mkdir("tmp")`
+right after mount, idempotent (already-exists is silently fine).
+Works identically on the real Duo with zero SD card changes. Existing
+dynamic test fixtures (`newfile`, `deletetest`, `mkdirtest`,
+`renametest`, `movetest`) moved under `tmp/` instead of littering root.
+
+**`/proc`, a synthetic process-info server** (`user/procd.c3`, new
+process, spawned unconditionally on every board after
+diskd/sdd/fsd/fsd2 so it never disturbs their existing hardcoded pid
+conventions). The actual interesting design point: it speaks the
+*same* `FS_READ`/`FS_LIST` wire verbs fsd already does, just
+synthesizing content from a new `SYS_PROC_INFO` syscall
+(`src/entry.c3`, read-only, no permission check) instead of reading
+disk sectors — `user.c3`'s `fs_read()`/`fs_list()` needed zero changes
+to work against it. `ls /proc` lists live pids by scanning
+1..PROCD_SCAN_MAX (a generous local bound, not the kernel-only
+`PROCS_MAX`) calling `proc_info()` for each; `/proc/<pid>/status`
+formats a short text reply. `NS_MOUNTS_MAX` grew 4->5 for the new
+`"/proc/"` mount.
+
+**Real bug found via `lsproc` failing**: `fs_list("/proc", ...)` (no
+trailing slash) doesn't contain the full `"/proc/"` mount prefix, so
+it silently fell through to the `""` catch-all (fsd) instead of
+reaching procd, and failed there since `/proc` isn't a real fsd
+directory — both servers just return -1, so the wrong-server routing
+was invisible until traced. Fixed by using `"/proc/"` in the client
+call, matching `"/2/"`'s own established trailing-slash convention.
+
+**Verified**: full regression suite on both filesystems (including
+`ping`/`p9test`/`nstest`/`pstest`/`lsproc`), a 10-boot multi-boot
+stress batch (2 full mkdir/rename/move cycles under `/tmp` plus the
+rest of the suite each boot — see the previous entry for why that
+specific combination matters), all clean.
+
+**Files changed:** `user/procd.c3` (new), `src/entry.c3`
+(`SYS_PROC_INFO`), `src/process.c3` (namespace slot 0 rename, new
+`/proc/` slot, `NS_MOUNTS_MAX` 4->5, `procd_pid`), `src/kernel.c3`
+(spawn procd), `user/user.c3` (`SYS_PROC_INFO`/`proc_info()`),
+`user/fsd.c3` (`/tmp` auto-create), `user/shell.c3`
+(`ping`/`p9test`/`nstest` namespace updates, fixtures moved under
+`tmp/`, `pstest`/`lsproc`),
+`scripts/build_user.sh`/`scripts/build.sh`/`scripts/build_duo.sh`
+(procd added to the build).
+
+---
+
 ## 2026-08-20 (18) — A real ext2 bug found chasing what looked like a preemption race
 
 Running `mkdirtest`/`renametest`/`movetest` repeatedly in one boot

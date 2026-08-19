@@ -27,6 +27,7 @@ const int SYS_JOIN       = 13;
 const int SYS_FS_PARTITION_INFO = 14;
 const int SYS_FUTEX_WAIT = 15; // block while *addr == expected — see src/entry.c3's case
 const int SYS_FUTEX_WAKE = 16; // wake every waiter blocked on addr in this address space
+const int SYS_PROC_INFO  = 17; // returns another process's state/generation — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -260,6 +261,16 @@ fn int ns_unmount(char* prefix) @export("ns_unmount") {
 // src/entry.c3 for the full reasoning).
 fn int join(int pid, uint generation) @export("join") {
     return syscall(SYS_JOIN, pid, (long)generation, 0);
+}
+
+// Returns 0 and fills *state_out/*generation_out if pid is currently
+// live, -1 otherwise (either out-pointer may be null if unneeded, same
+// convention as ns_resolve's own out_prefix_len). state is
+// src/process.c3's PROC_RUNNABLE (1) or PROC_BLOCKED (2) — never
+// PROC_UNUSED (0), since the kernel's own proc_by_pid() already
+// filters that case out before this can return success.
+fn int proc_info(int pid, uint* state_out, uint* generation_out) @export("proc_info") {
+    return syscall(SYS_PROC_INFO, pid, (long)state_out, (long)generation_out);
 }
 
 // Blocks while *addr == expected, atomically with respect to any

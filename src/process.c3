@@ -74,9 +74,16 @@ int fsd_pid = 0;
 // physically swapping board::FS_PARTITION_START_SECTOR and reflashing).
 int fsd2_pid = 0;
 
-const NS_MOUNTS_MAX = 4;   // Small fixed table — three real entries now
-                            // ("/" -> echod, "" -> fsd, "/2/" -> fsd2),
-                            // one spare.
+// The process-info server (see user/procd.c3) — 0 until created,
+// reachable under the "/proc/" prefix. Unlike fsd/fsd2, spawned
+// unconditionally on every board (kernel.c3) — it has no storage
+// hardware dependency, just SYS_PROC_INFO, which every process can
+// already call.
+int procd_pid = 0;
+
+const NS_MOUNTS_MAX = 5;   // Small fixed table — four real entries now
+                            // ("/srv/echo/" -> echod, "" -> fsd, "/2/"
+                            // -> fsd2, "/proc/" -> procd), one spare.
 const NS_PREFIX_MAX = 32;  // Longest path prefix a mount entry can match.
 
 // One binding in a process's namespace: any path starting with `prefix`
@@ -453,23 +460,32 @@ fn Process* create_process(void* image, uint image_size)
 	proc.sp = (uptr)sp;
 	proc.page_table = page_table;
 
-	// Default namespace: everything under "/" resolves to echod, which is
-	// always pid 2 (see kernel.c3 — it's the first process spawned after
-	// idle, deterministically). This is the same placeholder binding
-	// shell.c3's p9test used to hardcode directly; now it's a real
-	// per-process kernel lookup instead.
-	str_copy(&proc.namespace[0].prefix[0], "/", NS_PREFIX_MAX);
+	// Default namespace: "/srv/echo/" resolves to echod, which is always
+	// pid 2 (see kernel.c3 — it's the first process spawned after idle,
+	// deterministically). Real Plan 9 convention: /srv is where server
+	// processes get *named* in the namespace — this is the mount's
+	// original placeholder binding (shell.c3's p9test used to hardcode
+	// pid 2 directly) finally landing on the right prefix, not just a
+	// real lookup replacing a hardcoded one. It used to be bound to bare
+	// "/" instead — semantically backwards (echod is a service, not the
+	// filesystem root) and purely an artifact of predating this rename;
+	// see docs/devlog.md. Trailing slash deliberately, matching "/2/"'s
+	// own convention below, so a future "/srv/echo2" can't accidentally
+	// prefix-match too.
+	str_copy(&proc.namespace[0].prefix[0], "/srv/echo/", NS_PREFIX_MAX);
 	proc.namespace[0].server_pid = 2;
 	proc.namespace[0].server_generation = mount_generation(2);
 
 	// "" is a catch-all — str_starts_with treats an empty prefix as
 	// matching everything, and its zero length always loses a longest-
-	// prefix-match tie against "/" above — so this only ever wins for
-	// paths that don't start with "/" at all: plain filenames like
-	// "hello.txt", exactly how user.c3's fs_read/fs_write call
-	// ns_resolve(). Routes them to fsd (0 — "unused" — for any process
-	// created before fsd exists, namely idle/echod/diskd themselves,
-	// none of which ever need this).
+	// prefix-match tie against any of the real prefixes above/below — so
+	// this only ever wins for paths that don't start with "/" at all:
+	// plain filenames like "hello.txt", exactly how user.c3's
+	// fs_read/fs_write call ns_resolve(). Also, now that nothing claims
+	// bare "/" anymore, this transparently catches absolute paths like
+	// "/hello.txt" too — no separate "/" -> fsd mount needed. Routes to
+	// fsd (0 — "unused" — for any process created before fsd exists,
+	// namely idle/echod/diskd themselves, none of which ever need this).
 	str_copy(&proc.namespace[1].prefix[0], "", NS_PREFIX_MAX);
 	proc.namespace[1].server_pid = fsd_pid;
 	proc.namespace[1].server_generation = mount_generation(fsd_pid);
@@ -482,7 +498,14 @@ fn Process* create_process(void* image, uint image_size)
 	proc.namespace[2].server_pid = fsd2_pid;
 	proc.namespace[2].server_generation = mount_generation(fsd2_pid);
 
-	for (int m = 3; m < NS_MOUNTS_MAX; m++)
+	// "/proc/" — the process-info server (see procd_pid's own comment
+	// above, user/procd.c3). Same harmless-0-before-creation pattern as
+	// namespace[1]/[2].
+	str_copy(&proc.namespace[3].prefix[0], "/proc/", NS_PREFIX_MAX);
+	proc.namespace[3].server_pid = procd_pid;
+	proc.namespace[3].server_generation = mount_generation(procd_pid);
+
+	for (int m = 4; m < NS_MOUNTS_MAX; m++)
 	{
 		proc.namespace[m].server_pid = 0;
 	}

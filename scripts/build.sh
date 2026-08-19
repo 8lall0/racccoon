@@ -147,6 +147,7 @@ LLC=${LLC:-llc}
     build/user/diskd.bin.o \
     build/user/sdd.bin.o \
     build/user/fsd.bin.o \
+    build/user/procd.bin.o \
     -T src/kernel.ld \
     -Map=build/kernel.map \
     -o build/kernel.elf

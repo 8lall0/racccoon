@@ -320,6 +320,16 @@ fn void fs_mount()
 		// see fs_reserve_protection_summary()'s own comment for why
 		// it's shared rather than duplicated per backend.
 		fs_write_disabled = false;
+		// /tmp: a real scratch directory, self-created here rather than
+		// baked into a disk image or an SD card — works identically on
+		// QEMU and the real Duo with zero manual setup. Idempotent:
+		// ext2_mkdir() already returns -1 ("already exists") harmlessly
+		// once this has run before, which is the expected steady state
+		// from the second boot on. Result deliberately ignored — a
+		// failure here (e.g. fs_write_disabled flipping back on if
+		// fs_reserve_sector_range overflows further down) just means
+		// /tmp isn't there yet, same as if this line didn't exist.
+		ext2_mkdir("tmp");
 		ext2_reserve_protected(&FS_PROTECTED_NAME);
 		fs_reserve_protection_summary();
 		return;
@@ -329,6 +339,8 @@ fn void fs_mount()
 		fs_type = FS_TYPE_FAT32;
 		fat32_mount();
 		fs_write_disabled = false;
+		// See the ext2 branch's own comment above — same reasoning.
+		fat32_mkdir("tmp");
 		fat32_reserve_protected(&FS_PROTECTED_NAME);
 		fs_reserve_protection_summary();
 		return;
