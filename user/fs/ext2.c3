@@ -883,6 +883,62 @@ fn bool ext2_zero_inode(uint inode_num)
 	return ext2_write_block(ext2_inode_table_blocks[group] + block_offset, &block_buf);
 }
 
+// Finds a directory-entry slot to write a new entry into, reusing an
+// existing, allocated-but-logically-empty block (one whose own single
+// entry was deleted) if one exists, only allocating a genuinely new
+// block if none is found. Without this, a directory block slot never
+// gets reclaimed after delete/rename removes an entry (only the
+// entry's own entry_inode field gets cleared — see
+// ext2_delete_recursive/ext2_rename's own comments — never the block
+// itself), so a directory that sees repeated create/delete activity
+// (exactly what /tmp sees) would otherwise permanently exhaust its
+// 12-direct-block limit after just a handful of cycles, even though it
+// never holds more than a few live entries at once. Found exactly this
+// way: a stress test doing repeated mkdir/rename/delete cycles under
+// /tmp reliably exhausted its 12 slots after ~3 cycles — which then
+// looked exactly like e2fsck-visible corruption (a later create
+// silently failing after already having allocated a real, valid child
+// inode, orphaning it — see ext2_create_file/ext2_mkdir's own rollback
+// for the other half of that fix), not a resource-exhaustion refusal.
+//
+// Returns false only if the directory is genuinely full (12 slots, all
+// holding a live entry) or on a real I/O error. On success, fills
+// *out_block with the block to write the new entry into, and
+// *out_needs_link with whether `dir` itself still needs updating
+// (dir.block[*out_new_slot] = *out_block, plus size/blocks) — false
+// when reusing an existing slot (dir already points at this block),
+// true when a genuinely new one was allocated.
+fn bool ext2_find_or_reuse_dir_slot(Ext2_inode_info* dir, uint* out_block, bool* out_needs_link, uint* out_new_slot)
+{
+	uint free_slot = 12; // sentinel: no unallocated slot found yet
+	for (uint s = 0; s < 12; s++)
+	{
+		if (dir.block[s] == 0)
+		{
+			if (free_slot == 12) free_slot = s;
+			continue;
+		}
+		char[EXT2_MAX_BLOCK_SIZE] existing_buf @noinit;
+		if (!ext2_read_block(dir.block[s], &existing_buf)) return false;
+		uint* existing_inode = (uint*)&existing_buf[EXT2_DIRENT_INODE];
+		if (*existing_inode == 0)
+		{
+			*out_block = dir.block[s];
+			*out_needs_link = false;
+			return true;
+		}
+	}
+
+	if (free_slot >= 12) return false; // genuinely full
+
+	uint new_block = ext2_alloc_block();
+	if (new_block == 0) return false;
+	*out_block = new_block;
+	*out_needs_link = true;
+	*out_new_slot = free_slot;
+	return true;
+}
+
 // Creates a new, empty (zero-size) inode for `name` and links it into
 // the root directory. Fails outright if the root's own 12 direct blocks
 // are already all in use — a real v1 limit (see this file's header
@@ -914,12 +970,18 @@ fn bool ext2_create_file(uint dir_inode_num, char* name, uint* out_inode_num)
 	Ext2_inode_info dir;
 	if (!ext2_read_inode(dir_inode_num, &dir)) return false;
 
-	uint slot = 0;
-	while (slot < 12 && dir.block[slot] != 0) slot++;
-	if (slot >= 12) return false; // this directory's 12 direct blocks are full
-
-	uint new_block = ext2_alloc_block();
-	if (new_block == 0) return false;
+	uint new_block;
+	bool needs_link;
+	uint new_slot;
+	if (!ext2_find_or_reuse_dir_slot(&dir, &new_block, &needs_link, &new_slot))
+	{
+		// Directory genuinely full (or a real I/O error) — the inode
+		// allocated above would otherwise leak, unreferenced by
+		// anything, forever. See ext2_find_or_reuse_dir_slot's own
+		// comment.
+		ext2_free_inode(inode_num);
+		return false;
+	}
 
 	uint name_len = ext2_strlen(name);
 	char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
@@ -934,15 +996,18 @@ fn bool ext2_create_file(uint dir_inode_num, char* name, uint* out_inode_num)
 
 	if (!ext2_write_block(new_block, &block_buf)) return false;
 
-	dir.block[slot] = new_block;
-	dir.size += ext2_block_size; // kept correct — real ext2 readers use a directory's own size to know how far to scan its blocks
-	// Second real-hardware bug fixed alongside links_count above:
-	// i_blocks (512-byte sectors, a separate field from i_size — see
-	// EXT2_INODE_BLOCKS's own comment) was never bumped when a
-	// directory gained a new block, caught by e2fsck as a real
-	// inconsistency on the actual boot card.
-	dir.blocks += ext2_block_size / SECTOR_SIZE;
-	if (!ext2_write_inode(dir_inode_num, &dir)) return false;
+	if (needs_link)
+	{
+		dir.block[new_slot] = new_block;
+		dir.size += ext2_block_size; // kept correct — real ext2 readers use a directory's own size to know how far to scan its blocks
+		// Second real-hardware bug fixed alongside links_count above:
+		// i_blocks (512-byte sectors, a separate field from i_size —
+		// see EXT2_INODE_BLOCKS's own comment) was never bumped when a
+		// directory gained a new block, caught by e2fsck as a real
+		// inconsistency on the actual boot card.
+		dir.blocks += ext2_block_size / SECTOR_SIZE;
+		if (!ext2_write_inode(dir_inode_num, &dir)) return false;
+	}
 
 	*out_inode_num = inode_num;
 	return true;
@@ -1436,7 +1501,7 @@ fn int ext2_mkdir(char* path)
 	if (!ext2_zero_inode(new_inode_num)) return -1;
 
 	uint new_block = ext2_alloc_block();
-	if (new_block == 0) return -1;
+	if (new_block == 0) { ext2_free_inode(new_inode_num); return -1; }
 
 	char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
 	for (uint i = 0; i < EXT2_MAX_BLOCK_SIZE; i++) block_buf[i] = 0;
@@ -1475,12 +1540,19 @@ fn int ext2_mkdir(char* path)
 	Ext2_inode_info parent;
 	if (!ext2_read_inode(parent_inode, &parent)) return -1;
 
-	uint slot = 0;
-	while (slot < 12 && parent.block[slot] != 0) slot++;
-	if (slot >= 12) return -1; // parent's 12 direct blocks are already full
-
-	uint parent_new_block = ext2_alloc_block();
-	if (parent_new_block == 0) return -1;
+	uint parent_block;
+	bool needs_link;
+	uint new_slot;
+	if (!ext2_find_or_reuse_dir_slot(&parent, &parent_block, &needs_link, &new_slot))
+	{
+		// Parent genuinely full (or a real I/O error) — the child
+		// directory we just fully built (inode + its own "."/".."
+		// block) would otherwise leak, unreferenced by anything,
+		// forever. See ext2_find_or_reuse_dir_slot's own comment.
+		ext2_free_block(new_block);
+		ext2_free_inode(new_inode_num);
+		return -1;
+	}
 
 	uint name_len = ext2_strlen(leaf);
 	char[EXT2_MAX_BLOCK_SIZE] parent_block_buf @noinit;
@@ -1492,12 +1564,15 @@ fn int ext2_mkdir(char* path)
 	parent_block_buf[EXT2_DIRENT_NAME_LEN] = (char)name_len;
 	for (uint i = 0; i < name_len; i++) parent_block_buf[EXT2_DIRENT_NAME + i] = leaf[i];
 
-	if (!ext2_write_block(parent_new_block, &parent_block_buf)) return -1;
+	if (!ext2_write_block(parent_block, &parent_block_buf)) return -1;
 
-	parent.block[slot] = parent_new_block;
-	parent.size += ext2_block_size;
-	parent.blocks += ext2_block_size / SECTOR_SIZE;
-	parent.links_count += 1; // the new subdirectory's own ".." now references this one
+	if (needs_link)
+	{
+		parent.block[new_slot] = parent_block;
+		parent.size += ext2_block_size;
+		parent.blocks += ext2_block_size / SECTOR_SIZE;
+	}
+	parent.links_count += 1; // the new subdirectory's own ".." now references this one — always needed, regardless of slot reuse
 	if (!ext2_write_inode(parent_inode, &parent)) return -1;
 
 	if (!ext2_inc_used_dirs((new_inode_num - 1) / ext2_inodes_per_group)) return -1;
@@ -1543,12 +1618,10 @@ fn int ext2_rename(char* old_path, char* new_path)
 	Ext2_inode_info new_parent;
 	if (!ext2_read_inode(new_parent_inode, &new_parent)) return -1;
 
-	uint slot = 0;
-	while (slot < 12 && new_parent.block[slot] != 0) slot++;
-	if (slot >= 12) return -1; // destination directory's 12 direct blocks are already full
-
-	uint new_block = ext2_alloc_block();
-	if (new_block == 0) return -1;
+	uint new_block;
+	bool needs_link;
+	uint new_slot;
+	if (!ext2_find_or_reuse_dir_slot(&new_parent, &new_block, &needs_link, &new_slot)) return -1; // destination directory genuinely full
 
 	uint name_len = ext2_strlen(new_leaf);
 	char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
@@ -1561,9 +1634,12 @@ fn int ext2_rename(char* old_path, char* new_path)
 	for (uint i = 0; i < name_len; i++) block_buf[EXT2_DIRENT_NAME + i] = new_leaf[i];
 	if (!ext2_write_block(new_block, &block_buf)) return -1;
 
-	new_parent.block[slot] = new_block;
-	new_parent.size += ext2_block_size;
-	new_parent.blocks += ext2_block_size / SECTOR_SIZE;
+	if (needs_link)
+	{
+		new_parent.block[new_slot] = new_block;
+		new_parent.size += ext2_block_size;
+		new_parent.blocks += ext2_block_size / SECTOR_SIZE;
+	}
 
 	bool is_dir = (mode & EXT2_S_IFDIR) != 0;
 	bool cross_parent = new_parent_inode != old_parent_inode;
@@ -1572,7 +1648,10 @@ fn int ext2_rename(char* old_path, char* new_path)
 	{
 		new_parent.links_count += 1; // moved directory's own ".." now references this parent
 	}
-	if (!ext2_write_inode(new_parent_inode, &new_parent)) return -1;
+	if (needs_link || (is_dir && cross_parent))
+	{
+		if (!ext2_write_inode(new_parent_inode, &new_parent)) return -1;
+	}
 
 	if (is_dir && cross_parent)
 	{

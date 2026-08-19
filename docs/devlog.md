@@ -4,6 +4,74 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (18) — A real ext2 bug found chasing what looked like a preemption race
+
+Running `mkdirtest`/`renametest`/`movetest` repeatedly in one boot
+(real create/delete churn against the same directory) turned up ext2
+corruption: orphaned, unlinked inodes, confirmed via `debugfs`. It
+looked exactly like a real preemption race at first — reproduced only
+when a test ran long enough to span actual timer ticks, cleared up
+when debug `print()`s were added (which seemed to "fix" it by slowing
+things down), and FAT32 stayed 100% clean under identical stress. All
+three observations turned out to have the same, non-preemption
+explanation.
+
+**Actual root cause, found by instrumenting `diskd_rw` and
+`ext2_delete_recursive`'s own return sites directly**: `diskd_rw`
+never failed a single time across the entire investigation — ruling
+out an I/O race outright. The real failure was
+`ext2_delete_recursive`'s own `ext2_find_in_dir` call returning "not
+found" — because the entry genuinely never existed. `ext2_mkdir`/
+`ext2_create_file`/`ext2_rename` never reused a parent directory's own
+freed block slot after a delete — clearing a directory entry only
+zeroes that one dirent's `entry_inode` field, never reclaims the
+*block* it lives in from the parent's `block[]` array. With only 12
+direct-block slots and ~5 slots consumed per mkdir+rename+move cycle,
+the test directory's own slot list is permanently exhausted after ~2-3
+cycles — every later create silently fails (a clean "directory full"
+refusal), and the failure never recovers because nothing ever frees a
+slot.
+
+This explains every earlier observation without preemption at all:
+"more real time" just meant "more completed cycles" (more slots
+consumed, hits the wall sooner); debug prints "fixing" it just meant
+fewer cycles fit in the same wall-clock test duration; FAT32's own
+`fat32_find_free_dirent` already scans for *either* a free *or*
+`FAT32_DIRENT_DELETED` slot, so it never has this limit at all.
+Confirmed directly: `ext2_create_file`/`ext2_mkdir` allocate the
+child's own inode (and, for mkdir, its own "."/".." block) *before*
+checking whether the parent has a free slot — so a slot-exhaustion
+failure orphaned an already-fully-built child. Matches the two
+corrupted-inode shapes found via `debugfs` exactly: a leaked
+zero-size regular file (mode/links_count set, no blocks — exactly
+what `ext2_create_file` leaves when its parent-slot check fails right
+after writing the child's own empty inode) and an orphaned directory
+with real content (mode/links_count/blocks all intact, matching
+`ext2_mkdir` failing at the same point after fully building the
+child's own directory block).
+
+**Fix**: new `ext2_find_or_reuse_dir_slot()` helper (`ext2.c3`) —
+scans a parent's existing blocks for one whose single entry was
+deleted (`entry_inode == 0`) before allocating a new one, only
+returning "genuinely full" once no free *or* reusable slot exists.
+Used by `ext2_create_file`, `ext2_mkdir`, `ext2_rename`. Combined
+with rollback (`ext2_free_inode`/`ext2_free_block` on the child) when
+the parent genuinely has no room, so even a real "directory full"
+never leaks — matches the `fs_write`/`fs_delete_recursive` invariant
+this driver already keeps everywhere else (fail cleanly, never
+partially).
+
+**Verified**: the exact 20- and 40-cycle stress sequences that
+reliably corrupted before (failing by cycle ~3 every time) now pass
+100% clean — 60/60 and 120/120 test results, `e2fsck -n -f` clean at
+both sizes. Full regression suite on both filesystems, all clean.
+
+**Files changed:** `user/fs/ext2.c3` (`ext2_find_or_reuse_dir_slot`
+and its three callers: `ext2_create_file`, `ext2_mkdir`,
+`ext2_rename`).
+
+---
+
 ## 2026-08-19 (17) — Directory listing, mkdir, and rename/move
 
 Three features, all made meaningfully cheaper by infrastructure this
