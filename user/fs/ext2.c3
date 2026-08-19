@@ -1032,21 +1032,6 @@ fn int ext2_write(char* name, char* src, uint len)
 	return (int)written;
 }
 
-// Entry point dispatched from fsd.c3's main() for FS_DELETE. Handles
-// both a regular file and an *empty* directory (ext2_dir_is_empty,
-// below — a non-empty one is refused, matching real rmdir()'s own
-// semantics: no recursive auto-delete, that's real, separate,
-// deliberately-not-attempted-here work with real destructive
-// potential).
-//
-// Order matters, same "fail toward leak, not corruption" reasoning as
-// fat32_delete's own comment: clear the directory entry first (makes
-// the file unreachable via lookup), then zero the inode's own record
-// (drops stale metadata — mirrors ext2_zero_inode's own reasoning for
-// a freshly *allocated* inode, in reverse), then free its data blocks,
-// and only once nothing references them anymore, free the inode itself
-// — never mark something reusable while anything might still reference
-// it.
 // Checks whether a directory's own data blocks contain any real entry
 // besides "." and ".." (every subdirectory's own two self/parent
 // entries — ext2 names aren't space-padded like FAT32's, so these are
@@ -1088,12 +1073,20 @@ fn bool ext2_dir_is_empty(Ext2_inode_info* dir)
 	return true;
 }
 
-// Entry point dispatched from fsd.c3's main() for FS_DELETE. Handles
-// both a regular file and an *empty* directory (ext2_dir_is_empty,
-// above — a non-empty one is refused, matching real rmdir()'s own
-// semantics: no recursive auto-delete, that's real, separate,
-// deliberately-not-attempted-here work with real destructive
-// potential).
+// Entry point dispatched from fsd.c3's main() for a non-recursive
+// FS_DELETE. Handles both a regular file and an *empty* directory
+// (ext2_dir_is_empty, above — a non-empty one is refused, matching
+// real rmdir()'s own semantics: no recursive auto-delete here; see
+// ext2_delete_recursive below for that).
+//
+// Order matters, same "fail toward leak, not corruption" reasoning as
+// fat32_delete's own comment: clear the directory entry first (makes
+// the file unreachable via lookup), then zero the inode's own record
+// (drops stale metadata — mirrors ext2_zero_inode's own reasoning for
+// a freshly *allocated* inode, in reverse), then free its data blocks,
+// and only once nothing references them anymore, free the inode itself
+// — never mark something reusable while anything might still reference
+// it.
 fn int ext2_delete(char* name)
 {
 	uint dir_inode;

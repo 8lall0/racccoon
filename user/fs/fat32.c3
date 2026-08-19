@@ -773,13 +773,13 @@ fn bool fat32_dir_is_empty(uint dir_cluster)
 	return true;
 }
 
-// Entry point dispatched from fsd.c3's main() for FS_DELETE. Handles
-// both a regular file and an *empty* directory (fat32_dir_is_empty,
-// above — a non-empty one is refused, matching real rmdir()'s own
-// semantics: no recursive auto-delete, that's real, separate,
-// deliberately-not-attempted-here work with real destructive
-// potential). Marks the directory entry FAT32_DIRENT_DELETED — the
-// same value fat32_find_free_dirent already recognizes as reusable —
+// Entry point dispatched from fsd.c3's main() for a non-recursive
+// FS_DELETE. Handles both a regular file and an *empty* directory
+// (fat32_dir_is_empty, above — a non-empty one is refused, matching
+// real rmdir()'s own semantics: no recursive auto-delete here; see
+// fat32_delete_recursive below for that). Marks the directory entry
+// FAT32_DIRENT_DELETED — the same value fat32_find_free_dirent already
+// recognizes as reusable —
 // *before* freeing the cluster chain, not after: if freeing fails
 // partway, an entry that's already invisible to lookups with some of
 // its clusters still marked used is a leak, safe; freeing the chain
