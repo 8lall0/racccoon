@@ -4,6 +4,101 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-19 (17) — Directory listing, mkdir, and rename/move
+
+Three features, all made meaningfully cheaper by infrastructure this
+session already built for recursive delete (raw-entry directory
+walking, the cluster/inode-zero-vs-root ".." convention, the
+allocate-block-and-link-a-dirent shape `ext2_mkdir` and `ext2_rename`
+both reuse). No real c3 stdlib code to adapt here the way `std::atomic`
+was for the futex work — `std::io::path`'s own `ls`/`mkdir` are thin
+OS-native wrappers (`os::native_*`), not portable algorithms, and there
+is no `rename` in the stdlib above `libc::rename`'s raw extern
+binding — so these are built idiomatically for this environment, only
+borrowing the stdlib's API *shape* (an `ls` that lists, an `mkdir`
+that refuses if the parent doesn't exist) as naming inspiration.
+
+**`fat32_list`/`ext2_list`** (`FS_LIST`, new verb 23): single-reply, no
+pagination (same v1-scope limit as everything else in this protocol) —
+up to 31 fixed 36-byte records (32-byte name + 1-byte type + padding)
+fit in one `FS_MSG_MAX` reply. FAT32's own version converts each raw
+8.3 on-disk name back into a normal "NAME.EXT" display string — the
+one place this driver ever hands a name back to a caller instead of
+just matching against one.
+
+**`fat32_mkdir`/`ext2_mkdir`** (`FS_MKDIR`, verb 24): creates an empty
+directory, refusing if anything already exists there. Self-contained
+rather than sharing `fat32_create_file`/`ext2_create_file`'s own
+entry-linking logic — close in shape, but a directory needs its own
+"."/".." seeded (ext2's own inode also needs `links_count = 2`, not 1,
+and the *parent's* `links_count` needs its own +1 for the new
+subdirectory's ".." — real extra work a plain file never needs), and
+forcing that into the existing functions via a flag felt like the
+wrong trade against just duplicating the shape once more, the same
+choice `fat32_delete_recursive`/`ext2_delete_recursive` already made
+for the same reason. ".." on FAT32 points at cluster 0 when the parent
+is root — the real on-disk convention every reader expects, not
+something invented here.
+
+**`fat32_rename`/`ext2_rename`** (`FS_RENAME`, verb 25, the one verb
+with two paths on the wire — old at byte 0..99, new at 100..199):
+handles same-directory rename and cross-directory move uniformly by
+always adding a fresh entry at the destination (reusing the source's
+existing cluster/size/attr on FAT32, or just the same inode number on
+ext2 — genuinely cheap there, a dirent is only ever a name -> inode
+link, so a move never touches file data or the inode at all) and then
+removing the source entry, new-before-old so a failure partway through
+leans toward "briefly visible under both names," never "lost
+entirely." Moving a directory across parents fixes up its own ".."
+(both backends) and adjusts both parents' `links_count` (ext2 only).
+Refuses if the destination already exists (no silent overwrite, unlike
+POSIX `rename(2)`) and refuses a cross-filesystem move outright (no
+copy-then-delete fallback to silently turn an atomic-looking rename
+into a non-atomic one). Does not detect "moving a directory into its
+own subtree" (a real cycle) — a known, documented gap, not silently
+worked around; the existing recursion-depth cap on
+`fat32_delete_dir_contents`/`ext2_delete_dir_contents` is the backstop
+that keeps a resulting cycle from ever causing an unbounded walk, just
+not from being created.
+
+**Real bug found while testing, not by inspection**: `renametest`'s
+first fixture names, `rentest_a.txt`/`rentest_b.txt` (9 characters
+before the extension), silently collided under FAT32's 8.3 short-name
+truncation — both truncate to the identical `RENTEST_.TXT`, so the
+"destination already exists" check correctly refused every single
+run. Same root cause as `nestdir`/`nesteddir` two entries ago
+(`fat32_name_to_8_3`'s naive 8-character cutoff, no numeric-tail
+scheme), made again here before this test's own failure caught it —
+isolated via temporary checkpoint prints inside `fat32_rename` itself
+(dispatched from a real `print()` call in the fsd process, not a
+kernel debug path) rather than guessing. Fixed by shortening to
+`ren_a.txt`/`ren_b.txt`/`mv_a`/`mv_b` (all ≤8 characters, matching
+`emptydir`/`subdir`/`nestdir`'s own already-established discipline).
+
+**Verified**: full regression suite on both `disk.img` (FAT32) and
+`disk_ext2.img` (ext2) — `ls`/`lssub`, `mkdirtest`, `renametest`,
+`movetest` alongside every existing command. `fsck.vfat -n`/
+`e2fsck -n -f` clean on both after each new test. Unlike `rmrtest`
+(previous-previous entry), `mkdirtest`/`renametest`/`movetest` all
+create and clean up their own fixtures — confirmed safe to run
+repeatedly against the same image, including a 10-boot stress batch
+(`mkdirtest`/`renametest`/`movetest`/`ls`/`lssub`/`mutextest`/
+`racetest` in sequence each boot) with zero failures. One false
+alarm along the way — 8 of an initial 10 stress-batch boots came up
+"kernel.elf: No such file or directory" — traced to a race in the
+test harness itself (a second, separately-launched `build.sh`
+deleting `build/kernel.elf` mid-loop, not a kernel bug); a clean rerun
+without the concurrent rebuild passed 10/10.
+
+**Files changed:** `user/fs/fat32.c3` (`fat32_list`, `fat32_mkdir`,
+`fat32_rename`), `user/fs/ext2.c3` (`ext2_list`, `ext2_mkdir`,
+`ext2_rename`, `ext2_inc_used_dirs`), `user/fsd.c3` (dispatches for
+all three new verbs), `user/user.c3` (`FS_LIST`/`FS_MKDIR`/
+`FS_RENAME`, `fs_list`/`fs_mkdir`/`fs_rename`), `user/shell.c3`
+(`ls`, `lssub`, `mkdirtest`, `renametest`, `movetest`).
+
+---
+
 ## 2026-08-19 (16) — Recursive delete
 
 The other half of this session's work (see the previous entry for the

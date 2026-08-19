@@ -364,7 +364,7 @@ fn void main() @export("main")
 		uint verb = 0;
 		int from = ipc_recv_type(&buf, FS_MSG_MAX, &verb);
 		if (from <= 0) continue;
-		if (verb != FS_READ && verb != FS_WRITE && verb != FS_DELETE) continue;
+		if (verb != FS_READ && verb != FS_WRITE && verb != FS_DELETE && verb != FS_LIST && verb != FS_MKDIR && verb != FS_RENAME) continue;
 
 		int* result_len_field = (int*)&buf;
 
@@ -383,6 +383,16 @@ fn void main() @export("main")
 		for (int i = 0; i < 100; i++)
 		{
 			filename[i] = buf[i];
+		}
+		// FS_RENAME-only (see user.c3's own wire-format comment) — every
+		// other verb's byte 100.. means something else entirely (a
+		// length, a recursive flag, listing output), captured unconditionally
+		// here anyway, same "grab everything before buf gets reused for the
+		// reply" discipline this whole block already follows.
+		char[100] new_filename @noinit;
+		for (int i = 0; i < 100; i++)
+		{
+			new_filename[i] = buf[100 + i];
 		}
 		uint* len_field = (uint*)&buf[100];
 		int req_len = (int)*len_field;
@@ -414,6 +424,82 @@ fn void main() @export("main")
 				else if (fs_type == FS_TYPE_EXT2)
 				{
 					result = recursive ? ext2_delete_recursive(&filename) : ext2_delete(&filename);
+				}
+			}
+			*result_len_field = result;
+			ipc_send(from, verb, &buf, FS_MSG_MAX);
+			continue;
+		}
+
+		if (verb == FS_LIST)
+		{
+			// req_len/the recursive-flag byte range aren't used here — a
+			// listing only ever sends the directory path (see user.c3's
+			// wire-format comment). max_entries is bounded by how many
+			// FS_LIST_ENTRY_SIZE records actually fit in one reply
+			// (FS_MSG_MAX - 4, the same 4-byte result-count header every
+			// other verb here uses) — no pagination, see user.c3's own
+			// comment.
+			int max_entries = (int)((FS_MSG_MAX - 4) / FS_LIST_ENTRY_SIZE);
+			int count = -1;
+			if (fs_type == FS_TYPE_FAT32)
+			{
+				if (!fat32_list(&filename, &buf[4], max_entries, &count)) count = -1;
+			}
+			else if (fs_type == FS_TYPE_EXT2)
+			{
+				if (!ext2_list(&filename, &buf[4], max_entries, &count)) count = -1;
+			}
+			*result_len_field = count;
+			ipc_send(from, verb, &buf, FS_MSG_MAX);
+			continue;
+		}
+
+		if (verb == FS_MKDIR)
+		{
+			// No protected-name check needed here the way FS_WRITE/FS_DELETE
+			// have one: mkdir can never target the protected file's own name
+			// (fat32_mkdir/ext2_mkdir's own "already exists" check already
+			// refuses that, since the protected file's entry is right there).
+			// fs_write_disabled is still checked explicitly, though — every
+			// write mkdir would attempt goes through fs_write_sector ->
+			// diskd_rw(), which refuses on its own if writes are disabled
+			// (mount still in progress, or fs_reserve_sector_range()
+			// overflow), so this is a cheap early exit, not a correctness
+			// requirement — avoids allocating a cluster/inode/block just to
+			// have the very next write on it refused anyway.
+			int result = -1;
+			if (!fs_write_disabled)
+			{
+				if (fs_type == FS_TYPE_FAT32)
+				{
+					result = fat32_mkdir(&filename);
+				}
+				else if (fs_type == FS_TYPE_EXT2)
+				{
+					result = ext2_mkdir(&filename);
+				}
+			}
+			*result_len_field = result;
+			ipc_send(from, verb, &buf, FS_MSG_MAX);
+			continue;
+		}
+
+		if (verb == FS_RENAME)
+		{
+			// Same fs_write_disabled early-exit reasoning as FS_MKDIR's own
+			// comment — cheap, not a correctness requirement, the real
+			// backstop is diskd_rw() itself.
+			int result = -1;
+			if (!fs_write_disabled)
+			{
+				if (fs_type == FS_TYPE_FAT32)
+				{
+					result = fat32_rename(&filename, &new_filename);
+				}
+				else if (fs_type == FS_TYPE_EXT2)
+				{
+					result = ext2_rename(&filename, &new_filename);
 				}
 			}
 			*result_len_field = result;

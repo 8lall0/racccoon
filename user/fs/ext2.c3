@@ -697,6 +697,22 @@ fn bool ext2_dec_used_dirs(uint group)
 	return ext2_write_block(bgdt_block, &bgdt_buf);
 }
 
+// Inverse of ext2_dec_used_dirs() — same shape, +1 instead of -1.
+// Needed by ext2_mkdir (below): the new directory's own group, not the
+// parent's, same convention ext2_dec_used_dirs already uses.
+fn bool ext2_inc_used_dirs(uint group)
+{
+	uint descriptors_per_block = ext2_block_size / EXT2_BGD_SIZE;
+	uint bgdt_block = ext2_first_data_block + 1 + (group / descriptors_per_block);
+	uint offset_in_block = (group % descriptors_per_block) * EXT2_BGD_SIZE + EXT2_BGD_USED_DIRS_COUNT;
+
+	char[EXT2_MAX_BLOCK_SIZE] bgdt_buf @noinit;
+	if (!ext2_read_block(bgdt_block, &bgdt_buf)) return false;
+	ushort* bg_dirs = (ushort*)&bgdt_buf[offset_in_block];
+	*bg_dirs += 1;
+	return ext2_write_block(bgdt_block, &bgdt_buf);
+}
+
 // Linear scan of every group's block bitmap, group 0 first, for a
 // clear bit — not group-0-only anymore, so this driver's own writes
 // aren't confined there as it fills up (see EXT2_MAX_GROUPS's own
@@ -1304,6 +1320,287 @@ fn int ext2_delete_recursive(char* name)
 		if (!ext2_free_block(inode.block[b])) return -1;
 	}
 	if (!ext2_free_inode(inode_num)) return -1;
+
+	return 0;
+}
+
+// Entry point dispatched from fsd.c3's main() for FS_LIST. Same
+// scope/limits as fat32_list's own comment (single reply, no
+// pagination, "."/".." skipped). Unlike FAT32, ext2 names aren't
+// space-padded or 8.3-truncated — copied verbatim, capped at
+// FS_LIST_NAME_MAX (a real ext2 name can be longer; this driver has no
+// long-name support to round-trip through on the read side either, so
+// this matches the rest of it).
+fn bool ext2_list(char* path, char* out_buf, int max_entries, int* out_count)
+{
+	uint dir_inode;
+	if (path[0] == 0)
+	{
+		dir_inode = EXT2_ROOT_INODE;
+	}
+	else
+	{
+		uint parent_inode;
+		if (!ext2_resolve_dir(path, &parent_inode)) return false;
+		char* leaf = ext2_leaf_name(path);
+		uint inode_num;
+		uint entry_sector;
+		uint entry_offset;
+		uint mode;
+		if (!ext2_find_in_dir(parent_inode, leaf, &inode_num, &entry_sector, &entry_offset, &mode)) return false;
+		if ((mode & EXT2_S_IFDIR) == 0) return false;
+		dir_inode = inode_num;
+	}
+
+	Ext2_inode_info dir;
+	if (!ext2_read_inode(dir_inode, &dir)) return false;
+
+	int count = 0;
+	for (uint b = 0; b < 12 && count < max_entries; b++)
+	{
+		uint block = dir.block[b];
+		if (block == 0) continue;
+
+		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
+		if (!ext2_read_block(block, &block_buf)) return false;
+
+		uint offset = 0;
+		while (offset < ext2_block_size && count < max_entries)
+		{
+			char* entry = &block_buf[offset];
+			uint*   entry_inode   = (uint*)&entry[EXT2_DIRENT_INODE];
+			ushort* rec_len_field = (ushort*)&entry[EXT2_DIRENT_REC_LEN];
+			char    name_len_byte = entry[EXT2_DIRENT_NAME_LEN];
+
+			uint rec_len = (uint)*rec_len_field;
+			if (rec_len == 0) break;
+
+			uint entry_name_len = (uint)name_len_byte & 0xFF;
+			if (*entry_inode != 0)
+			{
+				bool is_dot    = entry_name_len == 1 && entry[EXT2_DIRENT_NAME] == '.';
+				bool is_dotdot = entry_name_len == 2 && entry[EXT2_DIRENT_NAME] == '.' && entry[EXT2_DIRENT_NAME + 1] == '.';
+				if (!is_dot && !is_dotdot)
+				{
+					Ext2_inode_info child;
+					if (!ext2_read_inode(*entry_inode, &child)) return false;
+
+					char* rec = &out_buf[(uint)count * FS_LIST_ENTRY_SIZE];
+					uint copy_len = entry_name_len;
+					if (copy_len > FS_LIST_NAME_MAX - 1) copy_len = FS_LIST_NAME_MAX - 1;
+					for (uint k = 0; k < copy_len; k++) rec[k] = entry[EXT2_DIRENT_NAME + k];
+					rec[copy_len] = 0;
+					rec[FS_LIST_NAME_MAX] = ((child.mode & EXT2_S_IFDIR) != 0) ? (char)1 : (char)0;
+					count++;
+				}
+			}
+
+			offset += rec_len;
+		}
+	}
+	*out_count = count;
+	return true;
+}
+
+// Entry point dispatched from fsd.c3's main() for FS_MKDIR. Creates an
+// empty directory at `path` — refuses if anything already exists
+// there, or if the parent doesn't. Self-contained rather than sharing
+// ext2_create_file's own "allocate a block, add a dirent to the
+// parent" logic: close enough in shape, but a directory also needs its
+// own data block pre-seeded with real "." and ".." entries and an
+// extra links_count bump on the *parent* (its own ".." now references
+// it) that ext2_create_file has no reason to do for a regular file —
+// same "self-contained rather than force a shared abstraction" choice
+// fat32_mkdir makes for the same reason.
+//
+// mode 0x41ED = EXT2_S_IFDIR | 0755 — the standard real-world value
+// for an ordinary directory (same permission convention
+// ext2_create_file's own 0644 already follows for regular files).
+fn int ext2_mkdir(char* path)
+{
+	uint parent_inode;
+	if (!ext2_resolve_dir(path, &parent_inode)) return -1;
+	char* leaf = ext2_leaf_name(path);
+
+	uint existing_inode;
+	uint existing_sector;
+	uint existing_offset;
+	uint existing_mode;
+	if (ext2_find_in_dir(parent_inode, leaf, &existing_inode, &existing_sector, &existing_offset, &existing_mode))
+	{
+		return -1; // already exists
+	}
+
+	uint new_inode_num = ext2_alloc_inode();
+	if (new_inode_num == 0) return -1;
+	if (!ext2_zero_inode(new_inode_num)) return -1;
+
+	uint new_block = ext2_alloc_block();
+	if (new_block == 0) return -1;
+
+	char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
+	for (uint i = 0; i < EXT2_MAX_BLOCK_SIZE; i++) block_buf[i] = 0;
+
+	uint*   dot_inode   = (uint*)&block_buf[EXT2_DIRENT_INODE];
+	ushort* dot_rec_len = (ushort*)&block_buf[EXT2_DIRENT_REC_LEN];
+	*dot_inode = new_inode_num;
+	*dot_rec_len = 12; // 4 (inode) + 2 (rec_len) + 1 (name_len) + 1 (file_type) + 1 (".") rounded to 4
+	block_buf[EXT2_DIRENT_NAME_LEN] = (char)1;
+	block_buf[EXT2_DIRENT_NAME] = '.';
+
+	uint*   dotdot_inode   = (uint*)&block_buf[12 + EXT2_DIRENT_INODE];
+	ushort* dotdot_rec_len = (ushort*)&block_buf[12 + EXT2_DIRENT_REC_LEN];
+	*dotdot_inode = parent_inode;
+	*dotdot_rec_len = (ushort)(ext2_block_size - 12); // fills the rest of the block, standard ext2 convention
+	block_buf[12 + EXT2_DIRENT_NAME_LEN] = (char)2;
+	block_buf[12 + EXT2_DIRENT_NAME] = '.';
+	block_buf[12 + EXT2_DIRENT_NAME + 1] = '.';
+
+	if (!ext2_write_block(new_block, &block_buf)) return -1;
+
+	Ext2_inode_info new_inode;
+	new_inode.mode = EXT2_S_IFDIR | 0x1ED;
+	new_inode.size = ext2_block_size;
+	// 2, not 1: one for the parent's own directory entry pointing at
+	// this inode, one for this directory's own "." entry pointing at
+	// itself — same real-hardware-verified reasoning as
+	// ext2_create_file's own links_count comment, extended by the one
+	// extra self-reference every directory (but no regular file) has.
+	new_inode.links_count = 2;
+	new_inode.blocks = ext2_block_size / SECTOR_SIZE;
+	new_inode.block[0] = new_block;
+	for (uint i = 1; i < 12; i++) new_inode.block[i] = 0;
+	if (!ext2_write_inode(new_inode_num, &new_inode)) return -1;
+
+	Ext2_inode_info parent;
+	if (!ext2_read_inode(parent_inode, &parent)) return -1;
+
+	uint slot = 0;
+	while (slot < 12 && parent.block[slot] != 0) slot++;
+	if (slot >= 12) return -1; // parent's 12 direct blocks are already full
+
+	uint parent_new_block = ext2_alloc_block();
+	if (parent_new_block == 0) return -1;
+
+	uint name_len = ext2_strlen(leaf);
+	char[EXT2_MAX_BLOCK_SIZE] parent_block_buf @noinit;
+	for (uint i = 0; i < EXT2_MAX_BLOCK_SIZE; i++) parent_block_buf[i] = 0;
+	uint*   entry_inode_field   = (uint*)&parent_block_buf[EXT2_DIRENT_INODE];
+	ushort* entry_rec_len_field = (ushort*)&parent_block_buf[EXT2_DIRENT_REC_LEN];
+	*entry_inode_field = new_inode_num;
+	*entry_rec_len_field = (ushort)ext2_block_size; // whole block, one entry
+	parent_block_buf[EXT2_DIRENT_NAME_LEN] = (char)name_len;
+	for (uint i = 0; i < name_len; i++) parent_block_buf[EXT2_DIRENT_NAME + i] = leaf[i];
+
+	if (!ext2_write_block(parent_new_block, &parent_block_buf)) return -1;
+
+	parent.block[slot] = parent_new_block;
+	parent.size += ext2_block_size;
+	parent.blocks += ext2_block_size / SECTOR_SIZE;
+	parent.links_count += 1; // the new subdirectory's own ".." now references this one
+	if (!ext2_write_inode(parent_inode, &parent)) return -1;
+
+	if (!ext2_inc_used_dirs((new_inode_num - 1) / ext2_inodes_per_group)) return -1;
+
+	return 0;
+}
+
+// Entry point dispatched from fsd.c3's main() for FS_RENAME. Same
+// scope as fat32_rename's own comment (uniform same-parent-or-not
+// handling, destination-must-not-exist, no cycle detection — see
+// there for the full reasoning). Genuinely cheap on ext2 specifically:
+// a directory entry is just a name -> inode_num link, so moving a file
+// or directory never touches its data at all, only the entry that
+// points at it — same "one new dirent, one removed dirent" shape as
+// fat32_rename, just without any cluster/size copying since ext2's own
+// dirent format doesn't carry either.
+fn int ext2_rename(char* old_path, char* new_path)
+{
+	uint old_parent_inode;
+	if (!ext2_resolve_dir(old_path, &old_parent_inode)) return -1;
+	char* old_leaf = ext2_leaf_name(old_path);
+
+	uint inode_num;
+	uint old_entry_sector;
+	uint old_entry_offset;
+	uint mode;
+	if (!ext2_find_in_dir(old_parent_inode, old_leaf, &inode_num, &old_entry_sector, &old_entry_offset, &mode)) return -1;
+	if (fs_is_protected_entry(old_entry_sector, old_entry_offset)) return -1;
+
+	uint new_parent_inode;
+	if (!ext2_resolve_dir(new_path, &new_parent_inode)) return -1;
+	char* new_leaf = ext2_leaf_name(new_path);
+
+	uint existing_inode;
+	uint existing_sector;
+	uint existing_offset;
+	uint existing_mode;
+	if (ext2_find_in_dir(new_parent_inode, new_leaf, &existing_inode, &existing_sector, &existing_offset, &existing_mode))
+	{
+		return -1; // destination already exists
+	}
+
+	Ext2_inode_info new_parent;
+	if (!ext2_read_inode(new_parent_inode, &new_parent)) return -1;
+
+	uint slot = 0;
+	while (slot < 12 && new_parent.block[slot] != 0) slot++;
+	if (slot >= 12) return -1; // destination directory's 12 direct blocks are already full
+
+	uint new_block = ext2_alloc_block();
+	if (new_block == 0) return -1;
+
+	uint name_len = ext2_strlen(new_leaf);
+	char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
+	for (uint i = 0; i < EXT2_MAX_BLOCK_SIZE; i++) block_buf[i] = 0;
+	uint*   entry_inode_field   = (uint*)&block_buf[EXT2_DIRENT_INODE];
+	ushort* entry_rec_len_field = (ushort*)&block_buf[EXT2_DIRENT_REC_LEN];
+	*entry_inode_field = inode_num;
+	*entry_rec_len_field = (ushort)ext2_block_size;
+	block_buf[EXT2_DIRENT_NAME_LEN] = (char)name_len;
+	for (uint i = 0; i < name_len; i++) block_buf[EXT2_DIRENT_NAME + i] = new_leaf[i];
+	if (!ext2_write_block(new_block, &block_buf)) return -1;
+
+	new_parent.block[slot] = new_block;
+	new_parent.size += ext2_block_size;
+	new_parent.blocks += ext2_block_size / SECTOR_SIZE;
+
+	bool is_dir = (mode & EXT2_S_IFDIR) != 0;
+	bool cross_parent = new_parent_inode != old_parent_inode;
+
+	if (is_dir && cross_parent)
+	{
+		new_parent.links_count += 1; // moved directory's own ".." now references this parent
+	}
+	if (!ext2_write_inode(new_parent_inode, &new_parent)) return -1;
+
+	if (is_dir && cross_parent)
+	{
+		// Fix up the moved directory's own ".." (always its first
+		// entry in block[0] — universal ext2 convention, not just this
+		// driver's own, so this holds for a directory created by any
+		// real tool too) to point at its new parent, then drop the old
+		// parent's own link for the one it just lost — inverse of the
+		// += above.
+		Ext2_inode_info moved;
+		if (!ext2_read_inode(inode_num, &moved)) return -1;
+		char[EXT2_MAX_BLOCK_SIZE] moved_block_buf @noinit;
+		if (!ext2_read_block(moved.block[0], &moved_block_buf)) return -1;
+		uint* dotdot_inode = (uint*)&moved_block_buf[12 + EXT2_DIRENT_INODE];
+		*dotdot_inode = new_parent_inode;
+		if (!ext2_write_block(moved.block[0], &moved_block_buf)) return -1;
+
+		Ext2_inode_info old_parent;
+		if (!ext2_read_inode(old_parent_inode, &old_parent)) return -1;
+		if (old_parent.links_count > 0) old_parent.links_count -= 1;
+		if (!ext2_write_inode(old_parent_inode, &old_parent)) return -1;
+	}
+
+	char[SECTOR_SIZE] old_sector_buf @noinit;
+	if (!fs_read_sector(old_entry_sector, &old_sector_buf)) return -1;
+	uint* old_entry_inode_field = (uint*)&old_sector_buf[old_entry_offset + EXT2_DIRENT_INODE];
+	*old_entry_inode_field = 0;
+	if (!fs_write_sector(old_entry_sector, &old_sector_buf)) return -1;
 
 	return 0;
 }

@@ -432,7 +432,33 @@ fn void print_uint(uint n) @export("print_uint") {
 const uint FS_READ   = 20;
 const uint FS_WRITE  = 21;
 const uint FS_DELETE = 22;
+const uint FS_LIST   = 23;
+const uint FS_MKDIR  = 24; // byte 0..99 = path, nothing else to send; reply reuses 0..3 for 0/-1, same as FS_DELETE
+// FS_RENAME: the one verb here that needs two paths, so it's the one
+// exception to "byte 0..99 = the path" — byte 0..99 = old path, byte
+// 100..199 = new path (same "up to 99 chars, null-terminated"
+// convention, just used twice). Refuses if new already exists (no
+// silent overwrite, unlike POSIX rename(2)) or if old is the write-
+// protected file. Reply reuses 0..3 for 0/-1, same as FS_DELETE/
+// FS_MKDIR.
+const uint FS_RENAME = 25;
 const uint FS_MSG_MAX = 1128;
+
+// FS_LIST: byte 0..99 = directory path ("" means the root), same as
+// FS_READ/FS_WRITE/FS_DELETE's own filename field. Reply: byte 0..3 =
+// int count (or -1 on error — not a directory, not found, etc), then
+// `count` fixed-size FS_LIST_ENTRY_SIZE records starting at byte 4:
+// FS_LIST_NAME_MAX bytes of null-terminated name, then 1 byte of type
+// (0 = file, 1 = directory), then padding out to FS_LIST_ENTRY_SIZE.
+// v1 scope, deliberately limited like everything else in this
+// protocol: one reply, no continuation/pagination — a directory with
+// more than fs_list()'s own max_entries worth of real entries is
+// silently truncated, not reported as an error (matches how
+// fat32_read_file/ext2 read short past their own block/indirect
+// limits elsewhere in this codebase — "return however much fit" over
+// a hard failure).
+const uint FS_LIST_NAME_MAX   = 32;
+const uint FS_LIST_ENTRY_SIZE = 36;
 
 fn int fs_read(char* filename, char* buf, int len) @export("fs_read") {
     uint prefix_len = 0;
@@ -542,6 +568,111 @@ fn int fs_delete(char* filename) @export("fs_delete") {
 // genuinely destructive from here on: no confirmation prompt, no undo.
 fn int fs_delete_recursive(char* filename) @export("fs_delete_recursive") {
     return fs_delete_impl(filename, 1);
+}
+
+// Lists `dirname` ("" for the root) into out_buf, which must be at
+// least FS_LIST_ENTRY_SIZE * max_entries bytes — same "caller owns the
+// buffer, tells us its size" convention as fs_read. Returns the number
+// of entries actually written (0..max_entries), or -1 on error (not
+// found, not a directory). See user.c3's own FS_LIST wire-format
+// comment for each record's layout.
+fn int fs_list(char* dirname, char* out_buf, int max_entries) @export("fs_list") {
+    uint prefix_len = 0;
+    int fsd_pid = ns_resolve(dirname, &prefix_len);
+    if (fsd_pid < 0) return -1;
+    char* stripped = &dirname[prefix_len];
+
+    char[FS_MSG_MAX] req @noinit;
+    int i = 0;
+    while (stripped[i] != 0 && i < 99) {
+        req[i] = stripped[i];
+        i++;
+    }
+    req[i] = 0;
+
+    uint reply_verb = 0;
+    int from = p9_call(fsd_pid, FS_LIST, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
+    if (from <= 0 || reply_verb != FS_LIST) return -1;
+
+    int* result_count_field = (int*)&req;
+    int result_count = *result_count_field;
+    if (result_count < 0) return result_count;
+    if (result_count > max_entries) result_count = max_entries;
+    int total_bytes = result_count * (int)FS_LIST_ENTRY_SIZE;
+    for (int j = 0; j < total_bytes; j++) {
+        out_buf[j] = req[4 + j];
+    }
+    return result_count;
+}
+
+// Creates an empty directory at `dirname` — refuses if anything
+// already exists there, or if the parent doesn't (no "mkdir -p": the
+// parent must already exist). Real, destructive-adjacent from here on
+// the same way fs_delete_recursive is: creates real, persistent
+// on-disk state, no undo besides a subsequent fs_delete.
+fn int fs_mkdir(char* dirname) @export("fs_mkdir") {
+    uint prefix_len = 0;
+    int fsd_pid = ns_resolve(dirname, &prefix_len);
+    if (fsd_pid < 0) return -1;
+    char* stripped = &dirname[prefix_len];
+
+    char[FS_MSG_MAX] req @noinit;
+    int i = 0;
+    while (stripped[i] != 0 && i < 99) {
+        req[i] = stripped[i];
+        i++;
+    }
+    req[i] = 0;
+
+    uint reply_verb = 0;
+    int from = p9_call(fsd_pid, FS_MKDIR, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
+    if (from <= 0 || reply_verb != FS_MKDIR) return -1;
+
+    int* result_field = (int*)&req;
+    return *result_field;
+}
+
+// Renames/moves old_path to new_path — see FS_RENAME's own wire-format
+// comment for the full scope (destination must not already exist, no
+// cross-directory-cycle detection). Cross-filesystem moves (old and
+// new resolving to different fsd instances, e.g. one on the default
+// mount and one under "/2/") are refused outright rather than
+// attempted — this driver has no copy-then-delete fallback the way a
+// real OS's rename(2)-EXDEV caller would use, and silently doing that
+// here would turn an atomic-looking rename into a non-atomic one
+// without the caller ever being told.
+fn int fs_rename(char* old_path, char* new_path) @export("fs_rename") {
+    uint old_prefix_len = 0;
+    int old_fsd_pid = ns_resolve(old_path, &old_prefix_len);
+    if (old_fsd_pid < 0) return -1;
+    uint new_prefix_len = 0;
+    int new_fsd_pid = ns_resolve(new_path, &new_prefix_len);
+    if (new_fsd_pid < 0) return -1;
+    if (old_fsd_pid != new_fsd_pid) return -1;
+
+    char* old_stripped = &old_path[old_prefix_len];
+    char* new_stripped = &new_path[new_prefix_len];
+
+    char[FS_MSG_MAX] req @noinit;
+    int i = 0;
+    while (old_stripped[i] != 0 && i < 99) {
+        req[i] = old_stripped[i];
+        i++;
+    }
+    req[i] = 0;
+    int j = 0;
+    while (new_stripped[j] != 0 && j < 99) {
+        req[100 + j] = new_stripped[j];
+        j++;
+    }
+    req[100 + j] = 0;
+
+    uint reply_verb = 0;
+    int from = p9_call(old_fsd_pid, FS_RENAME, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
+    if (from <= 0 || reply_verb != FS_RENAME) return -1;
+
+    int* result_field = (int*)&req;
+    return *result_field;
 }
 
 fn int strcmp(char* a, char* b) {

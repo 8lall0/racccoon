@@ -187,6 +187,102 @@ fn void main() @export("main") {
             } else {
                 print("readsubfile2: not found (no second fsd mounted?)\n");
             }
+        } else if (strcmp(cmd, "ls") == 0) {
+            char[576] listbuf @noinit; // FS_LIST_ENTRY_SIZE * 16 entries
+            int count = fs_list("", &listbuf, 16);
+            if (count < 0) {
+                print("ls: failed\n");
+            } else {
+                for (int li = 0; li < count; li++) {
+                    char* rec = &listbuf[li * 36];
+                    print(rec);
+                    if (rec[32] != 0) {
+                        print("/");
+                    }
+                    print("\n");
+                }
+            }
+        } else if (strcmp(cmd, "lssub") == 0) {
+            // Same as ls, against subdir/ — proves fs_list resolves a
+            // non-root path to a directory and lists *its* entries, not
+            // just the special-cased "" root path.
+            char[576] listbuf2 @noinit;
+            int count2 = fs_list("subdir", &listbuf2, 16);
+            if (count2 < 0) {
+                print("lssub: failed\n");
+            } else {
+                for (int li2 = 0; li2 < count2; li2++) {
+                    char* rec2 = &listbuf2[li2 * 36];
+                    print(rec2);
+                    if (rec2[32] != 0) {
+                        print("/");
+                    }
+                    print("\n");
+                }
+            }
+        } else if (strcmp(cmd, "mkdirtest") == 0) {
+            // Unlike rmrtest's nestdir/ (a build-time fixture, consumed
+            // permanently once deleted — see docs/devlog.md), this
+            // creates its own fixture dynamically and cleans it back up
+            // at the end via fs_delete_recursive — safe to run more than
+            // once against the same disk image, including repeatedly in
+            // the same boot. Exercises the new directory for real (write
+            // a file into it, read it back), not just "mkdir succeeded
+            // and nothing else."
+            int made = fs_mkdir("mkdirtest_dir");
+            int made_again = fs_mkdir("mkdirtest_dir"); // must refuse: already exists
+            int wrote = fs_write("mkdirtest_dir/inner.txt", "made by mkdirtest\n", 19);
+            char[32] mkdir_buf @noinit;
+            int len = fs_read("mkdirtest_dir/inner.txt", &mkdir_buf, 32);
+            int deleted = fs_delete_recursive("mkdirtest_dir");
+            if (made == 0 && made_again < 0 && wrote >= 0 && len >= 0 && deleted == 0) {
+                print("mkdirtest: ok\n");
+            } else {
+                print("mkdirtest: FAILED\n");
+            }
+        } else if (strcmp(cmd, "renametest") == 0) {
+            // Same-directory rename — the common case. Own fixture,
+            // self-cleaning, same discipline as mkdirtest. Names kept
+            // to 8 characters or under before the extension — FAT32's
+            // 8.3 short names truncate anything longer, and "ren_a"/
+            // "ren_b" differing only in their 9th character (as
+            // "rentest_a"/"rentest_b" originally did) would truncate to
+            // the exact same short name and collide — the same class
+            // of mistake nestdir/nesteddir's own comment already
+            // documents (scripts/build.sh), made again here before
+            // being caught by this test itself failing.
+            fs_write("ren_a.txt", "renamed content\n", 17);
+            int renamed = fs_rename("ren_a.txt", "ren_b.txt");
+            char[32] ren_buf @noinit;
+            int len_new = fs_read("ren_b.txt", &ren_buf, 32);
+            int old_gone = fs_read("ren_a.txt", &ren_buf, 32); // must now fail
+            int cleanup = fs_delete("ren_b.txt");
+            if (renamed == 0 && len_new >= 0 && old_gone < 0 && cleanup == 0) {
+                print("renametest: ok\n");
+            } else {
+                print("renametest: FAILED\n");
+            }
+        } else if (strcmp(cmd, "movetest") == 0) {
+            // Cross-directory move — the "move" half of "rename/move",
+            // proving fat32_rename/ext2_rename's own directory-entry
+            // relink actually crosses two different parents, not just
+            // renaming in place. Two fresh directories, a file created
+            // in the first and moved into the second; both cleaned up
+            // recursively at the end regardless of which step failed.
+            // Same short-name discipline as renametest above.
+            fs_mkdir("mv_a");
+            fs_mkdir("mv_b");
+            fs_write("mv_a/f.txt", "moved content\n", 15);
+            int moved = fs_rename("mv_a/f.txt", "mv_b/f.txt");
+            char[32] mv_buf @noinit;
+            int len_moved = fs_read("mv_b/f.txt", &mv_buf, 32);
+            int cleanup_a = fs_delete_recursive("mv_a");
+            int cleanup_b = fs_delete_recursive("mv_b");
+            if (moved == 0 && len_moved >= 0 && cleanup_a == 0 && cleanup_b == 0) {
+                print("movetest: ok\n");
+            } else {
+                print("movetest: FAILED\n");
+            }
         } else if (strcmp(cmd, "writefile") == 0) {
             fs_write("hello.txt", "Hello from shell!\n", 19);
         } else if (strcmp(cmd, "newfile") == 0) {

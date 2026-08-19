@@ -930,6 +930,314 @@ fn int fat32_delete_recursive(char* name)
 	return fat32_free_cluster_chain(cluster) ? 0 : -1;
 }
 
+// Entry point dispatched from fsd.c3's main() for FS_LIST. Lists
+// dir_cluster's own entries (path == "" means the root) into out_buf,
+// one fixed-size FS_LIST_ENTRY_SIZE record per real entry ("."/".."
+// skipped, same as fat32_dir_is_empty/fat32_delete_dir_contents),
+// stopping at max_entries — v1 scope, no pagination, matching every
+// other "single reply, no continuation" limit in this codebase (see
+// fsd.c3's own header comment). Converts each 8.3 on-disk name (always
+// space-padded to 11 bytes) back into a normal display string
+// ("NAME.EXT", no trailing dot if the extension is empty) — the
+// inverse of fat32_name_to_8_3, needed here specifically because a
+// listing is the one place this driver ever hands a raw on-disk name
+// back to a caller instead of just matching against one.
+fn bool fat32_list(char* path, char* out_buf, int max_entries, int* out_count)
+{
+	uint dir_cluster;
+	if (path[0] == 0)
+	{
+		dir_cluster = fat32_root_cluster;
+	}
+	else
+	{
+		uint parent_cluster;
+		if (!fat32_resolve_dir(path, &parent_cluster)) return false;
+		char* leaf = fat32_leaf_name(path);
+		char[11] name11 @noinit;
+		fat32_name_to_8_3(leaf, &name11);
+		uint cluster;
+		uint size;
+		uint entry_sector;
+		uint entry_offset;
+		char attr;
+		if (!fat32_find_in_dir(parent_cluster, &name11, &cluster, &size, &entry_sector, &entry_offset, &attr)) return false;
+		if ((attr & FAT32_DIRENT_ATTR_DIRECTORY) == 0) return false;
+		dir_cluster = cluster;
+	}
+
+	int count = 0;
+	uint cluster = dir_cluster;
+	char[SECTOR_SIZE] sector_buf @noinit;
+	while (cluster != 0 && cluster < FAT32_EOC_MIN && count < max_entries)
+	{
+		uint sector = fat32_cluster_to_sector(cluster);
+		for (uint s = 0; s < fat32_sectors_per_cluster && count < max_entries; s++)
+		{
+			if (!fs_read_sector(sector + s, &sector_buf)) return false;
+
+			for (uint e = 0; e < SECTOR_SIZE / FAT32_DIRENT_SIZE && count < max_entries; e++)
+			{
+				char* entry = &sector_buf[e * FAT32_DIRENT_SIZE];
+				if (entry[0] == FAT32_DIRENT_FREE_REST) { *out_count = count; return true; }
+				if (entry[0] == FAT32_DIRENT_DELETED) continue;
+
+				char attr = entry[FAT32_DIRENT_ATTR];
+				if (attr == FAT32_DIRENT_ATTR_LFN) continue;
+				if ((attr & FAT32_DIRENT_ATTR_VOLUME) != 0) continue;
+
+				bool is_dot    = entry[FAT32_DIRENT_NAME] == '.' && entry[FAT32_DIRENT_NAME + 1] == ' ';
+				bool is_dotdot = entry[FAT32_DIRENT_NAME] == '.' && entry[FAT32_DIRENT_NAME + 1] == '.' && entry[FAT32_DIRENT_NAME + 2] == ' ';
+				if (is_dot || is_dotdot) continue;
+
+				char* rec = &out_buf[(uint)count * FS_LIST_ENTRY_SIZE];
+				int ni = 0;
+				for (uint k = 0; k < 8 && entry[FAT32_DIRENT_NAME + k] != ' '; k++)
+				{
+					rec[ni] = entry[FAT32_DIRENT_NAME + k];
+					ni++;
+				}
+				if (entry[FAT32_DIRENT_NAME + 8] != ' ')
+				{
+					rec[ni] = '.';
+					ni++;
+					for (uint k = 8; k < 11 && entry[FAT32_DIRENT_NAME + k] != ' '; k++)
+					{
+						rec[ni] = entry[FAT32_DIRENT_NAME + k];
+						ni++;
+					}
+				}
+				rec[ni] = 0; // ni is always well under FS_LIST_NAME_MAX (11-byte 8.3 names + 1 dot)
+				rec[FS_LIST_NAME_MAX] = ((attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0) ? (char)1 : (char)0;
+				count++;
+			}
+		}
+		cluster = fat32_next_cluster(cluster);
+	}
+	*out_count = count;
+	return true;
+}
+
+// Entry point dispatched from fsd.c3's main() for FS_MKDIR. Creates an
+// empty directory at `path` — refuses if anything (file or directory)
+// already exists there, or if the parent doesn't. Self-contained
+// rather than sharing fat32_create_file's own "find/extend a free
+// dirent slot" logic: close enough in shape, but a directory also
+// needs its own first cluster pre-seeded with real "." and ".."
+// entries (fat32_create_file's files are legitimately empty — zero
+// clusters — until something writes to them), which doesn't fit
+// naturally into that function without a flag threading through it.
+//
+// ".." points at 0 (not fat32_root_cluster) when the new directory's
+// parent is the root — the real, standard FAT32 convention every
+// reader (including this driver's own fat32_delete_dir_contents,
+// which never inspects "."/".." clusters at all) expects, not
+// something this driver invented.
+fn int fat32_mkdir(char* path)
+{
+	uint parent_cluster;
+	if (!fat32_resolve_dir(path, &parent_cluster)) return -1;
+	char* leaf = fat32_leaf_name(path);
+
+	char[11] name11 @noinit;
+	fat32_name_to_8_3(leaf, &name11);
+
+	uint existing_cluster;
+	uint existing_size;
+	uint existing_sector;
+	uint existing_offset;
+	char existing_attr;
+	if (fat32_find_in_dir(parent_cluster, &name11, &existing_cluster, &existing_size, &existing_sector, &existing_offset, &existing_attr))
+	{
+		return -1; // already exists (file or directory)
+	}
+
+	uint new_cluster = fat32_alloc_cluster();
+	if (new_cluster == 0) return -1;
+
+	char[SECTOR_SIZE] zero_buf @noinit;
+	for (uint i = 0; i < SECTOR_SIZE; i++) zero_buf[i] = 0;
+	for (uint s = 0; s < fat32_sectors_per_cluster; s++)
+	{
+		if (!fs_write_sector(fat32_cluster_to_sector(new_cluster) + s, &zero_buf)) return -1;
+	}
+
+	uint dotdot_target = (parent_cluster == fat32_root_cluster) ? 0 : parent_cluster;
+
+	char[SECTOR_SIZE] dir_buf @noinit;
+	if (!fs_read_sector(fat32_cluster_to_sector(new_cluster), &dir_buf)) return -1;
+
+	char* dot_entry = &dir_buf[0];
+	dot_entry[0] = '.';
+	for (uint i = 1; i < 11; i++) dot_entry[i] = ' ';
+	dot_entry[FAT32_DIRENT_ATTR] = FAT32_DIRENT_ATTR_DIRECTORY;
+	ushort* dot_hi = (ushort*)&dot_entry[FAT32_DIRENT_CLUSTER_HI];
+	ushort* dot_lo = (ushort*)&dot_entry[FAT32_DIRENT_CLUSTER_LO];
+	*dot_hi = (ushort)(new_cluster >> 16);
+	*dot_lo = (ushort)(new_cluster & 0xFFFF);
+
+	char* dotdot_entry = &dir_buf[FAT32_DIRENT_SIZE];
+	dotdot_entry[0] = '.';
+	dotdot_entry[1] = '.';
+	for (uint i = 2; i < 11; i++) dotdot_entry[i] = ' ';
+	dotdot_entry[FAT32_DIRENT_ATTR] = FAT32_DIRENT_ATTR_DIRECTORY;
+	ushort* dotdot_hi = (ushort*)&dotdot_entry[FAT32_DIRENT_CLUSTER_HI];
+	ushort* dotdot_lo = (ushort*)&dotdot_entry[FAT32_DIRENT_CLUSTER_LO];
+	*dotdot_hi = (ushort)(dotdot_target >> 16);
+	*dotdot_lo = (ushort)(dotdot_target & 0xFFFF);
+
+	if (!fs_write_sector(fat32_cluster_to_sector(new_cluster), &dir_buf)) return -1;
+
+	uint entry_sector;
+	uint entry_offset;
+	uint last_parent_cluster;
+	if (!fat32_find_free_dirent(parent_cluster, &entry_sector, &entry_offset, &last_parent_cluster))
+	{
+		uint new_parent_cluster = fat32_alloc_cluster();
+		if (new_parent_cluster == 0) return -1;
+		for (uint s = 0; s < fat32_sectors_per_cluster; s++)
+		{
+			if (!fs_write_sector(fat32_cluster_to_sector(new_parent_cluster) + s, &zero_buf)) return -1;
+		}
+		if (!fat32_write_fat_entry(last_parent_cluster, new_parent_cluster)) return -1;
+		if (!fat32_write_fat_entry(new_parent_cluster, FAT32_EOC_MIN)) return -1;
+		entry_sector = fat32_cluster_to_sector(new_parent_cluster);
+		entry_offset = 0;
+	}
+
+	if (fs_is_protected_entry(entry_sector, entry_offset)) return -1;
+
+	char[SECTOR_SIZE] sector_buf @noinit;
+	if (!fs_read_sector(entry_sector, &sector_buf)) return -1;
+
+	char* entry = &sector_buf[entry_offset];
+	for (uint i = 0; i < 11; i++) entry[FAT32_DIRENT_NAME + i] = name11[i];
+	entry[FAT32_DIRENT_ATTR] = FAT32_DIRENT_ATTR_DIRECTORY;
+	for (uint i = 0x0C; i < 0x14; i++) entry[i] = 0;
+	ushort* cluster_hi = (ushort*)&entry[FAT32_DIRENT_CLUSTER_HI];
+	ushort* cluster_lo = (ushort*)&entry[FAT32_DIRENT_CLUSTER_LO];
+	uint*   size_field  = (uint*)&entry[FAT32_DIRENT_FILE_SIZE];
+	*cluster_hi = (ushort)(new_cluster >> 16);
+	*cluster_lo = (ushort)(new_cluster & 0xFFFF);
+	*size_field = 0;
+
+	if (!fs_write_sector(entry_sector, &sector_buf)) return -1;
+
+	return 0;
+}
+
+// Entry point dispatched from fsd.c3's main() for FS_RENAME. Handles
+// both a pure rename (same parent directory) and a real move (a
+// different one) uniformly: adds a brand-new entry at the destination
+// — same cluster/size/attr as the source, so no file *data* is ever
+// copied, only the directory entry that points at it — then removes
+// the source entry, in that order (new one safely in place before the
+// old one goes away, same "fail toward a leak/duplicate, never toward
+// losing the file" reasoning fat32_delete's own comment gives). A
+// same-parent rename could reuse the source's own slot in place
+// instead of consuming a fresh one, cheaper but real extra complexity
+// for one case; not done here — same "documented inefficiency, not a
+// correctness gap" tradeoff fat32_write's own header comment already
+// accepts elsewhere in this driver.
+//
+// Refuses outright (destination must not already exist — no silent
+// overwrite the way POSIX rename(2) allows) and refuses a source
+// that's the write-protected file. Does NOT detect "moving a directory
+// into its own subtree" (a real cycle) — a genuine known gap, not
+// silently worked around; see fat32_delete_dir_contents' own recursion
+// depth cap for the backstop that keeps a resulting cycle from ever
+// causing an unbounded walk, just not from being created in the first
+// place.
+fn int fat32_rename(char* old_path, char* new_path)
+{
+	uint old_parent_cluster;
+	if (!fat32_resolve_dir(old_path, &old_parent_cluster)) return -1;
+	char* old_leaf = fat32_leaf_name(old_path);
+	char[11] old_name11 @noinit;
+	fat32_name_to_8_3(old_leaf, &old_name11);
+
+	uint cluster;
+	uint size;
+	uint old_entry_sector;
+	uint old_entry_offset;
+	char attr;
+	if (!fat32_find_in_dir(old_parent_cluster, &old_name11, &cluster, &size, &old_entry_sector, &old_entry_offset, &attr)) return -1;
+	if (fs_is_protected_entry(old_entry_sector, old_entry_offset)) return -1;
+
+	uint new_parent_cluster;
+	if (!fat32_resolve_dir(new_path, &new_parent_cluster)) return -1;
+	char* new_leaf = fat32_leaf_name(new_path);
+	char[11] new_name11 @noinit;
+	fat32_name_to_8_3(new_leaf, &new_name11);
+
+	uint existing_cluster;
+	uint existing_size;
+	uint existing_sector;
+	uint existing_offset;
+	char existing_attr;
+	if (fat32_find_in_dir(new_parent_cluster, &new_name11, &existing_cluster, &existing_size, &existing_sector, &existing_offset, &existing_attr))
+	{
+		return -1; // destination already exists
+	}
+
+	uint new_entry_sector;
+	uint new_entry_offset;
+	uint last_new_parent_cluster;
+	if (!fat32_find_free_dirent(new_parent_cluster, &new_entry_sector, &new_entry_offset, &last_new_parent_cluster))
+	{
+		uint new_dir_cluster = fat32_alloc_cluster();
+		if (new_dir_cluster == 0) return -1;
+		char[SECTOR_SIZE] zero_buf @noinit;
+		for (uint i = 0; i < SECTOR_SIZE; i++) zero_buf[i] = 0;
+		for (uint s = 0; s < fat32_sectors_per_cluster; s++)
+		{
+			if (!fs_write_sector(fat32_cluster_to_sector(new_dir_cluster) + s, &zero_buf)) return -1;
+		}
+		if (!fat32_write_fat_entry(last_new_parent_cluster, new_dir_cluster)) return -1;
+		if (!fat32_write_fat_entry(new_dir_cluster, FAT32_EOC_MIN)) return -1;
+		new_entry_sector = fat32_cluster_to_sector(new_dir_cluster);
+		new_entry_offset = 0;
+	}
+	if (fs_is_protected_entry(new_entry_sector, new_entry_offset)) return -1;
+
+	char[SECTOR_SIZE] new_sector_buf @noinit;
+	if (!fs_read_sector(new_entry_sector, &new_sector_buf)) return -1;
+	char* new_entry = &new_sector_buf[new_entry_offset];
+	for (uint i = 0; i < 11; i++) new_entry[FAT32_DIRENT_NAME + i] = new_name11[i];
+	new_entry[FAT32_DIRENT_ATTR] = attr;
+	for (uint i = 0x0C; i < 0x14; i++) new_entry[i] = 0;
+	ushort* new_cluster_hi = (ushort*)&new_entry[FAT32_DIRENT_CLUSTER_HI];
+	ushort* new_cluster_lo = (ushort*)&new_entry[FAT32_DIRENT_CLUSTER_LO];
+	uint*   new_size_field  = (uint*)&new_entry[FAT32_DIRENT_FILE_SIZE];
+	*new_cluster_hi = (ushort)(cluster >> 16);
+	*new_cluster_lo = (ushort)(cluster & 0xFFFF);
+	*new_size_field = size;
+	if (!fs_write_sector(new_entry_sector, &new_sector_buf)) return -1;
+
+	// Moving a directory to a genuinely different parent: fix up its
+	// own ".." entry, same cluster-0-means-root convention fat32_mkdir
+	// uses.
+	if ((attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0 && new_parent_cluster != old_parent_cluster)
+	{
+		uint dotdot_target = (new_parent_cluster == fat32_root_cluster) ? 0 : new_parent_cluster;
+		char[SECTOR_SIZE] dir_buf @noinit;
+		if (!fs_read_sector(fat32_cluster_to_sector(cluster), &dir_buf)) return -1;
+		char* dotdot_entry = &dir_buf[FAT32_DIRENT_SIZE];
+		ushort* dotdot_hi = (ushort*)&dotdot_entry[FAT32_DIRENT_CLUSTER_HI];
+		ushort* dotdot_lo = (ushort*)&dotdot_entry[FAT32_DIRENT_CLUSTER_LO];
+		*dotdot_hi = (ushort)(dotdot_target >> 16);
+		*dotdot_lo = (ushort)(dotdot_target & 0xFFFF);
+		if (!fs_write_sector(fat32_cluster_to_sector(cluster), &dir_buf)) return -1;
+	}
+
+	char[SECTOR_SIZE] old_sector_buf @noinit;
+	if (!fs_read_sector(old_entry_sector, &old_sector_buf)) return -1;
+	old_sector_buf[old_entry_offset] = FAT32_DIRENT_DELETED;
+	if (!fs_write_sector(old_entry_sector, &old_sector_buf)) return -1;
+
+	return 0;
+}
+
 fn void fat32_mount()
 {
 	char[SECTOR_SIZE] boot_sector @noinit;
