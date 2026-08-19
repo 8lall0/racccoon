@@ -1032,10 +1032,12 @@ fn int ext2_write(char* name, char* src, uint len)
 	return (int)written;
 }
 
-// Entry point dispatched from fsd.c3's main() for FS_DELETE. v1 scope:
-// files only, not directories — same refusal ext2_read/ext2_write give
-// a directory; deleting one would need to recurse into (and empty) it
-// first, real, separate work not attempted here.
+// Entry point dispatched from fsd.c3's main() for FS_DELETE. Handles
+// both a regular file and an *empty* directory (ext2_dir_is_empty,
+// below — a non-empty one is refused, matching real rmdir()'s own
+// semantics: no recursive auto-delete, that's real, separate,
+// deliberately-not-attempted-here work with real destructive
+// potential).
 //
 // Order matters, same "fail toward leak, not corruption" reasoning as
 // fat32_delete's own comment: clear the directory entry first (makes
