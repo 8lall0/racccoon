@@ -232,6 +232,48 @@ fn void main() @export("main") {
             } else {
                 print("deleteprotected: WARNING: delete was ACCEPTED\n");
             }
+        } else if (strcmp(cmd, "rmdirtest") == 0) {
+            // Deletes a genuinely empty directory (emptydir/, seeded
+            // at build time — this driver has no mkdir of its own to
+            // create one on the fly) and confirms it's really gone by
+            // trying to delete it again, which should now fail (not
+            // found) — the same "before, action, after" shape
+            // deletetest uses, just via a second delete instead of a
+            // read (directories aren't readable as file content).
+            int del1 = fs_delete("emptydir");
+            int del2 = fs_delete("emptydir");
+            if (del1 == 0 && del2 < 0) {
+                print("rmdirtest: ok\n");
+            } else {
+                print("rmdirtest: FAILED\n");
+            }
+        } else if (strcmp(cmd, "rmdirtest2") == 0) {
+            // Same as rmdirtest, through the "/2/" mount.
+            int del1b = fs_delete("/2/emptydir");
+            int del2b = fs_delete("/2/emptydir");
+            if (del1b == 0 && del2b < 0) {
+                print("rmdirtest2: ok\n");
+            } else {
+                print("rmdirtest2: FAILED\n");
+            }
+        } else if (strcmp(cmd, "rmdirnonempty") == 0) {
+            // subdir/ (the existing subdirectory read/write test
+            // fixture) genuinely has content in it — confirms rmdir
+            // correctly refuses a non-empty directory rather than
+            // silently deleting its contents.
+            int nonempty_result = fs_delete("subdir");
+            if (nonempty_result < 0) {
+                print("rmdirnonempty: rejected (correct)\n");
+            } else {
+                print("rmdirnonempty: WARNING: non-empty directory was deleted\n");
+            }
+        } else if (strcmp(cmd, "rmdirnonempty2") == 0) {
+            int nonempty_result2 = fs_delete("/2/subdir");
+            if (nonempty_result2 < 0) {
+                print("rmdirnonempty2: rejected (correct)\n");
+            } else {
+                print("rmdirnonempty2: WARNING: non-empty directory was deleted\n");
+            }
         } else if (strcmp(cmd, "protectedwrite") == 0) {
             // Deliberately attempts to write the one file fsd is
             // supposed to refuse no matter what (see user/fsd.c3's

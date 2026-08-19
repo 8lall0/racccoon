@@ -29,6 +29,12 @@ LLC=${LLC:-llc}
   # writes into it same as the root.
   mmd -i build/disk.img ::subdir
   mcopy -i build/disk.img disk/subdir/*.txt ::subdir
+  # disk's own emptydir/ exercises fat32_delete()'s rmdir support (see
+  # docs/devlog.md) — a genuinely empty directory to actually remove.
+  # This driver has no mkdir of its own, so the positive case (delete
+  # succeeds) needs a real, pre-seeded empty directory; the negative
+  # case (refuses a non-empty one) is already covered by subdir itself.
+  mmd -i build/disk.img ::emptydir
 
   echo "==> Building disk image (ext2, for scripts/launch64_ext2.sh)..."
   # Additional, not a replacement — build/disk.img (FAT32) above stays
@@ -51,6 +57,9 @@ LLC=${LLC:-llc}
   # (see docs/devlog.md), same purpose as disk/subdir/ above.
   debugfs -w -R "mkdir subdir" build/disk_ext2.img > /dev/null
   debugfs -w -R "write disk-ext2/subdir/nested.txt subdir/nested.txt" build/disk_ext2.img > /dev/null
+  # disk_ext2's own emptydir/ — same rmdir-testing purpose as disk.img's
+  # own emptydir/ above.
+  debugfs -w -R "mkdir emptydir" build/disk_ext2.img > /dev/null
 
   echo "==> Building disk image (dual FAT32+ext2, for scripts/launch64_dual.sh)..."
   # Third test image — exercises fsd/fsd2 mounting two filesystems at once
@@ -75,11 +84,13 @@ LLC=${LLC:-llc}
   mcopy -i build/disk_dual.img disk/*.txt ::
   mmd -i build/disk_dual.img ::subdir
   mcopy -i build/disk_dual.img disk/subdir/*.txt ::subdir
+  mmd -i build/disk_dual.img ::emptydir
   dd if=/dev/zero of=build/disk_dual_ext2_part.img bs=1M count=8 status=none
   mke2fs -q -F -b 1024 build/disk_dual_ext2_part.img
   debugfs -w -R "write disk-ext2/hello.txt hello.txt" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "mkdir subdir" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write disk-ext2/subdir/nested.txt subdir/nested.txt" build/disk_dual_ext2_part.img > /dev/null
+  debugfs -w -R "mkdir emptydir" build/disk_dual_ext2_part.img > /dev/null
   dd if=build/disk_dual_ext2_part.img of=build/disk_dual.img bs=512 seek=18432 conv=notrunc status=none
   rm -f build/disk_dual_ext2_part.img
 

@@ -4,6 +4,69 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-19 (9) — Directory deletion (rmdir), both backends
+
+The natural follow-up to file delete, whose own comments explicitly
+deferred this: `fat32_delete()`/`ext2_delete()` now also handle an
+*empty* directory, reusing the same `FS_DELETE` verb rather than
+adding a new one — no wire protocol change needed. Matches real
+`rmdir()` semantics deliberately: refuses a non-empty directory,
+no recursive auto-delete (that's real, separate, genuinely dangerous
+work not attempted here).
+
+**FAT32**: new `fat32_dir_is_empty()` walks a directory's cluster
+chain checking for anything besides `.`/`..`. Those two don't 8.3-
+convert correctly through the existing `fat32_name_to_8_3()` (it treats
+a leading dot as "start of the extension", producing an all-spaces
+name for either) — matched directly against their real, fixed byte
+patterns instead of going through that path. Once confirmed empty, an
+empty directory deletes exactly like a file (mark the entry
+`FAT32_DIRENT_DELETED`, free its cluster chain) — FAT32 has no
+link-count concept, so nothing else to unwind.
+
+**ext2**: same shape (`ext2_dir_is_empty()`, matching by exact
+`name_len` since ext2 entries aren't space-padded) plus real,
+ext2-specific bookkeeping FAT32 doesn't have: the deleted directory's
+own `..` entry was a link to its parent, so the parent's `links_count`
+needs decrementing (the same field this session's earlier corruption
+fix taught was genuinely load-bearing, not cosmetic). **Found a second
+real bookkeeping gap the same way**: the very first rmdir test against
+`e2fsck` flagged "directory count wrong for group N" — `bg_used_dirs_
+count`, a per-group directory counter with no superblock-level twin,
+never touched before because this driver has no `mkdir` of its own to
+have ever incremented it. New `ext2_dec_used_dirs()` fixes it, using
+the *deleted directory's own* group (not the parent's).
+
+**A real test-construction problem, solved properly**: this driver has
+no `mkdir`, so testing the positive case (successfully removing an
+empty directory) needed a genuinely empty directory to exist first —
+added `emptydir/` to all three QEMU test images (`scripts/build.sh`,
+`mmd`/`debugfs mkdir`, no files inside). New `rmdirtest`/`rmdirtest2`
+delete it and confirm it's really gone by deleting it again (which
+should now fail) — the same "before, action, after" shape `deletetest`
+uses, just via a second delete instead of a read, since a directory
+isn't readable as file content. New `rmdirnonempty`/`rmdirnonempty2`
+confirm the existing, genuinely non-empty `subdir/` fixture is
+correctly refused.
+
+**Verified as rigorously as every other write-path change this
+session**: `e2fsck -n -f` caught the `bg_used_dirs_count` gap on the
+very first real test (not just trusted the code), came back completely
+clean once fixed. FAT32's own deletion cross-checked with `mdir`
+independently — `emptydir/` genuinely gone, `subdir/` genuinely still
+there after the correctly-refused non-empty attempt. Full regression
+suite (both QEMU images) unaffected, `racetest` still `a=1 b=1`.
+
+**Files changed:** `user/fs/fat32.c3` (`fat32_dir_is_empty`,
+`fat32_delete` branches on directory vs file), `user/fs/ext2.c3`
+(`EXT2_BGD_USED_DIRS_COUNT`, `ext2_dec_used_dirs`, `ext2_dir_is_empty`,
+`ext2_delete` handles directories: empty-check, parent link-count,
+used-dirs count), `user/shell.c3` (`rmdirtest`/`rmdirtest2`/
+`rmdirnonempty`/`rmdirnonempty2`), `scripts/build.sh` (`emptydir/`
+fixture in all three test images).
+
+---
+
 ## 2026-08-19 (8) — File delete/unlink, both backends
 
 fsd had no way to remove a file at all — the FS_READ/FS_WRITE wire

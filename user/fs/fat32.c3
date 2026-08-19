@@ -729,18 +729,64 @@ fn bool fat32_free_cluster_chain(uint first_cluster)
 	return true;
 }
 
-// Entry point dispatched from fsd.c3's main() for FS_DELETE. v1 scope:
-// files only, not directories — same refusal fat32_read/fat32_write
-// give a directory; deleting one would need to recurse into (and
-// empty) it first, real, separate work not attempted here. Marks the
-// directory entry FAT32_DIRENT_DELETED — the same value fat32_find_
-// free_dirent already recognizes as reusable — *before* freeing the
-// cluster chain, not after: if freeing fails partway, an entry that's
-// already invisible to lookups with some of its clusters still marked
-// used is a leak, safe; freeing the chain first and then failing to
-// mark the entry deleted would leave a still-visible file pointing at
-// clusters that could already be handed out to something else — a
-// real two-files-one-cluster corruption risk, not just a leak.
+// Checks whether a directory's cluster chain contains any real entry
+// besides "." and ".." (the two entries every subdirectory has by
+// convention — this driver never creates them itself, having no
+// mkdir, but real FAT32 tools always do). fat32_name_to_8_3 doesn't
+// handle "." or ".." correctly — it treats the leading dot as "start
+// of the extension", producing an all-spaces 8.3 name for either — so
+// they're matched directly against their real, fixed byte patterns
+// instead. Fails closed (returns false, "not empty") on any read
+// error, rather than risk letting fat32_delete free a directory it
+// couldn't actually confirm was empty.
+fn bool fat32_dir_is_empty(uint dir_cluster)
+{
+	uint cluster = dir_cluster;
+	char[SECTOR_SIZE] sector_buf @noinit;
+
+	while (cluster != 0 && cluster < FAT32_EOC_MIN)
+	{
+		uint sector = fat32_cluster_to_sector(cluster);
+		for (uint s = 0; s < fat32_sectors_per_cluster; s++)
+		{
+			if (!fs_read_sector(sector + s, &sector_buf)) return false;
+
+			for (uint e = 0; e < SECTOR_SIZE / FAT32_DIRENT_SIZE; e++)
+			{
+				char* entry = &sector_buf[e * FAT32_DIRENT_SIZE];
+				if (entry[0] == FAT32_DIRENT_FREE_REST) return true;
+				if (entry[0] == FAT32_DIRENT_DELETED) continue;
+
+				char attr = entry[FAT32_DIRENT_ATTR];
+				if (attr == FAT32_DIRENT_ATTR_LFN) continue;
+				if ((attr & FAT32_DIRENT_ATTR_VOLUME) != 0) continue;
+
+				bool is_dot    = entry[FAT32_DIRENT_NAME] == '.' && entry[FAT32_DIRENT_NAME + 1] == ' ';
+				bool is_dotdot = entry[FAT32_DIRENT_NAME] == '.' && entry[FAT32_DIRENT_NAME + 1] == '.' && entry[FAT32_DIRENT_NAME + 2] == ' ';
+				if (is_dot || is_dotdot) continue;
+
+				return false;
+			}
+		}
+		cluster = fat32_next_cluster(cluster);
+	}
+	return true;
+}
+
+// Entry point dispatched from fsd.c3's main() for FS_DELETE. Handles
+// both a regular file and an *empty* directory (fat32_dir_is_empty,
+// above — a non-empty one is refused, matching real rmdir()'s own
+// semantics: no recursive auto-delete, that's real, separate,
+// deliberately-not-attempted-here work with real destructive
+// potential). Marks the directory entry FAT32_DIRENT_DELETED — the
+// same value fat32_find_free_dirent already recognizes as reusable —
+// *before* freeing the cluster chain, not after: if freeing fails
+// partway, an entry that's already invisible to lookups with some of
+// its clusters still marked used is a leak, safe; freeing the chain
+// first and then failing to mark the entry deleted would leave a
+// still-visible file pointing at clusters that could already be
+// handed out to something else — a real two-files-one-cluster
+// corruption risk, not just a leak.
 fn int fat32_delete(char* name)
 {
 	uint dir_cluster;
@@ -756,8 +802,11 @@ fn int fat32_delete(char* name)
 	uint entry_offset;
 	char attr;
 	if (!fat32_find_in_dir(dir_cluster, &name11, &cluster, &size, &entry_sector, &entry_offset, &attr)) return -1;
-	if ((attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0) return -1;
 	if (fs_is_protected_entry(entry_sector, entry_offset)) return -1;
+	if ((attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0)
+	{
+		if (!fat32_dir_is_empty(cluster)) return -1;
+	}
 
 	char[SECTOR_SIZE] sector_buf @noinit;
 	if (!fs_read_sector(entry_sector, &sector_buf)) return -1;

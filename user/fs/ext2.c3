@@ -80,6 +80,16 @@ const uint EXT2_BGD_INODE_BITMAP       = 4;  // u32, block holding this group's 
 const uint EXT2_BGD_INODE_TABLE        = 8;  // u32, starting block of this group's inode table
 const uint EXT2_BGD_FREE_BLOCKS_COUNT  = 12; // u16 — group-0 copy of EXT2_SB_FREE_BLOCKS_COUNT, see its comment
 const uint EXT2_BGD_FREE_INODES_COUNT  = 14; // u16 — group-0 copy of EXT2_SB_FREE_INODES_COUNT, see its comment
+const uint EXT2_BGD_USED_DIRS_COUNT    = 16; // u16 — how many directories live in this group. No
+                                               // superblock-level twin to keep in sync (unlike the
+                                               // free-block/inode counts above) — this one's only
+                                               // tracked per-group. This driver never creates a
+                                               // directory itself (no mkdir), so only ext2_delete's
+                                               // own decrement on removal needs this — found via
+                                               // e2fsck flagging it after the very first real rmdir
+                                               // test, the same "verify with the oracle, don't just
+                                               // trust the write" discipline that caught the earlier
+                                               // free-count gap this session.
 
 // Inode field offsets, relative to the inode's own start.
 const uint EXT2_INODE_MODE        = 0;  // u16
@@ -669,6 +679,24 @@ fn bool ext2_inc_free_inodes(uint group)
 	return ext2_write_block(bgdt_block, &bgdt_buf);
 }
 
+// Decrements `group`'s own bg_used_dirs_count — no superblock-level
+// copy to keep in sync (see EXT2_BGD_USED_DIRS_COUNT's own comment),
+// just this one field. Called once per directory ext2_delete removes,
+// using the *deleted directory's own* group (where its inode lived),
+// not the parent's.
+fn bool ext2_dec_used_dirs(uint group)
+{
+	uint descriptors_per_block = ext2_block_size / EXT2_BGD_SIZE;
+	uint bgdt_block = ext2_first_data_block + 1 + (group / descriptors_per_block);
+	uint offset_in_block = (group % descriptors_per_block) * EXT2_BGD_SIZE + EXT2_BGD_USED_DIRS_COUNT;
+
+	char[EXT2_MAX_BLOCK_SIZE] bgdt_buf @noinit;
+	if (!ext2_read_block(bgdt_block, &bgdt_buf)) return false;
+	ushort* bg_dirs = (ushort*)&bgdt_buf[offset_in_block];
+	if (*bg_dirs > 0) *bg_dirs -= 1;
+	return ext2_write_block(bgdt_block, &bgdt_buf);
+}
+
 // Linear scan of every group's block bitmap, group 0 first, for a
 // clear bit — not group-0-only anymore, so this driver's own writes
 // aren't confined there as it fills up (see EXT2_MAX_GROUPS's own
@@ -1017,6 +1045,53 @@ fn int ext2_write(char* name, char* src, uint len)
 // and only once nothing references them anymore, free the inode itself
 // — never mark something reusable while anything might still reference
 // it.
+// Checks whether a directory's own data blocks contain any real entry
+// besides "." and ".." (every subdirectory's own two self/parent
+// entries — ext2 names aren't space-padded like FAT32's, so these are
+// matched by exact name_len + bytes instead). Fails closed (returns
+// false, "not empty") on any read error, rather than risk letting
+// ext2_delete free a directory it couldn't actually confirm was empty.
+fn bool ext2_dir_is_empty(Ext2_inode_info* dir)
+{
+	for (uint b = 0; b < 12; b++)
+	{
+		uint block = dir.block[b];
+		if (block == 0) continue;
+
+		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
+		if (!ext2_read_block(block, &block_buf)) return false;
+
+		uint offset = 0;
+		while (offset < ext2_block_size)
+		{
+			char* entry = &block_buf[offset];
+			uint*  entry_inode    = (uint*)&entry[EXT2_DIRENT_INODE];
+			ushort* rec_len_field = (ushort*)&entry[EXT2_DIRENT_REC_LEN];
+			char   name_len_byte  = entry[EXT2_DIRENT_NAME_LEN];
+
+			uint rec_len = (uint)*rec_len_field;
+			if (rec_len == 0) break;
+
+			uint entry_name_len = (uint)name_len_byte & 0xFF;
+			if (*entry_inode != 0)
+			{
+				bool is_dot    = entry_name_len == 1 && entry[EXT2_DIRENT_NAME] == '.';
+				bool is_dotdot = entry_name_len == 2 && entry[EXT2_DIRENT_NAME] == '.' && entry[EXT2_DIRENT_NAME + 1] == '.';
+				if (!is_dot && !is_dotdot) return false;
+			}
+
+			offset += rec_len;
+		}
+	}
+	return true;
+}
+
+// Entry point dispatched from fsd.c3's main() for FS_DELETE. Handles
+// both a regular file and an *empty* directory (ext2_dir_is_empty,
+// above — a non-empty one is refused, matching real rmdir()'s own
+// semantics: no recursive auto-delete, that's real, separate,
+// deliberately-not-attempted-here work with real destructive
+// potential).
 fn int ext2_delete(char* name)
 {
 	uint dir_inode;
@@ -1028,17 +1103,42 @@ fn int ext2_delete(char* name)
 	uint entry_offset;
 	uint mode;
 	if (!ext2_find_in_dir(dir_inode, leaf, &inode_num, &entry_sector, &entry_offset, &mode)) return -1;
-	if ((mode & EXT2_S_IFDIR) != 0) return -1;
 	if (fs_is_protected_entry(entry_sector, entry_offset)) return -1;
 
 	Ext2_inode_info inode;
 	if (!ext2_read_inode(inode_num, &inode)) return -1;
+
+	bool is_dir = (mode & EXT2_S_IFDIR) != 0;
+	if (is_dir && !ext2_dir_is_empty(&inode)) return -1;
 
 	char[SECTOR_SIZE] sector_buf @noinit;
 	if (!fs_read_sector(entry_sector, &sector_buf)) return -1;
 	uint* entry_inode_field = (uint*)&sector_buf[entry_offset + EXT2_DIRENT_INODE];
 	*entry_inode_field = 0;
 	if (!fs_write_sector(entry_sector, &sector_buf)) return -1;
+
+	if (is_dir)
+	{
+		// The deleted directory's own ".." entry was a link to its
+		// parent — undo that reference now that the directory itself
+		// is gone, or a real ext2 reader (this session already found
+		// one real, practical consequence of a wrong link count — see
+		// EXT2_INODE_LINKS_COUNT's own comment) would see the parent's
+		// own link count as one too many.
+		Ext2_inode_info parent;
+		if (!ext2_read_inode(dir_inode, &parent)) return -1;
+		if (parent.links_count > 0) parent.links_count -= 1;
+		if (!ext2_write_inode(dir_inode, &parent)) return -1;
+
+		// bg_used_dirs_count tracks how many directories live in the
+		// *deleted* directory's own group (where inode_num itself
+		// lives), not the parent's — same group math ext2_free_inode
+		// uses internally. Real, found-the-hard-way bookkeeping: a
+		// real e2fsck flags this specifically ("directory count wrong
+		// for group N") if it's left stale, the same class of gap as
+		// this session's earlier free-count fix.
+		if (!ext2_dec_used_dirs((inode_num - 1) / ext2_inodes_per_group)) return -1;
+	}
 
 	if (!ext2_zero_inode(inode_num)) return -1;
 
