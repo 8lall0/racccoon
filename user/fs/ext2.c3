@@ -6,9 +6,6 @@ module user;
 // extent additions) — not reverse-engineered.
 //
 // v1 scope, deliberately limited — applies to both read and write:
-//   - Root directory only (inode 2, a format constant — always the root,
-//     regardless of what the superblock says), same as FAT32's own v1
-//     scope.
 //   - Direct block pointers only (i_block[0..11], 12 of them) — single/
 //     double/triple indirect blocks are NOT walked. A file needing more
 //     than 12 blocks' worth of data reads back short, same "return
@@ -299,16 +296,20 @@ fn bool ext2_find_in_root(char* name, uint* out_inode, uint* out_entry_sector, u
 	return false;
 }
 
-// --- Subdirectory support (read path only) ------------------------------
+// --- Subdirectory support (read and write) ------------------------------
 //
-// v1 scope, deliberately limited to reads — same boundary as FAT32's own
-// (see user/fs/fat32.c3's matching comment): ext2_find_in_root and every
-// write-path function below are untouched, so create/overwrite/grow
-// still only ever operates on the root directory. A subdirectory is
-// just an inode with EXT2_S_IFDIR set whose own data blocks hold more
-// directory entries — the exact same shape as the root directory's own
-// blocks — so ext2_find_in_dir is ext2_find_in_root generalized to any
-// starting inode, not new logic.
+// ext2_read (below) and ext2_write (further down — create/overwrite/
+// grow a file inside a subdirectory, not just the root, generalizing
+// ext2_create_file the same way) both walk into a subdirectory using
+// the functions below. ext2_find_in_root and its one remaining caller,
+// ext2_reserve_protected, stay root-only on purpose: the one file that
+// ever needs protecting (fip.bin) is always in the root regardless of
+// what this feature does — same boundary as FAT32's own (see
+// user/fs/fat32.c3's matching comment). A subdirectory is just an inode
+// with EXT2_S_IFDIR set whose own data blocks hold more directory
+// entries — the exact same shape as the root directory's own blocks —
+// so ext2_find_in_dir is ext2_find_in_root generalized to any starting
+// inode, not new logic.
 
 // Same walk as ext2_find_in_root, but over any directory inode's direct
 // blocks, not just the root — and reports the matched entry's inode

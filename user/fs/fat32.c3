@@ -6,13 +6,13 @@ module user;
 // every other FAT32 reader implements), not vendor-specific or
 // reverse-engineered the way this project's SDHCI register maps were.
 //
-// v1 scope, deliberately limited: root directory only (fsd had no
-// subdirectory concept before this either — not a regression), 8.3
-// short filenames only (long filename / LFN directory entries are
-// skipped, not parsed), no caching — every call walks the root
-// directory fresh and follows the matched file's cluster chain on
-// demand, since there's no reasonable fixed-size cache for "however
-// many files happen to be on someone's real SD card."
+// v1 scope, deliberately limited: 8.3 short filenames only (long
+// filename / LFN directory entries are skipped, not parsed), no
+// caching — every call walks the relevant directory fresh (root, or a
+// subdirectory reached via fat32_resolve_dir — see its own comment)
+// and follows the matched file's cluster chain on demand, since
+// there's no reasonable fixed-size cache for "however many files
+// happen to be on someone's real SD card."
 //
 // Write support (create, overwrite, grow — see fat32_write()) started
 // read-only-only and was extended deliberately — see user/fsd.c3's own
@@ -182,19 +182,20 @@ fn bool fat32_find_in_root(char* name11, uint* out_cluster, uint* out_size, uint
 	return false;
 }
 
-// --- Subdirectory support (read path only) -----------------------------
+// --- Subdirectory support (read and write) ------------------------------
 //
-// v1 scope, deliberately limited to reads: fat32_find_in_root and every
-// write-path caller above are untouched — write support only ever
-// creates/overwrites/grows a file in the root directory, same as
-// before. These three functions exist purely so fat32_read (below) can
-// walk into a subdirectory to find a file to read; nothing here can
-// write anything. Real filesystem, standard on-disk format: a
-// subdirectory is just an ordinary directory entry (FAT32_DIRENT_ATTR_
-// DIRECTORY set) whose own cluster chain holds more directory entries,
-// same shape as the root directory itself — so fat32_find_in_dir is
-// fat32_find_in_root generalized to take any starting cluster, not new
-// logic.
+// fat32_read (below) and fat32_write (further down — create/overwrite/
+// grow a file inside a subdirectory, not just the root, generalizing
+// fat32_find_free_dirent/fat32_create_file the same way) both walk into
+// a subdirectory using the functions below. fat32_find_in_root and its
+// one remaining caller, fat32_reserve_protected, stay root-only on
+// purpose: the one file that ever needs protecting (fip.bin) is always
+// in the root regardless of what this feature does. Real filesystem,
+// standard on-disk format: a subdirectory is just an ordinary directory
+// entry (FAT32_DIRENT_ATTR_DIRECTORY set) whose own cluster chain holds
+// more directory entries, same shape as the root directory itself — so
+// fat32_find_in_dir is fat32_find_in_root generalized to take any
+// starting cluster, not new logic.
 
 // Same walk as fat32_find_in_root, but over any directory's cluster
 // chain, not just the root — and reports the matched entry's attribute
