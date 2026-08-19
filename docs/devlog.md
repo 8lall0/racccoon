@@ -4,6 +4,43 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-19 (4) — ext2 subdirectory support on real hardware: a real trigger for the documented "block group 0 only" limit
+
+Testing write-into-subdirectory support on the real card's `EXT2TEST`
+partition hit a wall: `sudo mkdir subdir` there, then `newsubfile2`/
+`readsubfile2` both failed with "not found" — even reading the
+already-seeded `nested.txt`. Not a new bug: `ext2.c3`'s own header
+comment has always scoped this driver to "block group 0 only," and
+`sudo debugfs -R "stat subdir" /dev/sdc2` showed exactly why it fired —
+the real kernel's `mkdir` allocated `subdir` as inode **16385**, but
+`sudo debugfs -R "show_super_stats -h"` showed this filesystem has only
+**8192 inodes per group**, putting that inode in group 1.
+`ext2_read_inode()` correctly refused it (`inode_num > ext2_inodes_per_
+group`) exactly as documented.
+
+Confirmed this was specifically about *how* the directory was created,
+not a filesystem-wide problem: real Linux `mkdir` uses a modern
+allocator that deliberately spreads new directories across groups for
+locality, which QEMU's own test fixtures (seeded via `debugfs`'s
+simpler first-fit allocator) never exercised — every previous
+real-hardware write went through either this driver's own group-0-only
+`ext2_alloc_inode()` or `debugfs`, neither of which had ever landed
+outside group 0 before.
+
+**Resolution, not a fix**: removed the kernel-created `subdir` (`sudo
+rm`/`rmdir` the contents first — debugfs has no clean recursive
+directory removal) and recreated it via `debugfs -w -R "mkdir subdir"`
+instead, landing at inode 14 this time — comfortably in group 0.
+`readsubfile2`/`newsubfile2` both then worked correctly on real
+hardware, confirming write-into-subdirectory support end to end on the
+ext2 backend. Multi-group support (real group-index math, reading
+additional block group descriptors) remains a genuine, understood gap
+— not attempted here, noted as real future work if this driver ever
+needs to interoperate with directories real Linux tools create instead
+of ones it creates itself.
+
+---
+
 ## 2026-08-19 (3) — ext2 free-count bookkeeping: not just cosmetic after all
 
 `user/fs/ext2.c3`'s own header comment had accepted, since the original
