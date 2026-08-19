@@ -75,7 +75,11 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	board::plic_init();
 	enable_external_interrupts();
 	enable_user_timer_access();
-	enable_timer_interrupts();
+	// TEMPORARILY DISABLED: hung the real Duo (T-Head C906) silently
+	// right here at boot — worked fine on QEMU. Re-enable once the real
+	// cause is understood (see docs/devlog.md); leaving this off
+	// restores a known-working boot on real hardware in the meantime.
+	// enable_timer_interrupts();
 
 	io::print("2: Trap handler set\n");
 
