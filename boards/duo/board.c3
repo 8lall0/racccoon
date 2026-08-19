@@ -88,6 +88,17 @@ const uint IRQ_SDHCI    = 36; // routed through plic_init()/handle_trap
                                // block-transfer completion instead of
                                // busy-polling INT_STATUS.
 
+// Real, confirmed timebase-frequency (rdtime()'s own tick rate), not
+// guessed — read directly from the real devicetree shipped in
+// duo-buildroot-sdk (build/boards/default/dts/cv180x_riscv/
+// cv180x_base_riscv.dtsi), same sourcing already used for user/sdd.c3's
+// own SD_TIMEBASE_HZ duplicate (board is kernel-only, unreachable from
+// user-mode code — see that file's own header comment for why it can't
+// just reference this constant directly). Kernel-side use: arming
+// `stimecmp` for a real timer interrupt (see entry.c3's enable_timer_
+// interrupts/arm_timer).
+const ulong TIMEBASE_HZ = 25000000;
+
 // One-time SD pad/power/clock bring-up (see user/sdd.c3's sdd_init) needs
 // three more, separate MMIO pages besides SD_MMIO_BASE itself — none of
 // them adjacent to it or to each other, so all three (plus SD_MMIO_BASE)

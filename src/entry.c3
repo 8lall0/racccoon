@@ -11,6 +11,7 @@ const SCAUSE_ECALL             = 8;
 // interrupt as an exception (or vice versa).
 const ulong SCAUSE_INTERRUPT_BIT = (1ul << 63);
 const SCAUSE_SUPERVISOR_EXTERNAL = 9;        // interrupt cause code for a PLIC-routed external interrupt — same code on both XLENs
+const SCAUSE_SUPERVISOR_TIMER    = 5;        // interrupt cause code for a real timer interrupt (sstc's stimecmp) — same code on both XLENs
 
 // Dedicated trap-frame anchor for traps taken during kernel_main's
 // bare-mode phase, between enable_external_interrupts() and the first
@@ -146,6 +147,70 @@ fn void enable_external_interrupts()
 {
 	write_csr("sie", read_reg("sie") | SIE_SEIE);
 	write_csr("sstatus", read_reg("sstatus") | SSTATUS_SIE);
+}
+
+// Arms the next timer interrupt: writes `time + delta_ticks` to
+// stimecmp (the sstc extension's own CSR — confirmed present in this
+// hart's own boot banner, "sstc" listed among Boot HART ISA
+// Extensions). A supervisor timer interrupt (SCAUSE_SUPERVISOR_TIMER)
+// fires once `time` reaches this value; handle_trap's own timer case
+// re-arms it every time it fires, or the same interrupt would
+// immediately refire forever (an interrupt storm, not a periodic
+// tick) — see that case's own comment.
+fn void arm_timer(ulong delta_ticks)
+{
+	ulong now = read_reg("time");
+	write_csr("stimecmp", now + delta_ticks);
+}
+
+const SIE_STIE = (1 << 5); // sie: supervisor timer interrupt enable
+
+// Total real timer interrupts handled since boot — inert bookkeeping,
+// not consulted by anything yet, but real, useful infrastructure for
+// whatever needs to observe "is this firing, how often" later (this
+// session's own verification used it directly — see docs/devlog.md).
+ulong timer_tick_count = 0;
+
+// Narrow first slice of real preemptive-scheduling support (see
+// docs/devlog.md): proves the sstc timer interrupt mechanism itself —
+// fires, correctly re-arms, and returns cleanly to whatever was
+// running — without yet forcing a context switch on each tick. Actual
+// preemption (yield()-ing from inside a timer interrupt) is real,
+// separate, higher-risk work: unlike every existing yield() point,
+// which only ever happens at a caller-chosen, known-safe moment, a
+// timer interrupt can land in the middle of *anything* — including
+// kernel state this codebase has never needed to guard against
+// concurrent access before (SYS_IPC_SEND's own multi-step bookkeeping,
+// mid-page-table-edit, etc.) — deliberately not attempted here.
+//
+// Real interrupt-latency characteristic found while verifying this,
+// directly relevant to that future work: SYS_GETCHAR (and SYS_IPC_RECV,
+// SYS_JOIN's poll loop — every *blocking* syscall in this kernel)
+// busy-loops with yield() *inside its own still-open trap*, never
+// reaching sret until its condition is met. Hardware auto-clears
+// sstatus.SIE on trap entry and only restores it on sret — so while
+// any process is stuck inside one of these (e.g. the shell idly
+// waiting for a keystroke), sstatus.SIE stays globally disabled for
+// every process switch_context() switches to in the meantime, not just
+// the one that's blocked (SIE is one shared, un-banked hardware bit,
+// switch_context is a plain software stack swap, not a trap return —
+// nothing about it touches SIE). Confirmed directly: with the shell
+// left idle, a timer armed for ~1s out didn't actually fire until
+// whenever the next keystroke arrived, sometimes many seconds later;
+// with the shell kept continuously busy (no idle GETCHAR wait), it
+// fired reliably every ~1s as armed. Not a bug in this mechanism — an
+// architectural fact worth knowing before assuming a timer-interrupt-
+// based preemptive scheduler would actually preempt a process stuck in
+// one of these loops; it wouldn't, for the exact same reason.
+fn void enable_timer_interrupts()
+{
+	// Arm *before* enabling sie.STIE, not after: stimecmp's reset value
+	// is implementation-defined and could easily be 0, which would make
+	// `time >= stimecmp` already true the instant STIE goes live —
+	// enabling the source with a real future deadline already in place
+	// avoids that spurious-immediate-fire window entirely.
+	arm_timer(board::TIMEBASE_HZ); // first tick ~1 second out
+	write_csr("sie", read_reg("sie") | SIE_STIE);
 }
 
 // mcounteren.TM (M-mode -> S-mode) is expected to already be enabled by
@@ -924,6 +989,18 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 			{
 				board::plic_complete(irq);
 			}
+		}
+		else if (code == SCAUSE_SUPERVISOR_TIMER)
+		{
+			// Rearm first, before anything else: stimecmp is what
+			// actually clears the pending interrupt (time < stimecmp
+			// again), so leaving the old, already-elapsed value in
+			// place would refire the instant interrupts are next
+			// enabled — an interrupt storm, not a periodic tick. No
+			// context switch here — see enable_timer_interrupts()'s
+			// own comment for why not yet.
+			arm_timer(board::TIMEBASE_HZ);
+			timer_tick_count += 1;
 		}
 		// No sepc adjustment for interrupts: unlike ecall (which must skip
 		// past the trapping instruction), the hardware already points sepc

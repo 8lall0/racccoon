@@ -4,6 +4,75 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-19 (10) — Real timer interrupts: the mechanism itself, and a real interrupt-latency finding
+
+Deliberately narrow first slice of preemptive-scheduling support,
+scoped down from the full feature on purpose: this kernel has been
+fully cooperative until now (every context switch happens at a
+caller-chosen `yield()`), so kernel state has never needed to guard
+against concurrent access — SYS_IPC_SEND's own multi-step bookkeeping,
+page-table edits, none of it. Forcing a `yield()` from inside a timer
+interrupt (real preemption) means that state could now get touched
+mid-update by whatever gets switched to, a whole new class of bug this
+codebase has never had to defend against. This session proves the
+*mechanism* — the interrupt fires, gets correctly re-armed, and
+returns cleanly to whatever was running — without yet taking that
+step.
+
+**Design**: `board::TIMEBASE_HZ` (real, confirmed values — 25MHz Duo,
+10MHz QEMU, same sourcing as the earlier real-timer-primitive work)
+added to both boards, the proper seam for a kernel-reachable
+board-specific fact (unlike `user/sdd.c3`'s own duplicate, needed only
+because `board` is kernel-only). `entry.c3` gained `arm_timer()`
+(writes `time + delta` to `stimecmp`, the sstc extension's own CSR —
+confirmed present in this hart's boot banner) and
+`enable_timer_interrupts()` (arms *before* enabling `sie.STIE`, not
+after — `stimecmp`'s reset value is implementation-defined and could
+easily be 0, which would make the interrupt already-pending the
+instant the source goes live). `handle_trap` gained a
+`SCAUSE_SUPERVISOR_TIMER` case: re-arms immediately (the only thing
+that actually clears the pending interrupt — leaving the elapsed value
+in place would refire it the instant interrupts are next enabled, a
+storm not a tick) and bumps an inert `timer_tick_count` counter. No
+context switch — that's the explicitly-deferred half.
+
+**A real finding, not a bug in this mechanism**: verified via a
+temporary debug print, the first armed tick (~1s out) didn't actually
+fire until several seconds later — once, coinciding almost exactly
+with whenever the next keystroke arrived at the idle shell, not on
+schedule. Traced to `SYS_GETCHAR`'s own handler: a `for(;;) { ...;
+yield(); }` loop running *entirely inside its own still-open trap*,
+never reaching `sret` until a character shows up — and the exact same
+shape is used by `SYS_IPC_RECV`'s blocking wait and `SYS_JOIN`'s poll
+loop. Hardware auto-clears `sstatus.SIE` on trap entry and only
+restores it on `sret`; since `switch_context()` is a plain software
+stack swap (not a trap return) and `sstatus.SIE` is one shared,
+un-banked hardware bit, every process `yield()` switches to *while*
+one of these loops is still open inherits that same globally-disabled
+state — not just the blocked process itself. Confirmed directly: shell
+left idle, the timer only fired once a keystroke finally arrived;
+shell kept continuously busy (repeated commands, never idly parked in
+`SYS_GETCHAR`), the same timer fired reliably every ~1s as armed
+(measured intervals: ~10.3M, 10.26M, 10.26M, 10.33M ticks against a
+10M-tick target). Documented directly in `enable_timer_interrupts()`'s
+own comment — genuinely relevant to whoever builds real preemption
+later: a timer-interrupt-based preemptive scheduler built on this same
+mechanism would *not* actually preempt a process stuck in any of these
+blocking syscalls, for the identical reason the timer itself was
+delayed.
+
+**Verified**: full regression suite (both QEMU images) unaffected,
+`racetest` still `a=1 b=1`, 30 rapid commands with the timer firing
+repeatedly throughout showed no instability.
+
+**Files changed:** `boards/duo/board.c3`/`boards/qemu/board.c3`
+(`TIMEBASE_HZ`), `src/entry.c3` (`SCAUSE_SUPERVISOR_TIMER`, `SIE_STIE`,
+`arm_timer`, `timer_tick_count`, `enable_timer_interrupts`,
+`handle_trap`'s new case), `src/kernel.c3` (calls
+`enable_timer_interrupts()` at boot).
+
+---
+
 ## 2026-08-19 (9) — Directory deletion (rmdir), both backends
 
 The natural follow-up to file delete, whose own comments explicitly

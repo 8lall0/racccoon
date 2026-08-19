@@ -116,6 +116,14 @@ const uptr SD_CLOCK_PAGE  = 0;
 // convention on the Duo.
 const uint IRQ_SDHCI = 0;
 
+// Real, confirmed timebase-frequency, not guessed — extracted directly
+// from this exact qemu-system-riscv64 binary via
+// `-machine virt,dumpdtb=...` + `dtc` (same sourcing already used for
+// the real timer primitive work, docs/devlog.md). See boards/duo/
+// board.c3's matching comment for the Duo's own value and what this is
+// used for kernel-side.
+const ulong TIMEBASE_HZ = 10000000;
+
 fn void plic_init()
 {
 	// Priority must be > 0 for the PLIC to ever forward the interrupt at
