@@ -627,6 +627,48 @@ fn bool ext2_dec_free_inodes(uint group)
 	return ext2_write_block(bgdt_block, &bgdt_buf);
 }
 
+// Same shape as ext2_dec_free_blocks(), incrementing instead — called
+// once per successful ext2_free_block().
+fn bool ext2_inc_free_blocks(uint group)
+{
+	char[SECTOR_SIZE] sb_sector @noinit;
+	if (!fs_read_sector(EXT2_SUPERBLOCK_SECTOR, &sb_sector)) return false;
+	uint* sb_free = (uint*)&sb_sector[EXT2_SB_FREE_BLOCKS_COUNT];
+	*sb_free += 1;
+	if (!fs_write_sector(EXT2_SUPERBLOCK_SECTOR, &sb_sector)) return false;
+
+	uint descriptors_per_block = ext2_block_size / EXT2_BGD_SIZE;
+	uint bgdt_block = ext2_first_data_block + 1 + (group / descriptors_per_block);
+	uint offset_in_block = (group % descriptors_per_block) * EXT2_BGD_SIZE + EXT2_BGD_FREE_BLOCKS_COUNT;
+
+	char[EXT2_MAX_BLOCK_SIZE] bgdt_buf @noinit;
+	if (!ext2_read_block(bgdt_block, &bgdt_buf)) return false;
+	ushort* bg_free = (ushort*)&bgdt_buf[offset_in_block];
+	*bg_free += 1;
+	return ext2_write_block(bgdt_block, &bgdt_buf);
+}
+
+// Same shape as ext2_dec_free_inodes(), incrementing instead — called
+// once per successful ext2_free_inode().
+fn bool ext2_inc_free_inodes(uint group)
+{
+	char[SECTOR_SIZE] sb_sector @noinit;
+	if (!fs_read_sector(EXT2_SUPERBLOCK_SECTOR, &sb_sector)) return false;
+	uint* sb_free = (uint*)&sb_sector[EXT2_SB_FREE_INODES_COUNT];
+	*sb_free += 1;
+	if (!fs_write_sector(EXT2_SUPERBLOCK_SECTOR, &sb_sector)) return false;
+
+	uint descriptors_per_block = ext2_block_size / EXT2_BGD_SIZE;
+	uint bgdt_block = ext2_first_data_block + 1 + (group / descriptors_per_block);
+	uint offset_in_block = (group % descriptors_per_block) * EXT2_BGD_SIZE + EXT2_BGD_FREE_INODES_COUNT;
+
+	char[EXT2_MAX_BLOCK_SIZE] bgdt_buf @noinit;
+	if (!ext2_read_block(bgdt_block, &bgdt_buf)) return false;
+	ushort* bg_free = (ushort*)&bgdt_buf[offset_in_block];
+	*bg_free += 1;
+	return ext2_write_block(bgdt_block, &bgdt_buf);
+}
+
 // Linear scan of every group's block bitmap, group 0 first, for a
 // clear bit — not group-0-only anymore, so this driver's own writes
 // aren't confined there as it fills up (see EXT2_MAX_GROUPS's own
@@ -688,6 +730,45 @@ fn uint ext2_alloc_inode()
 		}
 	}
 	return 0;
+}
+
+// Inverse of ext2_alloc_block() — clears `block`'s bit in its own
+// group's block bitmap and bumps both free-count copies back up. The
+// absolute-to-(group, bit) math is the exact inverse of ext2_alloc_
+// block()'s own `ext2_first_data_block + group * ext2_blocks_per_group
+// + i` — see its comment.
+fn bool ext2_free_block(uint block)
+{
+	uint group = (block - ext2_first_data_block) / ext2_blocks_per_group;
+	uint bit_index = (block - ext2_first_data_block) % ext2_blocks_per_group;
+	if (group >= ext2_group_count) return false;
+
+	char[EXT2_MAX_BLOCK_SIZE] bitmap_buf @noinit;
+	if (!ext2_read_block(ext2_block_bitmap_blocks[group], &bitmap_buf)) return false;
+	uint byte_i = bit_index / 8;
+	uint bit_i = bit_index % 8;
+	uint b = (uint)bitmap_buf[byte_i] & 0xFF;
+	bitmap_buf[byte_i] = (char)(b & ~(1 << bit_i));
+	if (!ext2_write_block(ext2_block_bitmap_blocks[group], &bitmap_buf)) return false;
+	return ext2_inc_free_blocks(group);
+}
+
+// Inverse of ext2_alloc_inode() — same shape as ext2_free_block(),
+// against the inode bitmap.
+fn bool ext2_free_inode(uint inode_num)
+{
+	uint group = (inode_num - 1) / ext2_inodes_per_group;
+	uint bit_index = (inode_num - 1) % ext2_inodes_per_group;
+	if (group >= ext2_group_count) return false;
+
+	char[EXT2_MAX_BLOCK_SIZE] bitmap_buf @noinit;
+	if (!ext2_read_block(ext2_inode_bitmap_blocks[group], &bitmap_buf)) return false;
+	uint byte_i = bit_index / 8;
+	uint bit_i = bit_index % 8;
+	uint b = (uint)bitmap_buf[byte_i] & 0xFF;
+	bitmap_buf[byte_i] = (char)(b & ~(1 << bit_i));
+	if (!ext2_write_block(ext2_inode_bitmap_blocks[group], &bitmap_buf)) return false;
+	return ext2_inc_free_inodes(group);
 }
 
 // Patches mode/size/links_count/blocks/block[] into inode_num's
@@ -921,6 +1002,54 @@ fn int ext2_write(char* name, char* src, uint len)
 	if (!ext2_write_inode(inode_num, &inode)) return -1;
 
 	return (int)written;
+}
+
+// Entry point dispatched from fsd.c3's main() for FS_DELETE. v1 scope:
+// files only, not directories — same refusal ext2_read/ext2_write give
+// a directory; deleting one would need to recurse into (and empty) it
+// first, real, separate work not attempted here.
+//
+// Order matters, same "fail toward leak, not corruption" reasoning as
+// fat32_delete's own comment: clear the directory entry first (makes
+// the file unreachable via lookup), then zero the inode's own record
+// (drops stale metadata — mirrors ext2_zero_inode's own reasoning for
+// a freshly *allocated* inode, in reverse), then free its data blocks,
+// and only once nothing references them anymore, free the inode itself
+// — never mark something reusable while anything might still reference
+// it.
+fn int ext2_delete(char* name)
+{
+	uint dir_inode;
+	if (!ext2_resolve_dir(name, &dir_inode)) return -1;
+	char* leaf = ext2_leaf_name(name);
+
+	uint inode_num;
+	uint entry_sector;
+	uint entry_offset;
+	uint mode;
+	if (!ext2_find_in_dir(dir_inode, leaf, &inode_num, &entry_sector, &entry_offset, &mode)) return -1;
+	if ((mode & EXT2_S_IFDIR) != 0) return -1;
+	if (fs_is_protected_entry(entry_sector, entry_offset)) return -1;
+
+	Ext2_inode_info inode;
+	if (!ext2_read_inode(inode_num, &inode)) return -1;
+
+	char[SECTOR_SIZE] sector_buf @noinit;
+	if (!fs_read_sector(entry_sector, &sector_buf)) return -1;
+	uint* entry_inode_field = (uint*)&sector_buf[entry_offset + EXT2_DIRENT_INODE];
+	*entry_inode_field = 0;
+	if (!fs_write_sector(entry_sector, &sector_buf)) return -1;
+
+	if (!ext2_zero_inode(inode_num)) return -1;
+
+	for (uint b = 0; b < 12; b++)
+	{
+		if (inode.block[b] == 0) continue;
+		if (!ext2_free_block(inode.block[b])) return -1;
+	}
+	if (!ext2_free_inode(inode_num)) return -1;
+
+	return 0;
 }
 
 // Looks up a protected file (plain name, e.g. "fip.bin") and: records

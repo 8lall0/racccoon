@@ -330,16 +330,19 @@ fn void print(char* s) {
 }
 
 // --- File access via fsd (user/fsd.c3) — the only way to touch a file
-// now that SYS_READFILE/SYS_WRITEFILE are gone from the kernel. Both
-// resolve `filename` through this process's own namespace (the ""
-// catch-all mount, src/process.c3's create_process — plain filenames
-// like "hello.txt" never start with "/", so they fall through to it)
-// rather than needing to know fsd's pid. Wire format (kept in sync by
-// hand with user/fsd.c3): byte 0..99 = filename, 100..103 = length
-// (uint), 104.. = file data — reply reuses 0..3 for the result length
-// (or -1) and, for a read, 4.. for the data.
-const uint FS_READ  = 20;
-const uint FS_WRITE = 21;
+// now that SYS_READFILE/SYS_WRITEFILE are gone from the kernel. All
+// three resolve `filename` through this process's own namespace (the
+// "" catch-all mount, src/process.c3's create_process — plain
+// filenames like "hello.txt" never start with "/", so they fall
+// through to it) rather than needing to know fsd's pid. Wire format
+// (kept in sync by hand with user/fsd.c3): byte 0..99 = filename,
+// 100..103 = length (uint, FS_READ/FS_WRITE only — FS_DELETE has
+// nothing else to send), 104.. = file data — reply reuses 0..3 for
+// the result (FS_READ/FS_WRITE: length or -1; FS_DELETE: 0 or -1) and,
+// for a read, 4.. for the data.
+const uint FS_READ   = 20;
+const uint FS_WRITE  = 21;
+const uint FS_DELETE = 22;
 const uint FS_MSG_MAX = 1128;
 
 fn int fs_read(char* filename, char* buf, int len) @export("fs_read") {
@@ -409,6 +412,29 @@ fn int fs_write(char* filename, char* buf, int len) @export("fs_write") {
 
     int* result_len_field = (int*)&req;
     return *result_len_field;
+}
+
+fn int fs_delete(char* filename) @export("fs_delete") {
+    uint prefix_len = 0;
+    int fsd_pid = ns_resolve(filename, &prefix_len);
+    if (fsd_pid < 0) return -1;
+    // See fs_read's own comment on why this strips the matched prefix.
+    char* stripped = &filename[prefix_len];
+
+    char[FS_MSG_MAX] req @noinit;
+    int i = 0;
+    while (stripped[i] != 0 && i < 99) {
+        req[i] = stripped[i];
+        i++;
+    }
+    req[i] = 0;
+
+    uint reply_verb = 0;
+    int from = p9_call(fsd_pid, FS_DELETE, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
+    if (from <= 0 || reply_verb != FS_DELETE) return -1;
+
+    int* result_field = (int*)&req;
+    return *result_field;
 }
 
 fn int strcmp(char* a, char* b) {

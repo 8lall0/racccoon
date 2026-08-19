@@ -712,6 +712,61 @@ fn int fat32_write(char* name, char* src, uint len)
 	return (int)written;
 }
 
+// Frees every cluster in first_cluster's chain, marking each 0 (free)
+// in every FAT copy. Reads each cluster's own next-link before
+// clearing its entry — clearing first would lose the rest of the
+// chain, same ordering concern fat32_write_file's own chain-extension
+// code has in reverse.
+fn bool fat32_free_cluster_chain(uint first_cluster)
+{
+	uint cluster = first_cluster;
+	while (cluster != 0 && cluster < FAT32_EOC_MIN)
+	{
+		uint next = fat32_next_cluster(cluster);
+		if (!fat32_write_fat_entry(cluster, 0)) return false;
+		cluster = next;
+	}
+	return true;
+}
+
+// Entry point dispatched from fsd.c3's main() for FS_DELETE. v1 scope:
+// files only, not directories — same refusal fat32_read/fat32_write
+// give a directory; deleting one would need to recurse into (and
+// empty) it first, real, separate work not attempted here. Marks the
+// directory entry FAT32_DIRENT_DELETED — the same value fat32_find_
+// free_dirent already recognizes as reusable — *before* freeing the
+// cluster chain, not after: if freeing fails partway, an entry that's
+// already invisible to lookups with some of its clusters still marked
+// used is a leak, safe; freeing the chain first and then failing to
+// mark the entry deleted would leave a still-visible file pointing at
+// clusters that could already be handed out to something else — a
+// real two-files-one-cluster corruption risk, not just a leak.
+fn int fat32_delete(char* name)
+{
+	uint dir_cluster;
+	if (!fat32_resolve_dir(name, &dir_cluster)) return -1;
+	char* leaf = fat32_leaf_name(name);
+
+	char[11] name11 @noinit;
+	fat32_name_to_8_3(leaf, &name11);
+
+	uint cluster;
+	uint size;
+	uint entry_sector;
+	uint entry_offset;
+	char attr;
+	if (!fat32_find_in_dir(dir_cluster, &name11, &cluster, &size, &entry_sector, &entry_offset, &attr)) return -1;
+	if ((attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0) return -1;
+	if (fs_is_protected_entry(entry_sector, entry_offset)) return -1;
+
+	char[SECTOR_SIZE] sector_buf @noinit;
+	if (!fs_read_sector(entry_sector, &sector_buf)) return -1;
+	sector_buf[entry_offset] = FAT32_DIRENT_DELETED;
+	if (!fs_write_sector(entry_sector, &sector_buf)) return -1;
+
+	return fat32_free_cluster_chain(cluster) ? 0 : -1;
+}
+
 fn void fat32_mount()
 {
 	char[SECTOR_SIZE] boot_sector @noinit;

@@ -4,6 +4,63 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-19 (8) — File delete/unlink, both backends
+
+fsd had no way to remove a file at all — the FS_READ/FS_WRITE wire
+protocol had no verb for it, and the shell had no equivalent command.
+Real, contained feature, built on top of everything else this session
+already put in place (subdirectory resolution, the protected-entry
+check, correct free-count bookkeeping).
+
+**Wire protocol**: `user/user.c3` gained `FS_DELETE` (verb 22) and
+`fs_delete(filename)` — filename-only request, reply reuses byte 0..3
+for a plain 0/-1 result (no length concept for a delete). `fsd.c3`'s
+dispatch gained a third branch alongside FS_READ/FS_WRITE, with the
+same protected-name fast-gate FS_WRITE already has before either
+backend even runs.
+
+**FAT32**: `fat32_delete()` resolves the containing directory (reusing
+`fat32_resolve_dir`, so subdirectory files delete correctly too),
+refuses a directory or the protected entry, then — order matters —
+marks the directory entry `FAT32_DIRENT_DELETED` *before* freeing its
+cluster chain (`fat32_free_cluster_chain()`, new). Marking first means
+a failure partway through just leaks space (safe); freeing first and
+then failing to mark the entry deleted would leave a still-visible
+file pointing at clusters that could already be reused elsewhere — a
+real corruption risk, not just a leak.
+
+**ext2**: `ext2_delete()` same shape, same ordering principle taken
+further given ext2 has more state to unwind: clear the directory
+entry, zero the inode's own record (`ext2_zero_inode`, reused),
+free each of its data blocks (new `ext2_free_block()`, the inverse of
+`ext2_alloc_block()` — same group-aware bitmap math in reverse), then
+free the inode itself (new `ext2_free_inode()`) — never marking
+something reusable while anything upstream of it might still
+reference it. New `ext2_inc_free_blocks()`/`ext2_inc_free_inodes()`
+mirror this session's earlier `ext2_dec_free_*` functions, keeping
+both free-count copies correct on the way back up too — the same
+bookkeeping that turned out to matter for real (auto-remount-read-only)
+consequences earlier this session.
+
+**Verified rigorously**: new `deletetest`/`deletetest2` shell commands
+(create, confirm present, delete, confirm genuinely gone) on both
+mounts, `deleteprotected` confirms `fip.bin` is still refused. `e2fsck
+-n -f` on the ext2 image after a delete: completely clean, no errors
+of any kind — the free-count/bitmap bookkeeping unwound correctly, not
+just the visible file. FAT32's deletion cross-checked with `mdir`
+(mtools, not `fsd`'s own read-back) — the file is genuinely gone from
+the directory listing. Full regression suite (both QEMU images)
+unaffected, `racetest` still `a=1 b=1`.
+
+**Files changed:** `user/user.c3` (`FS_DELETE`, `fs_delete()`),
+`user/fsd.c3` (dispatch), `user/fs/fat32.c3` (`fat32_free_cluster_
+chain`, `fat32_delete`), `user/fs/ext2.c3` (`ext2_inc_free_blocks`/
+`ext2_inc_free_inodes`, `ext2_free_block`/`ext2_free_inode`,
+`ext2_delete`), `user/shell.c3` (`deletetest`/`deletetest2`/
+`deleteprotected`).
+
+---
+
 ## 2026-08-19 (7) — Closing the last documented gap: directory-vs-file confusion in the protected-file lookup
 
 `ext2.c3`'s own header comment still listed "no directory-entry

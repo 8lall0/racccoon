@@ -386,7 +386,7 @@ fn void main() @export("main")
 		uint verb = 0;
 		int from = ipc_recv_type(&buf, FS_MSG_MAX, &verb);
 		if (from <= 0) continue;
-		if (verb != FS_READ && verb != FS_WRITE) continue;
+		if (verb != FS_READ && verb != FS_WRITE && verb != FS_DELETE) continue;
 
 		int* result_len_field = (int*)&buf;
 
@@ -412,6 +412,30 @@ fn void main() @export("main")
 		// set the field's high bit. See docs/devlog.md for the same
 		// hardening pass that added this check.
 		if (req_len < 0) req_len = 0;
+
+		if (verb == FS_DELETE)
+		{
+			// Same protected-name fast gate as FS_WRITE — the real
+			// backstop for both is each backend's own fs_is_protected_
+			// entry() check (matching the exact sector/offset reserved
+			// at mount time), this is just an obvious, cheap first
+			// refusal before either backend even runs.
+			int result = -1;
+			if (!fs_is_protected_name(&filename))
+			{
+				if (fs_type == FS_TYPE_FAT32)
+				{
+					result = fat32_delete(&filename);
+				}
+				else if (fs_type == FS_TYPE_EXT2)
+				{
+					result = ext2_delete(&filename);
+				}
+			}
+			*result_len_field = result;
+			ipc_send(from, verb, &buf, FS_MSG_MAX);
+			continue;
+		}
 
 		if (verb == FS_WRITE)
 		{

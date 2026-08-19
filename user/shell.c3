@@ -190,6 +190,48 @@ fn void main() @export("main") {
             } else {
                 print("newsubfile2: readback failed (no second fsd mounted?)\n");
             }
+        } else if (strcmp(cmd, "deletetest") == 0) {
+            // Create a file, confirm it's there, delete it, confirm
+            // it's genuinely gone — mount 1.
+            fs_write("deletetest.txt", "temporary\n", 10);
+            char[16] buf7 @noinit;
+            int before = fs_read("deletetest.txt", &buf7, 16);
+            int del = fs_delete("deletetest.txt");
+            int after = fs_read("deletetest.txt", &buf7, 16);
+            if (before >= 0 && del == 0 && after < 0) {
+                print("deletetest: ok\n");
+            } else {
+                print("deletetest: FAILED\n");
+            }
+        } else if (strcmp(cmd, "deletetest2") == 0) {
+            // Same as deletetest, through the "/2/" mount.
+            fs_write("/2/deletetest2.txt", "temporary\n", 10);
+            char[16] buf8 @noinit;
+            int before2 = fs_read("/2/deletetest2.txt", &buf8, 16);
+            int del2 = fs_delete("/2/deletetest2.txt");
+            int after2 = fs_read("/2/deletetest2.txt", &buf8, 16);
+            if (before2 >= 0 && del2 == 0 && after2 < 0) {
+                print("deletetest2: ok\n");
+            } else {
+                print("deletetest2: FAILED\n");
+            }
+        } else if (strcmp(cmd, "deleteprotected") == 0) {
+            // Deliberately attempts to delete the one file fsd is
+            // supposed to refuse no matter what. Unlike protectedwrite,
+            // this isn't a meaningful test on QEMU's own disposable
+            // test image: a missing file and a protected file both
+            // just return -1 here, with no "was accepted" contrast to
+            // tell them apart (protectedwrite's own missing-file case
+            // instead falls through to actually creating a file,
+            // which is what makes that one still show something real
+            // on QEMU). Only the real board, with a real fip.bin, is
+            // the real test.
+            int result = fs_delete("fip.bin");
+            if (result < 0) {
+                print("deleteprotected: rejected (correct)\n");
+            } else {
+                print("deleteprotected: WARNING: delete was ACCEPTED\n");
+            }
         } else if (strcmp(cmd, "protectedwrite") == 0) {
             // Deliberately attempts to write the one file fsd is
             // supposed to refuse no matter what (see user/fsd.c3's
