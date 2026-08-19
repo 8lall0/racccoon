@@ -16,11 +16,12 @@ module user;
 //     found a real need for this on actual hardware: a real Linux
 //     `mkdir` spread a new directory into group 1, which this driver
 //     used to refuse entirely.
-//   - No directory-entry file-type filtering: the on-disk file_type byte
-//     (only populated if the volume has that optional feature flag) is
-//     never consulted, so a directory sharing a requested file's name
-//     would be treated as a matching "file" and its own data blocks read
-//     as if they were file content. Narrow, known gap — not fixed here.
+//   - The on-disk file_type byte in a directory entry (only populated if
+//     the volume has that optional feature flag) is never consulted —
+//     but a directory sharing a requested file's name is still refused,
+//     via the matched inode's own authoritative mode field instead (see
+//     ext2_read/ext2_write and ext2_reserve_protected), which works
+//     regardless of whether that optional feature flag is even set.
 //
 // Write support (create, overwrite, grow — see ext2_write()) reuses
 // fsd.c3's generic write-protection machinery verbatim (the same
@@ -932,6 +933,16 @@ fn int ext2_write(char* name, char* src, uint len)
 // file that isn't found is simply nothing to protect — logged so it's
 // visible, not silently skipped. Mirrors fat32_reserve_protected()
 // exactly.
+//
+// A directory sharing the protected name is treated the same as "not
+// found" — ext2_find_in_root itself doesn't check type (it's the only
+// remaining caller, mount-time only, not the general-purpose lookup
+// ext2_read/ext2_write use), so the check happens here instead, right
+// after reading the inode this function needed anyway. Reserving a
+// directory's own blocks as if they were "the protected file"'s data
+// would be a real category error, not just imprecise — this fails
+// toward treating a same-named directory as unprotected rather than
+// silently reserving the wrong blocks.
 fn void ext2_reserve_protected(char* name)
 {
 	uint inode_num;
@@ -943,10 +954,16 @@ fn void ext2_reserve_protected(char* name)
 		return;
 	}
 
-	fs_set_protected_entry(entry_sector, entry_offset);
-
 	Ext2_inode_info inode;
 	if (!ext2_read_inode(inode_num, &inode)) return;
+	if ((inode.mode & EXT2_S_IFDIR) != 0)
+	{
+		print("fsd: protected file not found, nothing to reserve for it\n");
+		return;
+	}
+
+	fs_set_protected_entry(entry_sector, entry_offset);
+
 	for (uint b = 0; b < 12; b++)
 	{
 		if (inode.block[b] == 0) continue;

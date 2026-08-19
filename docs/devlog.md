@@ -4,6 +4,47 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-19 (7) — Closing the last documented gap: directory-vs-file confusion in the protected-file lookup
+
+`ext2.c3`'s own header comment still listed "no directory-entry
+file-type filtering" as a known gap — checking turned out it was
+already closed for the parts that actually matter: `ext2_read`/
+`ext2_write` route through `ext2_find_in_dir` (added earlier this
+session for subdirectory support), which already reads the matched
+entry's real inode and refuses to treat a directory as file content,
+using the inode's own authoritative `mode` field rather than the
+optional, sometimes-absent on-disk `file_type` byte the old comment
+worried about — actually more robust than what was originally asked
+for.
+
+The one place this genuinely wasn't checked: `ext2_reserve_protected()`
+(mount-time lookup of `fip.bin`), whose only remaining caller of the
+now-narrowly-scoped `ext2_find_in_root` never looked at type at all. A
+directory happening to share the protected name would have had its
+own cluster chain reserved as if it were "the protected file"'s data —
+a category error, though a safe-direction one (over-protective, never
+under-protective or data-exposing). Fixed the same way in both
+backends for consistency: `ext2_reserve_protected` now checks the
+inode it already reads anyway; `fat32_find_in_root` (FAT32's own
+now-single-purpose equivalent, same "only `fat32_reserve_protected`
+still calls it" situation) gained an `out_attr` param so
+`fat32_reserve_protected` can check `FAT32_DIRENT_ATTR_DIRECTORY`
+directly from the dirent, no extra read needed there. Both fail the
+same way a genuinely-missing file already did: print, don't reserve.
+
+Verified via full regression suite (both single- and dual-mount QEMU
+images), `protectedwrite`/`racetest` unaffected. The real, hardware-
+relevant case (a real `fip.bin`, not a same-named directory) is
+unchanged — this only adds a new, narrow refusal path that was never
+exercised before.
+
+**Files changed:** `user/fs/ext2.c3` (`ext2_reserve_protected` checks
+`inode.mode & EXT2_S_IFDIR`, header comment updated), `user/fs/fat32.c3`
+(`fat32_find_in_root` gained `out_attr`, `fat32_reserve_protected`
+checks it).
+
+---
+
 ## 2026-08-19 (6) — ext2 multi-group allocation: this driver's own writes aren't confined to group 0 anymore
 
 Closes the last piece of the "block group 0 only" limitation — the

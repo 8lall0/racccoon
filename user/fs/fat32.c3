@@ -128,13 +128,15 @@ fn void fat32_name_to_8_3(char* input, char* out11)
 }
 
 // Walks the root directory's own cluster chain looking for a name11
-// (already in raw 8.3 form — see fat32_name_to_8_3) match. Returns true and
-// fills *out_cluster/*out_size/*out_entry_sector/*out_entry_offset on a
-// hit — the latter two (the entry's own location, not the file's data)
-// are needed by the write path (updating file_size in place) and by
-// fat32_reserve_protected() (protecting the entry itself, not just the
-// file's data clusters); the read path just ignores them.
-fn bool fat32_find_in_root(char* name11, uint* out_cluster, uint* out_size, uint* out_entry_sector, uint* out_entry_offset)
+// (already in raw 8.3 form — see fat32_name_to_8_3) match. Returns true
+// and fills *out_cluster/*out_size/*out_entry_sector/*out_entry_offset/
+// *out_attr on a hit. The only remaining caller is
+// fat32_reserve_protected() (read/write both go through
+// fat32_find_in_dir instead, see this file's own subdirectory-support
+// section) — out_attr lets it refuse a same-named directory rather
+// than reserving its own cluster chain as if it were "the protected
+// file"'s data, a real category error, not just imprecise.
+fn bool fat32_find_in_root(char* name11, uint* out_cluster, uint* out_size, uint* out_entry_sector, uint* out_entry_offset, char* out_attr)
 {
 	uint cluster = fat32_root_cluster;
 	char[SECTOR_SIZE] sector_buf @noinit;
@@ -170,10 +172,11 @@ fn bool fat32_find_in_root(char* name11, uint* out_cluster, uint* out_size, uint
 				ushort* cluster_hi = (ushort*)&entry[FAT32_DIRENT_CLUSTER_HI];
 				ushort* cluster_lo = (ushort*)&entry[FAT32_DIRENT_CLUSTER_LO];
 				uint*   size_field = (uint*)&entry[FAT32_DIRENT_FILE_SIZE];
-				*out_cluster = ((uint)*cluster_hi << 16) | (uint)*cluster_lo;
-				*out_size    = *size_field;
+				*out_cluster      = ((uint)*cluster_hi << 16) | (uint)*cluster_lo;
+				*out_size         = *size_field;
 				*out_entry_sector = sector + s;
 				*out_entry_offset = e * FAT32_DIRENT_SIZE;
+				*out_attr         = attr;
 				return true;
 			}
 		}
@@ -427,7 +430,17 @@ fn void fat32_reserve_protected(char* name)
 	uint size;
 	uint entry_sector;
 	uint entry_offset;
-	if (!fat32_find_in_root(&name11, &cluster, &size, &entry_sector, &entry_offset))
+	char attr;
+	if (!fat32_find_in_root(&name11, &cluster, &size, &entry_sector, &entry_offset, &attr))
+	{
+		print("fsd: protected file not found, nothing to reserve for it\n");
+		return;
+	}
+	// A same-named directory isn't the protected file — treated the
+	// same as "not found" rather than reserving its own cluster chain
+	// as if it were "the protected file"'s data (see fat32_find_in_
+	// root's own comment).
+	if ((attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0)
 	{
 		print("fsd: protected file not found, nothing to reserve for it\n");
 		return;
