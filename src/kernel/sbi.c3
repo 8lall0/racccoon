@@ -46,3 +46,21 @@ fn int __getchar()
 	Sbiret ret = sbi_call(0, 0, 0, 0, 0, 0, 0, 2);
 	return (int)ret.error;
 }
+
+// Legacy SBI extension 0 (sbi_set_timer) — asks M-mode firmware to
+// program the real hardware timer comparator (mtimecmp, M-mode-only)
+// on our behalf and arrange delivery of the next S-mode timer
+// interrupt once `stime_value` (an absolute time, same units as the
+// `time` CSR) is reached. Deliberately not direct stimecmp CSR access
+// (the sstc extension's own S-mode-writable register): confirmed on
+// real Milk-V Duo hardware that writing stimecmp directly hangs the
+// board silently (see docs/devlog.md) — likely menvcfg.STCE, the
+// M-mode bit that permits S-mode stimecmp access at all, not being set
+// by the Duo's own firmware, unlike QEMU's OpenSBI. This ecall-based
+// path needs no such permission — M-mode does the actual CSR
+// programming itself — same reasoning __putchar/__getchar above
+// already rely on for the console.
+fn void __set_timer(ulong stime_value)
+{
+	sbi_call((long)stime_value, 0, 0, 0, 0, 0, 0, 0);
+}

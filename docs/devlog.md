@@ -4,6 +4,41 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-19 (12) — Real timer interrupts, actually working on real hardware now
+
+Fixes the previous entry's real-hardware regression: switched
+`arm_timer()` (`entry.c3`) from a direct `stimecmp` CSR write to the
+SBI legacy `set_timer` ecall (new `sbi::__set_timer()`, same shape as
+the existing `__putchar`/`__getchar` bindings) — M-mode firmware
+programs the actual timer comparator on the kernel's behalf, needing
+no `menvcfg.STCE` permission for direct S-mode CSR access at all.
+`enable_timer_interrupts()` re-enabled in `src/kernel.c3`.
+
+**Verified properly this time**, same discipline as the failed
+attempt: temporary debug print, confirmed on QEMU first (fired
+correctly, ~1s intervals with the shell kept busy), *then* a real
+hardware round trip — and this time, real confirmation: `DBG timer
+tick (SBI)` appeared twice in the real console log, correctly
+interleaved with ongoing, unrelated `sdd` sector-read traffic, boot
+completing normally all the way to the shell prompt both times (with
+the debug print, and again on the final clean rebuild). No hang, no
+regression. Full QEMU regression suite (both images) unaffected,
+`racetest` still `a=1 b=1`.
+
+The narrow-scope boundary from two entries ago stands unchanged: this
+still only proves the interrupt mechanism itself (fires, rearms,
+returns cleanly) — no context switch happens on a tick yet. Actual
+preemption remains real, separate, higher-risk work, and the earlier
+interrupt-latency finding (blocking syscalls hold `sstatus.SIE`
+globally disabled for their own duration) is unaffected by this
+arming-mechanism change — same characteristic either way.
+
+**Files changed:** `src/kernel/sbi.c3` (`__set_timer`), `src/entry.c3`
+(`arm_timer` uses it instead of direct CSR access), `src/kernel.c3`
+(`enable_timer_interrupts()` re-enabled).
+
+---
+
 ## 2026-08-19 (11) — Real hardware correction: stimecmp hangs the real Duo, QEMU only proved half the story
 
 The previous entry's QEMU verification wasn't wrong, but it wasn't the

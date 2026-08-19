@@ -3,6 +3,7 @@ module kernel;
 import std::io;
 import panic;
 import board;
+import sbi;
 
 const SCAUSE_ECALL             = 8;
 // RV64 port: the interrupt bit is scause's MSB — bit 63 on RV64, not
@@ -149,18 +150,23 @@ fn void enable_external_interrupts()
 	write_csr("sstatus", read_reg("sstatus") | SSTATUS_SIE);
 }
 
-// Arms the next timer interrupt: writes `time + delta_ticks` to
-// stimecmp (the sstc extension's own CSR — confirmed present in this
-// hart's own boot banner, "sstc" listed among Boot HART ISA
-// Extensions). A supervisor timer interrupt (SCAUSE_SUPERVISOR_TIMER)
-// fires once `time` reaches this value; handle_trap's own timer case
-// re-arms it every time it fires, or the same interrupt would
-// immediately refire forever (an interrupt storm, not a periodic
-// tick) — see that case's own comment.
+// Arms the next timer interrupt via the SBI legacy set_timer call
+// (sbi::__set_timer) — deliberately not a direct write to stimecmp
+// (the sstc extension's own S-mode-writable CSR): confirmed on real
+// Milk-V Duo hardware that writing stimecmp directly hangs the board
+// silently (see docs/devlog.md and sbi::__set_timer's own comment for
+// the full story — likely menvcfg.STCE not being set by the Duo's own
+// firmware, unlike QEMU's OpenSBI). The SBI ecall asks M-mode firmware
+// to do the actual timer-comparator programming instead, needing no
+// such S-mode CSR permission at all. A supervisor timer interrupt
+// (SCAUSE_SUPERVISOR_TIMER) fires once `time` reaches `now +
+// delta_ticks`; handle_trap's own timer case re-arms it every time it
+// fires, or the same interrupt would immediately refire forever (an
+// interrupt storm, not a periodic tick) — see that case's own comment.
 fn void arm_timer(ulong delta_ticks)
 {
 	ulong now = read_reg("time");
-	write_csr("stimecmp", now + delta_ticks);
+	sbi::__set_timer(now + delta_ticks);
 }
 
 const SIE_STIE = (1 << 5); // sie: supervisor timer interrupt enable
