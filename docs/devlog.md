@@ -4,6 +4,57 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-19 (6) — ext2 multi-group allocation: this driver's own writes aren't confined to group 0 anymore
+
+Closes the last piece of the "block group 0 only" limitation — the
+entry below deliberately stopped at reads/updates, leaving
+`ext2_alloc_block()`/`ext2_alloc_inode()` group-0-only since that's
+the higher-risk half (this session already found two real corruption
+bugs in the allocator's own neighborhood). Extended carefully, on top
+of the mount-time per-group bitmap locations the previous entry
+already added.
+
+**Design**: `ext2_mount()`'s block-group-descriptor read now also
+caches every group's own block/inode bitmap block (not just the inode
+table, which the read-side fix already needed) into two more
+`[EXT2_MAX_GROUPS]` arrays. `ext2_alloc_block()`/`ext2_alloc_inode()`
+now loop over every group in turn — group 0 first, so existing
+single-group volumes see zero behavior change — computing the real
+absolute block/inode number from `(group, index-within-group)`.
+`ext2_dec_free_blocks()`/`ext2_dec_free_inodes()` gained a `group`
+parameter and now locate that specific group's own descriptor within
+the (possibly multi-block) BGDT instead of always assuming block 0's
+own 32-byte entry — the exact bug class this session's earlier
+free-count fix would have reintroduced if left group-0-only.
+`ext2_zero_inode()` also needed the same group-aware lookup, since it
+runs on whatever `ext2_alloc_inode()` just handed it, no longer
+guaranteed to be group 0. The old flat, group-0-only globals (`ext2_
+inode_table_block` etc.) were removed entirely rather than left
+dangling once nothing referenced them anymore.
+
+**Verified as rigorously as the read-side fix, maybe more so given the
+stakes**: baseline regression suite (including `e2fsck -n -f` on a
+fresh, untouched image) confirmed no behavior change for the normal,
+single-group case. Then actually forced the allocator's hand: built a
+small-group scratch image (`mke2fs -g 512`, 128 inodes/group), filled
+group 0's inodes completely via `debugfs` (confirmed via `stat` that
+the *next* file would land at inode 129, group 1), then had the
+*kernel's own* `newfile2` create a genuinely new file through the
+exhausted volume — landed at inode 130 (group 1), confirmed via
+`debugfs stat`, not just trusted. `e2fsck -n -f` on the result: fully
+clean, no errors of any kind, including group 1's own free-count
+bookkeeping. Re-ran the same stressed image with `readfile2`/
+`racetest` afterward — nothing else broke.
+
+**Files changed:** `user/fs/ext2.c3` (`ext2_block_bitmap_blocks[]`/
+`ext2_inode_bitmap_blocks[]`, `ext2_mount()`'s BGDT scan extended,
+`ext2_dec_free_blocks`/`ext2_dec_free_inodes` gained a `group`
+parameter, `ext2_alloc_block`/`ext2_alloc_inode`/`ext2_zero_inode`
+made group-aware, dead flat group-0 globals removed, header comments
+updated).
+
+---
+
 ## 2026-08-19 (5) — ext2 multi-group reads: closing the gap the real hardware exposed twice now
 
 The "block group 0 only" limitation bit twice in one session (see the

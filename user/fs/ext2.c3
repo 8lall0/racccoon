@@ -14,16 +14,11 @@ module user;
 //     than 12 blocks' worth of data reads back short, same "return
 //     however many bytes were actually reachable" discipline
 //     fat32_read_file uses for a broken chain, not an error.
-//   - Reading/updating an inode works across any block group (see
-//     ext2_read_inode/ext2_write_inode's own comments) — found a real
-//     need for this on actual hardware: a real Linux `mkdir` spread a
-//     new directory into group 1, which this driver used to refuse
-//     entirely. *Allocating* a new inode or block (ext2_alloc_inode/
-//     ext2_alloc_block) still only ever looks in group 0 — this
-//     driver's own writes have never needed more than that, and
-//     extending allocation itself to scan/update other groups' bitmaps
-//     and free-counts is real, separate, higher-risk work not
-//     attempted here.
+//   - Reading, updating, and allocating inodes/blocks all work across
+//     any block group, up to EXT2_MAX_GROUPS (see its own comment) —
+//     found a real need for this on actual hardware: a real Linux
+//     `mkdir` spread a new directory into group 1, which this driver
+//     used to refuse entirely.
 //   - No directory-entry file-type filtering: the on-disk file_type byte
 //     (only populated if the volume has that optional feature flag) is
 //     never consulted, so a directory sharing a requested file's name
@@ -78,9 +73,10 @@ const uint EXT2_SB_MAGIC             = 56; // u16, must be 0xEF53
 const uint EXT2_SB_REV_LEVEL         = 76; // u32, 0 = original (fixed 128-byte inodes), >=1 = dynamic
 const uint EXT2_SB_INODE_SIZE        = 88; // u16, only meaningful if rev_level >= 1
 
-// Block group descriptor (32 bytes), starting in the block immediately
-// after the superblock's own block. v1 only ever reads group 0's
-// descriptor, the first one in the table.
+// Block group descriptor (32 bytes each), starting in the block
+// immediately after the superblock's own block — ext2_mount() reads
+// every group's own descriptor, not just group 0's (see
+// EXT2_MAX_GROUPS's own comment).
 const uint EXT2_BGD_BLOCK_BITMAP       = 0;  // u32, block holding this group's block-allocation bitmap
 const uint EXT2_BGD_INODE_BITMAP       = 4;  // u32, block holding this group's inode-allocation bitmap
 const uint EXT2_BGD_INODE_TABLE        = 8;  // u32, starting block of this group's inode table
@@ -130,17 +126,16 @@ const uint EXT2_MAX_BLOCK_SIZE = 4096;
 // Real hardware bug found and fixed this session: this driver used to
 // only ever know group 0's inode table, so any inode belonging to a
 // different group (real Linux tools spread new files/directories
-// across groups; this driver's own allocator never did) was silently
-// treated as not-found — see ext2_read_inode/ext2_write_inode's own
-// comments and docs/devlog.md. ext2_alloc_block()/ext2_alloc_inode()
-// deliberately stay group-0-only (see their own comments) — only
-// reading/updating an *existing* inode needed to grow past group 0,
-// not allocating new ones, keeping the write path's own risk profile
-// unchanged. 64 groups is generous for this project's real hardware
-// (a 1GB partition needs about 8); a volume needing more just can't
-// fully interoperate past group 63 — ext2_read_inode/ext2_write_inode
-// already fail closed (treated as not-found) for anything beyond what
-// ext2_group_count/this array actually cover.
+// across groups) was silently treated as not-found — see
+// ext2_read_inode/ext2_write_inode's own comments and docs/devlog.md.
+// ext2_alloc_block()/ext2_alloc_inode() now scan every group too, so
+// this driver's own writes aren't confined to group 0 as it fills up
+// either. 64 groups is generous for this project's real hardware (a
+// 1GB partition needs about 8); a volume needing more just can't fully
+// interoperate/allocate past group 63 — every group-indexed lookup in
+// this file already fails closed (treated as not-found, or "no space
+// left") for anything beyond what ext2_group_count/these arrays
+// actually cover.
 const uint EXT2_MAX_GROUPS = 64;
 const uint EXT2_BGD_SIZE   = 32; // bytes per block group descriptor, standard fixed size
 
@@ -149,12 +144,11 @@ uint ext2_sectors_per_block;
 uint ext2_inode_size;
 uint ext2_inodes_per_group;
 uint ext2_blocks_per_group; // write-path only: ext2_alloc_block()'s scan bound
-uint ext2_inode_table_block; // group 0's inode table — still the only one ext2_alloc_inode/ext2_zero_inode ever touch
-uint ext2_block_bitmap_block; // write-path only
-uint ext2_inode_bitmap_block; // write-path only
 uint ext2_first_data_block; // write-path only: ext2_alloc_block()'s base for converting a bitmap bit index into a block number
 uint ext2_group_count;
-uint[EXT2_MAX_GROUPS] ext2_inode_table_blocks; // every group's own inode table block, for ext2_read_inode/ext2_write_inode
+uint[EXT2_MAX_GROUPS] ext2_inode_table_blocks;  // every group's own inode table block, for ext2_read_inode/ext2_write_inode
+uint[EXT2_MAX_GROUPS] ext2_block_bitmap_blocks; // every group's own block bitmap, for ext2_alloc_block
+uint[EXT2_MAX_GROUPS] ext2_inode_bitmap_blocks; // every group's own inode bitmap, for ext2_alloc_inode
 
 struct Ext2_inode_info
 {
@@ -524,28 +518,15 @@ fn void ext2_mount()
 	ext2_first_data_block = *first_data_block;
 
 	// Block group descriptor table starts in the block immediately
-	// after the superblock's own block. v1 only ever reads group 0's
-	// descriptor (the first 32 bytes of that block).
-	char[EXT2_MAX_BLOCK_SIZE] bgdt_buf @noinit;
-	if (!ext2_read_block(ext2_first_data_block + 1, &bgdt_buf))
-	{
-		fs_panic("failed to read ext2 block group descriptor");
-	}
-	uint* block_bitmap = (uint*)&bgdt_buf[EXT2_BGD_BLOCK_BITMAP];
-	uint* inode_bitmap = (uint*)&bgdt_buf[EXT2_BGD_INODE_BITMAP];
-	uint* inode_table   = (uint*)&bgdt_buf[EXT2_BGD_INODE_TABLE];
-	ext2_block_bitmap_block = *block_bitmap;
-	ext2_inode_bitmap_block = *inode_bitmap;
-	ext2_inode_table_block  = *inode_table;
-
-	// Every group's own inode table block, so ext2_read_inode/
-	// ext2_write_inode can resolve an inode belonging to *any* group —
-	// see EXT2_MAX_GROUPS's own comment for why (a real Linux `mkdir`
-	// on the real Duo card allocated a new directory in group 1, which
-	// this driver used to treat as not-found entirely). The descriptor
-	// table can itself span more than one block once there are enough
-	// groups (descriptors_per_block each), unlike the single-block read
-	// above, which only ever needed group 0's own entry.
+	// after the superblock's own block, and can itself span more than
+	// one block once there are enough groups (descriptors_per_block
+	// each). Reads every group's own block/inode bitmap and inode
+	// table location — not just group 0's — so ext2_read_inode/
+	// ext2_write_inode/ext2_alloc_block/ext2_alloc_inode can all
+	// resolve/allocate in any group. See EXT2_MAX_GROUPS's own comment
+	// for why: a real Linux `mkdir` on the real Duo card allocated a
+	// new directory in group 1, which this driver used to treat as
+	// not-found entirely.
 	uint* inodes_count_field = (uint*)&sb_sector[EXT2_SB_INODES_COUNT];
 	ext2_group_count = (*inodes_count_field + ext2_inodes_per_group - 1) / ext2_inodes_per_group;
 	if (ext2_group_count > EXT2_MAX_GROUPS) ext2_group_count = EXT2_MAX_GROUPS;
@@ -563,8 +544,12 @@ fn void ext2_mount()
 		{
 			uint g = bb * descriptors_per_block + d;
 			if (g >= ext2_group_count) break;
-			uint* group_inode_table = (uint*)&bgdt_scan_buf[d * EXT2_BGD_SIZE + EXT2_BGD_INODE_TABLE];
-			ext2_inode_table_blocks[g] = *group_inode_table;
+			uint* group_inode_table  = (uint*)&bgdt_scan_buf[d * EXT2_BGD_SIZE + EXT2_BGD_INODE_TABLE];
+			uint* group_block_bitmap = (uint*)&bgdt_scan_buf[d * EXT2_BGD_SIZE + EXT2_BGD_BLOCK_BITMAP];
+			uint* group_inode_bitmap = (uint*)&bgdt_scan_buf[d * EXT2_BGD_SIZE + EXT2_BGD_INODE_BITMAP];
+			ext2_inode_table_blocks[g]  = *group_inode_table;
+			ext2_block_bitmap_blocks[g] = *group_block_bitmap;
+			ext2_inode_bitmap_blocks[g] = *group_inode_bitmap;
 		}
 	}
 
@@ -579,24 +564,28 @@ fn void ext2_mount()
 	print("fsd: ext2 mounted, block_size=");
 	print_uint(ext2_block_size);
 	print(" inode_table_block=");
-	print_uint(ext2_inode_table_block);
+	print_uint(ext2_inode_table_blocks[0]);
 	print("\n");
 }
 
 // --- Write path -------------------------------------------------------
 
-// Decrements both copies of the free-block count (superblock's
-// s_free_blocks_count, group 0's own bg_free_blocks_count in the block
-// group descriptor) by one — called once per successful ext2_alloc_
-// block(). See EXT2_SB_FREE_BLOCKS_COUNT's own comment for why this
-// isn't just a cosmetic e2fsck complaint: a real Linux box's ext2
-// driver checks this at mount time and auto-remounts read-only if it's
-// wrong, found the hard way while testing on the actual boot card this
-// session. Two separate sector/block writes (superblock lives in a
-// fixed sector, the BGDT in a block) — same "each copy independently
-// read-modify-written" shape as fat32_write_fat_entry's multiple FAT
-// copies.
-fn bool ext2_dec_free_blocks()
+// Decrements both copies of the free-block count (superblock's global
+// s_free_blocks_count, and `group`'s own bg_free_blocks_count in the
+// block group descriptor table — not always group 0 anymore, since
+// ext2_alloc_block() below now allocates from any group) by one —
+// called once per successful allocation. See EXT2_SB_FREE_BLOCKS_
+// COUNT's own comment for why this isn't just a cosmetic e2fsck
+// complaint: a real Linux box's ext2 driver checks this at mount time
+// and auto-remounts read-only if it's wrong, found the hard way while
+// testing on the actual boot card this session. `group`'s own
+// descriptor can live in any of the (possibly several) BGDT blocks —
+// same `group / descriptors_per_block` / `group % descriptors_per_
+// block` math ext2_mount()'s own BGDT scan uses. Two separate sector/
+// block writes (superblock lives in a fixed sector, the BGDT in a
+// block) — same "each copy independently read-modify-written" shape
+// as fat32_write_fat_entry's multiple FAT copies.
+fn bool ext2_dec_free_blocks(uint group)
 {
 	char[SECTOR_SIZE] sb_sector @noinit;
 	if (!fs_read_sector(EXT2_SUPERBLOCK_SECTOR, &sb_sector)) return false;
@@ -604,16 +593,20 @@ fn bool ext2_dec_free_blocks()
 	*sb_free -= 1;
 	if (!fs_write_sector(EXT2_SUPERBLOCK_SECTOR, &sb_sector)) return false;
 
+	uint descriptors_per_block = ext2_block_size / EXT2_BGD_SIZE;
+	uint bgdt_block = ext2_first_data_block + 1 + (group / descriptors_per_block);
+	uint offset_in_block = (group % descriptors_per_block) * EXT2_BGD_SIZE + EXT2_BGD_FREE_BLOCKS_COUNT;
+
 	char[EXT2_MAX_BLOCK_SIZE] bgdt_buf @noinit;
-	if (!ext2_read_block(ext2_first_data_block + 1, &bgdt_buf)) return false;
-	ushort* bg_free = (ushort*)&bgdt_buf[EXT2_BGD_FREE_BLOCKS_COUNT];
+	if (!ext2_read_block(bgdt_block, &bgdt_buf)) return false;
+	ushort* bg_free = (ushort*)&bgdt_buf[offset_in_block];
 	*bg_free -= 1;
-	return ext2_write_block(ext2_first_data_block + 1, &bgdt_buf);
+	return ext2_write_block(bgdt_block, &bgdt_buf);
 }
 
 // Same shape as ext2_dec_free_blocks(), for inodes — called once per
 // successful ext2_alloc_inode().
-fn bool ext2_dec_free_inodes()
+fn bool ext2_dec_free_inodes(uint group)
 {
 	char[SECTOR_SIZE] sb_sector @noinit;
 	if (!fs_read_sector(EXT2_SUPERBLOCK_SECTOR, &sb_sector)) return false;
@@ -621,62 +614,75 @@ fn bool ext2_dec_free_inodes()
 	*sb_free -= 1;
 	if (!fs_write_sector(EXT2_SUPERBLOCK_SECTOR, &sb_sector)) return false;
 
+	uint descriptors_per_block = ext2_block_size / EXT2_BGD_SIZE;
+	uint bgdt_block = ext2_first_data_block + 1 + (group / descriptors_per_block);
+	uint offset_in_block = (group % descriptors_per_block) * EXT2_BGD_SIZE + EXT2_BGD_FREE_INODES_COUNT;
+
 	char[EXT2_MAX_BLOCK_SIZE] bgdt_buf @noinit;
-	if (!ext2_read_block(ext2_first_data_block + 1, &bgdt_buf)) return false;
-	ushort* bg_free = (ushort*)&bgdt_buf[EXT2_BGD_FREE_INODES_COUNT];
+	if (!ext2_read_block(bgdt_block, &bgdt_buf)) return false;
+	ushort* bg_free = (ushort*)&bgdt_buf[offset_in_block];
 	*bg_free -= 1;
-	return ext2_write_block(ext2_first_data_block + 1, &bgdt_buf);
+	return ext2_write_block(bgdt_block, &bgdt_buf);
 }
 
-// Linear scan of group 0's block bitmap for a clear bit. Marks it set
-// immediately, before returning it, closing the window where a second
-// allocation later in the same request could pick the same block twice
-// (same reasoning as fat32_alloc_cluster's own immediate-mark). Returns
-// 0 (never a valid block number — block 0 is always either unused or
-// the boot block, never allocatable) on "no free space" or any read/
-// write failure along the way.
+// Linear scan of every group's block bitmap, group 0 first, for a
+// clear bit — not group-0-only anymore, so this driver's own writes
+// aren't confined there as it fills up (see EXT2_MAX_GROUPS's own
+// comment). Marks it set immediately, before returning it, closing the
+// window where a second allocation later in the same request could
+// pick the same block twice (same reasoning as fat32_alloc_cluster's
+// own immediate-mark). Returns 0 (never a valid block number — block 0
+// is always either unused or the boot block, never allocatable) once
+// every group has been scanned with nothing free, or on any read/write
+// failure along the way.
 fn uint ext2_alloc_block()
 {
-	char[EXT2_MAX_BLOCK_SIZE] bitmap_buf @noinit;
-	if (!ext2_read_block(ext2_block_bitmap_block, &bitmap_buf)) return 0;
-
-	for (uint i = 0; i < ext2_blocks_per_group; i++)
+	for (uint group = 0; group < ext2_group_count; group++)
 	{
-		uint byte_i = i / 8;
-		uint bit_i = i % 8;
-		uint b = (uint)bitmap_buf[byte_i] & 0xFF;
-		if ((b & (1 << bit_i)) == 0)
+		char[EXT2_MAX_BLOCK_SIZE] bitmap_buf @noinit;
+		if (!ext2_read_block(ext2_block_bitmap_blocks[group], &bitmap_buf)) return 0;
+
+		for (uint i = 0; i < ext2_blocks_per_group; i++)
 		{
-			bitmap_buf[byte_i] = (char)(b | (1 << bit_i));
-			if (!ext2_write_block(ext2_block_bitmap_block, &bitmap_buf)) return 0;
-			if (!ext2_dec_free_blocks()) return 0;
-			return ext2_first_data_block + i;
+			uint byte_i = i / 8;
+			uint bit_i = i % 8;
+			uint b = (uint)bitmap_buf[byte_i] & 0xFF;
+			if ((b & (1 << bit_i)) == 0)
+			{
+				bitmap_buf[byte_i] = (char)(b | (1 << bit_i));
+				if (!ext2_write_block(ext2_block_bitmap_blocks[group], &bitmap_buf)) return 0;
+				if (!ext2_dec_free_blocks(group)) return 0;
+				return ext2_first_data_block + group * ext2_blocks_per_group + i;
+			}
 		}
 	}
 	return 0;
 }
 
-// Same shape as ext2_alloc_block(), against the inode bitmap. Returns a
-// 1-based inode number (0 = none free). Reserved inodes (1-10) are
-// already marked used by mke2fs at format time, so a plain first-clear-
-// bit scan naturally skips them — no special-cased reserved-inode-
-// number logic needed.
+// Same shape as ext2_alloc_block(), against every group's inode
+// bitmap. Returns a 1-based inode number (0 = none free). Reserved
+// inodes (1-10, group 0 only) are already marked used by mke2fs at
+// format time, so a plain first-clear-bit scan naturally skips them —
+// no special-cased reserved-inode-number logic needed.
 fn uint ext2_alloc_inode()
 {
-	char[EXT2_MAX_BLOCK_SIZE] bitmap_buf @noinit;
-	if (!ext2_read_block(ext2_inode_bitmap_block, &bitmap_buf)) return 0;
-
-	for (uint i = 0; i < ext2_inodes_per_group; i++)
+	for (uint group = 0; group < ext2_group_count; group++)
 	{
-		uint byte_i = i / 8;
-		uint bit_i = i % 8;
-		uint b = (uint)bitmap_buf[byte_i] & 0xFF;
-		if ((b & (1 << bit_i)) == 0)
+		char[EXT2_MAX_BLOCK_SIZE] bitmap_buf @noinit;
+		if (!ext2_read_block(ext2_inode_bitmap_blocks[group], &bitmap_buf)) return 0;
+
+		for (uint i = 0; i < ext2_inodes_per_group; i++)
 		{
-			bitmap_buf[byte_i] = (char)(b | (1 << bit_i));
-			if (!ext2_write_block(ext2_inode_bitmap_block, &bitmap_buf)) return 0;
-			if (!ext2_dec_free_inodes()) return 0;
-			return i + 1;
+			uint byte_i = i / 8;
+			uint bit_i = i % 8;
+			uint b = (uint)bitmap_buf[byte_i] & 0xFF;
+			if ((b & (1 << bit_i)) == 0)
+			{
+				bitmap_buf[byte_i] = (char)(b | (1 << bit_i));
+				if (!ext2_write_block(ext2_inode_bitmap_blocks[group], &bitmap_buf)) return 0;
+				if (!ext2_dec_free_inodes(group)) return 0;
+				return group * ext2_inodes_per_group + i + 1;
+			}
 		}
 	}
 	return 0;
@@ -730,17 +736,24 @@ fn bool ext2_write_inode(uint inode_num, Ext2_inode_info* info)
 // reads but a real ext2 tool would) would leak into the "new" file's
 // metadata. Parallels fat32_create_file's own "zero the reserved/date
 // fields on a reused deleted slot" correctness step.
+//
+// Group-aware, same as ext2_read_inode/ext2_write_inode: now that
+// ext2_alloc_inode() scans every group, the inode it just allocated
+// isn't guaranteed to be in group 0 anymore.
 fn bool ext2_zero_inode(uint inode_num)
 {
-	uint index = inode_num - 1;
-	uint byte_offset_in_table = index * ext2_inode_size;
+	uint group = (inode_num - 1) / ext2_inodes_per_group;
+	if (group >= ext2_group_count) return false;
+	uint index_in_group = (inode_num - 1) % ext2_inodes_per_group;
+
+	uint byte_offset_in_table = index_in_group * ext2_inode_size;
 	uint block_offset = byte_offset_in_table / ext2_block_size;
 	uint offset_in_block = byte_offset_in_table % ext2_block_size;
 
 	char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
-	if (!ext2_read_block(ext2_inode_table_block + block_offset, &block_buf)) return false;
+	if (!ext2_read_block(ext2_inode_table_blocks[group] + block_offset, &block_buf)) return false;
 	for (uint i = 0; i < ext2_inode_size; i++) block_buf[offset_in_block + i] = 0;
-	return ext2_write_block(ext2_inode_table_block + block_offset, &block_buf);
+	return ext2_write_block(ext2_inode_table_blocks[group] + block_offset, &block_buf);
 }
 
 // Creates a new, empty (zero-size) inode for `name` and links it into
