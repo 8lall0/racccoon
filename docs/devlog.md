@@ -4,6 +4,58 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-19 (14) — Real preemptive scheduling
+
+Built directly on the `sepc`-per-process fix (previous entry): the
+timer interrupt now actually forces a reschedule instead of only
+firing and returning to whatever was running.
+
+**The change**: in `handle_trap`'s `SCAUSE_SUPERVISOR_TIMER` case, after
+rearming, call `yield()` — but only when `current_proc.pid > 0`.
+
+**Why the `pid > 0` guard, specifically**: `enable_timer_interrupts()`
+runs early in `kernel_main`, so the timer is live for the rest of boot
+— including `kernel_main`'s own sequence of `create_process()` calls
+for echod/diskd/sdd/fsd/fsd2, all of which run as `current_proc ==
+idle_proc` (pid 0) and are not reentrant (interleaving two
+`create_process()`/`alloc_pages()` calls has no protection against
+corrupting shared allocator/process-table state). Excluding pid 0
+sidesteps that hazard entirely, and costs nothing: idle's own post-boot
+loop already calls `yield()` every iteration on its own, so forcing
+another one on top adds no benefit.
+
+**Why real processes (pid > 0) need no equivalent guard**: established
+directly by this session's own interrupt-latency finding (previous
+entry, and the comment above `enable_timer_interrupts()`) — a timer
+interrupt can only ever land during genuine, uninterrupted user-mode
+execution, never inside a trap's own kernel-mode handling (`sstatus.SIE`
+stays hardware-cleared for a trap's entire duration, regardless of how
+many `yield()`-driven `switch_context()` calls happen inside it while
+waiting on a blocking syscall). So `SYS_IPC_SEND`'s multi-step
+bookkeeping, mid-page-table-edit code, and every other piece of kernel
+state this codebase has never needed to guard against concurrent
+access — none of it is ever what gets preempted. What's actually being
+interrupted is always plain, isolated user-mode execution, which
+`yield()` was already safe to call from at any point.
+
+**Verified deliberately harder than a single boot**: full QEMU
+regression suite once (`hello`/`readfile`/`writefile`/`newfile`/
+`deletetest`/`rmdirtest`/`protectedwrite`/`ping`/`nstest`/`rforktest`/
+`sandboxtest`/`threadjointest`/`racetest` x4 — all correct), then 30
+additional full boots under randomized real preemption timing (each
+running `racetest` x5, `rforktest`, `sandboxtest`, `threadjointest`,
+`writefile`+`readfile`), checked for `unexpected trap`/`PANIC`, hangs,
+and specifically race corruption (`racetest` reporting anything other
+than `a=1 b=1`) — 30/30 clean. Real Duo hardware: clean boot through
+disk/fs mount, then `racetest` x4, `rforktest`, `sandboxtest` all
+correct, matching QEMU exactly.
+
+**Files changed:** `src/entry.c3` (`handle_trap`'s
+`SCAUSE_SUPERVISOR_TIMER` case gains the `yield()` call; the comment
+block above `enable_timer_interrupts()` rewritten to describe the now-
+real preemption instead of the deliberately-deferred slice from the
+previous session).
+
 ## 2026-08-19 (13) — Real preemption's first prerequisite: sepc needed to become per-process state
 
 First real design step toward actual preemptive scheduling (the

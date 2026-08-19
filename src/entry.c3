@@ -177,20 +177,21 @@ const SIE_STIE = (1 << 5); // sie: supervisor timer interrupt enable
 // session's own verification used it directly — see docs/devlog.md).
 ulong timer_tick_count = 0;
 
-// Narrow first slice of real preemptive-scheduling support (see
-// docs/devlog.md): proves the sstc timer interrupt mechanism itself —
-// fires, correctly re-arms, and returns cleanly to whatever was
-// running — without yet forcing a context switch on each tick. Actual
-// preemption (yield()-ing from inside a timer interrupt) is real,
-// separate, higher-risk work: unlike every existing yield() point,
-// which only ever happens at a caller-chosen, known-safe moment, a
-// timer interrupt can land in the middle of *anything* — including
-// kernel state this codebase has never needed to guard against
-// concurrent access before (SYS_IPC_SEND's own multi-step bookkeeping,
-// mid-page-table-edit, etc.) — deliberately not attempted here.
+// Real preemptive-scheduling support (see docs/devlog.md): the sstc
+// timer interrupt fires, re-arms, and — for real processes — forces a
+// reschedule via yield() (see the SCAUSE_SUPERVISOR_TIMER case in
+// handle_trap below) instead of only ever returning to whatever was
+// running. This is safe specifically because of where a timer
+// interrupt can land: unlike a hand-placed yield() call (always at a
+// caller-chosen, already-safe moment), an interrupt can in principle
+// land in the middle of *anything* — but the interrupt-latency
+// characteristic below establishes it can only ever land during
+// genuine user-mode execution, never mid-syscall kernel bookkeeping
+// (SYS_IPC_SEND's own multi-step state updates, mid-page-table-edit,
+// etc.), so no new concurrent-access hazard is introduced there.
 //
 // Real interrupt-latency characteristic found while verifying this,
-// directly relevant to that future work: SYS_GETCHAR (and SYS_IPC_RECV,
+// and exactly why the above is safe: SYS_GETCHAR (and SYS_IPC_RECV,
 // SYS_JOIN's poll loop — every *blocking* syscall in this kernel)
 // busy-loops with yield() *inside its own still-open trap*, never
 // reaching sret until its condition is met. Hardware auto-clears
@@ -204,10 +205,22 @@ ulong timer_tick_count = 0;
 // left idle, a timer armed for ~1s out didn't actually fire until
 // whenever the next keystroke arrived, sometimes many seconds later;
 // with the shell kept continuously busy (no idle GETCHAR wait), it
-// fired reliably every ~1s as armed. Not a bug in this mechanism — an
-// architectural fact worth knowing before assuming a timer-interrupt-
-// based preemptive scheduler would actually preempt a process stuck in
-// one of these loops; it wouldn't, for the exact same reason.
+// fired reliably every ~1s as armed. Direct consequence: a timer
+// interrupt can only ever land during genuine, uninterrupted user-mode
+// execution — never inside any trap's own kernel-mode handling,
+// regardless of how many yield()-driven switches happen inside it —
+// which is what makes forcing a reschedule from this handler safe
+// without any new locking.
+//
+// The other half of that safety — current_proc.pid > 0 in the
+// SCAUSE_SUPERVISOR_TIMER case below — excludes idle_proc (pid 0),
+// which covers two cases the argument above doesn't: kernel_main's own
+// boot-time sequence (create_process/alloc_pages for echod/diskd/fsd/
+// etc — real S-mode kernel code, not user-mode, and not reentrant —
+// running with interrupts already on, since this function is called
+// early in kernel_main), and idle's own post-boot respawn loop (which
+// already calls yield() every iteration on its own, so forcing another
+// one adds no benefit, only risk).
 fn void enable_timer_interrupts()
 {
 	// Arm *before* enabling sie.STIE, not after: stimecmp's reset value
@@ -1011,11 +1024,18 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 			// actually clears the pending interrupt (time < stimecmp
 			// again), so leaving the old, already-elapsed value in
 			// place would refire the instant interrupts are next
-			// enabled — an interrupt storm, not a periodic tick. No
-			// context switch here — see enable_timer_interrupts()'s
-			// own comment for why not yet.
+			// enabled — an interrupt storm, not a periodic tick.
 			arm_timer(board::TIMEBASE_HZ);
 			timer_tick_count += 1;
+
+			// Real preemption: force a reschedule on every tick, not
+			// just when a process happens to yield() on its own. See
+			// enable_timer_interrupts()'s own comment above for why
+			// this is safe and why it's gated on pid > 0.
+			if (current_proc.pid > 0)
+			{
+				yield();
+			}
 		}
 		// No sepc adjustment for interrupts: unlike ecall (which must skip
 		// past the trapping instruction), the hardware already points sepc
