@@ -1334,6 +1334,13 @@ fn void main() @export("main") {
             // hardware, or QEMU's own scripts/launch64_dual.sh), the
             // same convention readfile2/newfile2/etc. already use.
             fs_write("/2/owner_only.txt", "root content", 12);
+            // A real two-entry tree, not a bare empty dir — an empty
+            // dir wouldn't exercise ext2_delete_dir_contents' own child
+            // walk at all, so wouldn't actually prove recursive-delete
+            // ownership enforcement (see ext2_delete_recursive's own
+            // comment).
+            fs_mkdir("/2/owner_only_dir");
+            fs_write("/2/owner_only_dir/inner.txt", "root content", 12);
 
             uint fp_gen = 0;
             int fp_r = rfork(RFPROC, &fp_gen);
@@ -1364,6 +1371,16 @@ fn void main() @export("main") {
                 print("fspermtest: delete own file ");
                 print(fp_del2 >= 0 ? "ok\n" : "FAILED\n");
 
+                int fp_delr1 = fs_delete_recursive("/2/owner_only_dir");
+                print("fspermtest: recursive-delete root-owned dir as non-owner ");
+                print(fp_delr1 < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
+
+                fs_mkdir("/2/attacker_owned_dir");
+                fs_write("/2/attacker_owned_dir/inner.txt", "mine", 4);
+                int fp_delr2 = fs_delete_recursive("/2/attacker_owned_dir");
+                print("fspermtest: recursive-delete own dir ");
+                print(fp_delr2 >= 0 ? "ok\n" : "FAILED\n");
+
                 exit();
             } else {
                 join(fp_r, fp_gen);
@@ -1373,10 +1390,19 @@ fn void main() @export("main") {
                 if (fp_len >= 0) fp_readback[fp_len] = 0;
                 bool fp_intact = fp_len == 12 && strcmp(&fp_readback, "root content") == 0;
 
+                char[32] fp_dir_readback @noinit;
+                int fp_dir_len = fs_read("/2/owner_only_dir/inner.txt", &fp_dir_readback, 32);
+                if (fp_dir_len >= 0) fp_dir_readback[fp_dir_len] = 0;
+                bool fp_dir_intact = fp_dir_len == 12 && strcmp(&fp_dir_readback, "root content") == 0;
+
                 int fp_write_root = fs_write("/2/owner_only.txt", "root content v2", 16);
                 int fp_del_root = fs_delete("/2/owner_only.txt");
+                // Root's own legitimate recursive-delete path, exercising
+                // requester_uid == 0 still working unchanged through the
+                // new checks — also this test's own cleanup.
+                int fp_delr_root = fs_delete_recursive("/2/owner_only_dir");
 
-                if (fp_intact && fp_write_root >= 0 && fp_del_root >= 0) {
+                if (fp_intact && fp_dir_intact && fp_write_root >= 0 && fp_del_root >= 0 && fp_delr_root >= 0) {
                     print("fspermtest: ok\n");
                 } else {
                     print("fspermtest: FAILED\n");

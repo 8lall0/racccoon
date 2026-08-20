@@ -4,6 +4,62 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (47) — ext2 recursive-delete ownership enforcement
+
+Closes a gap the real ext2 permissions feature (entry 43) deliberately
+left open: `ext2_write`/`ext2_delete` both gate overwriting/deleting an
+*existing* file on `requester_uid` vs. the target's own `i_uid`/`IWUSR`/
+`IWOTH` bits, but `ext2_delete_recursive` (and its own helper
+`ext2_delete_dir_contents`) took no `requester_uid` at all — a non-root,
+non-owner process could `rm -r` an entire subtree it didn't own,
+including files it individually couldn't touch via plain `deletetest`.
+
+**Fix**: both now take `requester_uid`. `ext2_delete_recursive` checks it
+against the top-level target the same way `ext2_delete` already does;
+`ext2_delete_dir_contents` checks it against *every child it walks*,
+right after that child's own inode read and before anything destructive
+happens to it — same placement discipline the existing protected-entry
+check right above it already uses. Same caveat that existing check
+already has, not a new one introduced here: entries encountered earlier
+in the same directory, or already recursed into, may already be gone by
+the time a denied entry is hit deeper in the tree.
+
+The root/owner/other check itself was about to be duplicated a 3rd and
+4th time on top of the two copies already in `ext2_write`/`ext2_delete`
+— factored into one shared `ext2_write_allowed(inode, requester_uid)`
+helper, with those two existing call sites refactored to use it too (no
+behavior change there, same bits, same semantics).
+
+`user/fsd.c3`'s `FS_DELETE` dispatch now looks up `requester_uid` once
+and passes it to either `ext2_delete`/`ext2_delete_recursive`, instead of
+only the non-recursive branch doing the lookup.
+
+**Test coverage**: `fspermtest` (`user/shell.c3`) extended with two more
+sub-checks in the same setuid(42) child — real two-entry trees via
+`fs_mkdir`+`fs_write` (a bare empty dir wouldn't exercise the child walk
+at all): recursive-deleting a root-owned tree as non-owner (must fail),
+then creating, writing into, and recursive-deleting its *own* tree (must
+all succeed) — same "denied on someone else's, works on your own" shape
+the existing non-recursive sub-checks already establish. Root's own
+cleanup at the end uses `fs_delete_recursive` too, confirming
+`requester_uid == 0` still works unchanged through the new checks.
+
+**Verification**: full regression suite on all three QEMU images —
+`rmrtest` (existing plain recursive-delete test, run as root) unaffected
+on the single-mount images; it fails on the dual-mount image, but that's
+a pre-existing fixture gap (`nestdir` was never seeded onto that image's
+ext2 half, same class of gap entry 45 already flagged for that image's
+FAT32 half), not a regression. Three-boot stress batch, `e2fsck -n -f`
+clean on both ext2 images.
+
+**Real Milk-V Duo hardware confirmation**: `fspermtest: ok` against real
+`EXT2TEST`, including both new recursive-delete sub-checks, `lsproc`
+clean afterward.
+
+**Files changed:** `user/fs/ext2.c3`, `user/fsd.c3`, `user/shell.c3`.
+
+---
+
 ## 2026-08-21 (46) — exec() ext2 chunked-read caching
 
 Follow-up to the previous entry's own flagged issue: `exec()`

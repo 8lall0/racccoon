@@ -1272,6 +1272,21 @@ fn uint ext2_write_file(Ext2_inode_info* inode, char* src, uint len)
 	return bytes_written;
 }
 
+// Shared root/owner/other write-permission check — root, the target's
+// own owner (subject to EXT2_S_IWUSR), or anyone else if EXT2_S_IWOTH
+// allows it. No group bit checked, racccoon's own process-uid model has
+// no group concept. Used by ext2_write/ext2_delete (overwrite/delete of
+// an existing entry) and ext2_delete_recursive/ext2_delete_dir_contents
+// (the same check, once per entry the recursion actually touches) — one
+// shared check rather than four copies of correctness-critical logic.
+fn bool ext2_write_allowed(Ext2_inode_info* inode, uint requester_uid)
+{
+	if (requester_uid == 0) return true;
+	return (requester_uid == inode.uid)
+		? (inode.mode & EXT2_S_IWUSR) != 0
+		: (inode.mode & EXT2_S_IWOTH) != 0;
+}
+
 // Entry point dispatched from fsd.c3's main() for FS_WRITE. Only ever
 // called once fsd.c3's own fs_is_protected_name() check has already
 // passed, so no protected-name check here — but fs_is_protected_entry()
@@ -1326,13 +1341,7 @@ fn int ext2_write(char* name, char* src, uint len, uint requester_uid)
 	Ext2_inode_info inode;
 	if (!ext2_read_inode(inode_num, &inode)) return -1;
 
-	if (exists && requester_uid != 0)
-	{
-		bool allowed = (requester_uid == inode.uid)
-			? (inode.mode & EXT2_S_IWUSR) != 0
-			: (inode.mode & EXT2_S_IWOTH) != 0;
-		if (!allowed) return -1;
-	}
+	if (exists && !ext2_write_allowed(&inode, requester_uid)) return -1;
 
 	uint written = ext2_write_file(&inode, src, len);
 	inode.size = written;
@@ -1424,13 +1433,7 @@ fn int ext2_delete(char* name, uint requester_uid)
 	Ext2_inode_info inode;
 	if (!ext2_read_inode(inode_num, &inode)) return -1;
 
-	if (requester_uid != 0)
-	{
-		bool allowed = (requester_uid == inode.uid)
-			? (inode.mode & EXT2_S_IWUSR) != 0
-			: (inode.mode & EXT2_S_IWOTH) != 0;
-		if (!allowed) return -1;
-	}
+	if (!ext2_write_allowed(&inode, requester_uid)) return -1;
 
 	bool is_dir = (mode & EXT2_S_IFDIR) != 0;
 	if (is_dir && !ext2_dir_is_empty(&inode)) return -1;
@@ -1495,8 +1498,16 @@ const int EXT2_MAX_DELETE_DEPTH = 32;
 // ext2_delete's non-recursive path already does for the single
 // directory it removes, done here once per removed subdirectory
 // instead of once total). depth is the same recursion bound
-// fat32_delete_dir_contents uses.
-fn bool ext2_delete_dir_contents(uint dir_inode_num, int depth)
+// fat32_delete_dir_contents uses. requester_uid is checked against
+// every child this walks (ext2_write_allowed), same root/owner/other
+// rule ext2_delete's own non-recursive path already enforces — placed
+// right after each child's own inode read, before anything destructive
+// happens to it, mirroring the protected-entry check one line above it.
+// Same caveat that check already has: entries encountered earlier in
+// this directory, or already recursed into, may already be gone by the
+// time a denied entry is hit deeper in the tree — an existing property
+// of this function, not a new one.
+fn bool ext2_delete_dir_contents(uint dir_inode_num, int depth, uint requester_uid)
 {
 	if (depth >= EXT2_MAX_DELETE_DEPTH) return false;
 
@@ -1537,11 +1548,12 @@ fn bool ext2_delete_dir_contents(uint dir_inode_num, int depth)
 
 					Ext2_inode_info child;
 					if (!ext2_read_inode(child_inode_num, &child)) return false;
+					if (!ext2_write_allowed(&child, requester_uid)) return false;
 					bool child_is_dir = (child.mode & EXT2_S_IFDIR) != 0;
 
 					if (child_is_dir)
 					{
-						if (!ext2_delete_dir_contents(child_inode_num, depth + 1)) return false;
+						if (!ext2_delete_dir_contents(child_inode_num, depth + 1, requester_uid)) return false;
 
 						// child.block[] (read above, before recursing)
 						// stays accurate: the recursive call only ever
@@ -1584,8 +1596,14 @@ fn bool ext2_delete_dir_contents(uint dir_inode_num, int depth)
 // (checked by ext2_delete_dir_contents for every child, and here for
 // the target itself) aborts the whole operation before anything is
 // freed — never a partial delete that silently skips just the
-// protected part.
-fn int ext2_delete_recursive(char* name)
+// protected part. requester_uid is checked against the top-level
+// target here, and against every child ext2_delete_dir_contents itself
+// touches — closes the gap ext2_delete's own non-recursive ownership
+// check (this file's earlier permission entry) deliberately left open:
+// a non-owner could previously delete an entire subtree via this path
+// even though the same non-owner couldn't touch any single file in it
+// through plain ext2_delete.
+fn int ext2_delete_recursive(char* name, uint requester_uid)
 {
 	ext2_cache_valid = false; // see ext2_cache_path's own comment
 	uint dir_inode;
@@ -1601,13 +1619,14 @@ fn int ext2_delete_recursive(char* name)
 
 	Ext2_inode_info inode;
 	if (!ext2_read_inode(inode_num, &inode)) return -1;
+	if (!ext2_write_allowed(&inode, requester_uid)) return -1;
 
 	bool is_dir = (mode & EXT2_S_IFDIR) != 0;
 	if (is_dir)
 	{
 		// inode.block[] (read above) stays accurate across this call —
 		// see ext2_delete_dir_contents' own matching comment.
-		if (!ext2_delete_dir_contents(inode_num, 0)) return -1;
+		if (!ext2_delete_dir_contents(inode_num, 0, requester_uid)) return -1;
 	}
 
 	char[SECTOR_SIZE] sector_buf @noinit;

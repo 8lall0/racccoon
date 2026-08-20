@@ -442,21 +442,16 @@ fn void main() @export("main")
 				}
 				else if (fs_type == FS_TYPE_EXT2)
 				{
+					// Same requester-uid lookup either way — see
+					// FS_WRITE's own ext2 branch for why.
+					uint requester_uid = 0xFFFFFFFF;
+					proc_info(from, null, null, (int*)&requester_uid);
 					if (recursive)
 					{
-						// Unchanged, explicit v1 scope — see
-						// ext2_delete's own comment for why enforcing
-						// this correctly here would need checking every
-						// file the recursion touches, not just the
-						// top-level target.
-						result = ext2_delete_recursive(&filename);
+						result = ext2_delete_recursive(&filename, requester_uid);
 					}
 					else
 					{
-						// Same requester-uid lookup as FS_WRITE's own
-						// ext2 branch, same reasoning — see its comment.
-						uint requester_uid = 0xFFFFFFFF;
-						proc_info(from, null, null, (int*)&requester_uid);
 						result = ext2_delete(&filename, requester_uid);
 					}
 				}
