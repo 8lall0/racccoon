@@ -58,6 +58,20 @@ LLC=${LLC:-llc}
   # runtest/argvtest/pathtest keep using the flat binary unchanged.
   mcopy -i build/disk.img build/user/echod.elf ::bin/echod.elf
 
+  # bigfile.bin — deterministic byte[i] = i % 256 pattern, 300000 bytes,
+  # genuinely past ext2's own single-indirect reach even at the smallest
+  # 1024-byte block size used below (12 + 256 = 268 blocks = 268KB) —
+  # exercises user/fs/ext2.c3's double-indirect block support
+  # (ext2_resolve_block/ext2_resolve_leaf, see docs/devlog.md). Shared
+  # by both ext2 images below (single-mount and dual-mount) rather than
+  # regenerated twice. Generated at build time, not committed — this
+  # project's own disk-ext2/ fixtures are small, hand-authored text
+  # files; a 300KB generated binary belongs in build/ like every other
+  # generated image, not in version control. The pattern is
+  # independently recomputable by shell.c3's own bigreadtest, which
+  # never needs to read this exact file back to know what to expect.
+  python3 -c "import sys; sys.stdout.buffer.write(bytes(i % 256 for i in range(300000)))" > build/bigfile_fixture.bin
+
   echo "==> Building disk image (ext2, for scripts/launch64_ext2.sh)..."
   # Additional, not a replacement — build/disk.img (FAT32) above stays
   # the default image every other script/test uses. This one exists
@@ -93,6 +107,7 @@ LLC=${LLC:-llc}
   debugfs -w -R "mkdir bin" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_ext2.img > /dev/null
+  debugfs -w -R "write build/bigfile_fixture.bin bigfile.bin" build/disk_ext2.img > /dev/null
 
   echo "==> Building disk image (dual FAT32+ext2, for scripts/launch64_dual.sh)..."
   # Third test image — exercises fsd/fsd2 mounting two filesystems at once
@@ -133,6 +148,10 @@ LLC=${LLC:-llc}
   debugfs -w -R "mkdir bin" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_ext2_part.img > /dev/null
+  # bigfile.bin — same double-indirect-block fixture as the single-mount
+  # ext2 image above, needed here too since bigreadtest always targets
+  # "/2/bigfile.bin" (unambiguous, same reasoning as bin/echod above).
+  debugfs -w -R "write build/bigfile_fixture.bin bigfile.bin" build/disk_dual_ext2_part.img > /dev/null
   dd if=build/disk_dual_ext2_part.img of=build/disk_dual.img bs=512 seek=18432 conv=notrunc status=none
   rm -f build/disk_dual_ext2_part.img
 

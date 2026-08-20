@@ -4,6 +4,106 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (48) — ext2: double- and triple-indirect block support (read-only)
+
+Extends `ext2_resolve_block` (`user/fs/ext2.c3`) past its previous
+direct-blocks-plus-single-indirect reach (`i_block[0..11]` +
+`i_block[12]`, capped at `12 + block_size/4` blocks — 268KB at QEMU's
+1024-byte blocks) to walk all three levels the ext2 spec actually
+defines: `i_block[13]` (double-indirect) and `i_block[14]`
+(triple-indirect). Read-only, matching this file's own existing v1
+write scope (`ext2_write` stays direct-blocks-only, unaffected) —
+confirmed before writing any code that `ext2_write_inode` already
+preserves `i_block[12..14]` untouched across any existing write path
+(it patches specific fields into a block read fresh from disk each
+time, never reconstructing the record from scratch), so this needed no
+write-side changes at all to stay correct.
+
+**Design**: `Ext2_inode_info` gains `double_indirect_block`/
+`triple_indirect_block`. The old two-param cache (`char*`+`bool*`,
+good for exactly one indirect block) is replaced by a new
+`Ext2_block_cache` struct with independently-tracked slots for the
+leaf level (shared by single/double/triple — whichever leaf a given
+read is currently walking), the double/triple "top" pointer blocks
+(loaded once, constant for a file), and triple-indirect's own middle
+level. Identity-tracked by physical block number (`0xFFFFFFFF` sentinel
+for "not loaded yet," matching this project's own established
+fail-closed-sentinel convention) rather than a bare loaded bool,
+because — unlike the old single-indirect case — a read walking
+double/triple indirect crosses into genuinely different leaf/mid
+blocks as it advances, and `0` is itself a legitimate cached value (a
+sparse hole's all-zero leaf), so a bool alone couldn't tell "nothing
+loaded" from "loaded, and it's the hole." A shared `ext2_resolve_leaf`
+helper does the actual "load or reuse, zero-fill on a hole" work for
+every level. Stack cost checked, not assumed: 4 buffers × 4096 bytes =
+16KB, comfortably inside `fsd`'s own 64KB process stack alongside the
+caller's existing 4KB block buffer.
+
+In practice this driver's own 32-bit `i_size` (no `i_size_high`) already
+caps any representable file at 4GB, well below what triple-indirect
+alone can address — the new ceiling is a completeness property of the
+implementation, not something any real file on this project could ever
+approach.
+
+**Test coverage**: no existing fixture was big enough to exercise this
+(`echod` is ~70KB, well within the old single-indirect reach). Added
+`bigfile.bin` — a 300000-byte, deterministically-generated
+(`byte[i] = i % 256`) fixture seeded into both ext2 QEMU images
+(`scripts/build.sh`, via a small `python3` one-liner rather than a
+committed binary), genuinely past single-indirect reach at 1024-byte
+blocks. New `bigreadtest` (`user/shell.c3`) reads it via `fs_read_at` in
+1024-byte chunks (same shape `exec()`'s own loop uses) into a new
+global buffer (300KB — too big for a stack local, same reasoning
+`run_exec_buf` already established), then verifies *every byte*
+against the known pattern rather than just checking the read
+"succeeded" — a wrong block resolution would still return real,
+on-disk bytes, just the wrong ones, so only a full content check
+actually proves correctness. Targets `/2/bigfile.bin` unconditionally
+(same reasoning `fspermtest`'s own header comment already established
+for why an unprefixed path can't be trusted).
+
+Triple-indirect's own arithmetic has no dedicated fixture — a file that
+size isn't practical to generate or store for this project. Verified by
+code review and by sharing the exact same `ext2_resolve_leaf`/cache
+machinery double-indirect's own fixture exercises, rather than an
+end-to-end test — a real, accepted verification gap, stated plainly
+rather than silently assumed away.
+
+**Verification**: `bigreadtest: ok` on the dual-mount QEMU image (where
+`/2/` genuinely reaches ext2); correctly `FAILED` on the single-mount
+ext2 image (mount 2 is inactive there, same pre-existing precedent
+`fspermtest` already established, not a regression). Full regression
+suite on all three QEMU images unaffected by the signature change
+(`ext2_resolve_block`'s callers both updated), three-boot stress batch,
+`e2fsck -n -f` clean on both ext2 images.
+
+`bigreadtest` also gained better failure diagnostics along the way
+(reports whether the read itself failed vs. returned the wrong byte
+count vs. a specific mismatched offset, instead of a bare "FAILED") —
+needed for real: the first real-hardware run failed, and it turned out
+to be the exact same class of issue found twice already this session
+(entries 45/46's own `seed_ext2test_bin.sh` story) — `bigfile.bin`
+wasn't actually on the device, this time because the SD card's mount
+had simply dropped between seeding and testing, not a mountpoint-naming
+issue. The better diagnostics didn't end up needed to *find* that (a
+`findmnt`/`debugfs` check from the host caught it directly), but stay in
+the test now that they exist.
+
+**Real Milk-V Duo hardware confirmation**: `bigreadtest: ok` against
+real `EXT2TEST` (4096-byte blocks — genuinely different `N` than either
+QEMU image, confirming the arithmetic generalizes for real, not just on
+paper), `lsproc` clean afterward. At this block size the 300KB fixture
+actually stays within single-indirect reach (`12 + 1024 = 1036` blocks
+≈ 4.2MB) — this run exercises the refactored single-indirect path
+(now going through the shared `ext2_resolve_leaf` helper) for real, not
+double-indirect specifically; double-indirect itself was confirmed on
+QEMU's 1024-byte-block images, where the same 300KB fixture genuinely
+exceeds single-indirect's much smaller reach there.
+
+**Files changed:** `user/fs/ext2.c3`, `user/shell.c3`, `scripts/build.sh`.
+
+---
+
 ## 2026-08-21 (47) — ext2 recursive-delete ownership enforcement
 
 Closes a gap the real ext2 permissions feature (entry 43) deliberately

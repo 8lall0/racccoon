@@ -20,6 +20,14 @@ int thread_result = 0;
 const int RUN_EXEC_BUF_MAX = 262144;
 char[RUN_EXEC_BUF_MAX] run_exec_buf;
 
+// bigreadtest's own receive buffer (below) — global for the same reason
+// run_exec_buf above is: 300000 bytes is well past what this process's
+// own stack (STACK_SIZE, src/process.c3) could hold as a local. Sized
+// to exactly match BIGFILE_SIZE, the fixture size scripts/build.sh
+// seeds bigfile.bin at.
+const int BIGFILE_SIZE = 300000;
+char[BIGFILE_SIZE] bigread_buf;
+
 fn void thread_body(void* arg) {
     thread_result = 99;
     print("thread: running on my own stack, wrote thread_result\n");
@@ -1407,6 +1415,59 @@ fn void main() @export("main") {
                 } else {
                     print("fspermtest: FAILED\n");
                 }
+            }
+        } else if (strcmp(cmd, "bigreadtest") == 0) {
+            // Exercises ext2's double-indirect block support
+            // (user/fs/ext2.c3's ext2_resolve_block/ext2_resolve_leaf):
+            // bigfile.bin (scripts/build.sh, BIGFILE_SIZE bytes,
+            // byte[i] = i % 256) is genuinely past single-indirect
+            // reach even at QEMU's own smallest 1024-byte block size
+            // (12 + 256 = 268 blocks = 268KB; this fixture is 300KB) —
+            // the first file this driver has ever been asked to read
+            // that far. "/2/" prefix, unambiguous on real hardware —
+            // same reasoning fspermtest's own header comment already
+            // established. Reads via fs_read_at in chunks, same shape
+            // exec()'s own loop uses (user/user.c3), then verifies
+            // every single byte against the known pattern — not just
+            // that some plausible-looking bytes came back, since a
+            // wrong block resolution would still return real, on-disk
+            // bytes, just the wrong ones, and any single wrong block
+            // anywhere in the file is instantly detectable this way.
+            uint br_total = 0;
+            bool br_read_ok = true;
+            for (;;) {
+                if (br_total >= (uint)BIGFILE_SIZE) break;
+                int br_chunk = (int)((uint)BIGFILE_SIZE - br_total);
+                if (br_chunk > 1024) br_chunk = 1024;
+                int br_got = fs_read_at("/2/bigfile.bin", &bigread_buf[br_total], br_chunk, br_total);
+                if (br_got < 0) { br_read_ok = false; break; }
+                if (br_got == 0) break;
+                br_total += (uint)br_got;
+            }
+
+            uint br_mismatch_at = (uint)BIGFILE_SIZE; // sentinel: no mismatch found
+            bool br_content_ok = br_read_ok && br_total == (uint)BIGFILE_SIZE;
+            if (br_content_ok) {
+                for (uint br_i = 0; br_i < (uint)BIGFILE_SIZE; br_i++) {
+                    if ((char)(br_i % 256) != bigread_buf[br_i]) { br_content_ok = false; br_mismatch_at = br_i; break; }
+                }
+            }
+
+            print("bigreadtest: ");
+            if (br_content_ok) {
+                print("ok\n");
+            } else {
+                print("FAILED (read_ok=");
+                print(br_read_ok ? "1" : "0");
+                print(" total=");
+                print_uint(br_total);
+                print("/");
+                print_uint((uint)BIGFILE_SIZE);
+                if (br_mismatch_at != (uint)BIGFILE_SIZE) {
+                    print(" first_mismatch_at=");
+                    print_uint(br_mismatch_at);
+                }
+                print(")\n");
             }
         } else if (strcmp(cmd, "rforktest") == 0) {
             // Plain rfork(RFPROC): the child gets an independent copy of

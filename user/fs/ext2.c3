@@ -9,13 +9,16 @@ import std::nolibc::mem;
 //
 // v1 scope, deliberately limited:
 //   - Reading (ext2_read/ext2_read_at) walks direct block pointers
-//     (i_block[0..11]) plus one level of single-indirect (i_block[12] —
-//     see ext2_resolve_block's own comment) — double/triple indirect
-//     are NOT walked. At this project's own 1024-byte block size that's
-//     12 + 256 = 268 blocks (268KB), comfortably past racccoon's own
-//     ~70KB binaries. A file needing more than that reads back short,
-//     same "return however many bytes were actually reachable"
-//     discipline fat32_read_file uses for a broken chain, not an error.
+//     (i_block[0..11]) plus all three levels of indirection (i_block[12],
+//     [13], [14] — see ext2_resolve_block's own comment). In practice
+//     this covers any file this driver could ever be asked to read: its
+//     own 32-bit i_size already caps a representable file at 4GB, far
+//     below what triple-indirect alone can address. A file needing more
+//     than that (impossible given the i_size cap, but see
+//     ext2_resolve_block's own comment for the exact boundary) reads
+//     back short, same "return however many bytes were actually
+//     reachable" discipline fat32_read_file uses for a broken chain, not
+//     an error.
 //   - Writing (ext2_write, below) stays direct-blocks-only (i_block[0..11]) —
 //     nothing in this project's own test suite writes a file bigger
 //     than 12 blocks, so single-indirect write support isn't attempted
@@ -206,6 +209,8 @@ struct Ext2_inode_info
 	uint blocks;       // see EXT2_INODE_BLOCKS's own comment — 512-byte sectors, not ext2_block_size blocks
 	uint[12] block; // direct block pointers
 	uint indirect_block; // i_block[12] — see ext2_resolve_block's own comment
+	uint double_indirect_block; // i_block[13] — see ext2_resolve_block's own comment
+	uint triple_indirect_block; // i_block[14] — see ext2_resolve_block's own comment
 }
 
 fn bool ext2_probe()
@@ -282,52 +287,155 @@ fn bool ext2_read_inode(uint inode_num, Ext2_inode_info* out)
 	uint* block_ptrs = (uint*)&inode_bytes[EXT2_INODE_BLOCK];
 	mem::copy(&out.block, block_ptrs, 48); // 12 uint (4 bytes each) direct block pointers
 	out.indirect_block = block_ptrs[12]; // i_block[12] — see ext2_resolve_block's own comment
+	out.double_indirect_block = block_ptrs[13]; // i_block[13] — see ext2_resolve_block's own comment
+	out.triple_indirect_block = block_ptrs[14]; // i_block[14] — see ext2_resolve_block's own comment
 	return true;
 }
 
-// Resolves logical block index `b` (0-based, within one file) into its
-// real on-disk block number — direct (b < 12, straight from inode.block)
-// or through the single-indirect block (i_block[12], one more level of
-// 4-byte pointers) for 12 <= b < 12 + ext2_block_size/4. Only ever
-// called within that range (ext2_read/ext2_read_at's own loop bounds
-// enforce it) — double/triple indirect stay out of this driver's scope
-// (see this file's own header comment), the same "12 blocks only" limit
-// ext2_write still has.
-//
-// indirect_cache/indirect_loaded are caller-owned (one read.c3-local
-// char[EXT2_MAX_BLOCK_SIZE] + bool per read loop, not a global): the
-// indirect block itself only needs reading once no matter how many of
-// its 256 (at this project's own 1024-byte block size) pointers a given
-// read actually needs, same "read once, reuse" shape ext2_read_inode's
-// own inode-table block already gets implicitly by being read once
-// per call.
-//
-// A 0 result within the supported range is unambiguous: a genuine
-// ext2 sparse hole (no block ever allocated there), same as inode.block[b]
-// already being 0 means for a direct block today — including when
-// inode.indirect_block itself is 0 (no indirect block allocated at all
-// yet — every pointer within it reads as 0, the same way an
-// entirely-unallocated indirect block would). Callers zero-fill on 0,
-// exactly like the existing direct-block path.
-fn uint ext2_resolve_block(Ext2_inode_info* inode, uint b, char* indirect_cache, bool* indirect_loaded)
+// Caller-owned resolution cache for ext2_resolve_block, one per read
+// loop (ext2_read/ext2_read_at) — not a global, same reasoning as the
+// single-level cache this replaced. `leaf`/`mid` are identity-tracked
+// by physical block number (not just a loaded bool) because unlike the
+// single-indirect case, a read loop walking double/triple indirect
+// crosses into *different* leaf/mid blocks as `b` advances — one slot
+// per level is still enough (ext2_read/ext2_read_at always call with
+// non-decreasing `b`), but which block occupies that slot changes over
+// the call. 0xFFFFFFFF (not 0) marks "nothing loaded yet": 0 is itself
+// a legitimate cached value (a sparse hole's all-zero leaf), so a plain
+// loaded bool can't tell "not loaded" from "loaded, and it's the hole
+// case" once a slot holds different leaves across one call. `double_top`/
+// `triple_top` need only a bool — each file has at most one of each,
+// constant for the whole double-/triple-indirect range, no identity to
+// track. Stack cost: 4 buffers × EXT2_MAX_BLOCK_SIZE (4096) = 16KB,
+// comfortably inside STACK_SIZE (64KB, src/process.c3) alongside the
+// caller's own 4KB block_buf.
+struct Ext2_block_cache
 {
-	if (b < 12) return inode.block[b];
+	char[EXT2_MAX_BLOCK_SIZE] leaf;
+	uint leaf_block_num;
+	char[EXT2_MAX_BLOCK_SIZE] mid;
+	uint mid_block_num;
+	char[EXT2_MAX_BLOCK_SIZE] double_top;
+	bool double_top_loaded;
+	char[EXT2_MAX_BLOCK_SIZE] triple_top;
+	bool triple_top_loaded;
+}
 
-	if (!*indirect_loaded)
+// Loads the leaf block `leaf_ptr` points at into cache.leaf (zero-filled
+// on leaf_ptr == 0 — a genuine sparse hole, same semantics inode.block[b]
+// already has for a direct block) unless it's already the one cached,
+// then returns its `index_in_leaf`'th direct block pointer. Shared by
+// every indirection level in ext2_resolve_block below: single-indirect's
+// own one leaf (inode.indirect_block itself), and whichever leaf
+// double/triple-indirect are currently walking.
+fn uint ext2_resolve_leaf(Ext2_block_cache* cache, uint leaf_ptr, uint index_in_leaf)
+{
+	if (cache.leaf_block_num != leaf_ptr)
 	{
-		if (inode.indirect_block == 0)
+		if (leaf_ptr == 0)
 		{
-			for (uint i = 0; i < EXT2_MAX_BLOCK_SIZE; i++) indirect_cache[i] = 0;
+			for (uint i = 0; i < EXT2_MAX_BLOCK_SIZE; i++) cache.leaf[i] = 0;
 		}
-		else if (!ext2_read_block(inode.indirect_block, indirect_cache))
+		else if (!ext2_read_block(leaf_ptr, &cache.leaf))
 		{
 			return 0;
 		}
-		*indirect_loaded = true;
+		cache.leaf_block_num = leaf_ptr;
+	}
+	uint* leaf_ptrs = (uint*)&cache.leaf;
+	return leaf_ptrs[index_in_leaf];
+}
+
+// Resolves logical block index `b` (0-based, within one file) into its
+// real on-disk block number — direct (b < 12, straight from inode.block),
+// single-indirect (i_block[12], one more level of 4-byte pointers),
+// double-indirect (i_block[13], two more levels), or triple-indirect
+// (i_block[14], three more levels). n = ext2_block_size/4 is how many
+// 4-byte pointers fit in one block, so each level multiplies reach by n:
+// 12 + n (single) + n*n (double) + n*n*n (triple) blocks total. No
+// overflow risk in that arithmetic — n is capped at
+// EXT2_MAX_BLOCK_SIZE/4 = 1024, so n*n*n (~1.07 billion) comfortably
+// fits uint32. Only ever called within that combined range (ext2_read/
+// ext2_read_at's own loop bounds enforce it) — b past even triple-
+// indirect's reach is in practice unreachable anyway: this driver's own
+// i_size field is 32-bit only (no i_size_high support), capping any
+// representable file at 4GB, already far below what triple-indirect's
+// own n*n*n blocks could address at any real block size.
+//
+// A 0 result within the supported range is unambiguous: a genuine
+// ext2 sparse hole (no block ever allocated there), same as inode.block[b]
+// already being 0 means for a direct block today. Callers zero-fill on
+// 0, exactly like the existing direct-block path.
+fn uint ext2_resolve_block(Ext2_inode_info* inode, uint b, Ext2_block_cache* cache)
+{
+	if (b < 12) return inode.block[b];
+
+	uint n = ext2_block_size / 4;
+	uint single_end = 12 + n;
+	if (b < single_end)
+	{
+		return ext2_resolve_leaf(cache, inode.indirect_block, b - 12);
 	}
 
-	uint* indirect_ptrs = (uint*)indirect_cache;
-	return indirect_ptrs[b - 12];
+	uint double_end = single_end + n * n;
+	if (b < double_end)
+	{
+		if (!cache.double_top_loaded)
+		{
+			if (inode.double_indirect_block == 0)
+			{
+				for (uint i = 0; i < EXT2_MAX_BLOCK_SIZE; i++) cache.double_top[i] = 0;
+			}
+			else if (!ext2_read_block(inode.double_indirect_block, &cache.double_top))
+			{
+				return 0;
+			}
+			cache.double_top_loaded = true;
+		}
+		uint* double_ptrs = (uint*)&cache.double_top;
+		uint idx = b - single_end;
+		uint leaf_ptr = double_ptrs[idx / n];
+		return ext2_resolve_leaf(cache, leaf_ptr, idx % n);
+	}
+
+	uint triple_end = double_end + n * n * n;
+	if (b < triple_end)
+	{
+		if (!cache.triple_top_loaded)
+		{
+			if (inode.triple_indirect_block == 0)
+			{
+				for (uint i = 0; i < EXT2_MAX_BLOCK_SIZE; i++) cache.triple_top[i] = 0;
+			}
+			else if (!ext2_read_block(inode.triple_indirect_block, &cache.triple_top))
+			{
+				return 0;
+			}
+			cache.triple_top_loaded = true;
+		}
+		uint* triple_ptrs = (uint*)&cache.triple_top;
+		uint idx = b - double_end;
+		uint mid_ptr = triple_ptrs[idx / (n * n)];
+
+		if (cache.mid_block_num != mid_ptr)
+		{
+			if (mid_ptr == 0)
+			{
+				for (uint i = 0; i < EXT2_MAX_BLOCK_SIZE; i++) cache.mid[i] = 0;
+			}
+			else if (!ext2_read_block(mid_ptr, &cache.mid))
+			{
+				return 0;
+			}
+			cache.mid_block_num = mid_ptr;
+		}
+		uint* mid_ptrs = (uint*)&cache.mid;
+		uint rem = idx % (n * n);
+		uint leaf_ptr = mid_ptrs[rem / n];
+		return ext2_resolve_leaf(cache, leaf_ptr, rem % n);
+	}
+
+	return 0; // past triple-indirect's own reach — see this function's own comment
 }
 
 fn uint ext2_strlen(char* s)
@@ -557,14 +665,18 @@ fn int ext2_read(char* name, char* dst, uint len)
 	uint read_len = len;
 	if (read_len > inode.size) read_len = inode.size;
 
-	uint max_block = 12 + ext2_block_size / 4;
-	char[EXT2_MAX_BLOCK_SIZE] indirect_cache @noinit;
-	bool indirect_loaded = false;
+	uint ern = ext2_block_size / 4;
+	uint max_block = 12 + ern + ern * ern + ern * ern * ern;
+	Ext2_block_cache cache @noinit;
+	cache.leaf_block_num = 0xFFFFFFFF;
+	cache.mid_block_num = 0xFFFFFFFF;
+	cache.double_top_loaded = false;
+	cache.triple_top_loaded = false;
 
 	uint bytes_read = 0;
 	for (uint b = 0; b < max_block && bytes_read < read_len; b++)
 	{
-		uint block = ext2_resolve_block(&inode, b, &indirect_cache, &indirect_loaded);
+		uint block = ext2_resolve_block(&inode, b, &cache);
 		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
 		if (block == 0)
 		{
@@ -645,11 +757,12 @@ fn int ext2_read_at(char* name, char* dst, uint len, uint offset)
 
 	uint start_block = offset / ext2_block_size;
 	uint offset_in_block = offset % ext2_block_size;
-	uint max_block = 12 + ext2_block_size / 4;
+	uint ern = ext2_block_size / 4;
+	uint max_block = 12 + ern + ern * ern + ern * ern * ern;
 
 	// offset >= inode.size above already caught genuine EOF; reaching
 	// here with start_block past what this driver can resolve (direct
-	// blocks plus one level of single-indirect — see
+	// blocks plus direct/single/double/triple-indirect — see
 	// ext2_resolve_block's own comment) means the file legitimately
 	// continues but this driver can't reach the rest, a real error
 	// (-1), not 0 ("clean EOF" — exec()'s own chunked-read loop,
@@ -663,16 +776,22 @@ fn int ext2_read_at(char* name, char* dst, uint len, uint offset)
 	// binary's own code, unrelated to how much of it actually got
 	// loaded) pointing outside the pages SYS_EXEC went on to map — a
 	// page fault, not against exec()'s own read path at all. Same
-	// reasoning still applies at the new, higher boundary.
+	// reasoning still applies at the new, much higher boundary — though
+	// in practice unreachable now, since this driver's own 32-bit
+	// i_size already caps any representable file at 4GB, well below
+	// what max_block can address.
 	if (start_block >= max_block) return -1;
 
-	char[EXT2_MAX_BLOCK_SIZE] indirect_cache @noinit;
-	bool indirect_loaded = false;
+	Ext2_block_cache cache @noinit;
+	cache.leaf_block_num = 0xFFFFFFFF;
+	cache.mid_block_num = 0xFFFFFFFF;
+	cache.double_top_loaded = false;
+	cache.triple_top_loaded = false;
 
 	uint bytes_read = 0;
 	for (uint b = start_block; b < max_block && bytes_read < read_len; b++)
 	{
-		uint block = ext2_resolve_block(&inode, b, &indirect_cache, &indirect_loaded);
+		uint block = ext2_resolve_block(&inode, b, &cache);
 		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
 		if (block == 0)
 		{
