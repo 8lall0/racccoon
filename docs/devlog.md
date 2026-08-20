@@ -4,6 +4,77 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (46) — exec() ext2 chunked-read caching
+
+Follow-up to the previous entry's own flagged issue: `exec()`
+(`user/user.c3`) loops calling `fs_read_at()` in ~1124-byte chunks
+(`FS_MSG_MAX-4`), and `ext2_read_at` (`user/fs/ext2.c3`) was redoing a
+completely fresh path walk from the filesystem root — `ext2_resolve_dir`
++ `ext2_find_in_dir` — on *every single chunk*, even though every call in
+one `exec()`'s loop targets the exact same path. Loading the 71648-byte
+`echod` on real hardware took ~64 chunk calls, each repeating the full
+walk instead of reusing the previous one, ~1900 total sector reads for
+one binary load — the "is this actually stuck?" scare from the previous
+entry.
+
+**Fix**: a single-slot cache in `ext2.c3` — `ext2_cache_valid`/
+`ext2_cache_path`/`ext2_cache_inode_num` — remembers the last path
+`ext2_read_at` resolved. A hit skips straight to `ext2_read_inode`
+(still re-read fresh from disk every call — cheap, one block read, and
+correctness-safe even if something else mutated the file between two
+chunk calls of the same `exec()` loop, rather than assuming nothing else
+writes during exec()). One slot, not a table: one `exec()` read loop only
+ever re-reads one path. Every ext2 mutation (`ext2_write`/`ext2_delete`/
+`ext2_delete_recursive`/`ext2_mkdir`/`ext2_rename`) invalidates the cache
+unconditionally as its first statement, rather than checking whether it
+actually touched the cached path — simpler, and `ext2_delete_recursive`
+in particular never reconstructs path strings for what it removes, so
+there's nothing to compare against there anyway. Cost of the
+unconditional approach is only ever a hit-rate one (an unrelated
+mutation mid-`exec()`-loop costs one extra resolve on the next chunk,
+then it's a hit again), never a correctness one.
+
+`ext2_read` (the non-chunked, single-call read path) is untouched —
+never called in a loop, so there's no repeated-resolve cost to remove,
+and leaving it out of the cache avoids a plain `fs_read()` from one
+process evicting another process's mid-`exec()` cache slot for no
+benefit.
+
+**FAT32 has the identical bug, arguably worse** (`fat32_read_file_at`
+re-walks the cluster chain from the start every chunk call too — an
+O(offset/cluster_size) walk that gets *more* expensive each successive
+chunk, unlike ext2's flat O(depth)). Flagged, not fixed here — the right
+shape is different (resume from a remembered cluster+offset, not an
+inode number) and deserves its own entry.
+
+**Verification**: full regression suite on all three QEMU images
+(single-mount ext2, single-mount FAT32, dual-mount) — every existing
+test still passes, including `fspermtest` run *between* two `runtest2`/
+`elftest2` calls on the dual-mount image specifically to prove
+invalidation works (fspermtest's own writes/deletes invalidate the
+cache mid-suite; the following `runtest2`/`elftest2` still correctly
+re-resolve `/2/bin/echod` from scratch and pass). Three-boot stress
+batch, `e2fsck -n -f` clean on both the single-mount and dual-mount
+ext2 images, `fsck.vfat -n` clean on the dual image's FAT32 half (same
+pre-existing free-cluster-count cosmetic warning this project has always
+had there, untouched by this entry).
+
+**Real Milk-V Duo hardware confirmation**, against the real `EXT2TEST`
+partition — `runtest2`/`argvtest2`/`pathtest2`/`elftest2` all `ok`,
+`lsproc` clean afterward. Noticeably but not dramatically faster than
+the previous entry's "is this actually stuck?" run — expected, not a
+red flag: `ext2_read_inode` still re-reads fresh from disk on every
+single chunk by deliberate design (the correctness tradeoff described
+above), so this cache only removes the directory-walk portion of each
+chunk's cost, roughly halving the block reads per chunk rather than
+eliminating almost all of them. The walk itself (the part that scaled
+with path depth and was the actual source of the near-1900-sector-read
+total) is gone.
+
+**Files changed:** `user/fs/ext2.c3`.
+
+---
+
 ## 2026-08-21 (45) — `runtest2`/`argvtest2`/`pathtest2`/`elftest2`: proper mount-2 re-verification
 
 Follow-up to the previous entry's own discovery: `runtest`/`argvtest`/

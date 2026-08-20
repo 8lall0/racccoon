@@ -178,6 +178,25 @@ uint[EXT2_MAX_GROUPS] ext2_inode_table_blocks;  // every group's own inode table
 uint[EXT2_MAX_GROUPS] ext2_block_bitmap_blocks; // every group's own block bitmap, for ext2_alloc_block
 uint[EXT2_MAX_GROUPS] ext2_inode_bitmap_blocks; // every group's own inode bitmap, for ext2_alloc_inode
 
+// exec()'s own chunked-read fast path (user/user.c3's exec(), FS_READ_AT):
+// a single-slot cache of the last path ext2_read_at() resolved, so a run
+// of chunk calls for the *same* file (the only pattern exec() ever
+// produces) can skip straight to ext2_read_inode() instead of redoing
+// ext2_resolve_dir()+ext2_find_in_dir() from the root on every ~1124-byte
+// chunk. Found the hard way on real hardware (docs/devlog.md): loading a
+// 71648-byte binary took ~64 chunk calls, each repeating the full path
+// walk, ~1900 sector reads for one exec(). One slot, not a small table —
+// one exec() read loop only ever re-reads one path. Every ext2 mutation
+// (ext2_write/delete/delete_recursive/mkdir/rename) invalidates this
+// unconditionally rather than trying to check whether it actually
+// touched the cached path — simpler, and ext2_delete_recursive in
+// particular has no reconstructed path string to compare against anyway.
+bool      ext2_cache_valid;
+char[100] ext2_cache_path;      // exact bytes of the resolved path — 100
+                                 // matches fsd.c3's own filename wire-field
+                                 // size, not a new constant
+uint      ext2_cache_inode_num; // ext2_cache_path's own leaf inode number
+
 struct Ext2_inode_info
 {
 	uint mode;
@@ -585,19 +604,38 @@ fn int ext2_read(char* name, char* dst, uint len)
 // loop watches for, distinct from -1's "something is actually wrong."
 fn int ext2_read_at(char* name, char* dst, uint len, uint offset)
 {
-	uint dir_inode;
-	if (!ext2_resolve_dir(name, &dir_inode)) return -1;
-	char* leaf = ext2_leaf_name(name);
-
 	uint inode_num;
-	uint dummy_sector;
-	uint dummy_offset;
-	uint mode;
-	if (!ext2_find_in_dir(dir_inode, leaf, &inode_num, &dummy_sector, &dummy_offset, &mode)) return -1;
-	if ((mode & EXT2_S_IFDIR) != 0) return -1;
+
+	// Cache hit: exec()'s own chunked-read loop (user/user.c3) calls this
+	// repeatedly for the same path — see ext2_cache_path's own comment.
+	// Skip the path walk entirely and let ext2_read_inode below refresh
+	// the inode fresh from disk either way.
+	if (ext2_cache_valid && strcmp(name, &ext2_cache_path) == 0)
+	{
+		inode_num = ext2_cache_inode_num;
+	}
+	else
+	{
+		uint dir_inode;
+		if (!ext2_resolve_dir(name, &dir_inode)) return -1;
+		char* leaf = ext2_leaf_name(name);
+
+		uint dummy_sector;
+		uint dummy_offset;
+		uint mode;
+		if (!ext2_find_in_dir(dir_inode, leaf, &inode_num, &dummy_sector, &dummy_offset, &mode)) return -1;
+		if ((mode & EXT2_S_IFDIR) != 0) return -1;
+
+		mem::copy(&ext2_cache_path, name, 100);
+		ext2_cache_inode_num = inode_num;
+		ext2_cache_valid = true;
+	}
 
 	Ext2_inode_info inode;
 	if (!ext2_read_inode(inode_num, &inode)) return -1;
+	// Only IFDIR guard on the cache-hit path (which never runs
+	// ext2_find_in_dir) — redundant but harmless on a miss.
+	if ((inode.mode & EXT2_S_IFDIR) != 0) return -1;
 
 	if (offset >= inode.size) return 0;
 
@@ -1263,6 +1301,7 @@ fn uint ext2_write_file(Ext2_inode_info* inode, char* src, uint len)
 // `exists` is already true.
 fn int ext2_write(char* name, char* src, uint len, uint requester_uid)
 {
+	ext2_cache_valid = false; // see ext2_cache_path's own comment
 	uint dir_inode;
 	if (!ext2_resolve_dir(name, &dir_inode)) return -1;
 	char* leaf = ext2_leaf_name(name);
@@ -1370,6 +1409,7 @@ fn bool ext2_dir_is_empty(Ext2_inode_info* dir)
 // checking every file it touches, not just the top-level target.
 fn int ext2_delete(char* name, uint requester_uid)
 {
+	ext2_cache_valid = false; // see ext2_cache_path's own comment
 	uint dir_inode;
 	if (!ext2_resolve_dir(name, &dir_inode)) return -1;
 	char* leaf = ext2_leaf_name(name);
@@ -1547,6 +1587,7 @@ fn bool ext2_delete_dir_contents(uint dir_inode_num, int depth)
 // protected part.
 fn int ext2_delete_recursive(char* name)
 {
+	ext2_cache_valid = false; // see ext2_cache_path's own comment
 	uint dir_inode;
 	if (!ext2_resolve_dir(name, &dir_inode)) return -1;
 	char* leaf = ext2_leaf_name(name);
@@ -1697,6 +1738,7 @@ fn bool ext2_list(char* path, char* out_buf, int max_entries, int* out_count)
 // could never rmdir it again.
 fn int ext2_mkdir(char* path, uint requester_uid)
 {
+	ext2_cache_valid = false; // see ext2_cache_path's own comment
 	uint parent_inode;
 	if (!ext2_resolve_dir(path, &parent_inode)) return -1;
 	char* leaf = ext2_leaf_name(path);
@@ -1841,6 +1883,7 @@ fn bool ext2_would_create_cycle(uint candidate_dir_inode, uint forbidden_inode)
 // ext2's own dirent format doesn't carry either.
 fn int ext2_rename(char* old_path, char* new_path)
 {
+	ext2_cache_valid = false; // see ext2_cache_path's own comment
 	uint old_parent_inode;
 	if (!ext2_resolve_dir(old_path, &old_parent_inode)) return -1;
 	char* old_leaf = ext2_leaf_name(old_path);
