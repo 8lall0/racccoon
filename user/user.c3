@@ -28,6 +28,7 @@ const int SYS_FS_PARTITION_INFO = 14;
 const int SYS_FUTEX_WAIT = 15; // block while *addr == expected — see src/entry.c3's case
 const int SYS_FUTEX_WAKE = 16; // wake every waiter blocked on addr in this address space
 const int SYS_PROC_INFO  = 17; // returns another process's state/generation — see src/entry.c3's case
+const int SYS_KILL       = 18; // kills another process by pid (+ optional generation check) — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -271,6 +272,17 @@ fn int join(int pid, uint generation) @export("join") {
 // filters that case out before this can return success.
 fn int proc_info(int pid, uint* state_out, uint* generation_out) @export("proc_info") {
     return syscall(SYS_PROC_INFO, pid, (long)state_out, (long)generation_out);
+}
+
+// Kills pid. expected_generation is a wildcard when 0 ("kill whatever's
+// at this pid right now"); any other value must match that pid's live
+// Process.generation exactly or this fails, the same stale-pid
+// protection join()'s own generation argument gives — see SYS_KILL's
+// case in src/entry.c3 for the full reasoning. Returns 0 on success, -1
+// if the pid doesn't exist, is the caller itself, or the generation
+// didn't match.
+fn int kill(int pid, uint expected_generation) @export("kill") {
+    return syscall(SYS_KILL, pid, (long)expected_generation, 0);
 }
 
 // Blocks while *addr == expected, atomically with respect to any

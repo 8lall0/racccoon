@@ -10,6 +10,31 @@ int rfork_child_ran = 0; // set by rforkmemtest's child, checked by rforkmemresu
 char[4096] thread_stack;
 int thread_result = 0;
 
+// Formats pid (always >= 1, PROCS_MAX = 16 so never more than 2 digits)
+// as decimal into buf, returning the digit count — killtest's own
+// private copy of the same digit logic procd_format_uint (procd.c3) and
+// print_uint (user.c3) already have, kept local since shell.bin and
+// procd.bin are separate binaries (scripts/build_user.sh) and this is
+// the only place shell.c3 needs it.
+fn int killtest_format_pid(int pid, char* buf) {
+    if (pid == 0) {
+        buf[0] = '0';
+        return 1;
+    }
+    char[6] digits @noinit;
+    int count = 0;
+    int n = pid;
+    while (n > 0) {
+        digits[count] = (char)('0' + n % 10);
+        n /= 10;
+        count++;
+    }
+    for (int k = 0; k < count; k++) {
+        buf[k] = digits[count - 1 - k];
+    }
+    return count;
+}
+
 fn void thread_body(void* arg) {
     thread_result = 99;
     print("thread: running on my own stack, wrote thread_result\n");
@@ -562,6 +587,81 @@ fn void main() @export("main") {
                     }
                     print("\n");
                 }
+            }
+        } else if (strcmp(cmd, "killtest") == 0) {
+            // /proc/<pid>/ctl (procd.c3's FS_WRITE handler): the one
+            // write path /proc has, and the only command it accepts is
+            // "kill" — fs_write() here is the exact same generic call
+            // every disk-backed write already uses, same as pstest/
+            // lsproc's fs_read()/fs_list() against a synthetic server.
+            //
+            // Spawns a throwaway child that spins forever (plain
+            // rfork(RFPROC), same as rforktest) instead of exiting on
+            // its own, so there's something genuinely alive to kill —
+            // real preemptive scheduling (src/entry.c3's timer path)
+            // means this doesn't starve the parent while it spins.
+            int kt_r = rfork(RFPROC, null);
+            if (kt_r < 0) {
+                print("rfork failed\n");
+            } else if (kt_r == 0) {
+                for (;;) {
+                    rfork_shared_value = rfork_shared_value + 1;
+                }
+            } else {
+                char[16] kt_status_path @noinit;
+                char[16] kt_ctl_path @noinit;
+                int kt_pos = 0;
+                char* kt_prefix = "/proc/";
+                while (kt_prefix[kt_pos] != 0) {
+                    kt_status_path[kt_pos] = kt_prefix[kt_pos];
+                    kt_ctl_path[kt_pos] = kt_prefix[kt_pos];
+                    kt_pos++;
+                }
+                int kt_digits = killtest_format_pid(kt_r, &kt_status_path[kt_pos]);
+                for (int kd = 0; kd < kt_digits; kd++) {
+                    kt_ctl_path[kt_pos + kd] = kt_status_path[kt_pos + kd];
+                }
+                kt_pos += kt_digits;
+                char* kt_status_suffix = "/status";
+                int kt_si = 0;
+                while (kt_status_suffix[kt_si] != 0) {
+                    kt_status_path[kt_pos + kt_si] = kt_status_suffix[kt_si];
+                    kt_si++;
+                }
+                kt_status_path[kt_pos + kt_si] = 0;
+                char* kt_ctl_suffix = "/ctl";
+                int kt_ci = 0;
+                while (kt_ctl_suffix[kt_ci] != 0) {
+                    kt_ctl_path[kt_pos + kt_ci] = kt_ctl_suffix[kt_ci];
+                    kt_ci++;
+                }
+                kt_ctl_path[kt_pos + kt_ci] = 0;
+
+                char[128] kt_buf @noinit;
+                int kt_before_len = fs_read(&kt_status_path, &kt_buf, 128);
+                print("killtest: child ");
+                print(kt_before_len >= 0 ? "alive before kill\n" : "MISSING before kill (already wrong)\n");
+
+                int kt_write_result = fs_write(&kt_ctl_path, "kill", 4);
+                int kt_after_len = fs_read(&kt_status_path, &kt_buf, 128);
+                if (kt_write_result >= 0 && kt_after_len < 0) {
+                    print("killtest: PASS (kill succeeded, child gone)\n");
+                } else {
+                    print("killtest: FAILED\n");
+                }
+
+                // Edge cases: killing an already-dead pid must fail
+                // cleanly (proc_by_pid finds nothing), and echod (pid
+                // 2, always alive) must survive a garbage ctl command
+                // unharmed — procd only ever recognizes "kill".
+                int kt_double_kill = fs_write(&kt_ctl_path, "kill", 4);
+                print("killtest: re-kill of dead pid ");
+                print(kt_double_kill < 0 ? "correctly failed\n" : "WRONGLY succeeded\n");
+
+                int kt_bogus_result = fs_write("/proc/2/ctl", "bogus", 5);
+                int kt_echod_after = fs_read("/proc/2/status", &kt_buf, 128);
+                print("killtest: bogus ctl command ");
+                print(kt_bogus_result < 0 && kt_echod_after >= 0 ? "correctly rejected, echod still alive\n" : "WRONGLY accepted or echod harmed\n");
             }
         } else if (strcmp(cmd, "rforktest") == 0) {
             // Plain rfork(RFPROC): the child gets an independent copy of

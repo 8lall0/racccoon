@@ -59,6 +59,7 @@ const SYS_FS_PARTITION_INFO = 14; // fsd-only: returns current_proc.fs_partition
 const SYS_FUTEX_WAIT = 15; // block while *addr == expected — see its case below
 const SYS_FUTEX_WAKE = 16; // wake every waiter blocked on addr in this address space
 const SYS_PROC_INFO  = 17; // procd-only in practice, but open to any caller — see its case below
+const SYS_KILL       = 18; // procd-only in practice (the /proc/<pid>/ctl write path), open to any caller — see its case below
 
 // rfork flags — Plan 9 names, this kernel's own subset. RFPROC is
 // required (rfork() without it returns -1 in this v1: real Plan 9 uses
@@ -1008,6 +1009,108 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			uint* generation_out = (uint*)(uptr)f.a2;
 			if (state_out != null) *state_out = (uint)queried.state;
 			if (generation_out != null) *generation_out = queried.generation;
+			f.a0 = 0;
+		case SYS_KILL:
+			// Kills an arbitrary target process — the write half of
+			// /proc/<pid>/ctl (user/procd.c3), the first write path
+			// /proc has ever needed. No permission check, same
+			// reasoning as SYS_PROC_INFO above: this kernel has no
+			// user/permission concept at all, so restricting *which*
+			// caller can kill *which* target would be security
+			// theater, not a real boundary.
+			//
+			// expected_generation (a1) mirrors SYS_JOIN's own
+			// join_generation: 0 is a wildcard ("kill whatever's at
+			// this pid right now" — generation starts at 0 and
+			// create_process (process.c3) always increments it past 0
+			// before a slot goes live, so 0 is never a valid live
+			// generation); any other value must match exactly,
+			// closing the same stale-pid race SYS_JOIN/
+			// Mount.server_generation already close elsewhere.
+			// procd's own ctl handler always fetches the live
+			// generation via SYS_PROC_INFO immediately before calling
+			// this, rather than passing 0.
+			//
+			// Known, accepted limitation: any other process currently
+			// blocked waiting on the killed target specifically (a
+			// sender mid-rendezvous in SYS_IPC_SEND, waiting for
+			// msg_acked) is left blocked forever — nothing forcibly
+			// unblocks a waiter when its counterpart is killed out
+			// from under it. Same class of gap as SYS_IPC_SEND's own
+			// stale-pid comment above, not attempted here.
+			int kill_pid = (int)f.a0;
+			uint kill_expected_generation = (uint)f.a1;
+			if (kill_pid == current_proc.pid)
+			{
+				// Same self-deadlock-shaped reasoning as SYS_JOIN's
+				// own self-check, though the failure mode here is
+				// different (this would tear down the very page
+				// table the code performing the teardown is running
+				// under) — reject; SYS_EXIT already exists for
+				// killing yourself.
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			Process* kill_target = proc_by_pid(kill_pid);
+			if (kill_target == null || (kill_expected_generation != 0 && kill_target.generation != kill_expected_generation))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+
+			// Same page-table-teardown-if-not-shared logic as
+			// SYS_EXIT above, just targeting kill_target instead of
+			// current_proc — see that case's own comment for the
+			// full reasoning (shared-table rfork(RFPROC|RFMEM)
+			// siblings, the 3-level Sv39 walk, etc.). Inlined for the
+			// same reason SYS_EXIT is: a call out to a moderately
+			// complex function from inside this switch has
+			// reproducibly broken boot before.
+			bool kill_table_shared = false;
+			for (int kshare_i = 0; kshare_i < PROCS_MAX; kshare_i++)
+			{
+				if (&procs[kshare_i] == kill_target) continue;
+				if (procs[kshare_i].state == PROC_UNUSED) continue;
+				if (procs[kshare_i].page_table == kill_target.page_table)
+				{
+					kill_table_shared = true;
+					break;
+				}
+			}
+
+			if (!kill_table_shared)
+			{
+				ulong* kill_table2 = kill_target.page_table;
+				for (uint kvpn2 = 0; kvpn2 < 512; kvpn2++)
+				{
+					if ((kill_table2[kvpn2] & PAGE_V) == 0) continue;
+					ulong* kill_table1 = (ulong*)pte_to_paddr(kill_table2[kvpn2]);
+
+					for (uint kvpn1 = 0; kvpn1 < 512; kvpn1++)
+					{
+						if ((kill_table1[kvpn1] & PAGE_V) == 0) continue;
+						ulong* kill_table0 = (ulong*)pte_to_paddr(kill_table1[kvpn1]);
+
+						for (uint kvpn0 = 0; kvpn0 < 512; kvpn0++)
+						{
+							if ((kill_table0[kvpn0] & PAGE_V) == 0) continue;
+							if (kill_table0[kvpn0] & PAGE_U)
+							{
+								uptr kill_leaf_paddr = pte_to_paddr(kill_table0[kvpn0]);
+								free_pages(kill_leaf_paddr, 1);
+							}
+						}
+
+						free_pages((uptr)kill_table0, 1);
+					}
+
+					free_pages((uptr)kill_table1, 1);
+				}
+				free_pages((uptr)kill_table2, 1);
+			}
+
+			kill_target.state = PROC_UNUSED;
+			kill_target.pid = 0;
 			f.a0 = 0;
 		default:
 			panic::panic("unexpected syscall");

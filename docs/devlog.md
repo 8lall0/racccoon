@@ -4,6 +4,81 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (20) — /proc/<pid>/ctl: the first write path /proc has, and a real SYS_KILL
+
+Checking what to build next turned up three already-closed gaps before
+finding real work: the `SYS_IPC_SEND` "KNOWN GAP" and the `racetest`
+`a=1 b=0` race were both already fixed in the 2026-08-18 (3) entry
+below (closing the stale-namespace-pid gap turned out to also explain
+`racetest` was `PROCS_MAX` exhaustion, not IPC, all along); and ext2
+multi-group support (flagged as a genuine gap in the 2026-08-19 (4)
+entry) turned out to already be fully implemented and verified in
+entries (5)/(6) the very next day — every allocation/read/write path
+is group-aware. Only a stale comment survived
+(`ext2_write_inode` claiming "new allocations stay group-0-only,"
+contradicted by `ext2_zero_inode`'s own correct comment three lines
+below) — fixed in passing.
+
+### /proc/<pid>/ctl
+
+The real remaining gap: procd (`user/procd.c3`) was read-only, so a
+future kill-via-ctl was explicitly deferred at the time `/proc` was
+built (entry (19) below). Closed now, reusing the same design insight
+as `FS_READ`/`FS_LIST`: `FS_WRITE` (verb 21) is just as generic as the
+other two — `user.c3`'s existing `fs_write()` reaches procd with zero
+client-side changes, the same way `fs_read()`/`fs_list()` already did.
+
+**New `SYS_KILL` syscall** (`src/entry.c3`, next free number 18):
+kills an arbitrary target pid, no permission check (same reasoning as
+`SYS_PROC_INFO` — this kernel has no user/permission concept at all).
+Takes an optional `expected_generation` (0 = wildcard), mirroring
+`SYS_JOIN`'s own `join_generation` — closes the same stale-pid race
+`Mount.server_generation`/`SYS_JOIN` already close elsewhere. Inlined
+in the switch, same page-table-teardown-if-not-shared logic as
+`SYS_EXIT`, just targeting an arbitrary `Process*` instead of
+`current_proc` (and, unlike `SYS_EXIT`, returning normally to the
+caller rather than yielding away permanently). Rejects killing
+yourself — `SYS_EXIT` already exists for that, and tearing down your
+own running page table from inside this code path is a different,
+unsafe shape. **Known, accepted limitation, documented in the case
+itself**: any other process blocked mid-rendezvous waiting
+specifically on the killed target (`SYS_IPC_SEND`'s own `msg_acked`
+wait) is left blocked forever — nothing forcibly unblocks a waiter
+when its counterpart is killed out from under it.
+
+**procd's ctl handler** (`user/procd.c3`): `"<pid>"` now lists two
+files (`status`, `ctl`) instead of one. Writing to `"<pid>/ctl"` only
+recognizes one command, `"kill"` — fetches the target's live
+generation via `proc_info()` immediately before calling the new
+`kill()` wrapper (`user.c3`) with it, keeping the check-then-act
+window as narrow as possible. Any other command, or a path whose
+suffix isn't exactly `"/ctl"`, is rejected cleanly (-1), not silently
+accepted.
+
+**New shell command, `killtest`**: `rfork(RFPROC)`s a throwaway child
+that spins forever (real preemptive scheduling means this doesn't
+starve anything else), confirms it's alive via `/proc/<pid>/status`,
+kills it via `fs_write("/proc/<pid>/ctl", "kill", 4)`, confirms the
+pid is now gone. Also checks two edge cases: re-killing an
+already-dead pid fails cleanly, and a bogus ctl command against echod
+(pid 2) is rejected without harming it.
+
+**Verified**: full regression suite (`ping`/`p9test`/`nstest`/
+`pstest`/`lsproc`/`rforktest`/`threadjointest`/`racetest`) unaffected
+on both filesystems, an 8-boot stress batch of `killtest` plus the
+suite all clean, and — the real proof the page-table teardown works,
+not just the state flip — `lsproc`'s own listing and `rforktest`'s
+next child both confirm the killed pid's slot is genuinely reusable
+afterward (`rforktest` lands its own child at the exact pid `killtest`
+just freed).
+
+**Files changed:** `src/entry.c3` (`SYS_KILL`), `user/user.c3`
+(`kill()`), `user/procd.c3` (`FS_WRITE` handling, `ctl` file in
+listings, `procd_skip_pid`), `user/shell.c3` (`killtest`),
+`user/fs/ext2.c3` (stale comment fix, unrelated).
+
+---
+
 ## 2026-08-20 (19) — A Plan-9-style structure: /srv, /tmp, /proc
 
 Verifying this work is what actually turned up the previous entry's

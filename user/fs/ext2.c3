@@ -827,8 +827,8 @@ fn bool ext2_write_inode(uint inode_num, Ext2_inode_info* info)
 
 	// Same group-aware lookup as ext2_read_inode — see its own comment.
 	// Updating an *existing* inode's fields (e.g. overwriting a file's
-	// content) needs to reach whatever group it's really in, even
-	// though new allocations (ext2_alloc_inode) stay group-0-only.
+	// content) needs to reach whatever group it's really in — same as
+	// ext2_alloc_inode(), which also scans every group now.
 	uint group = (inode_num - 1) / ext2_inodes_per_group;
 	if (group >= ext2_group_count) return false;
 	uint index_in_group = (inode_num - 1) % ext2_inodes_per_group;
