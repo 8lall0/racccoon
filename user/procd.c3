@@ -31,28 +31,6 @@ module user;
 // would silently miss live processes, so this errs high.
 const int PROCD_SCAN_MAX = 32;
 
-fn int procd_format_uint(uint n, char* buf)
-{
-    if (n == 0)
-    {
-        buf[0] = '0';
-        return 1;
-    }
-    char[10] digits @noinit;
-    int count = 0;
-    while (n > 0)
-    {
-        digits[count] = (char)('0' + n % 10);
-        n /= 10;
-        count++;
-    }
-    for (int k = 0; k < count; k++)
-    {
-        buf[k] = digits[count - 1 - k];
-    }
-    return count;
-}
-
 fn uint procd_parse_pid(char* path)
 {
     uint n = 0;
@@ -102,10 +80,7 @@ fn void main() @export("main") {
         if (verb != FS_READ && verb != FS_LIST && verb != FS_WRITE) continue;
 
         char[100] path @noinit;
-        for (int i = 0; i < 100; i++)
-        {
-            path[i] = buf[i];
-        }
+        mem::copy(&path, &buf, 100);
 
         if (verb == FS_LIST)
         {
@@ -121,7 +96,7 @@ fn void main() @export("main") {
                     if (proc_info(pid, &state, &gen) == 0)
                     {
                         char* rec = &buf[4 + count * 36];
-                        int n = procd_format_uint((uint)pid, rec);
+                        int n = format_uint((uint)pid, rec);
                         rec[n] = 0;
                         rec[32] = 1; // directory
                         count++;
@@ -223,11 +198,11 @@ fn void main() @export("main") {
         {
             int pos = 4;
             pos = procd_append_str(&buf, pos, "pid: ");
-            pos += procd_format_uint(pid_val, &buf[pos]);
+            pos += format_uint(pid_val, &buf[pos]);
             pos = procd_append_str(&buf, pos, "\nstate: ");
             pos = procd_append_str(&buf, pos, state == 1 ? "RUNNABLE" : "BLOCKED");
             pos = procd_append_str(&buf, pos, "\ngeneration: ");
-            pos += procd_format_uint(gen, &buf[pos]);
+            pos += format_uint(gen, &buf[pos]);
             pos = procd_append_str(&buf, pos, "\n");
             *result_len_field = pos - 4;
         }

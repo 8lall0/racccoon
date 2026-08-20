@@ -497,20 +497,10 @@ fn void print(char* s) {
 // something worth repeating for mutextest's own counter, which needs
 // more than two digits.
 fn void print_uint(uint n) @export("print_uint") {
-    if (n == 0) {
-        putchar('0');
-        return;
-    }
     char[10] digits @noinit; // uint::max is 10 digits
-    int count = 0;
-    while (n > 0) {
-        digits[count] = (char)('0' + n % 10);
-        n /= 10;
-        count++;
-    }
-    while (count > 0) {
-        count--;
-        putchar(digits[count]);
+    int count = format_uint(n, &digits);
+    for (int i = 0; i < count; i++) {
+        putchar(digits[i]);
     }
 }
 

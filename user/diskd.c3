@@ -263,10 +263,7 @@ fn void main() @export("main")
 		if (is_write)
 		{
 			char* src = &buf[4];
-			for (uint i = 0; i < SECTOR_SIZE; i++)
-			{
-				req.data[i] = src[i];
-			}
+			mem::copy(&req.data, src, SECTOR_SIZE);
 		}
 
 		vq.descs[0].addr  = (ulong)req_paddr;
@@ -307,10 +304,7 @@ fn void main() @export("main")
 		if (!is_write)
 		{
 			char* dst = &buf[4];
-			for (uint i = 0; i < SECTOR_SIZE; i++)
-			{
-				dst[i] = req.data[i];
-			}
+			mem::copy(dst, &req.data, SECTOR_SIZE);
 		}
 		ipc_reply(from, verb, &buf, DISKD_MSG_MAX, from_gen);
 	}

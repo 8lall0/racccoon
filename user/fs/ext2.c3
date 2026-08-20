@@ -237,7 +237,7 @@ fn bool ext2_read_inode(uint inode_num, Ext2_inode_info* out)
 	out.links_count = (uint)*links_count_field;
 	out.blocks      = *blocks_field;
 	uint* block_ptrs = (uint*)&inode_bytes[EXT2_INODE_BLOCK];
-	for (uint i = 0; i < 12; i++) out.block[i] = block_ptrs[i];
+	mem::copy(&out.block, block_ptrs, 48); // 12 uint (4 bytes each) direct block pointers
 	return true;
 }
 
@@ -850,7 +850,7 @@ fn bool ext2_write_inode(uint inode_num, Ext2_inode_info* info)
 	*links_count_field = (ushort)info.links_count;
 	*blocks_field      = info.blocks;
 	uint* block_ptrs = (uint*)&inode_bytes[EXT2_INODE_BLOCK];
-	for (uint i = 0; i < 12; i++) block_ptrs[i] = info.block[i];
+	mem::copy(block_ptrs, &info.block, 48); // 12 uint (4 bytes each) direct block pointers
 
 	return ext2_write_block(ext2_inode_table_blocks[group] + block_offset, &block_buf);
 }

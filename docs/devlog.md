@@ -4,6 +4,79 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (26) — Revisiting the c3 stdlib adaptation: mem::copy/set, and consolidating format_uint
+
+Returned to an early-session goal (adapting the real c3 stdlib into
+this project) that had only gotten as far as `user/atomic.c3`
+(`std::atomic::types`, for the futex/`Mutex` work). User-mode binaries
+build with `--use-stdlib=no` (`scripts/build_user.sh`) — the real
+stdlib isn't reachable from them at all, so "adapting" means the same
+thing `atomic.c3` already established: port a small, self-contained
+piece under the real module name, so it's a drop-in as far as any code
+using it is concerned.
+
+### `user/mem.c3`: `mem::copy`/`mem::set`, ported not reinvented
+
+The real stdlib already has exactly the right piece to copy from:
+`std::core::mem`'s own `@feat(NO_LIBC)` block
+(`/usr/lib/c3c/lib/std/core/mem.c3`) — plain C-style `__memcpy`/
+`__memset`/`__memcmp`, no allocator, no OS dependency, already written
+for exactly this situation. Copied over near-verbatim (only real change:
+`CInt` isn't reachable under `--use-stdlib=no` either, swapped for
+plain `int`), plus `copy()`/`set()` as ordinary functions rather than
+the real stdlib's macro-based `mem::copy()`/`mem::set()` (those lower
+through `$$memcpy`/`$$memset` compiler builtins tied to stdlib
+machinery this build doesn't have reachable) — giving user-mode code
+the exact same `mem::copy(dst, src, len)` call shape the kernel side
+already uses everywhere via the real module.
+
+Replaced seven scattered hand-rolled fixed-length byte-copy loops with
+it: two near-identical 100-byte path-buffer copies (`procd.c3`,
+`envd.c3`), one in `fsd.c3`, two `SECTOR_SIZE` sector-data copies
+(`diskd.c3`), one 64-byte env-var-value copy (`envd.c3`'s own
+inheritance code, entry (25) above), and two 48-byte (12×`uint`)
+inode-block-pointer copies (`ext2.c3`'s `ext2_read_inode`/
+`write_inode`) — left every loop that does more than a pure fixed-
+length copy (null-terminator early exit, case transformation) alone,
+those aren't the same operation.
+
+### String/format helpers: a real mismatch, handled honestly
+
+Went looking for the same treatment for `strcmp`/`str_copy`-shaped
+helpers and integer formatting — found it doesn't fit. The real
+stdlib's string utilities (`std::core::string`) are built entirely
+around `String`/`ZString` value types (length-tracked, allocator-
+aware), and this codebase is plain-`char*` C-strings throughout;
+porting `String.compare_to`/`starts_with` would mean dragging in
+supporting infrastructure just to reach `strcmp`-shaped functionality
+— a worse trade than what's already there. Same story for integer
+formatting: the real stdlib's number-to-string logic lives inside
+`std::io`'s `Formatter`, an allocator/stream-based subsystem, not a
+small standalone function. Reported this rather than forcing a bad-fit
+port.
+
+**What *was* real**: `print_uint()` (`user.c3`), `procd_format_uint()`
+(`procd.c3`), and `killtest_format_pid()` (`shell.c3`) were three
+near-identical copies of the same decimal-digit-extraction loop, each
+hand-copied because every binary is a separate build unit with nothing
+shared. Consolidated into one `format_uint()` (new `user/fmt.c3`,
+explicitly *not* claimed as a stdlib port — this is racccoon's own
+logic, just finally written once). Net effect across the affected
+files: 94 lines removed, 22 added.
+
+**Verified**: full regression suite clean on both filesystems
+(including `readsubfile`/`newsubfile` specifically exercising the
+`ext2_read_inode`/`write_inode` block-pointer copy, content confirmed
+byte-identical to the old loop), a 10-boot stress batch clean,
+`e2fsck -n -f`/`fsck.vfat -n` clean after.
+
+**Files changed:** `user/mem.c3` (new), `user/fmt.c3` (new),
+`scripts/build_user.sh` (both added to every binary), `user/procd.c3`/
+`envd.c3`/`fsd.c3`/`diskd.c3`/`fs/ext2.c3`/`user.c3`/`shell.c3`
+(hand-rolled loops replaced).
+
+---
+
 ## 2026-08-20 (25) — /env inheritance across rfork, lazily
 
 The one gap `/env` shipped with, closed the same session: a forked

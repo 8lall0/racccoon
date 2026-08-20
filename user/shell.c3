@@ -10,31 +10,6 @@ int rfork_child_ran = 0; // set by rforkmemtest's child, checked by rforkmemresu
 char[4096] thread_stack;
 int thread_result = 0;
 
-// Formats pid (always >= 1, PROCS_MAX = 16 so never more than 2 digits)
-// as decimal into buf, returning the digit count — killtest's own
-// private copy of the same digit logic procd_format_uint (procd.c3) and
-// print_uint (user.c3) already have, kept local since shell.bin and
-// procd.bin are separate binaries (scripts/build_user.sh) and this is
-// the only place shell.c3 needs it.
-fn int killtest_format_pid(int pid, char* buf) {
-    if (pid == 0) {
-        buf[0] = '0';
-        return 1;
-    }
-    char[6] digits @noinit;
-    int count = 0;
-    int n = pid;
-    while (n > 0) {
-        digits[count] = (char)('0' + n % 10);
-        n /= 10;
-        count++;
-    }
-    for (int k = 0; k < count; k++) {
-        buf[k] = digits[count - 1 - k];
-    }
-    return count;
-}
-
 fn void thread_body(void* arg) {
     thread_result = 99;
     print("thread: running on my own stack, wrote thread_result\n");
@@ -646,7 +621,7 @@ fn void main() @export("main") {
                     kt_ctl_path[kt_pos] = kt_prefix[kt_pos];
                     kt_pos++;
                 }
-                int kt_digits = killtest_format_pid(kt_r, &kt_status_path[kt_pos]);
+                int kt_digits = format_uint((uint)kt_r, &kt_status_path[kt_pos]);
                 for (int kd = 0; kd < kt_digits; kd++) {
                     kt_ctl_path[kt_pos + kd] = kt_status_path[kt_pos + kd];
                 }

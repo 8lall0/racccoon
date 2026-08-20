@@ -148,7 +148,7 @@ fn void env_maybe_inherit(int pid, uint gen)
             env_table[slot].pid = pid;
             env_table[slot].generation = gen;
             env_copy_name(&env_table[slot].name, &env_table[i].name);
-            for (int vi = 0; vi < ENV_VALUE_MAX; vi++) env_table[slot].value[vi] = env_table[i].value[vi];
+            mem::copy(&env_table[slot].value, &env_table[i].value, ENV_VALUE_MAX);
         }
     }
 
@@ -176,10 +176,7 @@ fn void main() @export("main") {
         env_maybe_inherit(from, from_gen);
 
         char[100] path @noinit;
-        for (int i = 0; i < 100; i++)
-        {
-            path[i] = buf[i];
-        }
+        mem::copy(&path, &buf, 100);
 
         if (verb == FS_READ)
         {

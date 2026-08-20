@@ -393,10 +393,7 @@ fn void main() @export("main")
 		// specific name normalization (FAT32's 8.3 form) happens inside
 		// that backend, not here.
 		char[100] filename @noinit;
-		for (int i = 0; i < 100; i++)
-		{
-			filename[i] = buf[i];
-		}
+		mem::copy(&filename, &buf, 100);
 		// FS_RENAME-only (see user.c3's own wire-format comment) — every
 		// other verb's byte 100.. means something else entirely (a
 		// length, a recursive flag, listing output), captured unconditionally
