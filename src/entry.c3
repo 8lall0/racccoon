@@ -84,6 +84,14 @@ const EXEC_MAX_IMAGE_PAGES = EXEC_MAX_IMAGE_SIZE / PAGE_SIZE;
 const EXEC_MAX_ARGV_SIZE  = 4096;
 const EXEC_MAX_ARGV_PAGES = EXEC_MAX_ARGV_SIZE / PAGE_SIZE;
 
+// Real ELF64/RISC-V executables (racccoon's own toolchain output,
+// build/user/*.elf, before objcopy strips it to a flat binary) can be
+// exec()'d too now, not just racccoon's own flat-binary format — see
+// SYS_EXEC's own case. 8 PT_LOAD segments is generous headroom; a real
+// binary from this toolchain needs 3 (confirmed via llvm-readelf on
+// build/user/echod.elf: .text, .rodata, .data+.bss).
+const EXEC_MAX_ELF_SEGMENTS = 8;
+
 // rfork flags — Plan 9 names, this kernel's own subset. RFPROC is
 // required (rfork() without it returns -1 in this v1: real Plan 9 uses
 // that combination to change the *caller's* own group membership in
@@ -1443,28 +1451,237 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// intact, not half-replaced, same "fail toward not losing
 			// what's already there" discipline this session's own
 			// ext2 slot-reuse fix already established.
-			uint exec_page_count = (exec_image_size + PAGE_SIZE - 1) / PAGE_SIZE;
-			uptr[EXEC_MAX_IMAGE_PAGES] exec_staged @noinit;
-			bool exec_stage_ok = true;
-			for (uint ep = 0; ep < exec_page_count; ep++)
+			//
+			// exec_staged/exec_seg_perm are explicitly zeroed (not
+			// @noinit) rather than relying on the flat-binary path's own
+			// "every slot from 0..exec_page_count gets touched
+			// sequentially" — the ELF path below fills these sparsely,
+			// by segment page-range, and needs 0 to reliably mean "not
+			// yet allocated" everywhere, including slots no segment ever
+			// touches (a real, if rare, alignment gap between segments —
+			// stays unmapped later, not silently zero-filled).
+			uint exec_page_count = 0;
+			uptr[EXEC_MAX_IMAGE_PAGES] exec_staged;
+			uint[EXEC_MAX_IMAGE_PAGES] exec_seg_perm;
+			for (uint zp = 0; zp < EXEC_MAX_IMAGE_PAGES; zp++)
 			{
-				uptr exec_page = alloc_pages(1);
-				if (exec_page == 0)
+				exec_staged[zp] = 0;
+				exec_seg_perm[zp] = 0;
+			}
+			bool exec_stage_ok = true;
+			ulong exec_entry_point = USER_BASE;
+
+			// Real ELF64/RISC-V executable? (racccoon's own toolchain
+			// output, build/user/*.elf, before objcopy strips it to a
+			// flat binary — see docs/devlog.md for the full design and
+			// the real llvm-readelf output this was built against.)
+			// Sniffed by magic, not by any caller-provided flag: exec()
+			// itself (user.c3) has no format opinion, it just reads
+			// bytes and hands them here.
+			bool exec_is_elf = exec_image_size >= 64
+				&& exec_image[0] == (char)0x7F && exec_image[1] == 'E'
+				&& exec_image[2] == 'L' && exec_image[3] == 'F';
+
+			if (exec_is_elf)
+			{
+				// e_ident[4]=EI_CLASS (2=ELFCLASS64), e_ident[5]=EI_DATA
+				// (1=little-endian) — reject anything else outright
+				// rather than misinterpret a 32-bit or big-endian file
+				// as this layout.
+				if ((char)exec_image[4] != (char)2 || (char)exec_image[5] != (char)1)
 				{
-					exec_stage_ok = false;
-					for (uint fp = 0; fp < ep; fp++) free_pages(exec_staged[fp], 1);
+					f.a0 = (ulong)(-1);
 					break;
 				}
-				uint exec_off = ep * PAGE_SIZE;
-				uint exec_remaining = exec_image_size - exec_off;
-				uint exec_copy_size = exec_remaining < PAGE_SIZE ? exec_remaining : PAGE_SIZE;
-				mem::copy((void*)exec_page, exec_image + exec_off, (sz)exec_copy_size);
-				exec_staged[ep] = exec_page;
+
+				ushort* exec_e_type_p     = (ushort*)&exec_image[16];
+				ushort* exec_e_machine_p  = (ushort*)&exec_image[18];
+				ulong*  exec_e_entry_p    = (ulong*)&exec_image[24];
+				ulong*  exec_e_phoff_p    = (ulong*)&exec_image[32];
+				ushort* exec_e_phentsize_p = (ushort*)&exec_image[54];
+				ushort* exec_e_phnum_p    = (ushort*)&exec_image[56];
+
+				ushort exec_e_type      = *exec_e_type_p;
+				ushort exec_e_machine   = *exec_e_machine_p;
+				ulong  exec_e_entry     = *exec_e_entry_p;
+				ulong  exec_e_phoff     = *exec_e_phoff_p;
+				ushort exec_e_phentsize = *exec_e_phentsize_p;
+				ushort exec_e_phnum     = *exec_e_phnum_p;
+
+				// e_type=2 (ET_EXEC) only — ET_DYN (PIE) would need real
+				// relocation processing, out of scope. e_machine=243
+				// (EM_RISCV). e_phentsize must be the real Elf64_Phdr
+				// size (56 bytes) — anything else means this isn't a
+				// layout the fixed-offset reads below can trust.
+				if (exec_e_type != 2 || exec_e_machine != 243 || exec_e_phentsize != 56
+					|| exec_e_phnum == 0 || exec_e_phnum > EXEC_MAX_ELF_SEGMENTS)
+				{
+					f.a0 = (ulong)(-1);
+					break;
+				}
+				// Program headers must actually fit inside the buffer
+				// exec() really read — bounds-checked before a single
+				// byte of any header is trusted, not assumed from
+				// e_phnum/e_phoff alone.
+				if (exec_e_phoff > (ulong)exec_image_size
+					|| (ulong)exec_e_phnum * 56 > (ulong)exec_image_size - exec_e_phoff)
+				{
+					f.a0 = (ulong)(-1);
+					break;
+				}
+
+				for (uint pi = 0; pi < (uint)exec_e_phnum && exec_stage_ok; pi++)
+				{
+					char* exec_ph = exec_image + exec_e_phoff + (ulong)(pi * 56);
+					uint* exec_p_type_p   = (uint*)&exec_ph[0];
+					uint* exec_p_flags_p  = (uint*)&exec_ph[4];
+					ulong* exec_p_offset_p = (ulong*)&exec_ph[8];
+					ulong* exec_p_vaddr_p  = (ulong*)&exec_ph[16];
+					ulong* exec_p_filesz_p = (ulong*)&exec_ph[32];
+					ulong* exec_p_memsz_p  = (ulong*)&exec_ph[40];
+
+					// PT_LOAD is type 1 — everything else (GNU_STACK,
+					// .riscv.attributes, ...) is skipped entirely, same
+					// as a real loader only ever maps PT_LOAD segments.
+					if (*exec_p_type_p != 1) continue;
+
+					uint  exec_p_flags  = *exec_p_flags_p;
+					ulong exec_p_offset = *exec_p_offset_p;
+					ulong exec_p_vaddr  = *exec_p_vaddr_p;
+					ulong exec_p_filesz = *exec_p_filesz_p;
+					ulong exec_p_memsz  = *exec_p_memsz_p;
+
+					// Every bound checked without risking overflow:
+					// p_memsz itself capped before it's ever added to
+					// p_vaddr, source range checked against the real
+					// buffer size, not assumed from the header alone.
+					if (exec_p_filesz > exec_p_memsz
+						|| exec_p_memsz > (ulong)EXEC_MAX_IMAGE_SIZE
+						|| exec_p_vaddr < (ulong)USER_BASE
+						|| exec_p_vaddr - (ulong)USER_BASE > (ulong)EXEC_MAX_IMAGE_SIZE - exec_p_memsz
+						|| exec_p_offset > (ulong)exec_image_size
+						|| exec_p_filesz > (ulong)exec_image_size - exec_p_offset)
+					{
+						exec_stage_ok = false;
+						break;
+					}
+
+					uint exec_seg_start_off = (uint)(exec_p_vaddr - (ulong)USER_BASE);
+					uint exec_seg_page_start = exec_seg_start_off / PAGE_SIZE;
+					uint exec_seg_page_end = (uint)((exec_p_vaddr - (ulong)USER_BASE + exec_p_memsz + (ulong)PAGE_SIZE - 1) / (ulong)PAGE_SIZE);
+
+					// p_flags bits: PF_X=1, PF_W=2, PF_R=4 — every real
+					// racccoon segment is readable, but union whatever
+					// this segment actually declares rather than
+					// assuming PAGE_R unconditionally.
+					uint exec_seg_flags = 0;
+					if ((exec_p_flags & 4) != 0) exec_seg_flags |= PAGE_R;
+					if ((exec_p_flags & 2) != 0) exec_seg_flags |= PAGE_W;
+					if ((exec_p_flags & 1) != 0) exec_seg_flags |= PAGE_X;
+
+					// A physical page can't grant partial-page
+					// permissions — echod.elf's own segments 0/1 share
+					// page 1 (0x1001000-0x1001fff) with different
+					// permissions each, confirmed via llvm-readelf, not
+					// a hypothetical case. Union every touching
+					// segment's own flags into that page rather than
+					// letting the last one silently win.
+					for (uint spi = exec_seg_page_start; spi < exec_seg_page_end; spi++)
+					{
+						if (exec_staged[spi] == 0)
+						{
+							uptr exec_seg_page = alloc_pages(1);
+							if (exec_seg_page == 0)
+							{
+								exec_stage_ok = false;
+								break;
+							}
+							exec_staged[spi] = exec_seg_page;
+						}
+						exec_seg_perm[spi] |= exec_seg_flags;
+						if (spi + 1 > exec_page_count) exec_page_count = spi + 1;
+					}
+					if (!exec_stage_ok) break;
+
+					// Copy p_filesz bytes from the file into the right
+					// page-relative positions — same partial-copy-at-
+					// page-boundaries shape user/fs/fat32.c3's
+					// fat32_read_file_at (and ext2's own equivalent)
+					// already use for their own offset-based reads.
+					// alloc_pages() already zero-fills every page it
+					// hands back (src/allocation.c3) — the memsz-filesz
+					// gap (echod.elf's own segment 2: filesz=0x30,
+					// memsz=0x10150) comes out correctly zeroed for
+					// free, no explicit zeroing needed here.
+					uint exec_copied = 0;
+					while (exec_copied < (uint)exec_p_filesz)
+					{
+						uint exec_dst_off = exec_seg_start_off + exec_copied;
+						uint exec_dst_page = exec_dst_off / PAGE_SIZE;
+						uint exec_dst_in_page = exec_dst_off % PAGE_SIZE;
+						uint exec_chunk = PAGE_SIZE - exec_dst_in_page;
+						uint exec_remaining = (uint)exec_p_filesz - exec_copied;
+						if (exec_chunk > exec_remaining) exec_chunk = exec_remaining;
+						mem::copy((void*)(exec_staged[exec_dst_page] + exec_dst_in_page), exec_image + exec_p_offset + exec_copied, (sz)exec_chunk);
+						exec_copied += exec_chunk;
+					}
+				}
+
+				if (exec_stage_ok)
+				{
+					// e_entry must land on a page a real PT_LOAD segment
+					// actually staged above — not just "somewhere inside
+					// the generous EXEC_MAX_IMAGE_SIZE ceiling."
+					if (exec_e_entry < (ulong)USER_BASE
+						|| exec_e_entry - (ulong)USER_BASE >= (ulong)(exec_page_count * PAGE_SIZE)
+						|| exec_staged[(uint)((exec_e_entry - (ulong)USER_BASE) / (ulong)PAGE_SIZE)] == 0)
+					{
+						exec_stage_ok = false;
+					}
+					else
+					{
+						exec_entry_point = exec_e_entry;
+					}
+				}
+
+				if (!exec_stage_ok)
+				{
+					for (uint fp = 0; fp < EXEC_MAX_IMAGE_PAGES; fp++)
+					{
+						if (exec_staged[fp] != 0) free_pages(exec_staged[fp], 1);
+					}
+					f.a0 = (ulong)(-1);
+					break;
+				}
 			}
-			if (!exec_stage_ok)
+			else
 			{
-				f.a0 = (ulong)(-1);
-				break;
+				// racccoon's own flat-binary format — one contiguous
+				// blob at USER_BASE, mapped RWX uniformly, unchanged
+				// from before the ELF path above existed.
+				exec_page_count = (exec_image_size + PAGE_SIZE - 1) / PAGE_SIZE;
+				for (uint ep = 0; ep < exec_page_count; ep++)
+				{
+					uptr exec_page = alloc_pages(1);
+					if (exec_page == 0)
+					{
+						exec_stage_ok = false;
+						for (uint fp = 0; fp < ep; fp++) free_pages(exec_staged[fp], 1);
+						break;
+					}
+					uint exec_off = ep * PAGE_SIZE;
+					uint exec_remaining = exec_image_size - exec_off;
+					uint exec_copy_size = exec_remaining < PAGE_SIZE ? exec_remaining : PAGE_SIZE;
+					mem::copy((void*)exec_page, exec_image + exec_off, (sz)exec_copy_size);
+					exec_staged[ep] = exec_page;
+					exec_seg_perm[ep] = PAGE_R | PAGE_W | PAGE_X;
+				}
+				if (!exec_stage_ok)
+				{
+					f.a0 = (ulong)(-1);
+					break;
+				}
+				exec_entry_point = USER_BASE;
 			}
 
 			// Same staging discipline, second pass, for the (usually
@@ -1491,7 +1708,15 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			if (!argv_stage_ok)
 			{
-				for (uint fp = 0; fp < exec_page_count; fp++) free_pages(exec_staged[fp], 1);
+				// Guarded (not every slot 0..exec_page_count is
+				// necessarily allocated for the ELF path — a real gap
+				// between segments stays 0) — the flat-binary path's own
+				// slots are always non-zero here too, so this is a no-op
+				// change for that path.
+				for (uint fp = 0; fp < exec_page_count; fp++)
+				{
+					if (exec_staged[fp] != 0) free_pages(exec_staged[fp], 1);
+				}
 				f.a0 = (ulong)(-1);
 				break;
 			}
@@ -1527,10 +1752,16 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				}
 			}
 
-			// Map the newly staged pages at USER_BASE.
+			// Map the newly staged pages at USER_BASE, with each page's
+			// own accumulated permission (uniform RWX for the flat-binary
+			// path, the real per-segment union for ELF — see exec_seg_perm's
+			// own comment above). A real gap between ELF segments
+			// (exec_staged[mp] == 0) stays unmapped, not silently
+			// zero-filled.
 			for (uint mp = 0; mp < exec_page_count; mp++)
 			{
-				map_page(current_proc.page_table, (uptr)USER_BASE + (uptr)(mp * PAGE_SIZE), exec_staged[mp], PAGE_U | PAGE_R | PAGE_W | PAGE_X);
+				if (exec_staged[mp] == 0) continue;
+				map_page(current_proc.page_table, (uptr)USER_BASE + (uptr)(mp * PAGE_SIZE), exec_staged[mp], PAGE_U | exec_seg_perm[mp]);
 			}
 
 			// argv's own pages, right after the image's own last mapped
@@ -1560,14 +1791,18 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// Redirect execution: the standard trap-return path
 			// restores this into the real sepc CSR before sret, so the
 			// next time this process runs, it starts fresh at
-			// USER_BASE instead of resuming where the old program's
-			// ecall left off. No user-mode stack pointer needs setting
+			// exec_entry_point instead of resuming where the old
+			// program's ecall left off — USER_BASE for the flat-binary
+			// path (unchanged), the validated real e_entry for ELF (for
+			// racccoon's own toolchain output this is USER_BASE too,
+			// confirmed via llvm-readelf, but a real loader shouldn't
+			// assume that). No user-mode stack pointer needs setting
 			// here — user/user.c3's own start() sets its own sp from a
-			// link-time __stack_top constant baked into every image,
-			// as its very first instruction, so whatever the
-			// trapframe's stale sp says is irrelevant the moment a
-			// fresh image starts running.
-			current_proc.saved_sepc = USER_BASE;
+			// link-time __stack_top constant baked into every image, as
+			// its very first instruction, so whatever the trapframe's
+			// stale sp says is irrelevant the moment a fresh image
+			// starts running.
+			current_proc.saved_sepc = exec_entry_point;
 			// argc/argv's own base address, handed off via a0/a1 exactly
 			// the way a normal syscall would hand back a return value —
 			// safe to repurpose them for this instead, since control

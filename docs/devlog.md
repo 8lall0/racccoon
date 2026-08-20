@@ -4,6 +4,104 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (40) — ELF loading confirmed on real Milk-V Duo hardware
+
+Follow-up to the previous entry: `elftest: ok` on the real C906 core
+(`DUOBOOT`/FAT32) alongside `runtest` re-confirmed, `lsproc` clean
+afterward. The multi-segment, per-segment-permission-union staging and
+the real `e_entry` redirect both hold outside QEMU's emulation.
+
+**Files changed:** none (hardware verification only).
+
+---
+
+## 2026-08-20 (39) — ELF loading for `SYS_EXEC`
+
+Closes the last item flagged in the original exec() plan: "no ELF
+loading... a real ELF loader is a substantially bigger, separate
+project." `SYS_EXEC` can now load real ELF64/RISC-V executables, not
+just racccoon's own flat-binary format.
+
+**Confirmed via `llvm-readelf` before writing any code** that this
+would be a genuinely non-trivial loader, not a hand-wave: racccoon's
+own toolchain output (`build/user/echod.elf`, before `objcopy` strips
+it to the flat binary the rest of this session's `exec()` work used)
+has 3 `PT_LOAD` segments with 3 different permission combinations
+(`.text` R-E, `.rodata` R, `.data`+`.bss` RW), and the last segment's
+`memsz` (0x10150) far exceeds its `filesz` (0x30) — a real `.bss` gap
+that must be zero-filled, not read from the file. Segments 0 and 1 are
+even adjacent enough to share one physical page
+(`0x1001000-0x1001fff`) with *different* permissions each — a real
+case a hand-crafted test fixture would have had to specifically
+manufacture, and this one didn't need to.
+
+**Detection**: `SYS_EXEC` (`src/entry.c3`) sniffs the magic bytes
+(`\x7FELF`) at the top of its case; `exec()`'s own user-mode wrapper
+(`user.c3`) is completely unchanged — it already just reads bytes and
+hands them over, no format opinion of its own. Both the ELF and
+flat-binary paths converge on the same shared tail this session
+already built (argv staging, old-image teardown, TLB flush,
+`saved_sepc` redirect). Kept inlined in the switch like every other
+case here, not factored into a helper — a documented, proven
+constraint of this codebase (an unexplained c3c compiler bug: "a call
+out to a moderately complex function from inside this switch has
+reproducibly broken boot before"), so this makes the case long but
+consistent with the existing pattern rather than a deviation from it.
+
+**Validation before trusting anything**: `ELFCLASS64`, little-endian,
+`ET_EXEC` only (rejects `ET_DYN`/PIE — would need real relocation
+processing, out of scope), `EM_RISCV`, segment count bounded, program
+headers bounds-checked against the real buffer size before a single
+byte of any header is trusted. Per `PT_LOAD` segment: `filesz <= memsz`,
+`vaddr`/`memsz` bounded without risking overflow, source range checked
+against the actual file size — any failure aborts before any
+staging/teardown, same "fail toward not losing what's already there"
+discipline the image/argv staging already established.
+
+**Staging, one real wrinkle**: a page-table entry can't grant
+partial-page permissions, but `echod.elf`'s own segments 0/1 genuinely
+share a page with different flags — confirmed above, not hypothetical.
+Fixed by unioning every touching segment's own permission flags into
+that page rather than letting the last one silently win, tracked in a
+new parallel `exec_seg_perm[]` array alongside the existing
+`exec_staged[]`. `alloc_pages()` already zero-fills every page it hands
+back (confirmed in `src/allocation.c3`) — the `.bss` gap and any
+inter-segment page padding come out correctly zeroed for free.
+`exec_page_count` became "highest touched page index + 1" rather than
+a plain size-derived count, so a genuine gap between segments stays
+unmapped, not silently zero-filled — the mapping loop now skips any
+untouched slot.
+
+**Entry point**: `e_entry`, not an assumed `USER_BASE` — validated to
+land on a page a real segment actually staged, then used for the
+redirect. For racccoon's own binaries this happens to equal `USER_BASE`
+anyway (confirmed via `llvm-readelf -h`), but a real loader shouldn't
+assume that.
+
+**Test**: `elftest` (`shell.c3`) — same `rfork`+sync+`exec`+"ready"
+handshake `runtest` already established, execs `bin/echod.elf` (the
+real ELF, seeded by `scripts/build.sh` alongside the existing flat
+`bin/echod`) instead of the flat binary, same "hi echod" echo check.
+One naming wrinkle found immediately: the fixture was first seeded as
+`bin/echod_elf`, which doesn't fit FAT32's 8.3 short-name format —
+mtools generated an `ECHOD_~1` alias this driver's simple 8.3
+converter (`fat32_name_to_8_3`, a plain 8-character truncation, no LFN
+support) can't reproduce, so the lookup failed before `SYS_EXEC` ever
+ran. Renamed to `bin/echod.elf` (5+3 characters, fits 8.3 exactly, no
+alias needed).
+
+**Verification**: full regression suite (through `permtest`)
+unaffected — the flat-binary path is untouched code, only reached when
+the magic-byte check fails — plus `elftest` on both filesystems
+(`FAILED (exec load failed)` on ext2, the same pre-existing
+12-direct-block limit `runtest`/`argvtest`/`pathtest` already hit
+there), run repeatedly with `lsproc` showing no leaked slots, a
+three-boot stress batch, `fsck.vfat -n`/`e2fsck -n -f` clean.
+
+**Files changed:** `src/entry.c3`, `scripts/build.sh`, `user/shell.c3`.
+
+---
+
 ## 2026-08-20 (38) — `permtest` confirmed on real Milk-V Duo hardware
 
 Follow-up to the previous entry: every `permtest` sub-check (`setuid()`

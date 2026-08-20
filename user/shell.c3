@@ -891,6 +891,51 @@ fn void main() @export("main") {
                     }
                 }
             }
+        } else if (strcmp(cmd, "elftest") == 0) {
+            // Same rfork+sync+exec+"ready" handshake as runtest above
+            // (see its own comment for why each step's there), except
+            // this execs bin/echod.elf — a real ELF64/RISC-V executable
+            // (build/user/echod.elf, racccoon's own toolchain output,
+            // before objcopy strips it to the flat bin/echod runtest
+            // uses), exercising SYS_EXEC's own ELF loader (src/entry.c3)
+            // instead of the flat-binary path. Same "hi echod" echo
+            // check as runtest — proving the loaded process is
+            // genuinely executing (its code segment ran, its
+            // .bss-resident stack worked), not just that the syscall
+            // returned success.
+            uint el_gen = 0;
+            int el_r = rfork(RFPROC, &el_gen);
+            if (el_r < 0) {
+                print("rfork failed\n");
+            } else if (el_r == 0) {
+                char[16] el_sync_buf @noinit;
+                int el_parent = ipc_recv(&el_sync_buf, 16);
+                ipc_send(el_parent, 0, "ack", 4);
+                exec("bin/echod.elf", &run_exec_buf, RUN_EXEC_BUF_MAX, el_parent, null, 0);
+                ipc_send(el_parent, 0, "failed", 7);
+                exit();
+            } else {
+                ipc_send(el_r, 0, "sync", 5);
+                char[16] el_ack_buf @noinit;
+                ipc_recv(&el_ack_buf, 16);
+
+                char[16] el_ready_buf @noinit;
+                ipc_recv(&el_ready_buf, 16);
+
+                if (strcmp(&el_ready_buf, "ready") != 0) {
+                    print("elftest: FAILED (exec load failed)\n");
+                } else {
+                    ipc_send(el_r, 0, "hi echod", 9);
+                    char[16] el_reply @noinit;
+                    int el_from = ipc_recv(&el_reply, 16);
+                    int el_killed = kill(el_r, el_gen);
+                    if (el_from == el_r && strcmp(&el_reply, "hi echod") == 0 && el_killed == 0) {
+                        print("elftest: ok\n");
+                    } else {
+                        print("elftest: FAILED\n");
+                    }
+                }
+            }
         } else if (strcmp(cmd, "argvtest") == 0) {
             // Same rfork+sync+exec+ready handshake as runtest above
             // (see its own comment for why each step's there) — the

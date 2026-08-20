@@ -50,6 +50,13 @@ LLC=${LLC:-llc}
   # for this test.
   mmd -i build/disk.img ::bin
   mcopy -i build/disk.img build/user/echod.bin ::bin/echod
+  # bin/echod.elf — same idea, but the real ELF (build/user/echod.elf,
+  # before objcopy strips it to the flat bin/echod above), exercising
+  # SYS_EXEC's own ELF loader (see docs/devlog.md): 3 PT_LOAD segments,
+  # 3 different permission combinations, a real .bss gap. Not a
+  # replacement for bin/echod — elftest execs this one specifically,
+  # runtest/argvtest/pathtest keep using the flat binary unchanged.
+  mcopy -i build/disk.img build/user/echod.elf ::bin/echod.elf
 
   echo "==> Building disk image (ext2, for scripts/launch64_ext2.sh)..."
   # Additional, not a replacement — build/disk.img (FAT32) above stays
@@ -85,6 +92,7 @@ LLC=${LLC:-llc}
   # bin/ above.
   debugfs -w -R "mkdir bin" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_ext2.img > /dev/null
+  debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_ext2.img > /dev/null
 
   echo "==> Building disk image (dual FAT32+ext2, for scripts/launch64_dual.sh)..."
   # Third test image — exercises fsd/fsd2 mounting two filesystems at once
