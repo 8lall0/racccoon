@@ -45,6 +45,7 @@ LLC=${LLC:-llc}
     build/user/sdd.bin.o \
     build/user/fsd.bin.o \
     build/user/procd.bin.o \
+    build/user/envd.bin.o \
     -T boards/duo/kernel.ld \
     -Map=build/kernel_duo.map \
     -o build/kernel_duo.elf

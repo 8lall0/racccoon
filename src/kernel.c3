@@ -46,6 +46,8 @@ extern char[] _binary_fsd_bin_start @cname("_binary_fsd_bin_start");
 extern char[] _binary_fsd_bin_end @cname("_binary_fsd_bin_end");
 extern char[] _binary_procd_bin_start @cname("_binary_procd_bin_start");
 extern char[] _binary_procd_bin_end @cname("_binary_procd_bin_end");
+extern char[] _binary_envd_bin_start @cname("_binary_envd_bin_start");
+extern char[] _binary_envd_bin_end @cname("_binary_envd_bin_end");
 
 fn void boot() @naked @export("boot") @section(".text.boot") @noinline @nostrip @used
 {
@@ -179,6 +181,16 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	Process* procd_proc = create_process((void*)&_binary_procd_bin_start, (uint)((uptr)&_binary_procd_bin_end - (uptr)&_binary_procd_bin_start));
 	procd_pid = procd_proc.pid;
 	io::print("procd created\n");
+
+	// envd (the "/env/" server, user/envd.c3) — same unconditional,
+	// spawned-right-after-procd reasoning as procd's own comment above:
+	// no storage-hardware dependency (just SYS_IPC_RECV_GEN/
+	// SYS_PROC_INFO, both already usable by every process regardless of
+	// board), and ordering still matters for the same reason
+	// (create_process's default namespace population, right below).
+	Process* envd_proc = create_process((void*)&_binary_envd_bin_start, (uint)((uptr)&_binary_envd_bin_end - (uptr)&_binary_envd_bin_start));
+	envd_pid = envd_proc.pid;
+	io::print("envd created\n");
 
 	// Single call site for create_process(shell), used for both the
 	// initial spawn and every respawn once idle notices nothing else is

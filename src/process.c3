@@ -81,12 +81,20 @@ int fsd2_pid = 0;
 // already call.
 int procd_pid = 0;
 
-const NS_MOUNTS_MAX = 8;   // Four static entries at boot ("/srv/echo/" ->
+// The per-process environment-variable server (see user/envd.c3) — 0
+// until created, reachable under the "/env/" prefix. Same "no storage
+// hardware dependency, spawned unconditionally" reasoning as procd_pid
+// above: envd only ever needs SYS_IPC_RECV_GEN/SYS_PROC_INFO, which
+// every process can already reach regardless of board.
+int envd_pid = 0;
+
+const NS_MOUNTS_MAX = 8;   // Five static entries at boot ("/srv/echo/" ->
                             // echod, "" -> fsd, "/2/" -> fsd2, "/proc/" ->
-                            // procd) plus real headroom for SYS_NS_MOUNT
-                            // (below) to add dynamically-posted ones at
-                            // runtime — was 5 (one spare) before dynamic
-                            // mounting existed to actually use the room.
+                            // procd, "/env/" -> envd) plus real headroom
+                            // for SYS_NS_MOUNT (below) to add
+                            // dynamically-posted ones at runtime — was 5
+                            // (one spare) before dynamic mounting existed
+                            // to actually use the room.
 const NS_PREFIX_MAX = 32;  // Longest path prefix a mount entry can match.
 
 // A small, kernel-global (not per-process — discoverable *by name*,
@@ -542,7 +550,14 @@ fn Process* create_process(void* image, uint image_size)
 	proc.namespace[3].server_pid = procd_pid;
 	proc.namespace[3].server_generation = mount_generation(procd_pid);
 
-	for (int m = 4; m < NS_MOUNTS_MAX; m++)
+	// "/env/" — the per-process environment-variable server (see
+	// envd_pid's own comment above, user/envd.c3). Same harmless-0-
+	// before-creation pattern as namespace[1]/[2]/[3].
+	str_copy(&proc.namespace[4].prefix[0], "/env/", NS_PREFIX_MAX);
+	proc.namespace[4].server_pid = envd_pid;
+	proc.namespace[4].server_generation = mount_generation(envd_pid);
+
+	for (int m = 5; m < NS_MOUNTS_MAX; m++)
 	{
 		proc.namespace[m].server_pid = 0;
 	}

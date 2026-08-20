@@ -758,6 +758,68 @@ fn void main() @export("main") {
                     print("srvtest: FAILED\n");
                 }
             }
+        } else if (strcmp(cmd, "envtest") == 0) {
+            // /env (user/envd.c3): per-process environment variables,
+            // reusing all four existing FS_* verbs (FS_READ/FS_WRITE/
+            // FS_LIST/FS_DELETE) — fs_write()/fs_read()/fs_list()/
+            // fs_delete() reach it with zero client-side changes, same
+            // as every other synthetic server this session built.
+            fs_write("/env/GREETING", "hello", 5);
+            char[32] env_buf @noinit;
+            int env_len = fs_read("/env/GREETING", &env_buf, 32);
+            if (env_len >= 0) env_buf[env_len] = 0;
+            bool env_read_ok = env_len == 5 && strcmp(&env_buf, "hello") == 0;
+
+            char[576] env_listbuf @noinit;
+            int env_count = fs_list("/env/", &env_listbuf, 16);
+            bool env_list_ok = false;
+            for (int ei = 0; ei < env_count; ei++) {
+                char* rec = &env_listbuf[ei * 36];
+                if (strcmp(rec, "GREETING") == 0) env_list_ok = true;
+            }
+
+            int env_del = fs_delete("/env/GREETING");
+            int env_after_del = fs_read("/env/GREETING", &env_buf, 32);
+            bool env_del_ok = env_del == 0 && env_after_del < 0;
+
+            // Isolation proof (the part that actually matters): a child
+            // sets its *own* "GREETING" to a different value; the
+            // parent's own var, re-set here, must come back exactly
+            // what the parent itself wrote, never the child's — proving
+            // two processes' vars under the same name don't collide,
+            // not just that reads/writes round-trip. Direct message to
+            // the child's own known pid first, not a busy-retry — same
+            // fix srvtest needed for the same reason (the timer only
+            // fires once per real second, see that entry's own
+            // root-cause writeup).
+            fs_write("/env/GREETING", "parent_value", 12);
+            uint env_child_gen = 0;
+            int env_child_r = rfork(RFPROC, &env_child_gen);
+            if (env_child_r == 0) {
+                char[16] env_sync_buf @noinit;
+                int env_parent_pid = ipc_recv(&env_sync_buf, 16);
+                fs_write("/env/GREETING", "child_value", 11);
+                ipc_send(env_parent_pid, 0, "done", 5);
+                exit();
+            } else if (env_child_r > 0) {
+                ipc_send(env_child_r, 0, "go", 3);
+                char[16] env_done_buf @noinit;
+                ipc_recv(&env_done_buf, 16);
+
+                int env_isolated_len = fs_read("/env/GREETING", &env_buf, 32);
+                if (env_isolated_len >= 0) env_buf[env_isolated_len] = 0;
+                bool env_isolated_ok = env_isolated_len == 12 && strcmp(&env_buf, "parent_value") == 0;
+
+                fs_delete("/env/GREETING");
+
+                if (env_read_ok && env_list_ok && env_del_ok && env_isolated_ok) {
+                    print("envtest: ok\n");
+                } else {
+                    print("envtest: FAILED\n");
+                }
+            } else {
+                print("rfork failed\n");
+            }
         } else if (strcmp(cmd, "rforktest") == 0) {
             // Plain rfork(RFPROC): the child gets an independent copy of
             // this process's address space (src/entry.c3's SYS_RFORK,

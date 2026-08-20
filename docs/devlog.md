@@ -4,6 +4,93 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (24) — /env: per-process environment variables, zero new syscalls
+
+The last item on the original `/srv`/`/tmp`/`/proc` plan's explicitly-
+out-of-scope list: "genuinely separate, much larger subsystems... with
+no existing racccoon mechanism to build on." With `/proc`'s read-only
+core, `/proc/<pid>/ctl` (the first `FS_WRITE` reuse), and real dynamic
+namespace binding all landed since then, `/env` turned out to need
+**no new syscalls at all** — a complete read/write/list/delete
+filesystem-shaped feature built entirely out of verbs
+(`FS_READ`/`FS_WRITE`/`FS_LIST`/`FS_DELETE`) this codebase already had,
+on a synthetic server exactly like `procd`.
+
+### Per-process privacy via the sender's own verified pid
+
+Real Plan 9's `/env` is a private per-process kernel device (`#e`) —
+racccoon has no per-process device concept and doesn't need one here:
+every request `envd` (new file, `user/envd.c3`) receives already
+carries the sender's kernel-verified `(pid, generation)` via
+`ipc_recv_type_gen()` (`SYS_IPC_RECV_GEN`, two entries back),
+unforgeable by the requester. Keying `env_table` by `(pid, generation,
+name)` and only ever matching a request's own `(from, from_gen)` gives
+genuine per-process isolation for free — no new kernel mechanism, just
+the same generation-safety discipline `Mount.server_generation`/
+`Srv_entry.generation` already established elsewhere. A pid reused by
+an unrelated process simply never matches its predecessor's leftover
+vars again; they become permanently inert clutter under a stale
+generation, exactly the same shape `Mount`/`Srv_entry` already treat a
+stale binding.
+
+**Slot reclamation, learned from the ext2 investigation rather than
+repeated**: a bounded table that only ever reclaims on exact-name-match
+(fine for `srv_table`'s handful of long-lived named services) would
+leak real capacity here, since env vars churn per-process. `FS_WRITE`
+needing a fresh slot on a full table scans for one whose owner is no
+longer live (`proc_info()` — already used by `procd.c3` — returning
+`-1`, or a live generation that no longer matches) before ever
+reporting "full" — the same "don't silently degrade after N
+operations" bar the ext2 directory-slot-reuse fix set, applied here
+before it could bite instead of after.
+
+### Wiring
+
+Same shape as `procd`'s own integration: `envd_pid` global
+(`src/process.c3`), a 5th static default-namespace slot (`"/env/"`),
+spawned unconditionally right after `procd` in `kernel.c3` (no storage-
+hardware dependency, same reasoning). `NS_MOUNTS_MAX` stayed at 8 — 5
+static entries now, still 3 spare for `SYS_NS_MOUNT`.
+
+### `envtest`'s isolation proof
+
+Round-tripping a var (write/read/list/delete) is the easy half; the
+part that actually matters is proving two processes' vars under the
+*same name* don't collide. `rfork(RFPROC)`s a child that sets its own
+`"GREETING"` to a different value than the parent's; the parent's own
+var, re-read afterward, must come back exactly what the parent itself
+wrote. Used the same direct-message-to-the-child's-own-known-pid
+handshake `srvtest` had to learn the hard way two entries back (not a
+busy-retry — the timer only fires once per real second) to synchronize
+before checking.
+
+**Verified**: full regression suite (`envtest` included) clean on both
+filesystems, `envtest` run repeatedly back-to-back confirming
+idempotent overwrite-in-place and no leaked process/env slots
+(`lsproc` after), a 10-boot stress batch (`envtest` twice per boot plus
+the rest of the suite) clean on both filesystems, `e2fsck -n -f`/
+`fsck.vfat -n` clean after.
+
+### Explicitly out of scope
+
+**No inheritance across `rfork`** — a forked child starts with a
+completely empty env, unlike real Plan 9 where children typically
+inherit their parent's. Would need `envd` to observe fork events,
+which nothing currently notifies it of — a real, separate mechanism
+change, not attempted here. The most Plan-9-surprising limitation of
+this slice. Also no env groups/`bind`-able sub-namespaces (a single
+flat namespace per process, same "not the full `ctl`/`mem`/`fd`/`ns`
+set" scoping `/proc` already accepted) and no cross-process env
+access by design (that's what makes it private, not another
+`srv_table`).
+
+**Files changed:** `user/envd.c3` (new), `src/process.c3` (`envd_pid`,
+5th namespace slot), `src/kernel.c3` (spawn `envd`), `scripts/
+build_user.sh`/`build.sh`/`build_duo.sh` (`envd` added to the build),
+`user/shell.c3` (`envtest`).
+
+---
+
 ## 2026-08-20 (23) — Real srv-post + mount: dynamic namespace binding
 
 The last piece explicitly deferred when `/srv`/`/tmp`/`/proc` were built:
