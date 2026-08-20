@@ -4,6 +4,52 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (29) — Real Duo hardware: everything since /srv confirmed, and a real flashing lesson
+
+Every feature from this session — `/srv`/`/tmp`/`/proc` (read + write),
+`SYS_KILL`, the reply-side stale-pid IPC fix, rename-cycle detection,
+real `SYS_SRV_POST`/`SYS_NS_MOUNT` dynamic namespace binding, `/env`
+(including lazy inheritance), and the `std::nolibc` stdlib port — run
+on the real Milk-V Duo now, not just QEMU. `envtest`/`srvtest`/
+`killtest`/`mkdirtest`/`renametest`/`movetest`/`cycletest`/`racetest`/
+`mutextest` all match QEMU exactly, including edge cases (`killtest`'s
+re-kill-of-a-dead-pid and bogus-ctl-command checks). `mutextest`
+specifically is the first real-hardware run of `std::nolibc::atomic`'s
+actual RV64 `lr.w`/`sc.w`/`amoadd.w` instructions, not just QEMU's own
+emulation of them — real hardware confirmed the same 16/16 result.
+
+**A real flashing mistake, corrected**: got this board's own flashing
+convention wrong on the first attempt — assumed a generic "raw `dd` to
+disk offset 0" convention without checking this project's own
+documented history first. The actual, already-established convention
+(confirmed back in the `2026-08-17 (6)` entry, from this exact board's
+own real-hardware bring-up) is different: BootROM reads `fip.bin` as a
+literal *file* inside the `DUOBOOT` FAT32 partition's own filesystem,
+not a raw region before it. `DUOBOOT` itself starts at sector 2048
+(`board::FS_PARTITION_START_SECTOR`), not sector 0 — a raw
+`dd if=fip.bin of=/dev/sdX bs=1M` starting at offset 0 overwrites the
+MBR/partition table instead, which is exactly what happened
+(`lsblk` afterward showed zero partitions where `DUOBOOT`/`EXT2TEST`
+used to be). Recovered with a full repartition (`sfdisk` recreating
+both partitions at their exact original sectors/sizes, `mkfs.vfat`/
+`mke2fs`, then copying `fip.bin` onto `DUOBOOT` the correct way) — full
+data loss on the card's test fixtures, but the board itself was never
+at risk (the corrupted region was purely the SD card's own partition
+table, nothing written to the chip's own boot ROM/flash).
+
+**New `scripts/flash_duo.sh`**: the correct, safe, repeatable flash
+step (mount `DUOBOOT`, copy `fip.bin` onto it as a file, unmount) —
+doesn't touch partitioning or existing filesystem content, safe to run
+after every rebuild. Doesn't attempt to fix a missing partition table;
+that needs the same manual `sfdisk`/`mkfs.vfat`/`mke2fs` recovery this
+entry describes, and it's destructive enough (wipes whatever's
+currently on the card) that it isn't worth automating into a script
+that runs unattended.
+
+**Files changed:** `scripts/flash_duo.sh` (new).
+
+---
+
 ## 2026-08-20 (28) — std::racccoon -> std::nolibc, gated by a real opt-in feature
 
 Two refinements to the previous entry's `std::racccoon::*` module,
