@@ -7,12 +7,19 @@ import std::nolibc::mem;
 // original ext2 on-disk format, unchanged by ext3/ext4's later journal/
 // extent additions) — not reverse-engineered.
 //
-// v1 scope, deliberately limited — applies to both read and write:
-//   - Direct block pointers only (i_block[0..11], 12 of them) — single/
-//     double/triple indirect blocks are NOT walked. A file needing more
-//     than 12 blocks' worth of data reads back short, same "return
-//     however many bytes were actually reachable" discipline
-//     fat32_read_file uses for a broken chain, not an error.
+// v1 scope, deliberately limited:
+//   - Reading (ext2_read/ext2_read_at) walks direct block pointers
+//     (i_block[0..11]) plus one level of single-indirect (i_block[12] —
+//     see ext2_resolve_block's own comment) — double/triple indirect
+//     are NOT walked. At this project's own 1024-byte block size that's
+//     12 + 256 = 268 blocks (268KB), comfortably past racccoon's own
+//     ~70KB binaries. A file needing more than that reads back short,
+//     same "return however many bytes were actually reachable"
+//     discipline fat32_read_file uses for a broken chain, not an error.
+//   - Writing (ext2_write, below) stays direct-blocks-only (i_block[0..11]) —
+//     nothing in this project's own test suite writes a file bigger
+//     than 12 blocks, so single-indirect write support isn't attempted
+//     here; see its own "v1 write scope" note below.
 //   - Reading, updating, and allocating inodes/blocks all work across
 //     any block group, up to EXT2_MAX_GROUPS (see its own comment) —
 //     found a real need for this on actual hardware: a real Linux
@@ -166,7 +173,8 @@ struct Ext2_inode_info
 	uint size;
 	uint links_count; // see EXT2_INODE_LINKS_COUNT's own comment
 	uint blocks;       // see EXT2_INODE_BLOCKS's own comment — 512-byte sectors, not ext2_block_size blocks
-	uint[12] block; // direct block pointers only — see this file's header comment
+	uint[12] block; // direct block pointers
+	uint indirect_block; // i_block[12] — see ext2_resolve_block's own comment
 }
 
 fn bool ext2_probe()
@@ -240,7 +248,53 @@ fn bool ext2_read_inode(uint inode_num, Ext2_inode_info* out)
 	out.blocks      = *blocks_field;
 	uint* block_ptrs = (uint*)&inode_bytes[EXT2_INODE_BLOCK];
 	mem::copy(&out.block, block_ptrs, 48); // 12 uint (4 bytes each) direct block pointers
+	out.indirect_block = block_ptrs[12]; // i_block[12] — see ext2_resolve_block's own comment
 	return true;
+}
+
+// Resolves logical block index `b` (0-based, within one file) into its
+// real on-disk block number — direct (b < 12, straight from inode.block)
+// or through the single-indirect block (i_block[12], one more level of
+// 4-byte pointers) for 12 <= b < 12 + ext2_block_size/4. Only ever
+// called within that range (ext2_read/ext2_read_at's own loop bounds
+// enforce it) — double/triple indirect stay out of this driver's scope
+// (see this file's own header comment), the same "12 blocks only" limit
+// ext2_write still has.
+//
+// indirect_cache/indirect_loaded are caller-owned (one read.c3-local
+// char[EXT2_MAX_BLOCK_SIZE] + bool per read loop, not a global): the
+// indirect block itself only needs reading once no matter how many of
+// its 256 (at this project's own 1024-byte block size) pointers a given
+// read actually needs, same "read once, reuse" shape ext2_read_inode's
+// own inode-table block already gets implicitly by being read once
+// per call.
+//
+// A 0 result within the supported range is unambiguous: a genuine
+// ext2 sparse hole (no block ever allocated there), same as inode.block[b]
+// already being 0 means for a direct block today — including when
+// inode.indirect_block itself is 0 (no indirect block allocated at all
+// yet — every pointer within it reads as 0, the same way an
+// entirely-unallocated indirect block would). Callers zero-fill on 0,
+// exactly like the existing direct-block path.
+fn uint ext2_resolve_block(Ext2_inode_info* inode, uint b, char* indirect_cache, bool* indirect_loaded)
+{
+	if (b < 12) return inode.block[b];
+
+	if (!*indirect_loaded)
+	{
+		if (inode.indirect_block == 0)
+		{
+			for (uint i = 0; i < EXT2_MAX_BLOCK_SIZE; i++) indirect_cache[i] = 0;
+		}
+		else if (!ext2_read_block(inode.indirect_block, indirect_cache))
+		{
+			return 0;
+		}
+		*indirect_loaded = true;
+	}
+
+	uint* indirect_ptrs = (uint*)indirect_cache;
+	return indirect_ptrs[b - 12];
 }
 
 fn uint ext2_strlen(char* s)
@@ -470,10 +524,14 @@ fn int ext2_read(char* name, char* dst, uint len)
 	uint read_len = len;
 	if (read_len > inode.size) read_len = inode.size;
 
+	uint max_block = 12 + ext2_block_size / 4;
+	char[EXT2_MAX_BLOCK_SIZE] indirect_cache @noinit;
+	bool indirect_loaded = false;
+
 	uint bytes_read = 0;
-	for (uint b = 0; b < 12 && bytes_read < read_len; b++)
+	for (uint b = 0; b < max_block && bytes_read < read_len; b++)
 	{
-		uint block = inode.block[b];
+		uint block = ext2_resolve_block(&inode, b, &indirect_cache, &indirect_loaded);
 		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
 		if (block == 0)
 		{
@@ -498,12 +556,12 @@ fn int ext2_read(char* name, char* dst, uint len)
 	return (int)bytes_read;
 }
 
-// Same lookup/direct-block shape as ext2_read above, but starts copying
-// from `offset` bytes into the file instead of from the beginning —
-// this driver's own 12-direct-block-only scope (no indirect blocks)
-// makes this simpler than FAT32's own equivalent (fat32_read_file_at):
-// no chain to walk, just index straight into block[offset /
-// ext2_block_size]. A fully separate function from ext2_read rather
+// Same lookup shape as ext2_read above, but starts copying from
+// `offset` bytes into the file instead of from the beginning — reads
+// through direct blocks (0..11) and, past those, the single-indirect
+// block (see ext2_resolve_block's own comment for both this driver's
+// real reach and why double/triple indirect still stay out of scope,
+// same as ext2_write). A fully separate function from ext2_read rather
 // than adding an offset parameter there, so the existing, heavily-
 // exercised offset-0 read path stays completely untouched. Built for
 // exec()'s own chunked reads (user/user.c3) — see fat32_read_file_at's
@@ -535,30 +593,34 @@ fn int ext2_read_at(char* name, char* dst, uint len, uint offset)
 
 	uint start_block = offset / ext2_block_size;
 	uint offset_in_block = offset % ext2_block_size;
+	uint max_block = 12 + ext2_block_size / 4;
 
-	// This driver only ever reads direct blocks 0..11 (see this file's
-	// own header comment and ext2_read()'s "v1 only reads [0..11]") —
-	// no indirect-block chain to walk beyond that. offset >= inode.size
-	// above already caught genuine EOF; reaching here with start_block
-	// past the last direct block means the file legitimately continues
-	// but this driver can't reach the rest, a real error (-1), not 0
-	// ("clean EOF" — exec()'s own chunked-read loop, user/user.c3,
-	// trusts 0 completely and stops there, thinking the whole file is
-	// in hand). Found the hard way: echod.bin (70KB) is the first file
-	// this driver was ever asked to read past 12*block_size — every
-	// existing test fixture is well under that. Returning 0 here let
-	// exec() silently truncate the image at ~12KB and install it
-	// anyway, corrupting nothing in the read itself but leaving
-	// __stack_top (a link-time constant baked into the binary's own
-	// code, unrelated to how much of it actually got loaded) pointing
-	// outside the pages SYS_EXEC went on to map — a page fault, not
-	// against exec()'s own read path at all.
-	if (start_block >= 12) return -1;
+	// offset >= inode.size above already caught genuine EOF; reaching
+	// here with start_block past what this driver can resolve (direct
+	// blocks plus one level of single-indirect — see
+	// ext2_resolve_block's own comment) means the file legitimately
+	// continues but this driver can't reach the rest, a real error
+	// (-1), not 0 ("clean EOF" — exec()'s own chunked-read loop,
+	// user/user.c3, trusts 0 completely and stops there, thinking the
+	// whole file is in hand). Found the hard way, before single-
+	// indirect support existed: echod.bin (70KB) was the first file
+	// this driver was ever asked to read past 12*block_size, and
+	// returning 0 here let exec() silently truncate the image and
+	// install it anyway, corrupting nothing in the read itself but
+	// leaving __stack_top (a link-time constant baked into the
+	// binary's own code, unrelated to how much of it actually got
+	// loaded) pointing outside the pages SYS_EXEC went on to map — a
+	// page fault, not against exec()'s own read path at all. Same
+	// reasoning still applies at the new, higher boundary.
+	if (start_block >= max_block) return -1;
+
+	char[EXT2_MAX_BLOCK_SIZE] indirect_cache @noinit;
+	bool indirect_loaded = false;
 
 	uint bytes_read = 0;
-	for (uint b = start_block; b < 12 && bytes_read < read_len; b++)
+	for (uint b = start_block; b < max_block && bytes_read < read_len; b++)
 	{
-		uint block = inode.block[b];
+		uint block = ext2_resolve_block(&inode, b, &indirect_cache, &indirect_loaded);
 		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
 		if (block == 0)
 		{

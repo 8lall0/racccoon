@@ -4,6 +4,73 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (42) — ext2 single-indirect blocks confirmed on real Milk-V Duo hardware, against real `EXT2TEST`
+
+Follow-up to the previous entry: `runtest`/`argvtest`/`pathtest`/
+`elftest` all pass against the real `EXT2TEST` partition on the real
+C906 core, `lsproc` clean afterward — the first time any of these four
+tests has run against real ext2 hardware at all (earlier real-hardware
+sessions this session only ever exercised them against `DUOBOOT`/FAT32,
+`EXT2TEST` staying untested for this family since seeding its `bin/`
+fixtures needs root). Seeded via a one-off `sudo` script copying
+`build/user/echod.bin`/`echod.elf` onto `EXT2TEST/bin/`, the same
+fixtures `scripts/build.sh` already seeds onto the QEMU ext2 image.
+
+**Files changed:** none (hardware verification only).
+
+---
+
+## 2026-08-20 (41) — ext2: single-indirect block support (read-only)
+
+`ext2.c3`'s own header comment has always been explicit: "Direct block
+pointers only (i_block[0..11])... single/double/triple indirect blocks
+are NOT walked." That gap had, by this point in the session, blocked
+four different tests — `runtest`/`argvtest`/`pathtest`/`elftest` — from
+working on the ext2 test image, each failing cleanly rather than
+crashing (a real, correct fix from earlier this session), but a real,
+recurring limitation rather than a one-off. Closed for reads.
+
+With this project's own `ext2_block_size=1024` (confirmed from its own
+boot logs), 12 direct blocks cover 12KB; one single-indirect block adds
+`1024/4=256` more block pointers — 268 blocks total, 268KB, comfortably
+past racccoon's own ~70KB binaries (`echod.bin`/`echod.elf`).
+Single-indirect alone is enough; double/triple stay out of scope, same
+as before.
+
+**One resolver, shared by both read paths**: `Ext2_inode_info` gained
+an `indirect_block` field (`i_block[12]`, the 13th on-disk pointer
+`ext2_read_inode` used to stop copying before), and a new
+`ext2_resolve_block(inode, b, indirect_cache, indirect_loaded)` —
+direct for `b < 12` unchanged, lazily reads the indirect block (once
+per read, cached across the loop) and indexes into it for
+`12 <= b < 12 + ext2_block_size/4`. Both `ext2_read` and
+`ext2_read_at`'s own block loops now call this instead of indexing
+`inode.block[b]` directly, with their upper bound raised from `12` to
+`12 + ext2_block_size/4` to match. A `0` result within that range stays
+unambiguous — a genuine ext2 sparse hole, zero-filled exactly like a
+direct block always has been, including when `indirect_block` itself
+is unset (every pointer within it reads as 0, same as an
+entirely-unallocated indirect block would). Beyond that range, the
+loop simply stops — the same "short read, not an error" discipline the
+old 12-block limit already had, just at a higher boundary.
+
+**Read-only, matching what's actually motivated**: nothing in the
+current test suite writes a file bigger than 12 blocks, so
+`ext2_write`/`ext2_write_inode` keep their own existing 12-direct-block
+limit unchanged — explicitly scoped out, not silently dropped, noted
+in the file's own header comment.
+
+**Verification**: `runtest`/`argvtest`/`pathtest`/`elftest` all flip
+from `FAILED (exec load failed)` to passing on ext2 — the direct,
+motivating proof. Full regression suite (ext2-backed reads included)
+unaffected — direct-block behavior is unchanged. All four newly-passing
+tests run repeatedly across a three-boot stress batch, `lsproc` clean
+throughout, `e2fsck -n -f` clean.
+
+**Files changed:** `user/fs/ext2.c3`.
+
+---
+
 ## 2026-08-20 (40) — ELF loading confirmed on real Milk-V Duo hardware
 
 Follow-up to the previous entry: `elftest: ok` on the real C906 core
