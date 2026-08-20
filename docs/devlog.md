@@ -4,6 +4,24 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (32) — `exec()`/`runtest` confirmed on real Milk-V Duo hardware
+
+Follow-up to the previous entry: built `kernel_duo.elf`, packaged
+`fip_duo.bin`, seeded `bin/echod` onto the real `DUOBOOT` FAT32
+partition (same file `build/user/echod.bin` QEMU's own test images use),
+flashed via the existing `scripts/flash_duo.sh` convention (`fip.bin` as
+a literal file on `DUOBOOT`, not a raw `dd`). `runtest` on real hardware:
+`runtest: ok` — the `saved_sepc`-clobber fix, the TLB flush, and the
+IPC-race fix from the previous entry all hold on the real C906 core, not
+just QEMU's emulation. Didn't seed `EXT2TEST` this round — writing there
+needs root (the partition's owned by `root` on this machine) and the
+outcome is already known from QEMU: `echod.bin` exceeds ext2's own
+12-direct-block limit, so it would just fail the same documented way.
+
+**Files changed:** none (hardware verification only).
+
+---
+
 ## 2026-08-20 (31) — `/bin`: a real `exec()` syscall, and three real bugs found chasing it
 
 The first real `/bin` support: a Plan-9/Unix-style `exec()` that replaces
