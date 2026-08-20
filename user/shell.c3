@@ -308,6 +308,35 @@ fn void main() @export("main") {
             } else {
                 print("movetest: FAILED\n");
             }
+        } else if (strcmp(cmd, "cycletest") == 0) {
+            // Proves fat32_rename/ext2_rename now refuse "moving a
+            // directory into its own subtree" instead of silently
+            // creating a cycle in the directory tree. Builds a real
+            // 2-level nested directory (tmp/cyc_a/cyc_b), then tries two
+            // ways to break it: renaming tmp/cyc_a directly into itself
+            // (depth-0 cycle — the new parent *is* the directory being
+            // moved) and into its own grandchild tmp/cyc_a/cyc_b
+            // (depth-1 cycle). Both must be refused (fs_rename returns
+            // -1) and must leave the tree genuinely untouched — checked
+            // by writing into and reading back from tmp/cyc_a/cyc_b
+            // afterward, not just trusting the -1. A real, non-cyclic
+            // move (cyc_b out to a sibling) proves the fix didn't just
+            // start refusing every directory rename.
+            fs_mkdir("tmp/cyc_a");
+            fs_mkdir("tmp/cyc_a/cyc_b");
+            int cyc_self = fs_rename("tmp/cyc_a", "tmp/cyc_a/self");
+            int cyc_grandchild = fs_rename("tmp/cyc_a", "tmp/cyc_a/cyc_b/deeper");
+            fs_write("tmp/cyc_a/cyc_b/marker.txt", "still intact\n", 13);
+            char[32] cyc_buf @noinit;
+            int cyc_still_intact = fs_read("tmp/cyc_a/cyc_b/marker.txt", &cyc_buf, 32);
+            int cyc_real_move = fs_rename("tmp/cyc_a/cyc_b", "tmp/cyc_b_moved");
+            int cleanup_a = fs_delete_recursive("tmp/cyc_a");
+            int cleanup_b = fs_delete_recursive("tmp/cyc_b_moved");
+            if (cyc_self < 0 && cyc_grandchild < 0 && cyc_still_intact >= 0 && cyc_real_move == 0 && cleanup_a == 0 && cleanup_b == 0) {
+                print("cycletest: ok\n");
+            } else {
+                print("cycletest: FAILED\n");
+            }
         } else if (strcmp(cmd, "writefile") == 0) {
             fs_write("hello.txt", "Hello from shell!\n", 19);
         } else if (strcmp(cmd, "newfile") == 0) {

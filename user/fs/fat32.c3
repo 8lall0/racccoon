@@ -1140,14 +1140,58 @@ fn int fat32_mkdir(char* path)
 // correctness gap" tradeoff fat32_write's own header comment already
 // accepts elsewhere in this driver.
 //
+// dir_cluster's own ".." entry, read directly rather than through the
+// normal named-lookup path: fat32_name_to_8_3("..") would mangle it
+// into something that never matches what fat32_mkdir actually wrote
+// (see that function's own header comment — the leading dot is treated
+// as the start of an extension). mkdir always places "." as a
+// directory's first entry and ".." as its second, both in the first
+// sector of its first cluster (fat32_mkdir's own dir_buf write, and
+// fat32_rename's existing ".." fixup above already reads/writes this
+// exact same fixed offset) — read that sector directly and pull the
+// cluster field out by fixed offset instead. Translates the on-disk
+// "0 means root" convention (fat32_mkdir's own dotdot_target) back into
+// a real cluster number, so callers never need to know about it.
+fn uint fat32_get_parent_cluster(uint dir_cluster)
+{
+	char[SECTOR_SIZE] sector_buf @noinit;
+	if (!fs_read_sector(fat32_cluster_to_sector(dir_cluster), &sector_buf)) return fat32_root_cluster;
+	char* dotdot_entry = &sector_buf[FAT32_DIRENT_SIZE];
+	ushort* cluster_hi = (ushort*)&dotdot_entry[FAT32_DIRENT_CLUSTER_HI];
+	ushort* cluster_lo = (ushort*)&dotdot_entry[FAT32_DIRENT_CLUSTER_LO];
+	uint parent = ((uint)*cluster_hi << 16) | (uint)*cluster_lo;
+	return parent == 0 ? fat32_root_cluster : parent;
+}
+
+// Walks from candidate_dir_cluster up through ".." entries — a plain
+// bounded iteration, not recursion, but the same "never trust an
+// on-disk structure to be well-formed enough for an unbounded walk"
+// caution fat32_delete_dir_contents' own recursion depth cap already
+// takes (reusing that exact constant: a directory tree deeper than
+// that was already being refused elsewhere, so a cycle-detection walk
+// doesn't need a more generous bound). Returns true (refuse the rename)
+// if forbidden_cluster is ever found among candidate_dir_cluster's own
+// ancestors, including candidate_dir_cluster itself — the case
+// fat32_rename actually calls this for is "is the destination's parent
+// directory forbidden_cluster itself, or somewhere inside it," which is
+// exactly "moving forbidden_cluster into its own subtree."
+fn bool fat32_would_create_cycle(uint candidate_dir_cluster, uint forbidden_cluster)
+{
+	uint cluster = candidate_dir_cluster;
+	for (int depth = 0; depth < FAT32_MAX_DELETE_DEPTH; depth++)
+	{
+		if (cluster == forbidden_cluster) return true;
+		if (cluster == fat32_root_cluster) return false;
+		cluster = fat32_get_parent_cluster(cluster);
+	}
+	return true; // depth exhausted without reaching root — refuse rather than risk missing a real cycle
+}
+
 // Refuses outright (destination must not already exist — no silent
-// overwrite the way POSIX rename(2) allows) and refuses a source
-// that's the write-protected file. Does NOT detect "moving a directory
-// into its own subtree" (a real cycle) — a genuine known gap, not
-// silently worked around; see fat32_delete_dir_contents' own recursion
-// depth cap for the backstop that keeps a resulting cycle from ever
-// causing an unbounded walk, just not from being created in the first
-// place.
+// overwrite the way POSIX rename(2) allows), refuses a source that's
+// the write-protected file, and — see fat32_would_create_cycle's own
+// comment — refuses "moving a directory into its own subtree" (a real
+// cycle), closing what used to be a genuine known gap here.
 fn int fat32_rename(char* old_path, char* new_path)
 {
 	uint old_parent_cluster;
@@ -1169,6 +1213,16 @@ fn int fat32_rename(char* old_path, char* new_path)
 	char* new_leaf = fat32_leaf_name(new_path);
 	char[11] new_name11 @noinit;
 	fat32_name_to_8_3(new_leaf, &new_name11);
+
+	// Moving a directory: refuse if the destination's own parent chain
+	// runs through the directory being moved — see
+	// fat32_would_create_cycle's own comment. Files can never create a
+	// cycle (they have no children to contain anything), so this only
+	// applies to attr's directory bit.
+	if ((attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0 && fat32_would_create_cycle(new_parent_cluster, cluster))
+	{
+		return -1;
+	}
 
 	uint existing_cluster;
 	uint existing_size;

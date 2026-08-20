@@ -1580,15 +1580,50 @@ fn int ext2_mkdir(char* path)
 	return 0;
 }
 
+// dir_inode_num's own ".." entry — always its block[0], universal ext2
+// convention (a directory's "."/".." pair is always one preformatted
+// block, packed together — see ext2_mkdir's own dotdot_inode write,
+// and ext2_rename's existing moved-directory fixup below, which reads
+// this exact same block[0]/offset-12 shape already). No "0 means root"
+// translation needed the way fat32_get_parent_cluster has: this
+// driver's own ext2_mkdir always writes the real parent_inode value
+// directly, and root's own ".." (pre-formatted by mke2fs, never
+// written by this driver) already points at EXT2_ROOT_INODE itself.
+fn uint ext2_get_parent_inode(uint dir_inode_num)
+{
+	Ext2_inode_info dir;
+	if (!ext2_read_inode(dir_inode_num, &dir)) return EXT2_ROOT_INODE;
+	char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
+	if (!ext2_read_block(dir.block[0], &block_buf)) return EXT2_ROOT_INODE;
+	uint* dotdot_inode = (uint*)&block_buf[12 + EXT2_DIRENT_INODE];
+	return *dotdot_inode;
+}
+
+// Same shape as fat32_would_create_cycle — see its own comment for the
+// full reasoning, including why FAT32_MAX_DELETE_DEPTH's ext2 sibling
+// (EXT2_MAX_DELETE_DEPTH) is the right bound to reuse here too.
+fn bool ext2_would_create_cycle(uint candidate_dir_inode, uint forbidden_inode)
+{
+	uint inode_num = candidate_dir_inode;
+	for (int depth = 0; depth < EXT2_MAX_DELETE_DEPTH; depth++)
+	{
+		if (inode_num == forbidden_inode) return true;
+		if (inode_num == EXT2_ROOT_INODE) return false;
+		inode_num = ext2_get_parent_inode(inode_num);
+	}
+	return true; // depth exhausted without reaching root — refuse rather than risk missing a real cycle
+}
+
 // Entry point dispatched from fsd.c3's main() for FS_RENAME. Same
 // scope as fat32_rename's own comment (uniform same-parent-or-not
-// handling, destination-must-not-exist, no cycle detection — see
-// there for the full reasoning). Genuinely cheap on ext2 specifically:
-// a directory entry is just a name -> inode_num link, so moving a file
-// or directory never touches its data at all, only the entry that
-// points at it — same "one new dirent, one removed dirent" shape as
-// fat32_rename, just without any cluster/size copying since ext2's own
-// dirent format doesn't carry either.
+// handling, destination-must-not-exist) — and, unlike when that
+// comment was originally written, cycle detection too: see
+// ext2_would_create_cycle's own comment. Genuinely cheap on ext2
+// specifically: a directory entry is just a name -> inode_num link, so
+// moving a file or directory never touches its data at all, only the
+// entry that points at it — same "one new dirent, one removed dirent"
+// shape as fat32_rename, just without any cluster/size copying since
+// ext2's own dirent format doesn't carry either.
 fn int ext2_rename(char* old_path, char* new_path)
 {
 	uint old_parent_inode;
@@ -1605,6 +1640,16 @@ fn int ext2_rename(char* old_path, char* new_path)
 	uint new_parent_inode;
 	if (!ext2_resolve_dir(new_path, &new_parent_inode)) return -1;
 	char* new_leaf = ext2_leaf_name(new_path);
+
+	// Moving a directory: refuse if the destination's own parent chain
+	// runs through the directory being moved — see
+	// ext2_would_create_cycle's own comment. Files can never create a
+	// cycle (they have no children to contain anything), so this only
+	// applies to mode's directory bit.
+	if ((mode & EXT2_S_IFDIR) != 0 && ext2_would_create_cycle(new_parent_inode, inode_num))
+	{
+		return -1;
+	}
 
 	uint existing_inode;
 	uint existing_sector;

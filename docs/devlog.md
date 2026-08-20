@@ -4,6 +4,70 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (22) — Rename-cycle detection, both backends
+
+The last confirmed, still-open gap on the list from the last few
+entries: `fat32_rename`/`ext2_rename` (introduced when directory
+listing/mkdir/rename landed) never detected "moving a directory into
+its own subtree" — a real cycle in the directory tree. Nothing
+refused it outright; only a recursion-depth cap in delete kept a
+resulting cycle from causing an unbounded walk, not from being created
+in the first place.
+
+**Design, same shape on both backends**: a directory's own `".."`
+entry, read directly rather than through the normal named-lookup path
+— `fat32_name_to_8_3("..")`/ext2's own leaf-name handling would mangle
+or mis-walk a literal `".."` (see `fat32_get_parent_cluster`'s own
+comment for the FAT32-specific reason: the leading dot is treated as
+the start of a file extension). Both drivers already write `".."` at a
+fixed, known location when creating a directory (FAT32: the second
+32-byte entry of the first cluster's first sector; ext2: `block[0]`,
+offset 12 — both already read/written by rename's own existing
+same-parent-vs-different-parent fixup), so the new
+`fat32_get_parent_cluster()`/`ext2_get_parent_inode()` helpers just
+read that fixed offset directly. A new `fat32_would_create_cycle()`/
+`ext2_would_create_cycle()` walks from the destination's parent
+directory up through `".."` entries — a plain bounded iteration, not
+recursion — until it either reaches the root (safe) or finds the
+directory being moved among its own ancestors, including itself
+(a cycle: refuse). Bounded by the same `FAT32_MAX_DELETE_DEPTH`/
+`EXT2_MAX_DELETE_DEPTH` constants delete's own recursion cap already
+uses — reused rather than duplicated, since both express the same
+"how deep a directory tree this driver is willing to trust" bound.
+Only checked when the source is actually a directory — a file being
+renamed/moved can never create a cycle, having no children to contain
+anything.
+
+**New shell command, `cycletest`**: builds a real 2-level nested
+directory (`tmp/cyc_a/cyc_b`), then tries two ways to break it —
+renaming `tmp/cyc_a` directly into itself (depth-0: the new parent
+*is* the directory being moved) and into its own grandchild
+`tmp/cyc_a/cyc_b` (depth-1). Both must be refused, and — the part that
+actually proves the tree wasn't left half-mutated by a refused
+rename, not just that `fs_rename` returned -1 — a write and read-back
+against `tmp/cyc_a/cyc_b/marker.txt` afterward must still work. A
+real, non-cyclic move (`tmp/cyc_a/cyc_b` out to a sibling) proves the
+fix didn't just start refusing every directory rename outright.
+
+**Verified**: full regression suite (`cycletest`/`mkdirtest`/
+`renametest`/`movetest`/`deletetest`/`newfile`/`racetest`, plus a
+manual pass including `rmrtest`/`writefile`/`readfile`) clean on both
+filesystems, `e2fsck -n -f`/`fsck.vfat -n` clean after (FAT32's own
+free-cluster-summary field stays a pre-existing, unrelated cosmetic
+mismatch — confirmed by checking the driver never writes that field at
+all, on either side of this change, not something this fix touched).
+A 10-boot stress batch of the self-cleaning subset of the suite (not
+`rmrtest`, which consumes a one-shot build-time fixture and isn't
+meant to repeat across boots on the same image — a test-harness fact
+rediscovered this entry, not a regression) clean on both filesystems.
+
+**Files changed:** `user/fs/fat32.c3` (`fat32_get_parent_cluster`,
+`fat32_would_create_cycle`, the check in `fat32_rename`), `user/fs/
+ext2.c3` (`ext2_get_parent_inode`, `ext2_would_create_cycle`, the
+check in `ext2_rename`), `user/shell.c3` (`cycletest`).
+
+---
+
 ## 2026-08-20 (21) — Closing the reply-side stale-pid window: SYS_IPC_REPLY/SYS_IPC_RECV_GEN
 
 `Mount.server_generation`/`SYS_JOIN` (2026-08-18 (3), and now `SYS_KILL`
