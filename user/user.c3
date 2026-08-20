@@ -29,6 +29,8 @@ const int SYS_FUTEX_WAIT = 15; // block while *addr == expected — see src/entr
 const int SYS_FUTEX_WAKE = 16; // wake every waiter blocked on addr in this address space
 const int SYS_PROC_INFO  = 17; // returns another process's state/generation — see src/entry.c3's case
 const int SYS_KILL       = 18; // kills another process by pid (+ optional generation check) — see src/entry.c3's case
+const int SYS_IPC_RECV_GEN = 19; // same as SYS_IPC_RECV, plus the sender's generation — see src/entry.c3's case
+const int SYS_IPC_REPLY    = 20; // same as SYS_IPC_SEND, plus an optional target-generation check — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -187,12 +189,51 @@ fn int syscall4(long sysno, long arg0, long arg1, long arg2, long arg3) {
     return (int)result;
 }
 
+fn int syscall5(long sysno, long arg0, long arg1, long arg2, long arg3, long arg4) {
+    // Same shape as syscall4(), one more argument in a5 — a3 is still
+    // always the syscall number. Only SYS_IPC_REPLY needs this so far
+    // (dest_pid, type, data_ptr, len, expected_generation).
+    long result;
+    asm {
+        mv $a0, arg0;
+        mv $a1, arg1;
+        mv $a2, arg2;
+        mv $a3, sysno;
+        mv $a4, arg3;
+        mv $a5, arg4;
+        ecall;
+        mv result, $a0;
+    }
+    return (int)result;
+}
+
 fn int ipc_send(int dest_pid, uint type, char* data, int len) @export("ipc_send") {
     return syscall4(SYS_IPC_SEND, dest_pid, (long)type, (long)data, len);
 }
 
+// Same as ipc_send(), plus an optional expected_generation (0 =
+// wildcard, same convention as kill()'s own) checked against the
+// target's live Process.generation before delivery — the reply-side
+// half of the stale-pid protection: pair with ipc_recv_type_gen()'s own
+// out_from_generation to close the window where the original requester
+// exits (or gets killed) and its pid gets reused before this reply
+// arrives. See SYS_IPC_REPLY's case in src/entry.c3 for the full
+// reasoning.
+fn int ipc_reply(int dest_pid, uint type, char* data, int len, uint expected_generation) @export("ipc_reply") {
+    return syscall5(SYS_IPC_REPLY, dest_pid, (long)type, (long)data, len, (long)expected_generation);
+}
+
 fn int ipc_recv_type(char* buf, int len, uint* out_type) @export("ipc_recv_type") {
     return syscall(SYS_IPC_RECV, (long)buf, len, (long)out_type);
+}
+
+// Same as ipc_recv_type(), plus the sender's own Process.generation
+// captured at delivery time (out_from_generation) — feed this straight
+// back into ipc_reply()'s own expected_generation to reply safely. A
+// distinct syscall (SYS_IPC_RECV_GEN) rather than a widened
+// SYS_IPC_RECV — see that case's own comment, src/entry.c3, for why.
+fn int ipc_recv_type_gen(char* buf, int len, uint* out_type, uint* out_from_generation) @export("ipc_recv_type_gen") {
+    return syscall4(SYS_IPC_RECV_GEN, (long)buf, len, (long)out_type, (long)out_from_generation);
 }
 
 fn int ipc_recv(char* buf, int len) @export("ipc_recv") {

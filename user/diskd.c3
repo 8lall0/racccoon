@@ -242,11 +242,15 @@ fn void main() @export("main")
 	{
 		char[DISKD_MSG_MAX] buf @noinit;
 		uint verb = 0;
-		int from = ipc_recv_type(&buf, DISKD_MSG_MAX, &verb);
-		// Unlike echod, a legitimate sender here can be KERNEL_PID (-1,
-		// src/entry.c3) — fs_init()/fs_flush() talk to diskd directly as
-		// kernel code, not through a real process's pid (see fs.c3's
-		// diskd_read_write). Only reject the "nothing received" case.
+		uint from_gen = 0;
+		int from = ipc_recv_type_gen(&buf, DISKD_MSG_MAX, &verb, &from_gen);
+		// Stale note removed: this used to say a legitimate sender could
+		// be a synthetic KERNEL_PID (-1) because fs_init()/fs_flush() once
+		// talked to diskd directly as kernel code (a pre-microkernel-split
+		// fs.c3 that no longer exists — see fsd.c3's own header comment).
+		// Every real sender today is fsd/fsd2, always a genuine process
+		// pid >= 1, so ipc_reply()'s generation check below is safe to
+		// rely on unconditionally.
 		if (from == 0) continue;
 		if (verb != DISKD_READ && verb != DISKD_WRITE) continue;
 
@@ -308,6 +312,6 @@ fn void main() @export("main")
 				dst[i] = req.data[i];
 			}
 		}
-		ipc_send(from, verb, &buf, DISKD_MSG_MAX);
+		ipc_reply(from, verb, &buf, DISKD_MSG_MAX, from_gen);
 	}
 }

@@ -96,7 +96,8 @@ fn void main() @export("main") {
     for (;;) {
         char[FS_MSG_MAX] buf @noinit;
         uint verb = 0;
-        int from = ipc_recv_type(&buf, FS_MSG_MAX, &verb);
+        uint from_gen = 0;
+        int from = ipc_recv_type_gen(&buf, FS_MSG_MAX, &verb, &from_gen);
         if (from <= 0) continue;
         if (verb != FS_READ && verb != FS_LIST && verb != FS_WRITE) continue;
 
@@ -162,7 +163,7 @@ fn void main() @export("main") {
                 }
             }
             *count_field = count;
-            ipc_send(from, verb, &buf, FS_MSG_MAX);
+            ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
             continue;
         }
 
@@ -203,7 +204,7 @@ fn void main() @export("main") {
                     *write_result_field = -1;
                 }
             }
-            ipc_send(from, verb, &buf, FS_MSG_MAX);
+            ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
             continue;
         }
 
@@ -230,6 +231,6 @@ fn void main() @export("main") {
             pos = procd_append_str(&buf, pos, "\n");
             *result_len_field = pos - 4;
         }
-        ipc_send(from, verb, &buf, FS_MSG_MAX);
+        ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
     }
 }

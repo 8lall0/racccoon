@@ -166,6 +166,12 @@ struct Process
 	// concurrent senders possible (see docs/devlog.md).
 	bool has_message;
 	int  msg_from;
+	uint msg_from_generation; // sender's own Process.generation, captured at delivery — lets
+	                          // a receiver that intends to reply later (SYS_IPC_RECV_GEN/
+	                          // SYS_IPC_REPLY, src/entry.c3) confirm msg_from still names the
+	                          // same process instance it received this message from, closing
+	                          // the reply-side counterpart of the stale-pid hazard
+	                          // Mount.server_generation/SYS_JOIN already close elsewhere.
 	uint msg_type;
 	char[MSG_MAX] msg_data;
 	bool msg_acked; // set by the receiver once *this* process's own pending send has been consumed

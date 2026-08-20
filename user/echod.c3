@@ -11,18 +11,19 @@ fn void main() @export("main") {
     char[64] buf @noinit;
     for (;;) {
         uint verb = 0;
-        int from = ipc_recv_type(&buf, 64, &verb);
+        uint from_gen = 0;
+        int from = ipc_recv_type_gen(&buf, 64, &verb, &from_gen);
         if (from <= 0) continue;
 
         if (verb == P9_TREAD) {
             char* canned = "hello from 9p-lite\n";
-            ipc_send(from, P9_TREAD, canned, 21);
+            ipc_reply(from, P9_TREAD, canned, 21, from_gen);
         } else if (verb == P9_TWALK) {
             // No real namespace yet (that's a later phase) — just prove
             // the path made it across by handing it straight back.
-            ipc_send(from, P9_TWALK, &buf, 64);
+            ipc_reply(from, P9_TWALK, &buf, 64, from_gen);
         } else {
-            ipc_send(from, verb, &buf, 64);
+            ipc_reply(from, verb, &buf, 64, from_gen);
         }
     }
 }

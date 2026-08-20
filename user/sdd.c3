@@ -843,9 +843,10 @@ fn void main() @export("main")
 	{
 		char[DISKD_MSG_MAX] buf @noinit;
 		uint verb = 0;
-		int from = ipc_recv_type(&buf, DISKD_MSG_MAX, &verb);
-		// Same as diskd: a legitimate sender can be KERNEL_PID (-1) via
-		// fs.c3's kernel-internal client, not just a real process pid.
+		uint from_gen = 0;
+		int from = ipc_recv_type_gen(&buf, DISKD_MSG_MAX, &verb, &from_gen);
+		// Same stale note removed as diskd.c3's own — see its comment:
+		// every real sender today is a genuine process pid >= 1.
 		if (from == 0) continue;
 		if (verb != DISKD_READ && verb != DISKD_WRITE) continue;
 
@@ -864,6 +865,6 @@ fn void main() @export("main")
 		}
 
 		buf[0] = status;
-		ipc_send(from, verb, &buf, DISKD_MSG_MAX);
+		ipc_reply(from, verb, &buf, DISKD_MSG_MAX, from_gen);
 	}
 }

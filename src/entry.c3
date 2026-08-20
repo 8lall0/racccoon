@@ -60,6 +60,8 @@ const SYS_FUTEX_WAIT = 15; // block while *addr == expected — see its case bel
 const SYS_FUTEX_WAKE = 16; // wake every waiter blocked on addr in this address space
 const SYS_PROC_INFO  = 17; // procd-only in practice, but open to any caller — see its case below
 const SYS_KILL       = 18; // procd-only in practice (the /proc/<pid>/ctl write path), open to any caller — see its case below
+const SYS_IPC_RECV_GEN = 19; // same as SYS_IPC_RECV, plus the sender's generation — see its case below
+const SYS_IPC_REPLY    = 20; // same as SYS_IPC_SEND, plus an optional target-generation check — see its case below
 
 // rfork flags — Plan 9 names, this kernel's own subset. RFPROC is
 // required (rfork() without it returns -1 in this v1: real Plan 9 uses
@@ -540,6 +542,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 
 			mem::copy(&ipc_target.msg_data, ipc_data, (sz)ipc_copy_len);
 			ipc_target.msg_from = current_proc.pid;
+			ipc_target.msg_from_generation = current_proc.generation;
 			ipc_target.msg_type = ipc_type;
 			current_proc.msg_acked = false;
 			ipc_target.has_message = true;
@@ -555,6 +558,61 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// "the inbox looks empty again", which could just as easily
 			// mean a different sender's message arrived and got consumed
 			// instead).
+			while (!current_proc.msg_acked)
+			{
+				current_proc.state = PROC_BLOCKED;
+				yield();
+			}
+			f.a0 = 0;
+		case SYS_IPC_REPLY:
+			// Same shape as SYS_IPC_SEND above (kept as a full,
+			// separate copy rather than factored out — same
+			// inlining reason as SYS_EXIT/SYS_KILL), plus one
+			// addition: an optional expected_generation (a5) check
+			// on the target, mirroring SYS_KILL's own wildcard
+			// convention (0 = don't care). This is the piece that
+			// actually closes the reply-side stale-pid window —
+			// SYS_IPC_SEND's own proc_by_pid check only ever
+			// guarded against a dead/never-existed pid, never
+			// against "this pid, but a different process now"; a
+			// server built to reply safely calls SYS_IPC_RECV_GEN
+			// (below) to capture the requester's generation right
+			// when the request arrives, then passes it straight
+			// back in here. Without that captured generation, a
+			// server whose reply lands after the original requester
+			// has already exited and had its pid slot reused would
+			// otherwise silently misdeliver the reply to the new,
+			// unrelated occupant.
+			int reply_dest_pid = (int)f.a0;
+			uint reply_type    = (uint)f.a1;
+			char* reply_data   = (char*)(uptr)f.a2;
+			int reply_len      = (int)f.a4;
+			uint reply_expected_generation = (uint)f.a5;
+			int reply_copy_len = reply_len > MSG_MAX ? MSG_MAX : reply_len;
+			if (reply_copy_len < 0) reply_copy_len = 0;
+			Process* reply_target = proc_by_pid(reply_dest_pid);
+			if (!reply_target || (reply_expected_generation != 0 && reply_target.generation != reply_expected_generation))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+
+			while (reply_target.has_message)
+			{
+				yield();
+			}
+
+			mem::copy(&reply_target.msg_data, reply_data, (sz)reply_copy_len);
+			reply_target.msg_from = current_proc.pid;
+			reply_target.msg_from_generation = current_proc.generation;
+			reply_target.msg_type = reply_type;
+			current_proc.msg_acked = false;
+			reply_target.has_message = true;
+			if (reply_target.state == PROC_BLOCKED)
+			{
+				reply_target.state = PROC_RUNNABLE;
+			}
+
 			while (!current_proc.msg_acked)
 			{
 				current_proc.state = PROC_BLOCKED;
@@ -594,6 +652,57 @@ fn void handle_syscall(Trap_frame* f) @noinline
 						if (recv_acked_sender.state == PROC_BLOCKED)
 						{
 							recv_acked_sender.state = PROC_RUNNABLE;
+						}
+					}
+					break;
+				}
+				current_proc.state = PROC_BLOCKED;
+				yield();
+			}
+		case SYS_IPC_RECV_GEN:
+			// Same shape as SYS_IPC_RECV above (kept as a full,
+			// separate copy, same reasoning as SYS_IPC_REPLY's own
+			// comment), plus one addition: also writes the sender's
+			// captured Process.generation (a3) out through a new
+			// optional out-pointer (a4) — the piece a server needs
+			// to later reply safely via SYS_IPC_REPLY instead of
+			// plain SYS_IPC_SEND. A distinct syscall number, not a
+			// widened SYS_IPC_RECV, on purpose: every existing
+			// SYS_IPC_RECV caller only ever sets a0-a2 (see
+			// user.c3's plain 3-arg syscall() wrapper), leaving a4
+			// holding whatever garbage was there before — reading it
+			// as a live out-pointer on the *same* syscall number
+			// would risk writing through that garbage for every
+			// caller that hasn't been updated to know about this.
+			char* recv_gen_buf       = (char*)(uptr)f.a0;
+			int recv_gen_len         = (int)f.a1;
+			uint* recv_gen_type_out  = (uint*)(uptr)f.a2;
+			uint* recv_gen_from_generation_out = (uint*)(uptr)f.a4;
+			for (;;)
+			{
+				if (current_proc.has_message)
+				{
+					int recv_gen_copy_len = recv_gen_len > MSG_MAX ? MSG_MAX : recv_gen_len;
+					if (recv_gen_copy_len < 0) recv_gen_copy_len = 0;
+					mem::copy(recv_gen_buf, &current_proc.msg_data, (sz)recv_gen_copy_len);
+					if (recv_gen_type_out != null)
+					{
+						*recv_gen_type_out = current_proc.msg_type;
+					}
+					if (recv_gen_from_generation_out != null)
+					{
+						*recv_gen_from_generation_out = current_proc.msg_from_generation;
+					}
+					f.a0 = (ulong)current_proc.msg_from;
+					current_proc.has_message = false;
+
+					Process* recv_gen_acked_sender = proc_by_pid(current_proc.msg_from);
+					if (recv_gen_acked_sender != null)
+					{
+						recv_gen_acked_sender.msg_acked = true;
+						if (recv_gen_acked_sender.state == PROC_BLOCKED)
+						{
+							recv_gen_acked_sender.state = PROC_RUNNABLE;
 						}
 					}
 					break;

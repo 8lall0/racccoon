@@ -4,6 +4,85 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (21) — Closing the reply-side stale-pid window: SYS_IPC_REPLY/SYS_IPC_RECV_GEN
+
+`Mount.server_generation`/`SYS_JOIN` (2026-08-18 (3), and now `SYS_KILL`
+too) all close the same shape of hazard on the *sending* side — a pid
+number getting silently reused by an unrelated process between "I
+learned this pid" and "I acted on it." One instance of that shape was
+still open: a server (fsd/procd/diskd/sdd/echod) receives a request via
+`SYS_IPC_RECV`, learns `msg_from`, and later replies via plain
+`ipc_send(msg_from, ...)` — but `SYS_IPC_SEND`'s rendezvous completes
+for the *client* the moment the server's `SYS_IPC_RECV` consumes the
+message, before the server has computed or sent any reply. If the
+client somehow exited (or got killed — `SYS_KILL` from the entry above
+made this newly reachable, not just theoretical) in the narrow window
+before its own follow-up `ipc_recv`, a server's later reply could
+silently misdeliver to whatever unrelated process now occupies that
+reused pid.
+
+**Design**: two new syscalls, kept fully separate from
+`SYS_IPC_SEND`/`SYS_IPC_RECV` rather than widening either — the same
+"new syscall number, not a repurposed one" choice `SYS_KILL` made over
+extending `SYS_EXIT`. `SYS_IPC_SEND` captures the sender's own
+`Process.generation` into a new `Process.msg_from_generation` field
+(`src/process.c3`) alongside the existing `msg_from`, unconditionally,
+every send — free, no new call convention needed on the sending side.
+`SYS_IPC_RECV_GEN` is `SYS_IPC_RECV` plus that captured generation
+handed back through a new optional out-pointer; `SYS_IPC_REPLY` is
+`SYS_IPC_SEND` plus an optional `expected_generation` (wildcard 0,
+`SYS_KILL`'s own convention) checked against the target before
+delivery. A server that wants to reply safely calls
+`ipc_recv_type_gen()` instead of `ipc_recv_type()`, then
+`ipc_reply(dest, ..., from_gen)` instead of `ipc_send()` — the captured
+generation travels the shortest possible path, receive to reply,
+closing the window down to just those two syscalls.
+
+**Why not just widen `SYS_IPC_RECV`/`SYS_IPC_SEND` in place**: every
+existing `SYS_IPC_RECV` caller only ever sets `a0`-`a2` (`user.c3`'s
+plain 3-arg `syscall()` wrapper) — reading `a4` as a live out-pointer
+on that *same* syscall number would mean writing through whatever
+garbage register value was left over from unrelated prior code, for
+every caller not yet updated to know about it. A distinct syscall
+number sidesteps this entirely: the only wrapper that ever emits
+`SYS_IPC_RECV_GEN` is the new one, which always sets `a4` correctly by
+construction. `SYS_IPC_REPLY` needed a genuinely new argument slot
+anyway (`expected_generation`, a 5th real argument) — `syscall4`'s
+existing `a0`-`a2`+`a4` layout was already full (`dest_pid`/`type`/
+`data`/`len`), so this is also where `syscall5` (`user.c3`, `a0`-`a2`+
+`a4`+`a5`) was added.
+
+**Migrated every server** (`fsd`/`procd`/`diskd`/`sdd`/`echod`) to
+`ipc_recv_type_gen()`/`ipc_reply()` — mechanical, same shape in each:
+one new `from_gen` local, `ipc_recv_type` -> `ipc_recv_type_gen`,
+every `ipc_send(from, ...)` reply -> `ipc_reply(from, ..., from_gen)`.
+Found two more stale comments along the way (`diskd.c3`/`sdd.c3`, both
+claiming a legitimate sender could be a synthetic `KERNEL_PID` (-1)
+"via `fs.c3`'s kernel-internal client" — `fs.c3` doesn't exist anymore,
+removed when the filesystem moved into user-mode `fsd` — see `fsd.c3`'s
+own header comment) — fixed in passing, same as the ext2 comment two
+entries back.
+
+**Known, accepted limitation, same as `SYS_KILL`'s own**: this closes
+the specific *reply-misdelivery* shape, not every possible IPC-related
+consequence of a pid dying mid-conversation — a process genuinely
+blocked mid-rendezvous waiting on a target that then dies is still
+left blocked forever either way.
+
+**Verified**: full regression suite (`ping`/`p9test`/`nstest`/`pstest`/
+`sandboxtest`/`killtest`/`rforktest`/`threadjointest`/`racetest`/
+`mutextest`/`writefile`/`readfile`/`newfile`/`deletetest`/`mkdirtest`/
+`renametest`/`movetest`) clean on both filesystems, a 10-boot stress
+batch of the same suite all clean.
+
+**Files changed:** `src/process.c3` (`Process.msg_from_generation`),
+`src/entry.c3` (`SYS_IPC_RECV_GEN`, `SYS_IPC_REPLY`), `user/user.c3`
+(`syscall5`, `ipc_recv_type_gen()`, `ipc_reply()`), `user/fsd.c3`,
+`user/procd.c3`, `user/diskd.c3`, `user/sdd.c3`, `user/echod.c3`
+(migrated to the generation-checked reply path).
+
+---
+
 ## 2026-08-20 (20) — /proc/<pid>/ctl: the first write path /proc has, and a real SYS_KILL
 
 Checking what to build next turned up three already-closed gaps before

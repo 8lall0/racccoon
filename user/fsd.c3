@@ -374,7 +374,8 @@ fn void main() @export("main")
 	{
 		char[FS_MSG_MAX] buf @noinit;
 		uint verb = 0;
-		int from = ipc_recv_type(&buf, FS_MSG_MAX, &verb);
+		uint from_gen = 0;
+		int from = ipc_recv_type_gen(&buf, FS_MSG_MAX, &verb, &from_gen);
 		if (from <= 0) continue;
 		if (verb != FS_READ && verb != FS_WRITE && verb != FS_DELETE && verb != FS_LIST && verb != FS_MKDIR && verb != FS_RENAME) continue;
 
@@ -439,7 +440,7 @@ fn void main() @export("main")
 				}
 			}
 			*result_len_field = result;
-			ipc_send(from, verb, &buf, FS_MSG_MAX);
+			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
 			continue;
 		}
 
@@ -463,7 +464,7 @@ fn void main() @export("main")
 				if (!ext2_list(&filename, &buf[4], max_entries, &count)) count = -1;
 			}
 			*result_len_field = count;
-			ipc_send(from, verb, &buf, FS_MSG_MAX);
+			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
 			continue;
 		}
 
@@ -493,7 +494,7 @@ fn void main() @export("main")
 				}
 			}
 			*result_len_field = result;
-			ipc_send(from, verb, &buf, FS_MSG_MAX);
+			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
 			continue;
 		}
 
@@ -515,7 +516,7 @@ fn void main() @export("main")
 				}
 			}
 			*result_len_field = result;
-			ipc_send(from, verb, &buf, FS_MSG_MAX);
+			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
 			continue;
 		}
 
@@ -540,7 +541,7 @@ fn void main() @export("main")
 				}
 			}
 			*result_len_field = result;
-			ipc_send(from, verb, &buf, FS_MSG_MAX);
+			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
 			continue;
 		}
 
@@ -556,6 +557,6 @@ fn void main() @export("main")
 		}
 		*result_len_field = result;
 
-		ipc_send(from, verb, &buf, FS_MSG_MAX);
+		ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
 	}
 }
