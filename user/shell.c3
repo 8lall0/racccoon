@@ -985,6 +985,106 @@ fn void main() @export("main") {
                     }
                 }
             }
+        } else if (strcmp(cmd, "permtest") == 0) {
+            // Process.uid (src/process.c3): root (uid 0, this shell's
+            // own default by inheritance) may kill/reclaim anything; a
+            // non-root process may not. Three processes: this shell
+            // (root), a "victim" child (inherits root, posts itself as
+            // "victim" then spins forever — same spin shape killtest's
+            // own child already uses), and an "attacker" child that
+            // drops to uid 42 (setuid() — only possible because it
+            // inherited root from the shell) then tries, and must fail
+            // at, every angle: kill() directly, setuid(0) again
+            // (re-escalation), srv_post("victim") (hijacking its
+            // name), and the /proc/<pid>/ctl "kill" path — the one
+            // that would silently succeed without procd's own
+            // permission check (user/procd.c3), since procd itself is
+            // always root.
+            uint pm_victim_gen = 0;
+            int pm_victim = rfork(RFPROC, &pm_victim_gen);
+            if (pm_victim < 0) {
+                print("rfork failed\n");
+            } else if (pm_victim == 0) {
+                srv_post("victim");
+                // Sync point: this recv() can't return until the
+                // parent's own send below does, so by the time that
+                // happens, srv_post() above is guaranteed to have
+                // already run — same reasoning srvtest's own child
+                // sync relies on.
+                char[16] pm_sync_buf @noinit;
+                ipc_recv(&pm_sync_buf, 16);
+                for (;;) {
+                    rfork_shared_value = rfork_shared_value + 1;
+                }
+            } else {
+                ipc_send(pm_victim, 0, "sync", 5);
+
+                uint pm_attacker_gen = 0;
+                int pm_attacker = rfork(RFPROC, &pm_attacker_gen);
+                if (pm_attacker < 0) {
+                    print("rfork failed\n");
+                } else if (pm_attacker == 0) {
+                    char[16] pm_go_buf @noinit;
+                    int pm_parent = ipc_recv(&pm_go_buf, 16);
+
+                    int pm_su1 = setuid(42);
+                    print("permtest: setuid(42) ");
+                    print(pm_su1 == 0 ? "ok\n" : "FAILED\n");
+
+                    int pm_kill1 = kill(pm_victim, pm_victim_gen);
+                    print("permtest: kill(victim) as non-root ");
+                    print(pm_kill1 != 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
+
+                    int pm_su2 = setuid(0);
+                    print("permtest: re-setuid(0) as non-root ");
+                    print(pm_su2 != 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
+
+                    int pm_post = srv_post("victim");
+                    print("permtest: srv_post hijack as non-root ");
+                    print(pm_post != 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
+
+                    char[16] pm_ctl_path @noinit;
+                    int pm_pos = 0;
+                    char* pm_prefix = "/proc/";
+                    while (pm_prefix[pm_pos] != 0) {
+                        pm_ctl_path[pm_pos] = pm_prefix[pm_pos];
+                        pm_pos++;
+                    }
+                    int pm_digits = fmt::format_uint((uint)pm_victim, &pm_ctl_path[pm_pos]);
+                    pm_pos += pm_digits;
+                    char* pm_suffix = "/ctl";
+                    int pm_si = 0;
+                    while (pm_suffix[pm_si] != 0) {
+                        pm_ctl_path[pm_pos + pm_si] = pm_suffix[pm_si];
+                        pm_si++;
+                    }
+                    pm_pos += pm_si;
+                    pm_ctl_path[pm_pos] = 0;
+                    int pm_ctl_result = fs_write(&pm_ctl_path, "kill", 4);
+                    print("permtest: /proc/ctl kill as non-root ");
+                    print(pm_ctl_result < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
+
+                    ipc_send(pm_parent, 0, "done", 5);
+                    exit();
+                } else {
+                    ipc_send(pm_attacker, 0, "go", 3);
+                    char[16] pm_done_buf @noinit;
+                    ipc_recv(&pm_done_buf, 16);
+
+                    // Confirms the victim genuinely survived every one
+                    // of the attacker's attempts above — not just that
+                    // they each returned an error code.
+                    uint pm_victim_state = 0;
+                    int pm_victim_alive = proc_info(pm_victim, &pm_victim_state, null, null);
+                    int pm_victim_killed = kill(pm_victim, pm_victim_gen);
+
+                    if (pm_victim_alive == 0 && pm_victim_killed == 0) {
+                        print("permtest: ok\n");
+                    } else {
+                        print("permtest: FAILED\n");
+                    }
+                }
+            }
         } else if (strcmp(cmd, "rforktest") == 0) {
             // Plain rfork(RFPROC): the child gets an independent copy of
             // this process's address space (src/entry.c3's SYS_RFORK,

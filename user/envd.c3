@@ -100,7 +100,7 @@ fn int env_find_free_or_reclaim()
     {
         uint live_state = 0;
         uint live_gen = 0;
-        if (proc_info(env_table[i].pid, &live_state, &live_gen) != 0 || live_gen != env_table[i].generation)
+        if (proc_info(env_table[i].pid, &live_state, &live_gen, null) != 0 || live_gen != env_table[i].generation)
         {
             return i;
         }

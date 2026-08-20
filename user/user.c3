@@ -36,6 +36,7 @@ const int SYS_SRV_POST     = 21; // posts current_proc under a short name in the
 const int SYS_NS_MOUNT     = 22; // binds a posted srv_table name at a path prefix in the caller's own namespace — see src/entry.c3's case
 const int SYS_PARENT_INFO  = 23; // returns a process's parent pid/generation, if it has one — see src/entry.c3's case
 const int SYS_EXEC         = 24; // replaces the calling process's own image in place — see src/entry.c3's case
+const int SYS_SETUID       = 25; // sets the caller's own uid, only while still root — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -519,14 +520,31 @@ fn int join(int pid, uint generation) @export("join") {
     return syscall(SYS_JOIN, pid, (long)generation, 0);
 }
 
-// Returns 0 and fills *state_out/*generation_out if pid is currently
-// live, -1 otherwise (either out-pointer may be null if unneeded, same
-// convention as ns_resolve's own out_prefix_len). state is
-// src/process.c3's PROC_RUNNABLE (1) or PROC_BLOCKED (2) — never
-// PROC_UNUSED (0), since the kernel's own proc_by_pid() already
-// filters that case out before this can return success.
-fn int proc_info(int pid, uint* state_out, uint* generation_out) @export("proc_info") {
-    return syscall(SYS_PROC_INFO, pid, (long)state_out, (long)generation_out);
+// Returns 0 and fills *state_out/*generation_out/*uid_out if pid is
+// currently live, -1 otherwise (any out-pointer may be null if
+// unneeded, same convention as ns_resolve's own out_prefix_len). state
+// is src/process.c3's PROC_RUNNABLE (1) or PROC_BLOCKED (2) — never
+// PROC_UNUSED (0), since the kernel's own proc_by_pid() already filters
+// that case out before this can return success. uid_out (new, syscall4
+// for the extra argument — see src/entry.c3's SYS_PROC_INFO case for
+// why widening the wrapper directly is safe here) is what lets a
+// server like procd (user/procd.c3) look up the real requester's uid
+// before acting on their behalf with its own, always-root privilege.
+fn int proc_info(int pid, uint* state_out, uint* generation_out, int* uid_out) @export("proc_info") {
+    return syscall4(SYS_PROC_INFO, pid, (long)state_out, (long)generation_out, (long)uid_out);
+}
+
+// Sets the caller's own uid — never another process's — and only
+// while still root (uid 0); once dropped, permanent. The only
+// privilege primitive this kernel has: no login, no credentials, just
+// "a root process can voluntarily drop itself (or a freshly-rforked
+// child, which inherits root too) to a lower, permanent privilege
+// level" — the standard fork() + child-calls-setuid() idiom. Gates
+// kill() (root or same-uid target only) and srv_post()'s
+// reclaim-an-existing-name case (root or same-uid as the live holder)
+// — see both their own comments, src/entry.c3.
+fn int setuid(int new_uid) @export("setuid") {
+    return syscall(SYS_SETUID, new_uid, 0, 0);
 }
 
 // Returns pid's parent pid, filling *parent_generation_out (may be null

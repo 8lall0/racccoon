@@ -96,7 +96,7 @@ fn void main() @export("main") {
                 {
                     uint state = 0;
                     uint gen = 0;
-                    if (proc_info(pid, &state, &gen) == 0)
+                    if (proc_info(pid, &state, &gen, null) == 0)
                     {
                         char* rec = &buf[4 + count * 36];
                         int n = fmt::format_uint((uint)pid, rec);
@@ -113,7 +113,7 @@ fn void main() @export("main") {
                 uint pid_val = procd_parse_pid(&path);
                 uint state = 0;
                 uint gen = 0;
-                if (proc_info((int)pid_val, &state, &gen) == 0)
+                if (proc_info((int)pid_val, &state, &gen, null) == 0)
                 {
                     char* rec0 = &buf[4];
                     char* name0 = "status";
@@ -169,11 +169,30 @@ fn void main() @export("main") {
 
                 uint state = 0;
                 uint gen = 0;
+                int target_uid = 0;
+                int requester_uid = 0;
                 // Fetch the live generation immediately before kill()
                 // rather than trusting anything cached — see kill()'s
                 // own comment (user.c3) for why this specific ordering
                 // matters.
-                if (strcmp(&cmd, "kill") == 0 && proc_info((int)pid_val, &state, &gen) == 0 && kill((int)pid_val, gen) == 0)
+                //
+                // procd itself is always root (create_process()'s own
+                // default, src/process.c3) — kill() only ever sees
+                // *this* process's own uid when procd is the one
+                // calling it, never the real requester's, so the
+                // kernel's own SYS_KILL check (root-or-same-uid,
+                // src/entry.c3) can't enforce anything on this indirect
+                // path unless checked here first. from (the real
+                // requester's pid, captured by ipc_recv_type_gen at the
+                // top of main()) is who this request is actually from,
+                // not procd itself. Without this, /proc/<pid>/ctl would
+                // be a complete, ungated root-kill-as-a-service
+                // backdoor around the new permission model entirely.
+                bool kill_authorized = strcmp(&cmd, "kill") == 0
+                    && proc_info((int)pid_val, &state, &gen, &target_uid) == 0
+                    && proc_info(from, null, null, &requester_uid) == 0
+                    && (requester_uid == 0 || requester_uid == target_uid);
+                if (kill_authorized && kill((int)pid_val, gen) == 0)
                 {
                     *write_result_field = (int)write_len;
                 }
@@ -193,7 +212,7 @@ fn void main() @export("main") {
         uint state = 0;
         uint gen = 0;
         int* result_len_field = (int*)&buf;
-        if (proc_info((int)pid_val, &state, &gen) != 0)
+        if (proc_info((int)pid_val, &state, &gen, null) != 0)
         {
             *result_len_field = -1;
         }

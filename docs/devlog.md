@@ -4,6 +4,108 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (38) — `permtest` confirmed on real Milk-V Duo hardware
+
+Follow-up to the previous entry: every `permtest` sub-check (`setuid()`
+drop, then the four denied attempts: direct `kill()`, re-`setuid(0)`,
+`srv_post()` hijack, and the `/proc/ctl` path) passes on the real C906
+core, alongside `killtest` re-confirmed (root killing root through the
+now-permission-checked procd path), `lsproc` clean afterward.
+
+**Files changed:** none (hardware verification only).
+
+---
+
+## 2026-08-20 (37) — A real permission model: process ownership (`uid`)
+
+Closes a gap flagged in this kernel's own code, not just a plan
+document: `SYS_KILL` and `SYS_SRV_POST` (`src/entry.c3`) both carried
+comments explicitly saying "no permission check... this kernel has no
+user/permission concept at all, so restricting *which* caller can act
+on *which* target would be security theater, not a real boundary."
+This closes that gap for exactly the two places it was flagged.
+
+**`Process.uid`** (`src/process.c3`): every boot-time server
+(`create_process()`) is explicitly root (uid 0), the same "explicit,
+not relied-on zero-init" reasoning already used for `parent_pid`.
+`SYS_RFORK` copies it into the child unchanged, same as
+`parent_pid`/`parent_generation`; `SYS_EXEC` doesn't touch it at all —
+same pid, same namespace, same uid, matching everything else that
+already survives `exec()` unchanged.
+
+**`setuid()`** (new `SYS_SETUID`) is the *only* privilege primitive
+added, deliberately minimal: sets the caller's own uid, and only while
+still root — once dropped, permanent, no way back up. No login, no
+credentials, just the standard `fork()` + child-calls-`setuid()`
+idiom. Without it every process would stay root forever by
+inheritance and the new checks below would never actually deny
+anything.
+
+**`SYS_KILL`** now requires root or the same uid as the target.
+**`SYS_SRV_POST`** now requires root or the same uid as the *current,
+live* holder of a name — but only when reclaiming one; a first-time
+claim (free slot) stays unrestricted, nothing to protect yet, and a
+name whose old holder is actually dead is still the "server restart"
+case, also unrestricted.
+
+**The backdoor this would otherwise leave wide open**: found while
+tracing `killtest`'s own existing test — it kills through
+`user/procd.c3`'s `/proc/<pid>/ctl` `FS_WRITE` handler, which calls the
+raw `kill()` syscall *as procd itself*, and procd is a boot-time
+server, always root. Gating only the raw syscall would leave
+`/proc/<pid>/ctl` as a complete, ungated root-kill-as-a-service
+backdoor around the entire model: any process, any uid, writes "kill"
+and it always succeeds, since the kernel only ever sees procd's own
+uid, never the real requester's. Fixed in `procd.c3` itself, not the
+kernel — matching this codebase's existing split between mechanical
+kernel syscalls and policy living in user-mode servers (e.g. `fsd.c3`'s
+own `FS_READ_AT` wire-format handling). `proc_info()` gained a 4th
+out-param, `uid_out` (switching its wrapper from the plain 3-arg
+`syscall()` to `syscall4`, same shape `fs_read_at` already uses for its
+own 4th argument — safe to widen this one directly rather than adding
+a new syscall number the way `SYS_IPC_RECV_GEN` did, since `proc_info()`
+has exactly one real caller-set, updated in this same change, not an
+ABI with independent consumers). procd's "kill" handler now looks up
+both the real requester's uid (`from`, already captured by
+`ipc_recv_type_gen`) and the target's before ever calling `kill()`, and
+refuses the write otherwise.
+
+**Test**: new shell command `permtest` — three processes: the shell
+(root), a "victim" child (inherits root, posts itself as `"victim"`,
+then spins forever, same shape `killtest`'s own spin-child already
+uses), and an "attacker" child that drops to uid 42 then tries, and
+must fail at, every angle: `kill()` directly, `setuid(0)` again
+(re-escalation), `srv_post("victim")` (hijacking its name), and the
+`/proc/<pid>/ctl` "kill" path — the one that would silently succeed
+without the procd-side fix above. The parent confirms the victim
+genuinely survived every attempt (`proc_info()`, not just trusting the
+attacker's own error codes) before killing it itself, root's own
+legitimate path.
+
+**Explicitly out of scope, and why**: `SYS_IPC_SEND`/`SYS_IPC_REPLY` —
+servers must stay reachable by any caller, gating message delivery
+would break this kernel's whole "everything is a server anyone can
+talk to" model, not fix a real gap. `SYS_NS_MOUNT`/`SYS_NS_UNMOUNT` —
+already correctly self-scoped (only ever touches the caller's own
+namespace). Real filesystem permission bits — ext2 actually has
+on-disk `i_uid`/`i_gid` that this driver has always deliberately never
+read (confirmed via direct survey of `Ext2_inode_info`); wiring real
+per-file ownership through fsd's wire protocol is a separate, much
+larger project. Any login/user-database concept — this kernel has
+none, `uid` stays an opaque identity, not a name, matching Plan 9's
+own minimal approach.
+
+**Verification**: full regression suite (`killtest` included — still
+root killing root through the now-checked procd path) plus `permtest`,
+both filesystems, `permtest` run repeatedly with `lsproc` showing no
+leaked slots; a three-boot stress batch; `fsck.vfat -n`/`e2fsck -n -f`
+clean.
+
+**Files changed:** `src/process.c3`, `src/entry.c3`, `user/user.c3`,
+`user/procd.c3`, `user/envd.c3`, `user/shell.c3`.
+
+---
+
 ## 2026-08-20 (36) — `exec_path()`/`pathtest` confirmed on real Milk-V Duo hardware
 
 Follow-up to the previous entry: `pathtest: ok` on the real C906 core

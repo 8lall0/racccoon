@@ -205,6 +205,18 @@ struct Process
 	int  parent_pid;
 	uint parent_generation;
 
+	// This process's owner — 0 (root) for every create_process()'d
+	// boot-time server, explicitly set there for the same "explicit, not
+	// relied-on zero-init" reason as parent_pid above. SYS_RFORK
+	// (entry.c3) inherits this into the child unchanged; SYS_EXEC doesn't
+	// touch it at all, same as pid/namespace. The only way it ever
+	// changes after that is SYS_SETUID, and only while still 0 — see its
+	// own comment. Gates SYS_KILL (root or same-uid only) and
+	// SYS_SRV_POST's reclaim-an-existing-name case; deliberately doesn't
+	// touch SYS_IPC_SEND/RECV or SYS_NS_MOUNT — see docs/devlog.md for
+	// why those stay open.
+	int uid;
+
 	// Single-slot inbox, now a true two-sided rendezvous (src/entry.c3's
 	// SYS_IPC_SEND/RECV/POLL): SEND blocks until the target's inbox is
 	// actually free before depositing (never silently overwrites an
@@ -552,6 +564,9 @@ fn Process* create_process(void* image, uint image_size)
 	// parent_pid. See Process.parent_pid's own comment above.
 	proc.parent_pid = 0;
 	proc.parent_generation = 0;
+	// Every boot-time server is root — same explicit-zero-init reasoning
+	// as parent_pid above. See Process.uid's own comment.
+	proc.uid = 0;
 
 	// Default namespace: "/srv/echo/" resolves to echod, which is always
 	// pid 2 (see kernel.c3 — it's the first process spawned after idle,

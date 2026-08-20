@@ -66,6 +66,7 @@ const SYS_SRV_POST     = 21; // posts current_proc under a short name in the glo
 const SYS_NS_MOUNT     = 22; // binds a posted srv_table name at a path prefix in the caller's own namespace — see its case below
 const SYS_PARENT_INFO  = 23; // returns a process's parent pid/generation, if it has one — see its case below
 const SYS_EXEC         = 24; // replaces the calling process's own image in place — see its case below
+const SYS_SETUID       = 25; // sets the caller's own uid, only while still root — see its case below
 
 // Generous cap on the image SYS_EXEC will install — real racccoon
 // binaries (build/user/*.bin) run 70-105KB; this leaves real headroom
@@ -994,6 +995,10 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// as SYS_PROC_INFO's own comment.
 			child.parent_pid = current_proc.pid;
 			child.parent_generation = current_proc.generation;
+			// Inherited unchanged — the only way it ever changes is
+			// SYS_SETUID, which the child can call on itself just like
+			// any other process (see that case's own comment).
+			child.uid = current_proc.uid;
 
 			// Optional out-pointer (a1), same "null means don't care"
 			// convention as SYS_IPC_RECV's type_out — lets the caller
@@ -1134,7 +1139,24 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// unprivileged `ps` is fine on a real Unix. Built for
 			// procd (user/procd.c3), the "/proc/" server, but open to
 			// any caller — there's no reason to restrict it further
-			// than that.
+			// than that. uid (a4, optional out-pointer, null means
+			// don't care — same convention as state_out/generation_out)
+			// is the same "not sensitive, an identity not a secret"
+			// reasoning — real Unix `ps` shows everyone's uid too. Added
+			// alongside the new Process.uid field specifically so
+			// procd's own ctl handler can look up the *real* requester's
+			// uid (not its own, always root) before calling kill() —
+			// see that case's own comment. a4, not a3: a3 is always the
+			// syscall number (see syscall4's own comment, user.c3) —
+			// this is why proc_info()'s wrapper now uses syscall4
+			// instead of the plain 3-arg syscall(), same shape
+			// fs_read_at already uses for its own 4th argument. Safe to
+			// widen this specific wrapper directly rather than adding a
+			// new syscall number the way SYS_IPC_RECV_GEN did over
+			// SYS_IPC_RECV: proc_info() has exactly one caller in this
+			// whole tree (procd.c3) and it's updated in this same
+			// change, not a real ABI with independent callers to keep
+			// working unmodified.
 			int query_pid = (int)f.a0;
 			Process* queried = proc_by_pid(query_pid);
 			if (queried == null)
@@ -1144,17 +1166,23 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			uint* state_out = (uint*)(uptr)f.a1;
 			uint* generation_out = (uint*)(uptr)f.a2;
+			int* uid_out = (int*)(uptr)f.a4;
 			if (state_out != null) *state_out = (uint)queried.state;
 			if (generation_out != null) *generation_out = queried.generation;
+			if (uid_out != null) *uid_out = queried.uid;
 			f.a0 = 0;
 		case SYS_KILL:
 			// Kills an arbitrary target process — the write half of
 			// /proc/<pid>/ctl (user/procd.c3), the first write path
-			// /proc has ever needed. No permission check, same
-			// reasoning as SYS_PROC_INFO above: this kernel has no
-			// user/permission concept at all, so restricting *which*
-			// caller can kill *which* target would be security
-			// theater, not a real boundary.
+			// /proc has ever needed. Real permission check now
+			// (Process.uid, process.c3): root (uid 0) may kill anyone,
+			// otherwise only a process with the exact same uid as the
+			// target. Note this only protects a *direct* SYS_KILL
+			// call — procd itself is always root, so its own ctl
+			// handler (user/procd.c3) needs and has its own separate
+			// check on the real requester's uid before it ever gets
+			// here, or this call arriving *as procd* would bypass the
+			// check below entirely. See docs/devlog.md for that half.
 			//
 			// expected_generation (a1) mirrors SYS_JOIN's own
 			// join_generation: 0 is a wildcard ("kill whatever's at
@@ -1190,6 +1218,11 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			Process* kill_target = proc_by_pid(kill_pid);
 			if (kill_target == null || (kill_expected_generation != 0 && kill_target.generation != kill_expected_generation))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			if (current_proc.uid != 0 && current_proc.uid != kill_target.uid)
 			{
 				f.a0 = (ulong)(-1);
 				break;
@@ -1264,6 +1297,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			char* post_name = (char*)(uptr)f.a0;
 			int post_free_slot = -1;
 			int post_result = -1;
+			bool post_denied = false;
 			for (int ps = 0; ps < SRV_MAX; ps++)
 			{
 				if (srv_table[ps].pid == 0)
@@ -1273,13 +1307,25 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				}
 				if (str_eq(&srv_table[ps].name[0], post_name))
 				{
+					// Reclaiming a name still held by a genuinely live
+					// process (a dead holder's slot is the "server
+					// restart" case, still unrestricted) needs root or
+					// the same uid as that live holder (Process.uid,
+					// process.c3) — otherwise any process could
+					// silently hijack another's posted service name.
+					Process* post_existing = proc_by_pid(srv_table[ps].pid);
+					if (post_existing != null && current_proc.uid != 0 && current_proc.uid != post_existing.uid)
+					{
+						post_denied = true;
+						break;
+					}
 					srv_table[ps].pid = current_proc.pid;
 					srv_table[ps].generation = current_proc.generation;
 					post_result = 0;
 					break;
 				}
 			}
-			if (post_result != 0 && post_free_slot != -1)
+			if (!post_denied && post_result != 0 && post_free_slot != -1)
 			{
 				str_copy(&srv_table[post_free_slot].name[0], post_name, SRV_NAME_MAX);
 				srv_table[post_free_slot].pid = current_proc.pid;
@@ -1536,6 +1582,28 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// path apart from that failure one.
 			f.a0 = (ulong)exec_argc;
 			f.a1 = (ulong)exec_argv_base;
+		case SYS_SETUID:
+			// Sets the CALLER's own uid — never another process's (real
+			// setuid() semantics; there's no "setuid on someone else's
+			// behalf" primitive here). Only while still root: once a
+			// process has dropped to a non-zero uid, it can never call
+			// this again, so a privilege drop is permanent. This is
+			// deliberately the only privilege primitive this kernel has
+			// — no login, no credentials, just "a root process can
+			// voluntarily drop itself (or a freshly-rforked child, which
+			// inherits root too — see SYS_RFORK's own comment) to a
+			// lower, permanent privilege level," the standard fork() +
+			// child-calls-setuid() idiom. Without this, every process
+			// would stay uid 0 forever by inheritance and SYS_KILL/
+			// SYS_SRV_POST's own new checks below would never actually
+			// deny anything.
+			if (current_proc.uid != 0)
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			current_proc.uid = (int)f.a0;
+			f.a0 = 0;
 		default:
 			panic::panic("unexpected syscall");
 	}
