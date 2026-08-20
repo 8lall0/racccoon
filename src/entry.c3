@@ -64,6 +64,7 @@ const SYS_IPC_RECV_GEN = 19; // same as SYS_IPC_RECV, plus the sender's generati
 const SYS_IPC_REPLY    = 20; // same as SYS_IPC_SEND, plus an optional target-generation check — see its case below
 const SYS_SRV_POST     = 21; // posts current_proc under a short name in the global srv_table — see its case below
 const SYS_NS_MOUNT     = 22; // binds a posted srv_table name at a path prefix in the caller's own namespace — see its case below
+const SYS_PARENT_INFO  = 23; // returns a process's parent pid/generation, if it has one — see its case below
 
 // rfork flags — Plan 9 names, this kernel's own subset. RFPROC is
 // required (rfork() without it returns -1 in this v1: real Plan 9 uses
@@ -968,6 +969,14 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			child.generation++;
 			child.sp    = (uptr)child_sp;
 			child.state = PROC_RUNNABLE;
+			// Unlike create_process() (always 0 — see Process.parent_pid's
+			// own comment, process.c3), rfork's own child genuinely does
+			// have a parent: this forking process, right now. Captured
+			// for SYS_PARENT_INFO below, built for user/envd.c3's own
+			// lazy env-inheritance but open to any caller, same reasoning
+			// as SYS_PROC_INFO's own comment.
+			child.parent_pid = current_proc.pid;
+			child.parent_generation = current_proc.generation;
 
 			// Optional out-pointer (a1), same "null means don't care"
 			// convention as SYS_IPC_RECV's type_out — lets the caller
@@ -1314,6 +1323,29 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				}
 			}
 			f.a0 = (ulong)(iptr)mount_result;
+		case SYS_PARENT_INFO:
+			// Read-only, no permission check — same reasoning as
+			// SYS_PROC_INFO above. Returns the given pid's parent_pid
+			// (Process.parent_pid, process.c3) — -1 if the pid doesn't
+			// exist or genuinely has no parent (0, create_process()'d
+			// directly rather than forked; 0 is never a valid pid, so
+			// it's a safe sentinel translated to -1 here, matching
+			// every other "not found" convention in this protocol) —
+			// with the parent's own generation handed back through an
+			// optional out-pointer, so a caller (built for
+			// user/envd.c3's own lazy env-inheritance) can confirm that
+			// parent is still the exact instance this pid was forked
+			// from before trusting anything copied from it.
+			int parent_query_pid = (int)f.a0;
+			Process* parent_queried = proc_by_pid(parent_query_pid);
+			if (parent_queried == null || parent_queried.parent_pid == 0)
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			uint* parent_generation_out = (uint*)(uptr)f.a1;
+			if (parent_generation_out != null) *parent_generation_out = parent_queried.parent_generation;
+			f.a0 = (ulong)(iptr)parent_queried.parent_pid;
 		default:
 			panic::panic("unexpected syscall");
 	}

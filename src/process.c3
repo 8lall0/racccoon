@@ -191,6 +191,20 @@ struct Process
 	// closes.
 	uint generation;
 
+	// 0 means "no parent" — the state every create_process()'d process
+	// starts in (echod, fsd, a respawned shell, ...), explicitly reset
+	// there on every call since 0 is never a valid pid but a reused slot
+	// could otherwise leak a previous occupant's real parent_pid. Set to
+	// the forking process's own (pid, generation) only by SYS_RFORK
+	// (src/entry.c3), right alongside where it already populates
+	// everything else about the child. Exists for user/envd.c3's own
+	// lazy env-inheritance (SYS_PARENT_INFO, entry.c3) — parent_generation
+	// is what lets a caller confirm the named parent is still the exact
+	// instance it forked from, same staleness guard as
+	// Mount.server_generation/Srv_entry.generation elsewhere.
+	int  parent_pid;
+	uint parent_generation;
+
 	// Single-slot inbox, now a true two-sided rendezvous (src/entry.c3's
 	// SYS_IPC_SEND/RECV/POLL): SEND blocks until the target's inbox is
 	// actually free before depositing (never silently overwrites an
@@ -504,6 +518,13 @@ fn Process* create_process(void* image, uint image_size)
 	proc.state = PROC_RUNNABLE;
 	proc.sp = (uptr)sp;
 	proc.page_table = page_table;
+	// create_process() never has a "parent" in the fork sense (a fresh
+	// boot-time spawn or a shell respawn, not an existing process
+	// splitting in two) — explicit, not relied-on zero-init, since a
+	// reused slot could otherwise leak a previous occupant's real
+	// parent_pid. See Process.parent_pid's own comment above.
+	proc.parent_pid = 0;
+	proc.parent_generation = 0;
 
 	// Default namespace: "/srv/echo/" resolves to echod, which is always
 	// pid 2 (see kernel.c3 — it's the first process spawned after idle,

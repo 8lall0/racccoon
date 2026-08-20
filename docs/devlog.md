@@ -4,6 +4,59 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (25) — /env inheritance across rfork, lazily
+
+The one gap `/env` shipped with, closed the same session: a forked
+child used to start with a completely empty environment. Real
+inheritance would need the kernel to notify `envd` when a fork happens
+— no precedent anywhere in this codebase for the kernel initiating an
+IPC send to a server from inside another process's syscall handling,
+and genuinely a much bigger, riskier mechanism than the actual problem
+needs. Didn't need it: `envd` inherits **lazily**, the first time it
+ever sees a request from a given `(pid, generation)`, by asking who
+that process's parent is and copying that parent's *current* vars once.
+
+**One small kernel addition**: `Process.parent_pid`/`parent_generation`
+(`src/process.c3`) — 0 means no parent, the state every
+`create_process()`'d process starts in (explicitly zeroed there on
+every call, same "a reused slot must never leak a previous occupant's
+data" discipline this session restored for ext2's directory slots and
+`Mount`/`Srv_entry`'s generation checks, applied here before it could
+bite). `SYS_RFORK`'s existing child-population block sets both, right
+alongside where it already sets `child.pid`/`child.generation`. New
+read-only `SYS_PARENT_INFO` syscall (next free number, 23) exposes it —
+same no-permission-check shape as `SYS_PROC_INFO`.
+
+**`envd.c3`: a real reserved-name convention**. `".inherited"` — a
+leading `.`, mirroring Unix dotfiles — records "already handled this
+process instance" so `env_maybe_inherit()` never re-runs, without a
+second parallel tracking table. `FS_READ`/`FS_WRITE`/`FS_DELETE` now
+all refuse any `.`-prefixed name outright, and `FS_LIST` filters it out
+of what it shows the caller — a real mechanism now exists for future
+internal markers, not just this one. Inheritance itself is a one-time
+snapshot at first `/env` touch, not a live link, matching real Plan 9's
+own copy-on-fork semantics: neither side's later writes propagate to
+the other.
+
+**Extended `envtest` in place** rather than adding a new command: the
+child now reads `"GREETING"` *first*, before overwriting it, and checks
+it already reads back the parent's pre-fork value — proving inheritance
+actually ran — then proceeds exactly as before (overwrite with its own
+value, parent's own copy unaffected afterward).
+
+**Verified**: full regression suite (`envtest`'s extended check
+included) clean on both filesystems, run repeatedly back-to-back
+confirming no leaked process/env slots, a 10-boot stress batch clean,
+`e2fsck -n -f`/`fsck.vfat -n` clean after.
+
+**Files changed:** `src/process.c3` (`Process.parent_pid`/
+`parent_generation`, `create_process()`'s explicit reset), `src/entry.c3`
+(`SYS_RFORK`'s child-population, new `SYS_PARENT_INFO`), `user/user.c3`
+(`parent_info()`), `user/envd.c3` (`.`-prefix reserved-name guard,
+`env_maybe_inherit()`), `user/shell.c3` (`envtest` extended).
+
+---
+
 ## 2026-08-20 (24) — /env: per-process environment variables, zero new syscalls
 
 The last item on the original `/srv`/`/tmp`/`/proc` plan's explicitly-

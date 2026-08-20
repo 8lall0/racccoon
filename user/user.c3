@@ -33,6 +33,7 @@ const int SYS_IPC_RECV_GEN = 19; // same as SYS_IPC_RECV, plus the sender's gene
 const int SYS_IPC_REPLY    = 20; // same as SYS_IPC_SEND, plus an optional target-generation check — see src/entry.c3's case
 const int SYS_SRV_POST     = 21; // posts current_proc under a short name in the global srv_table — see src/entry.c3's case
 const int SYS_NS_MOUNT     = 22; // binds a posted srv_table name at a path prefix in the caller's own namespace — see src/entry.c3's case
+const int SYS_PARENT_INFO  = 23; // returns a process's parent pid/generation, if it has one — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -336,6 +337,16 @@ fn int join(int pid, uint generation) @export("join") {
 // filters that case out before this can return success.
 fn int proc_info(int pid, uint* state_out, uint* generation_out) @export("proc_info") {
     return syscall(SYS_PROC_INFO, pid, (long)state_out, (long)generation_out);
+}
+
+// Returns pid's parent pid, filling *parent_generation_out (may be null
+// if unneeded) with the parent's own generation — everything needed to
+// confirm that parent is still the exact instance pid was forked from
+// before trusting anything copied from it. Returns -1 if pid doesn't
+// exist or genuinely has no parent (create_process()'d directly rather
+// than forked — echod, fsd, a respawned shell, ...).
+fn int parent_info(int pid, uint* parent_generation_out) @export("parent_info") {
+    return syscall(SYS_PARENT_INFO, pid, (long)parent_generation_out, 0);
 }
 
 // Kills pid. expected_generation is a wildcard when 0 ("kill whatever's

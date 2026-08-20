@@ -106,6 +106,64 @@ fn int env_find_free_or_reclaim()
     return -1;
 }
 
+// Reserved marker name — a leading '.' establishes a real reserved-name
+// convention (mirrors Unix dotfiles): FS_READ/FS_WRITE/FS_DELETE all
+// refuse any name starting with '.', and FS_LIST filters it out of what
+// it shows the caller. This specific one records "already ran (or
+// deliberately skipped) inheritance for this exact process instance" —
+// see env_maybe_inherit's own comment — without needing a second
+// parallel table just to track that one bit per (pid, generation).
+const char* ENV_INHERITED_MARKER = ".inherited";
+
+// Lazy inherit-on-first-touch: called once per request, right after
+// (from, from_gen) is known, before any verb-specific handling. envd
+// has no way to be proactively notified when a fork happens (no
+// precedent anywhere in this codebase for the kernel initiating an IPC
+// send to a server from inside another process's syscall handling, and
+// building one would be a much bigger mechanism than this needs) — so
+// instead, the first time this process instance ever touches /env at
+// all, ask the kernel who its parent is (SYS_PARENT_INFO, src/entry.c3
+// — built for exactly this) and copy that parent's *current* vars once.
+// A one-time snapshot, not a live link — matches real Plan 9's own
+// copy-on-fork semantics, not an ongoing connection: neither side's
+// later writes propagate to the other, same as env_table's existing
+// per-(pid, generation) isolation already guarantees regardless.
+fn void env_maybe_inherit(int pid, uint gen)
+{
+    if (env_find(pid, gen, ENV_INHERITED_MARKER) >= 0) return;
+
+    uint parent_gen = 0;
+    int parent_pid = parent_info(pid, &parent_gen);
+    if (parent_pid > 0)
+    {
+        for (int i = 0; i < ENV_MAX; i++)
+        {
+            if (env_table[i].pid != parent_pid) continue;
+            if (env_table[i].generation != parent_gen) continue;
+            if (strcmp(&env_table[i].name, ENV_INHERITED_MARKER) == 0) continue;
+
+            int slot = env_find_free_or_reclaim();
+            if (slot < 0) break; // table genuinely full — best-effort, stop copying rather than fail the whole request
+
+            env_table[slot].pid = pid;
+            env_table[slot].generation = gen;
+            env_copy_name(&env_table[slot].name, &env_table[i].name);
+            for (int vi = 0; vi < ENV_VALUE_MAX; vi++) env_table[slot].value[vi] = env_table[i].value[vi];
+        }
+    }
+
+    // Marked regardless of whether there was a parent or copying fully
+    // succeeded, so this never re-runs for this process instance.
+    int marker_slot = env_find_free_or_reclaim();
+    if (marker_slot >= 0)
+    {
+        env_table[marker_slot].pid = pid;
+        env_table[marker_slot].generation = gen;
+        env_copy_name(&env_table[marker_slot].name, ENV_INHERITED_MARKER);
+        env_table[marker_slot].value[0] = 0;
+    }
+}
+
 fn void main() @export("main") {
     for (;;) {
         char[FS_MSG_MAX] buf @noinit;
@@ -115,6 +173,8 @@ fn void main() @export("main") {
         if (from <= 0) continue;
         if (verb != FS_READ && verb != FS_WRITE && verb != FS_LIST && verb != FS_DELETE) continue;
 
+        env_maybe_inherit(from, from_gen);
+
         char[100] path @noinit;
         for (int i = 0; i < 100; i++)
         {
@@ -123,7 +183,7 @@ fn void main() @export("main") {
 
         if (verb == FS_READ)
         {
-            int idx = env_find(from, from_gen, &path);
+            int idx = path[0] == '.' ? -1 : env_find(from, from_gen, &path);
             int* result_len_field = (int*)&buf;
             if (idx < 0)
             {
@@ -145,8 +205,15 @@ fn void main() @export("main") {
             uint write_len = *len_field;
             if (write_len > ENV_VALUE_MAX - 1) write_len = ENV_VALUE_MAX - 1;
 
-            int idx = env_find(from, from_gen, &path);
-            if (idx < 0) idx = env_find_free_or_reclaim();
+            // Reserved-name guard — see ENV_INHERITED_MARKER's own
+            // comment. A '.'-prefixed name is never user-writable, so no
+            // fallback to env_find_free_or_reclaim() either.
+            int idx = -1;
+            if (path[0] != '.')
+            {
+                idx = env_find(from, from_gen, &path);
+                if (idx < 0) idx = env_find_free_or_reclaim();
+            }
 
             int* result_field = (int*)&buf;
             if (idx < 0)
@@ -174,6 +241,7 @@ fn void main() @export("main") {
             {
                 if (env_table[i].pid != from) continue;
                 if (env_table[i].generation != from_gen) continue;
+                if (env_table[i].name[0] == '.') continue; // reserved names, e.g. ENV_INHERITED_MARKER, never shown
                 char* rec = &buf[4 + count * 36];
                 int n = 0;
                 while (env_table[i].name[n] != 0)
@@ -190,8 +258,8 @@ fn void main() @export("main") {
             continue;
         }
 
-        // FS_DELETE
-        int didx = env_find(from, from_gen, &path);
+        // FS_DELETE — same reserved-name guard as FS_READ/FS_WRITE above.
+        int didx = path[0] == '.' ? -1 : env_find(from, from_gen, &path);
         int* del_result_field = (int*)&buf;
         if (didx < 0)
         {

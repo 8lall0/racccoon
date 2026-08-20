@@ -782,29 +782,39 @@ fn void main() @export("main") {
             int env_after_del = fs_read("/env/GREETING", &env_buf, 32);
             bool env_del_ok = env_del == 0 && env_after_del < 0;
 
-            // Isolation proof (the part that actually matters): a child
-            // sets its *own* "GREETING" to a different value; the
-            // parent's own var, re-set here, must come back exactly
-            // what the parent itself wrote, never the child's — proving
-            // two processes' vars under the same name don't collide,
-            // not just that reads/writes round-trip. Direct message to
-            // the child's own known pid first, not a busy-retry — same
-            // fix srvtest needed for the same reason (the timer only
-            // fires once per real second, see that entry's own
-            // root-cause writeup).
+            // Inheritance + isolation proof (the part that actually
+            // matters): a child forked *after* the parent sets
+            // "GREETING" must see that value on its very first read —
+            // proving envd's lazy inherit-on-first-touch actually ran —
+            // then, after overwriting its own copy with a different
+            // value, the parent's own var (re-read afterward) must come
+            // back exactly what the parent itself wrote, never the
+            // child's — proving inheritance is a one-time snapshot, not
+            // a live link, and that two processes' vars under the same
+            // name still don't collide. Direct message to the child's
+            // own known pid first, not a busy-retry — same fix srvtest
+            // needed for the same reason (the timer only fires once per
+            // real second, see that entry's own root-cause writeup).
             fs_write("/env/GREETING", "parent_value", 12);
             uint env_child_gen = 0;
             int env_child_r = rfork(RFPROC, &env_child_gen);
             if (env_child_r == 0) {
                 char[16] env_sync_buf @noinit;
                 int env_parent_pid = ipc_recv(&env_sync_buf, 16);
+
+                char[32] env_child_buf @noinit;
+                int env_inherited_len = fs_read("/env/GREETING", &env_child_buf, 32);
+                if (env_inherited_len >= 0) env_child_buf[env_inherited_len] = 0;
+                bool env_inherited_ok = env_inherited_len == 12 && strcmp(&env_child_buf, "parent_value") == 0;
+
                 fs_write("/env/GREETING", "child_value", 11);
-                ipc_send(env_parent_pid, 0, "done", 5);
+                ipc_send(env_parent_pid, 0, env_inherited_ok ? "done1" : "done0", 6);
                 exit();
             } else if (env_child_r > 0) {
                 ipc_send(env_child_r, 0, "go", 3);
                 char[16] env_done_buf @noinit;
                 ipc_recv(&env_done_buf, 16);
+                bool env_inherited_ok = strcmp(&env_done_buf, "done1") == 0;
 
                 int env_isolated_len = fs_read("/env/GREETING", &env_buf, 32);
                 if (env_isolated_len >= 0) env_buf[env_isolated_len] = 0;
@@ -812,7 +822,7 @@ fn void main() @export("main") {
 
                 fs_delete("/env/GREETING");
 
-                if (env_read_ok && env_list_ok && env_del_ok && env_isolated_ok) {
+                if (env_read_ok && env_list_ok && env_del_ok && env_inherited_ok && env_isolated_ok) {
                     print("envtest: ok\n");
                 } else {
                     print("envtest: FAILED\n");
