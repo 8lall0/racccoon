@@ -102,6 +102,11 @@ const uint EXT2_BGD_USED_DIRS_COUNT    = 16; // u16 — how many directories liv
 
 // Inode field offsets, relative to the inode's own start.
 const uint EXT2_INODE_MODE        = 0;  // u16
+const uint EXT2_INODE_UID         = 2;  // u16 (low 16 bits — i_uid_high, real ext2's
+                                          // high half via i_osd2, not read, v1: this
+                                          // driver's own uid model, src/process.c3's
+                                          // Process.uid, is a plain int with no
+                                          // reserved high-bits meaning anyway)
 const uint EXT2_INODE_SIZE        = 4;  // u32 (low 32 bits — large-file high bits not read, v1)
 const uint EXT2_INODE_LINKS_COUNT = 26; // u16 — real hardware bug found here (see
                                           // ext2_create_file's own comment): a
@@ -119,10 +124,16 @@ const uint EXT2_INODE_BLOCKS      = 28; // u32 — count of 512-byte sectors thi
                                           // when a file/directory gained a block,
                                           // caught by e2fsck as "i_blocks is 8,
                                           // should be 24" on the root directory.
-const uint EXT2_INODE_BLOCK       = 40; // u32 x 15 (i_block[0..14]) — v1 only reads [0..11]
+const uint EXT2_INODE_BLOCK       = 40; // u32 x 15 (i_block[0..14]) — direct
+                                          // [0..11] plus single-indirect [12]; [13..14]
+                                          // (double/triple indirect) still unread, v1
 
 const uint EXT2_S_IFREG = 0x8000; // regular file bit in i_mode
 const uint EXT2_S_IFDIR = 0x4000; // directory bit in i_mode
+const uint EXT2_S_IWUSR = 0x0080; // owner-write permission bit in i_mode
+const uint EXT2_S_IWOTH = 0x0002; // other-write permission bit in i_mode — no
+                                    // group bit checked: racccoon's own process-uid
+                                    // model (src/process.c3) has no group concept
 
 const uint EXT2_ROOT_INODE = 2; // format constant, not read from the superblock
 
@@ -170,6 +181,7 @@ uint[EXT2_MAX_GROUPS] ext2_inode_bitmap_blocks; // every group's own inode bitma
 struct Ext2_inode_info
 {
 	uint mode;
+	uint uid; // i_uid — see ext2_write's own comment for how this gates a write/delete
 	uint size;
 	uint links_count; // see EXT2_INODE_LINKS_COUNT's own comment
 	uint blocks;       // see EXT2_INODE_BLOCKS's own comment — 512-byte sectors, not ext2_block_size blocks
@@ -239,10 +251,12 @@ fn bool ext2_read_inode(uint inode_num, Ext2_inode_info* out)
 
 	char* inode_bytes = &block_buf[offset_in_block];
 	ushort* mode_field        = (ushort*)&inode_bytes[EXT2_INODE_MODE];
+	ushort* uid_field         = (ushort*)&inode_bytes[EXT2_INODE_UID];
 	uint*   size_field        = (uint*)&inode_bytes[EXT2_INODE_SIZE];
 	ushort* links_count_field = (ushort*)&inode_bytes[EXT2_INODE_LINKS_COUNT];
 	uint*   blocks_field      = (uint*)&inode_bytes[EXT2_INODE_BLOCKS];
 	out.mode        = (uint)*mode_field;
+	out.uid         = (uint)*uid_field;
 	out.size        = *size_field;
 	out.links_count = (uint)*links_count_field;
 	out.blocks      = *blocks_field;
@@ -990,10 +1004,12 @@ fn bool ext2_write_inode(uint inode_num, Ext2_inode_info* info)
 
 	char* inode_bytes = &block_buf[offset_in_block];
 	ushort* mode_field        = (ushort*)&inode_bytes[EXT2_INODE_MODE];
+	ushort* uid_field         = (ushort*)&inode_bytes[EXT2_INODE_UID];
 	uint*   size_field        = (uint*)&inode_bytes[EXT2_INODE_SIZE];
 	ushort* links_count_field = (ushort*)&inode_bytes[EXT2_INODE_LINKS_COUNT];
 	uint*   blocks_field      = (uint*)&inode_bytes[EXT2_INODE_BLOCKS];
 	*mode_field        = (ushort)info.mode;
+	*uid_field         = (ushort)info.uid;
 	*size_field        = info.size;
 	*links_count_field = (ushort)info.links_count;
 	*blocks_field      = info.blocks;
@@ -1095,7 +1111,13 @@ fn bool ext2_find_or_reuse_dir_slot(Ext2_inode_info* dir, uint* out_block, bool*
 // dir_inode_num is the containing directory (root or a subdirectory —
 // see ext2_write's own comment on write-into-subdirectory support), not
 // always EXT2_ROOT_INODE anymore.
-fn bool ext2_create_file(uint dir_inode_num, char* name, uint* out_inode_num)
+// requester_uid stamps the new inode's own i_uid — creating a file is
+// itself unrestricted (no check against anything here — see this
+// file's own header comment on why directory-permission-gated create
+// isn't modeled), but the file needs a real owner from the moment it
+// exists so a *later* overwrite/delete (ext2_write/ext2_delete's own
+// enforcement) can tell its creator apart from anyone else.
+fn bool ext2_create_file(uint dir_inode_num, char* name, uint* out_inode_num, uint requester_uid)
 {
 	uint inode_num = ext2_alloc_inode();
 	if (inode_num == 0) return false;
@@ -1103,6 +1125,7 @@ fn bool ext2_create_file(uint dir_inode_num, char* name, uint* out_inode_num)
 
 	Ext2_inode_info new_inode;
 	new_inode.mode = EXT2_S_IFREG | 0x1A4; // 0644 permissions
+	new_inode.uid = requester_uid;
 	new_inode.size = 0;
 	// Real hardware bug, found and fixed this session (see
 	// EXT2_INODE_LINKS_COUNT's own comment): a freshly zeroed inode has
@@ -1227,7 +1250,18 @@ fn uint ext2_write_file(Ext2_inode_info* inode, char* src, uint len)
 // inode instead of always the root. ext2_find_in_root/its own root-only
 // callers below (ext2_reserve_protected) are untouched: the one file
 // that ever needs protecting (fip.bin) is always in the root.
-fn int ext2_write(char* name, char* src, uint len)
+// requester_uid (src/process.c3's Process.uid, looked up by fsd.c3
+// before ever calling this — see fsd.c3's own comment for why: this
+// function can't trust its own caller's identity the way SYS_KILL/
+// SYS_SRV_POST can trust current_proc, since fsd.c3 is a boot-time
+// server, always root, acting on a real requester's behalf) gates
+// overwriting an *existing* file: root, the file's own owner (subject
+// to its own EXT2_S_IWUSR bit), or anyone else if EXT2_S_IWOTH allows
+// it — no group bit checked, racccoon's own process-uid model has no
+// group concept. Creating a brand-new file stays unrestricted (see
+// ext2_create_file's own comment) — this check only applies once
+// `exists` is already true.
+fn int ext2_write(char* name, char* src, uint len, uint requester_uid)
 {
 	uint dir_inode;
 	if (!ext2_resolve_dir(name, &dir_inode)) return -1;
@@ -1244,7 +1278,7 @@ fn int ext2_write(char* name, char* src, uint len)
 
 	if (!exists)
 	{
-		if (!ext2_create_file(dir_inode, leaf, &inode_num)) return -1;
+		if (!ext2_create_file(dir_inode, leaf, &inode_num, requester_uid)) return -1;
 		if (!ext2_find_in_dir(dir_inode, leaf, &inode_num, &entry_sector, &entry_offset, &mode)) return -1;
 	}
 
@@ -1252,6 +1286,14 @@ fn int ext2_write(char* name, char* src, uint len)
 
 	Ext2_inode_info inode;
 	if (!ext2_read_inode(inode_num, &inode)) return -1;
+
+	if (exists && requester_uid != 0)
+	{
+		bool allowed = (requester_uid == inode.uid)
+			? (inode.mode & EXT2_S_IWUSR) != 0
+			: (inode.mode & EXT2_S_IWOTH) != 0;
+		if (!allowed) return -1;
+	}
 
 	uint written = ext2_write_file(&inode, src, len);
 	inode.size = written;
@@ -1316,7 +1358,17 @@ fn bool ext2_dir_is_empty(Ext2_inode_info* dir)
 // and only once nothing references them anymore, free the inode itself
 // — never mark something reusable while anything might still reference
 // it.
-fn int ext2_delete(char* name)
+//
+// requester_uid gates this the same way ext2_write's own overwrite
+// case does — root, the target's own owner (subject to EXT2_S_IWUSR),
+// or anyone else if EXT2_S_IWOTH allows it. Real Unix gates unlink()
+// by the *directory's* write permission, not the target's own — this
+// driver doesn't model directory permissions at all, so the target's
+// own write bit is used as a simple, reasonable stand-in.
+// ext2_delete_recursive (below) is unchanged — explicit v1 scope, not
+// silently dropped: enforcing this correctly there would mean
+// checking every file it touches, not just the top-level target.
+fn int ext2_delete(char* name, uint requester_uid)
 {
 	uint dir_inode;
 	if (!ext2_resolve_dir(name, &dir_inode)) return -1;
@@ -1331,6 +1383,14 @@ fn int ext2_delete(char* name)
 
 	Ext2_inode_info inode;
 	if (!ext2_read_inode(inode_num, &inode)) return -1;
+
+	if (requester_uid != 0)
+	{
+		bool allowed = (requester_uid == inode.uid)
+			? (inode.mode & EXT2_S_IWUSR) != 0
+			: (inode.mode & EXT2_S_IWOTH) != 0;
+		if (!allowed) return -1;
+	}
 
 	bool is_dir = (mode & EXT2_S_IFDIR) != 0;
 	if (is_dir && !ext2_dir_is_empty(&inode)) return -1;
@@ -1629,7 +1689,13 @@ fn bool ext2_list(char* path, char* out_buf, int max_entries, int* out_count)
 // mode 0x41ED = EXT2_S_IFDIR | 0755 — the standard real-world value
 // for an ordinary directory (same permission convention
 // ext2_create_file's own 0644 already follows for regular files).
-fn int ext2_mkdir(char* path)
+// requester_uid stamps the new directory's own i_uid, same reasoning
+// as ext2_create_file's own comment — creating a directory is itself
+// unrestricted, but ext2_delete's own enforcement (below) covers
+// removing an *empty* directory the same way it covers a regular
+// file, so this directory needs a real owner too, or its own creator
+// could never rmdir it again.
+fn int ext2_mkdir(char* path, uint requester_uid)
 {
 	uint parent_inode;
 	if (!ext2_resolve_dir(path, &parent_inode)) return -1;
@@ -1673,6 +1739,7 @@ fn int ext2_mkdir(char* path)
 
 	Ext2_inode_info new_inode;
 	new_inode.mode = EXT2_S_IFDIR | 0x1ED;
+	new_inode.uid = requester_uid;
 	new_inode.size = ext2_block_size;
 	// 2, not 1: one for the parent's own directory entry pointing at
 	// this inode, one for this directory's own "." entry pointing at

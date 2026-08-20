@@ -1130,6 +1130,93 @@ fn void main() @export("main") {
                     }
                 }
             }
+        } else if (strcmp(cmd, "fspermtest") == 0) {
+            // Real ext2 file permissions (i_uid + owner/other write
+            // bits, user/fs/ext2.c3): root (this shell, uid 0) may
+            // overwrite/delete anything; a non-root process may only
+            // touch what it owns (or what a file's own "other" bit
+            // allows). Creates a file directly (root-owned), rforks a
+            // child that drops to uid 42 and tries to tamper with it
+            // (both attempts must fail), then proves it can still
+            // fully manage its own files — create, overwrite, and
+            // delete all succeeding proves creation really does stamp
+            // the creator's own uid, not just that non-owner access
+            // gets denied.
+            //
+            // No IPC handshake needed the way permtest's own attacker
+            // needed one: fs_write()/fs_delete() are already
+            // synchronous blocking round trips, and join() (below,
+            // real Plan-9-style: blocks until the joined process is
+            // actually gone, src/entry.c3's SYS_JOIN) is exactly the
+            // "wait for the child to be genuinely, fully done" this
+            // needs.
+            //
+            // "/2/" prefix on every path here, not bare filenames —
+            // found the hard way testing this on real Duo hardware:
+            // an unprefixed path resolves through the "" catch-all
+            // mount (src/process.c3's default namespace), which binds
+            // to whichever fsd was created *first* — DUOBOOT/FAT32 on
+            // this board, not EXT2TEST/ext2 — any time both are
+            // mounted at once. FAT32 has no uid concept at all to
+            // enforce (by design, this feature's own scope), so every
+            // attempt silently "succeeded": not a bug in the
+            // enforcement logic itself, this test just wasn't actually
+            // reaching ext2. QEMU's own single-mount ext2 test image
+            // (scripts/launch64_ext2.sh) made the bare-path version
+            // look correct purely by accident — ext2 happened to be
+            // the only, and therefore default, mount there. "/2/"
+            // reaches ext2 unambiguously on any dual-mount setup (real
+            // hardware, or QEMU's own scripts/launch64_dual.sh), the
+            // same convention readfile2/newfile2/etc. already use.
+            fs_write("/2/owner_only.txt", "root content", 12);
+
+            uint fp_gen = 0;
+            int fp_r = rfork(RFPROC, &fp_gen);
+            if (fp_r < 0) {
+                print("rfork failed\n");
+            } else if (fp_r == 0) {
+                int fp_su = setuid(42);
+                print("fspermtest: setuid(42) ");
+                print(fp_su == 0 ? "ok\n" : "FAILED\n");
+
+                int fp_write1 = fs_write("/2/owner_only.txt", "attacker content", 17);
+                print("fspermtest: overwrite root-owned file as non-owner ");
+                print(fp_write1 < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
+
+                int fp_del1 = fs_delete("/2/owner_only.txt");
+                print("fspermtest: delete root-owned file as non-owner ");
+                print(fp_del1 < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
+
+                int fp_write2 = fs_write("/2/attacker_owned.txt", "mine", 4);
+                print("fspermtest: create own file ");
+                print(fp_write2 >= 0 ? "ok\n" : "FAILED\n");
+
+                int fp_write3 = fs_write("/2/attacker_owned.txt", "mine still", 10);
+                print("fspermtest: overwrite own file ");
+                print(fp_write3 >= 0 ? "ok\n" : "FAILED\n");
+
+                int fp_del2 = fs_delete("/2/attacker_owned.txt");
+                print("fspermtest: delete own file ");
+                print(fp_del2 >= 0 ? "ok\n" : "FAILED\n");
+
+                exit();
+            } else {
+                join(fp_r, fp_gen);
+
+                char[32] fp_readback @noinit;
+                int fp_len = fs_read("/2/owner_only.txt", &fp_readback, 32);
+                if (fp_len >= 0) fp_readback[fp_len] = 0;
+                bool fp_intact = fp_len == 12 && strcmp(&fp_readback, "root content") == 0;
+
+                int fp_write_root = fs_write("/2/owner_only.txt", "root content v2", 16);
+                int fp_del_root = fs_delete("/2/owner_only.txt");
+
+                if (fp_intact && fp_write_root >= 0 && fp_del_root >= 0) {
+                    print("fspermtest: ok\n");
+                } else {
+                    print("fspermtest: FAILED\n");
+                }
+            }
         } else if (strcmp(cmd, "rforktest") == 0) {
             // Plain rfork(RFPROC): the child gets an independent copy of
             // this process's address space (src/entry.c3's SYS_RFORK,

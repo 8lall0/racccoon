@@ -331,7 +331,7 @@ fn void fs_mount()
 		// failure here (e.g. fs_write_disabled flipping back on if
 		// fs_reserve_sector_range overflows further down) just means
 		// /tmp isn't there yet, same as if this line didn't exist.
-		ext2_mkdir("tmp");
+		ext2_mkdir("tmp", 0); // owned by root — this is fsd itself creating it, at mount time, not on any particular requester's behalf
 		ext2_reserve_protected(&FS_PROTECTED_NAME);
 		fs_reserve_protection_summary();
 		return;
@@ -442,7 +442,23 @@ fn void main() @export("main")
 				}
 				else if (fs_type == FS_TYPE_EXT2)
 				{
-					result = recursive ? ext2_delete_recursive(&filename) : ext2_delete(&filename);
+					if (recursive)
+					{
+						// Unchanged, explicit v1 scope — see
+						// ext2_delete's own comment for why enforcing
+						// this correctly here would need checking every
+						// file the recursion touches, not just the
+						// top-level target.
+						result = ext2_delete_recursive(&filename);
+					}
+					else
+					{
+						// Same requester-uid lookup as FS_WRITE's own
+						// ext2 branch, same reasoning — see its comment.
+						uint requester_uid = 0xFFFFFFFF;
+						proc_info(from, null, null, (int*)&requester_uid);
+						result = ext2_delete(&filename, requester_uid);
+					}
 				}
 			}
 			*result_len_field = result;
@@ -496,7 +512,16 @@ fn void main() @export("main")
 				}
 				else if (fs_type == FS_TYPE_EXT2)
 				{
-					result = ext2_mkdir(&filename);
+					// Same requester-uid lookup as FS_WRITE's own ext2
+					// branch — mkdir itself stays unrestricted (see
+					// ext2_mkdir's own comment), this just stamps the
+					// new directory with its real creator so a later
+					// rmdir (ext2_delete, which already covers empty
+					// directories the same as regular files) can tell
+					// them apart from anyone else.
+					uint requester_uid = 0xFFFFFFFF;
+					proc_info(from, null, null, (int*)&requester_uid);
+					result = ext2_mkdir(&filename, requester_uid);
 				}
 			}
 			*result_len_field = result;
@@ -543,7 +568,24 @@ fn void main() @export("main")
 				}
 				else if (fs_type == FS_TYPE_EXT2)
 				{
-					result = ext2_write(&filename, &buf[104], (uint)req_len);
+					// FAT32's own on-disk format has no uid concept to
+					// enforce against — only ext2 needs the real
+					// requester's own uid (Process.uid, src/process.c3),
+					// looked up here rather than trusted from this
+					// process's own identity: fsd is always root, so
+					// ext2_write's own enforcement would see nothing but
+					// root unless told who *actually* asked — the same
+					// backdoor shape procd's own /proc/ctl "kill" handler
+					// had before this session's permission-model entry
+					// fixed it, closed the same way. A failed lookup
+					// (the requester's own process no longer exists, a
+					// real if rare race) fails closed: 0xFFFFFFFF never
+					// matches a real uid and is never root, so an
+					// existing file's own overwrite gets refused rather
+					// than silently trusted.
+					uint requester_uid = 0xFFFFFFFF;
+					proc_info(from, null, null, (int*)&requester_uid);
+					result = ext2_write(&filename, &buf[104], (uint)req_len, requester_uid);
 				}
 			}
 			*result_len_field = result;

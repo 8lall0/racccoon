@@ -4,6 +4,132 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (44) — `fspermtest` confirmed on real hardware — after finding it was never really testing ext2 at all
+
+Follow-up to the previous entry, but a real bug-hunt, not a clean
+confirmation. First hardware run: `fspermtest: FAILED` — both denial
+checks ("overwrite root-owned file as non-owner", "delete...")
+**wrongly succeeded**. Added debug prints inside `ext2_write`/
+`ext2_delete`'s own enforcement branch and in `fsd.c3`'s
+`proc_info()` lookup; rebuilt, reflashed, reran — and *none of the new
+prints appeared at all*, even though the code they're inside of must
+have run for the write/delete to return success in the first place.
+That was the actual clue: the ext2 branch was never being reached.
+
+Root cause, confirmed by reading `src/process.c3`'s own default
+namespace setup and `SYS_NS_RESOLVE`'s longest-prefix match
+(`src/entry.c3`): the unprefixed catch-all mount (`""`) binds to
+whichever `fsd` was created *first* — `DUOBOOT`/FAT32 on this board,
+not `EXT2TEST`/ext2 — any time both are mounted, which is always true
+on real hardware (confirmed from this exact board's own boot log:
+`fsd: FAT32 mounted...` then later `fsd: ext2 mounted...`). `fspermtest`'s
+own `fs_write("owner_only.txt", ...)` (no `/2/` prefix) was resolving
+straight to FAT32 the whole time — which has no uid concept to enforce
+by design, so every write/delete just succeeded unconditionally. Not a
+bug in the enforcement logic itself (which the debug prints, once
+`/2/`-prefixed, showed working exactly as designed) — the test was
+just never reaching the code being tested. QEMU's own single-mount
+ext2 test image (`scripts/launch64_ext2.sh`) made the bare-path version
+look correct purely by accident: ext2 happens to be the *only*, and
+therefore default, mount there, so the same bare path that silently
+hit FAT32 on real hardware correctly hit ext2 on that specific QEMU
+image. Fixed by prefixing every path in `fspermtest` with `/2/` — the
+same convention `readfile2`/`newfile2`/etc. already established for
+exactly this reason — and re-verifying against QEMU's own dual-mount
+image (`scripts/launch64_dual.sh`), which matches real hardware's own
+topology, not the single-mount one.
+
+**A real, unresolved implication this surfaces**: `runtest`/`argvtest`/
+`pathtest`/`elftest` (and the previous entry's own "confirmed... against
+real `EXT2TEST`" claim) all use bare, unprefixed paths too
+(`"bin/echod"`, etc.) — meaning those real-hardware confirmations were
+almost certainly *also* silently hitting `DUOBOOT`/FAT32 instead of
+`EXT2TEST`, the same way `fspermtest` just was. FAT32 has no
+12-direct-block limit at all, so those runs passing proves nothing
+about whether the single-indirect-block work (two entries back) was
+ever actually exercised on real ext2 hardware. Flagged directly to the
+user rather than silently corrected — deciding whether/how to
+re-verify those four tests and that claim against real `EXT2TEST`
+(most likely via new `/2/`-prefixed `...2` variants, matching this same
+fix) is a separate decision, not made unilaterally here.
+
+**Verification**: `fspermtest` on QEMU's dual-mount image, repeated
+across a three-boot stress batch, `lsproc` clean, `e2fsck -n -f` clean
+on the ext2 half; the single-mount ext2 image's own full regression
+suite reconfirmed unaffected; real Duo hardware, against the actual
+`EXT2TEST` partition this time, confirmed via the same debug prints
+that proved the original failure — removed once the fix was confirmed
+end to end.
+
+**Files changed:** `user/shell.c3`.
+
+---
+
+## 2026-08-20 (43) — Real ext2 file permissions (`i_uid` + owner/other write bits)
+
+Closes the other gap the process-ownership permission-model entry
+explicitly deferred: ext2 has real on-disk `i_uid`/permission bits
+`Ext2_inode_info` never read — `mode`'s *type* bits (`EXT2_S_IFREG`/
+`EXT2_S_IFDIR`) were always parsed, but its *permission* bits weren't,
+and `i_uid` wasn't read at all. `ext2_create_file` already writes a
+sensible default (`EXT2_S_IFREG | 0x1A4`, 0644) into every new file's
+own `mode` — the permission bits were already being written correctly,
+just never enforced coming back.
+
+**Scope, matching this session's own established discipline**: gate
+*overwriting an existing file* and *deleting a file* (non-recursive) by
+ownership — root or the file's own owner (subject to `EXT2_S_IWUSR`),
+or anyone else if `EXT2_S_IWOTH` allows it. No group concept
+(racccoon's own process-uid model has none), no directory-permission
+modeling (creating a file isn't gated by its directory's own
+permissions, unlike real Unix), no recursive-delete enforcement (would
+need checking every file it touches) — all explicit, not silently
+dropped. Creating a new file (or an empty directory) stays
+unrestricted, but gets stamped with its creator's real uid, so
+*subsequent* writes to it are correctly gated.
+
+**The same backdoor shape `procd` already had**: `fsd.c3` (always
+root) is what actually calls `ext2_write`/`ext2_delete`/`ext2_mkdir` on
+a caller's behalf — enforcing against `fsd`'s own uid would enforce
+nothing. Closed the same way the `/proc/ctl` "kill" backdoor was:
+`fsd.c3` already captures `from` (the real requester, via
+`ipc_recv_type_gen`); before dispatching to the ext2 backend
+specifically, it looks up the requester's uid via `proc_info(from, null, null, &requester_uid)`
+(the 4-out-param version the permission-model entry added) and passes
+it through. A failed lookup (the requester's own process already gone,
+a real if rare race) fails closed to a sentinel (`0xFFFFFFFF`) that
+never matches a real uid and is never root. FAT32's own write/delete
+paths are untouched — its on-disk format has no uid concept at all to
+enforce against.
+
+**Found during implementation, not anticipated in planning**:
+`ext2_delete` (non-recursive) already handled both a regular file *and*
+an empty directory — meaning `ext2_mkdir`'s own newly-created
+directories needed the same creator-uid stamp `ext2_create_file` gets,
+or a directory's own creator could never `rmdir` it again once this
+landed. Threaded through the same way.
+
+**Test**: new shell command `fspermtest` — the shell (root) creates a
+file directly, `rfork()`s a child that drops to uid 42 and must fail at
+both overwriting and deleting it, then must fully succeed at creating,
+overwriting, and deleting a file of its own (proving owner access
+works and that creation really stamps the right uid, not just that
+denial works). No IPC handshake needed this time: `fs_write()`/
+`fs_delete()` are already synchronous, and `join()` (real Plan-9-style
+— blocks until the joined process is actually gone) is exactly the
+"wait for the child to be genuinely done" this needs, simpler than
+`permtest`'s own IPC-based signal.
+
+**Verification**: full regression suite unaffected (every existing
+process is uid 0 by inheritance, so every existing ext2 write/delete
+test keeps hitting the root-bypass path unchanged) plus `fspermtest`,
+run repeatedly with `lsproc` showing no leaked slots, a three-boot
+stress batch, `e2fsck -n -f` clean.
+
+**Files changed:** `user/fs/ext2.c3`, `user/fsd.c3`, `user/shell.c3`.
+
+---
+
 ## 2026-08-20 (42) — ext2 single-indirect blocks confirmed on real Milk-V Duo hardware, against real `EXT2TEST`
 
 Follow-up to the previous entry: `runtest`/`argvtest`/`pathtest`/
