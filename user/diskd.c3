@@ -1,6 +1,6 @@
 module user;
 
-import std::racccoon::mem;
+import std::nolibc::mem;
 
 // diskd: the virtio-blk driver, moved out of the trusted kernel into its
 // own user-mode process (microkernel plan phase 4 — see docs/devlog.md).

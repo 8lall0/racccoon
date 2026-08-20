@@ -1,6 +1,6 @@
 module user;
 
-import std::racccoon::mem;
+import std::nolibc::mem;
 
 // ext2 backend for fsd (see user/fsd.c3's own header comment for the
 // generic core / backend split). Standard, stable public spec (the

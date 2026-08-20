@@ -1,6 +1,6 @@
 module user;
 
-import std::racccoon::fmt;
+import std::nolibc::fmt;
 
 int rfork_shared_value = 0;
 int rfork_child_ran = 0; // set by rforkmemtest's child, checked by rforkmemresult

@@ -1,7 +1,7 @@
 module user;
 
-import std::racccoon::mem;
-import std::racccoon::fmt;
+import std::nolibc::mem;
+import std::nolibc::fmt;
 
 // /proc: a synthetic filesystem server (see docs/devlog.md) — speaks the
 // same FS_READ/FS_LIST/FS_WRITE wire protocol fsd.c3 already does (verbs

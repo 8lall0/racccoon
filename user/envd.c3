@@ -1,6 +1,6 @@
 module user;
 
-import std::racccoon::mem;
+import std::nolibc::mem;
 
 // /env: per-process environment variables, real Plan 9 idea (there
 // #e, a private per-process kernel device). Racccoon has no per-process

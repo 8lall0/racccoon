@@ -1,7 +1,7 @@
 module user;
 
-import std::racccoon::atomic;
-import std::racccoon::fmt;
+import std::nolibc::atomic;
+import std::nolibc::fmt;
 
 // Linker script symbol - declared as extern so C3 knows about it,
 // @cname ensures no mangling

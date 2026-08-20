@@ -4,6 +4,57 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (28) — std::racccoon -> std::nolibc, gated by a real opt-in feature
+
+Two refinements to the previous entry's `std::racccoon::*` module,
+both in the c3c fork (`~/Workspace/c3c`, still uncommitted there —
+deliberately, same as before), prompted by wanting something less
+project-branded and more genuinely reusable.
+
+**Location**: tried moving `mem.c3`/`atomic.c3`/`fmt.c3` to live inside
+the *real* canonical files (`lib/std/core/mem.c3`, `lib/std/atomic.c3`)
+as additional `@feat`-gated blocks, matching how `core/mem.c3` already
+keeps its `FREESTANDING_WASM`/`NO_LIBC` variants in one file. Tested
+directly and it doesn't work: those real files have *unconditional*
+top-level imports (`std::core::mem::allocators`, `std::os::posix`,
+`std::math`, `std::io`) that fail immediately when the file is passed
+as a standalone source argument under `--use-stdlib=no`, regardless of
+any `@feat` gate further down — confirmed by literally trying it, not
+assumed. This is exactly *why* the real stdlib's own freestanding
+pieces (`_nolibc/nolibc.c3`, `_nolibc/math_nolibc/`) are separate,
+self-contained files rather than gated blocks in the main ones — same
+constraint, same answer. So: renamed the *module path* instead —
+`std::racccoon::{mem,atomic,fmt}` -> `std::nolibc::{mem,atomic,fmt}`,
+staying physically in `lib/std/_nolibc/` (not nested under a
+project-branded subdirectory anymore).
+
+**Gating**: switched from the ambient `@feat(NO_LIBC)` (automatically
+active for *any* freestanding build, not just racccoon's) to an
+explicit `@feat(RACCCOON)`, activated only via a new `-D RACCCOON` flag
+in `scripts/build_user.sh`'s own `c3c compile-only` call. Verified both
+directions directly: compiles and produces the expected
+`std.nolibc.mem.o`/`std.nolibc.fmt.o` (atomic's generics inline into
+the caller, as before) with `-D RACCCOON` present; every symbol from
+all three modules is completely unreachable (`'mem::copy' could not be
+found`) without it. This means the module can sit in the fork's shared
+stdlib tree without silently activating for some *other* freestanding
+project built against the same fork that never opted in — dormant by
+default, not by convention.
+
+**Verified**: full regression suite clean on both filesystems
+(`mutextest` again exercising the real hardware atomics through the
+renamed/re-gated module), a 10-boot stress batch clean, `e2fsck -n -f`/
+`fsck.vfat -n` clean after.
+
+**Files changed:** `scripts/build_user.sh` (`-D RACCCOON`,
+`RACCCOON_STD_DIR` default path updated), `user/user.c3`/`procd.c3`/
+`shell.c3`/`envd.c3`/`fsd.c3`/`diskd.c3`/`fs/ext2.c3` (imports and
+qualified call sites updated to `std::nolibc::*`). Outside this repo:
+`~/Workspace/c3c`'s `lib/std/_nolibc/{mem,atomic,fmt}.c3` renamed from
+`std::racccoon::*` and re-gated (still uncommitted there).
+
+---
+
 ## 2026-08-20 (27) — Moving the stdlib adaptation into std::racccoon, in a real c3c fork
 
 Took the previous entry's `user/mem.c3`/`user/atomic.c3`/`user/fmt.c3`
