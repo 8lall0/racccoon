@@ -4,6 +4,37 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (30) — EXT2TEST fixtures restored, closing out the flashing-incident recovery
+
+Follow-up to the previous entry: the full repartition there left
+`EXT2TEST` freshly formatted but empty — the standard fixture set
+(`hello.txt`, `subdir/nested.txt`, `emptydir/`, `nestdir/inner.txt`,
+`nestdir/innerdir/inner2.txt`) needed restoring before the `"/2/"`-
+targeting regression commands (`readfile2`/`readsubfile2`/`newfile2`/
+`newsubfile2`/`deletetest2`/`rmdirtest2`) had anything real to exercise.
+Restored via `debugfs -w` directly on the block device — the exact
+same technique, and the exact same source files (`disk-ext2/hello.txt`,
+`disk-ext2/subdir/nested.txt`), `scripts/build.sh` already uses to seed
+`build/disk_ext2.img` for QEMU.
+
+**Confirmed on real hardware afterward**: `fsd`'s own idempotent `/tmp`
+auto-create had already fired on first mount against the freshly-seeded
+filesystem (a `tmp/` directory present with an epoch timestamp, seen in
+the post-seed directory listing, before any test explicitly touched
+it) — real, independent confirmation that mount-time write logic runs
+correctly against a genuinely fresh filesystem, not just the QEMU test
+images this codebase has run it against so far. Then the full `"/2/"`
+suite itself: all six commands correct, content byte-matching what was
+seeded (`"Hello from ext2!"`, `"Hello from an ext2 subdirectory!"`),
+dynamic write/read/delete/rmdir all clean.
+
+This closes out the recovery from the previous entry's flashing
+mistake — `EXT2TEST` is back to full parity with what a from-scratch
+`scripts/build.sh` run produces for QEMU, confirmed by direct
+real-hardware exercise rather than assumed from the seed step alone.
+
+---
+
 ## 2026-08-20 (29) — Real Duo hardware: everything since /srv confirmed, and a real flashing lesson
 
 Every feature from this session — `/srv`/`/tmp`/`/proc` (read + write),
