@@ -4,6 +4,89 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (45) — `runtest2`/`argvtest2`/`pathtest2`/`elftest2`: proper mount-2 re-verification
+
+Follow-up to the previous entry's own discovery: `runtest`/`argvtest`/
+`pathtest`/`elftest` all use bare, unprefixed paths (`"bin/echod"`,
+etc.), exactly the same class of bug `fspermtest` just had — so every
+earlier "confirmed against real `EXT2TEST`" claim for this test family,
+and the single-indirect-block feature's own hardware confirmation two
+entries back, almost certainly exercised `DUOBOOT`/FAT32 instead
+whenever both are mounted, which is always true on real hardware.
+Closes that out properly instead of leaving it flagged.
+
+**New `/2/`-prefixed variants**, not edits to the originals:
+`runtest2`/`argvtest2`/`pathtest2`/`elftest2` (`shell.c3`) are
+near-identical copies of `runtest`/`argvtest`/`pathtest`/`elftest`,
+differing only in the path(s) they target — `"/2/bin/echod"` instead of
+`"bin/echod"`, `/env/PATH` set to `"/2/nonexistent/:/2/bin/"` instead of
+`"nonexistent/:bin/"` for `pathtest2`. The originals stay exactly as
+they were, still useful for testing whichever filesystem is the
+*default* mount (which is genuinely FAT32 on real hardware, genuinely
+ext2 on QEMU's own single-mount ext2 image) — this isn't a case where
+the old versions were simply wrong and got replaced, they test a real,
+different thing (mount 1) than the new ones (mount 2, unambiguously).
+
+**`scripts/build.sh`'s dual-mount image** (`disk_dual.img`, backing
+`scripts/launch64_dual.sh` — the one QEMU config that actually matches
+real hardware's own topology, both filesystems mounted at once) never
+seeded `bin/echod`/`bin/echod.elf` onto either half at all; the new "2"
+variants needed them reachable at `/2/bin/echod`/`/2/bin/echod.elf`
+specifically. Added to the ext2 half's own scratch-image seeding step,
+alongside its existing `hello.txt`/`subdir`/`emptydir` fixtures.
+
+**Verification**: all four new tests on QEMU's dual-mount image, full
+regression suite there too (mount-1 tests correctly report
+`FAILED (exec load failed)` on this image — its own FAT32 half was
+never seeded with `bin/echod`, a pre-existing gap unrelated to this
+entry, not a regression), the single-mount images' own original tests
+reconfirmed unaffected, a three-boot stress batch, `fsck.vfat -n`/
+`e2fsck -n -f` clean on the dual image's own two halves.
+
+**Real Milk-V Duo hardware confirmation**, against the real `EXT2TEST`
+partition — `runtest2: ok`, `argvtest2: ok`, `pathtest2: ok`,
+`elftest2: ok`, `lsproc` clean afterward (no leaked slots). Two real
+things surfaced getting there, neither a bug in this entry's own code,
+both worth recording:
+
+- **The seeding round-trip itself silently missed the real device
+  once.** The scratch script that copies `bin/echod`/`bin/echod.elf`
+  onto `EXT2TEST` addressed it by a guessed mountpoint path
+  (`/run/media/$USER/EXT2TEST`) — `udisksctl mount` doesn't always
+  reuse that exact path; a stale mount/label already claiming it makes
+  udisks pick `EXT2TEST1` instead. `mkdir -p`/`cp` against the stale,
+  now-wrong path silently succeeded (created a directory on the *host's
+  own root filesystem*, not the device), and `ls -la` "confirmed" files
+  that were never on the SD card at all. First re-verification attempt
+  failed with the exact same `FAILED (exec load failed)` shape this
+  whole entry exists to properly test, for a completely mundane reason.
+  Fixed by resolving the mountpoint from the device (`findmnt -n -o
+  TARGET /dev/sdc2`) instead of a guessed label path, refusing to
+  proceed if it isn't actually mounted, and verifying the write
+  independently afterward via `debugfs -R "ls -l /bin"` straight
+  against the block device — bypasses the mount entirely, so it can't
+  be fooled the same way twice.
+- **Reading a real multi-chunk file over `/2/` on real hardware is
+  legitimately slow, easy to mistake for a hang.** `ext2_read_at`
+  (entry 41) does a completely uncached walk from root on *every*
+  `fs_read_at()` call — re-resolving `/2/bin/echod`'s directory chain
+  and both inodes from scratch each time — and each call only carries
+  ~1124 bytes (`FS_MSG_MAX-4`). Loading `echod` (71648 bytes) took
+  ~64 chunk calls, each doing ~5 block reads instead of 1, ~1900 sector
+  reads total just for one binary — visibly the same handful of
+  physical block addresses cycling on the serial console, easy to
+  mistake for an infinite loop. It wasn't one — `runtest2: ok` arrived
+  after waiting it out. Never surfaced before because every prior
+  real-hardware exec test used files well under one chunk. Not fixed
+  here (out of scope for a re-verification entry), but worth a real
+  entry later: caching the resolved dir/leaf inode across one exec()'s
+  own read loop instead of re-walking the path on every chunk would
+  turn this from O(chunks × depth) block reads into O(chunks + depth).
+
+**Files changed:** `user/shell.c3`, `scripts/build.sh`.
+
+---
+
 ## 2026-08-21 (44) — `fspermtest` confirmed on real hardware — after finding it was never really testing ext2 at all
 
 Follow-up to the previous entry, but a real bug-hunt, not a clean

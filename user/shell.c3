@@ -891,6 +891,52 @@ fn void main() @export("main") {
                     }
                 }
             }
+        } else if (strcmp(cmd, "runtest2") == 0) {
+            // Same as runtest above, but "/2/bin/echod" — the second
+            // mount, not the default one. Exists specifically to
+            // exercise mount 2 unambiguously: found the hard way
+            // (fspermtest, docs/devlog.md) that a bare, unprefixed
+            // path resolves through the "" catch-all mount
+            // (src/process.c3's default namespace), which binds to
+            // whichever fsd was created *first* — on real Duo
+            // hardware that's always DUOBOOT/FAT32, not EXT2TEST/ext2,
+            // any time both are mounted. runtest's own bare
+            // "bin/echod" only ever reached mount 2 on QEMU's
+            // single-mount ext2 image, by accident of ext2 being the
+            // only mount there.
+            uint rt2_gen = 0;
+            int rt2_r = rfork(RFPROC, &rt2_gen);
+            if (rt2_r < 0) {
+                print("rfork failed\n");
+            } else if (rt2_r == 0) {
+                char[16] rt2_sync_buf @noinit;
+                int rt2_parent = ipc_recv(&rt2_sync_buf, 16);
+                ipc_send(rt2_parent, 0, "ack", 4);
+                exec("/2/bin/echod", &run_exec_buf, RUN_EXEC_BUF_MAX, rt2_parent, null, 0);
+                ipc_send(rt2_parent, 0, "failed", 7);
+                exit();
+            } else {
+                ipc_send(rt2_r, 0, "sync", 5);
+                char[16] rt2_ack_buf @noinit;
+                ipc_recv(&rt2_ack_buf, 16);
+
+                char[16] rt2_ready_buf @noinit;
+                ipc_recv(&rt2_ready_buf, 16);
+
+                if (strcmp(&rt2_ready_buf, "ready") != 0) {
+                    print("runtest2: FAILED (exec load failed)\n");
+                } else {
+                    ipc_send(rt2_r, 0, "hi echod", 9);
+                    char[16] rt2_reply @noinit;
+                    int rt2_from = ipc_recv(&rt2_reply, 16);
+                    int rt2_killed = kill(rt2_r, rt2_gen);
+                    if (rt2_from == rt2_r && strcmp(&rt2_reply, "hi echod") == 0 && rt2_killed == 0) {
+                        print("runtest2: ok\n");
+                    } else {
+                        print("runtest2: FAILED\n");
+                    }
+                }
+            }
         } else if (strcmp(cmd, "elftest") == 0) {
             // Same rfork+sync+exec+"ready" handshake as runtest above
             // (see its own comment for why each step's there), except
@@ -936,6 +982,43 @@ fn void main() @export("main") {
                     }
                 }
             }
+        } else if (strcmp(cmd, "elftest2") == 0) {
+            // Same as elftest above, but "/2/bin/echod.elf" — see
+            // runtest2's own comment for why this needs its own,
+            // explicitly mount-2-targeted variant.
+            uint el2_gen = 0;
+            int el2_r = rfork(RFPROC, &el2_gen);
+            if (el2_r < 0) {
+                print("rfork failed\n");
+            } else if (el2_r == 0) {
+                char[16] el2_sync_buf @noinit;
+                int el2_parent = ipc_recv(&el2_sync_buf, 16);
+                ipc_send(el2_parent, 0, "ack", 4);
+                exec("/2/bin/echod.elf", &run_exec_buf, RUN_EXEC_BUF_MAX, el2_parent, null, 0);
+                ipc_send(el2_parent, 0, "failed", 7);
+                exit();
+            } else {
+                ipc_send(el2_r, 0, "sync", 5);
+                char[16] el2_ack_buf @noinit;
+                ipc_recv(&el2_ack_buf, 16);
+
+                char[16] el2_ready_buf @noinit;
+                ipc_recv(&el2_ready_buf, 16);
+
+                if (strcmp(&el2_ready_buf, "ready") != 0) {
+                    print("elftest2: FAILED (exec load failed)\n");
+                } else {
+                    ipc_send(el2_r, 0, "hi echod", 9);
+                    char[16] el2_reply @noinit;
+                    int el2_from = ipc_recv(&el2_reply, 16);
+                    int el2_killed = kill(el2_r, el2_gen);
+                    if (el2_from == el2_r && strcmp(&el2_reply, "hi echod") == 0 && el2_killed == 0) {
+                        print("elftest2: ok\n");
+                    } else {
+                        print("elftest2: FAILED\n");
+                    }
+                }
+            }
         } else if (strcmp(cmd, "argvtest") == 0) {
             // Same rfork+sync+exec+ready handshake as runtest above
             // (see its own comment for why each step's there) — the
@@ -978,6 +1061,45 @@ fn void main() @export("main") {
                         print("argvtest: ok\n");
                     } else {
                         print("argvtest: FAILED\n");
+                    }
+                }
+            }
+        } else if (strcmp(cmd, "argvtest2") == 0) {
+            // Same as argvtest above, but "/2/bin/echod" — see
+            // runtest2's own comment for why this needs its own,
+            // explicitly mount-2-targeted variant.
+            char* av2_arg = "argvtest2-marker";
+
+            uint av2_gen = 0;
+            int av2_r = rfork(RFPROC, &av2_gen);
+            if (av2_r < 0) {
+                print("rfork failed\n");
+            } else if (av2_r == 0) {
+                char[16] av2_sync_buf @noinit;
+                int av2_parent = ipc_recv(&av2_sync_buf, 16);
+                ipc_send(av2_parent, 0, "ack", 4);
+                exec("/2/bin/echod", &run_exec_buf, RUN_EXEC_BUF_MAX, av2_parent, &av2_arg, 1);
+                ipc_send(av2_parent, 0, "failed", 7);
+                exit();
+            } else {
+                ipc_send(av2_r, 0, "sync", 5);
+                char[16] av2_ack_buf @noinit;
+                ipc_recv(&av2_ack_buf, 16);
+
+                char[16] av2_ready_buf @noinit;
+                ipc_recv(&av2_ready_buf, 16);
+
+                if (strcmp(&av2_ready_buf, "ready") != 0) {
+                    print("argvtest2: FAILED (exec load failed)\n");
+                } else {
+                    char[64] av2_reply @noinit;
+                    uint av2_reply_verb = 0;
+                    int av2_from = p9_call(av2_r, P9_TREAD, null, 0, &av2_reply, 64, &av2_reply_verb);
+                    int av2_killed = kill(av2_r, av2_gen);
+                    if (av2_from == av2_r && av2_reply_verb == P9_TREAD && strcmp(&av2_reply, av2_arg) == 0 && av2_killed == 0) {
+                        print("argvtest2: ok\n");
+                    } else {
+                        print("argvtest2: FAILED\n");
                     }
                 }
             }
@@ -1027,6 +1149,49 @@ fn void main() @export("main") {
                         print("pathtest: ok\n");
                     } else {
                         print("pathtest: FAILED\n");
+                    }
+                }
+            }
+        } else if (strcmp(cmd, "pathtest2") == 0) {
+            // Same as pathtest above, but every /env/PATH segment
+            // "/2/"-prefixed, so exec_path() builds candidates against
+            // mount 2 specifically ("/2/nonexistent/echod" then
+            // "/2/bin/echod") — see runtest2's own comment for why
+            // this needs its own, explicitly mount-2-targeted variant.
+            fs_write("/env/PATH", "/2/nonexistent/:/2/bin/", 23);
+
+            uint pt2_gen = 0;
+            int pt2_r = rfork(RFPROC, &pt2_gen);
+            if (pt2_r < 0) {
+                print("rfork failed\n");
+            } else if (pt2_r == 0) {
+                char[16] pt2_sync_buf @noinit;
+                int pt2_parent = ipc_recv(&pt2_sync_buf, 16);
+                ipc_send(pt2_parent, 0, "ack", 4);
+                exec_path("echod", &run_exec_buf, RUN_EXEC_BUF_MAX, pt2_parent, null, 0);
+                ipc_send(pt2_parent, 0, "failed", 7);
+                exit();
+            } else {
+                ipc_send(pt2_r, 0, "sync", 5);
+                char[16] pt2_ack_buf @noinit;
+                ipc_recv(&pt2_ack_buf, 16);
+
+                char[16] pt2_ready_buf @noinit;
+                ipc_recv(&pt2_ready_buf, 16);
+
+                fs_delete("/env/PATH");
+
+                if (strcmp(&pt2_ready_buf, "ready") != 0) {
+                    print("pathtest2: FAILED (exec load failed)\n");
+                } else {
+                    ipc_send(pt2_r, 0, "hi echod", 9);
+                    char[16] pt2_reply @noinit;
+                    int pt2_from = ipc_recv(&pt2_reply, 16);
+                    int pt2_killed = kill(pt2_r, pt2_gen);
+                    if (pt2_from == pt2_r && strcmp(&pt2_reply, "hi echod") == 0 && pt2_killed == 0) {
+                        print("pathtest2: ok\n");
+                    } else {
+                        print("pathtest2: FAILED\n");
                     }
                 }
             }

@@ -124,6 +124,15 @@ LLC=${LLC:-llc}
   debugfs -w -R "mkdir subdir" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write disk-ext2/subdir/nested.txt subdir/nested.txt" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "mkdir emptydir" build/disk_dual_ext2_part.img > /dev/null
+  # bin/echod, bin/echod.elf — the exec()-family "2" test variants
+  # (runtest2/argvtest2/pathtest2/elftest2, shell.c3) need these
+  # reachable at "/2/bin/echod"/"/2/bin/echod.elf" specifically, not
+  # just via the default (mount 1) namespace — see docs/devlog.md for
+  # why an unprefixed path can't be trusted to reach mount 2 whenever
+  # a mount 1 also exists.
+  debugfs -w -R "mkdir bin" build/disk_dual_ext2_part.img > /dev/null
+  debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_ext2_part.img > /dev/null
+  debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_ext2_part.img > /dev/null
   dd if=build/disk_dual_ext2_part.img of=build/disk_dual.img bs=512 seek=18432 conv=notrunc status=none
   rm -f build/disk_dual_ext2_part.img
 
