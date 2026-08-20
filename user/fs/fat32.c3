@@ -385,6 +385,95 @@ fn int fat32_read(char* name, char* dst, uint len)
 	return (int)fat32_read_file(first_cluster, dst, read_len);
 }
 
+// Same chain-walk as fat32_read_file, but starts copying from `offset`
+// bytes into the file instead of from the beginning — skips whole
+// clusters via fat32_next_cluster() until reaching the one containing
+// `offset`, then whole sectors within it, then a partial-sector byte
+// skip for the very first sector actually copied from (every
+// subsequent sector copies from its own start normally). A fully
+// separate function from fat32_read_file rather than adding an offset
+// parameter there, so the existing, heavily-exercised offset-0 read
+// path stays completely untouched. Built for exec()'s own chunked
+// reads (user/user.c3) — real binaries (70-105KB) are far larger than
+// one FS_MSG_MAX (1128 bytes) IPC message, so loading one needs
+// repeated calls advancing this offset, not a single fat32_read().
+fn uint fat32_read_file_at(uint first_cluster, char* dst, uint len, uint offset)
+{
+	uint cluster_size = fat32_sectors_per_cluster * SECTOR_SIZE;
+	uint cluster = first_cluster;
+
+	uint clusters_to_skip = offset / cluster_size;
+	for (uint i = 0; i < clusters_to_skip && cluster != 0 && cluster < FAT32_EOC_MIN; i++)
+	{
+		cluster = fat32_next_cluster(cluster);
+	}
+
+	uint offset_in_cluster = offset % cluster_size;
+	uint sectors_to_skip = offset_in_cluster / SECTOR_SIZE;
+	uint skip_in_sector = offset_in_cluster % SECTOR_SIZE; // only ever applies to the first sector actually read
+
+	uint bytes_read = 0;
+	char[SECTOR_SIZE] sector_buf @noinit;
+	bool at_start = true;
+
+	while (cluster != 0 && cluster < FAT32_EOC_MIN && bytes_read < len)
+	{
+		uint sector = fat32_cluster_to_sector(cluster);
+		uint start_s = at_start ? sectors_to_skip : 0;
+		for (uint s = start_s; s < fat32_sectors_per_cluster && bytes_read < len; s++)
+		{
+			if (!fs_read_sector(sector + s, &sector_buf)) return bytes_read;
+
+			uint sk = at_start ? skip_in_sector : 0;
+			uint available = SECTOR_SIZE - sk;
+			uint chunk = len - bytes_read;
+			if (chunk > available) chunk = available;
+			for (uint i = 0; i < chunk; i++)
+			{
+				dst[bytes_read + i] = sector_buf[sk + i];
+			}
+			bytes_read += chunk;
+			at_start = false;
+		}
+		cluster = fat32_next_cluster(cluster);
+	}
+	return bytes_read;
+}
+
+// Entry point dispatched from fsd.c3's main() for FS_READ_AT — same
+// lookup shape as fat32_read above, but returns 0 (not -1) once
+// `offset` reaches or passes the file's own size, the "clean EOF"
+// signal exec()'s own chunked-read loop watches for to know when to
+// stop, distinct from -1's "something is actually wrong" (not found,
+// or a directory).
+fn int fat32_read_at(char* name, char* dst, uint len, uint offset)
+{
+	uint dir_cluster;
+	if (!fat32_resolve_dir(name, &dir_cluster)) return -1;
+	char* leaf = fat32_leaf_name(name);
+
+	char[11] name11 @noinit;
+	fat32_name_to_8_3(leaf, &name11);
+
+	uint first_cluster;
+	uint file_size;
+	uint dummy_sector;
+	uint dummy_offset;
+	char attr;
+	if (!fat32_find_in_dir(dir_cluster, &name11, &first_cluster, &file_size, &dummy_sector, &dummy_offset, &attr))
+	{
+		return -1;
+	}
+	if ((attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0) return -1;
+	if (offset >= file_size) return 0;
+
+	uint remaining = file_size - offset;
+	uint read_len = len;
+	if (read_len > remaining) read_len = remaining;
+
+	return (int)fat32_read_file_at(first_cluster, dst, read_len, offset);
+}
+
 // --- Write path -------------------------------------------------------
 
 // Writes one 4-byte little-endian FAT entry (low 28 bits of `value`,

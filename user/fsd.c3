@@ -379,7 +379,7 @@ fn void main() @export("main")
 		uint from_gen = 0;
 		int from = ipc_recv_type_gen(&buf, FS_MSG_MAX, &verb, &from_gen);
 		if (from <= 0) continue;
-		if (verb != FS_READ && verb != FS_WRITE && verb != FS_DELETE && verb != FS_LIST && verb != FS_MKDIR && verb != FS_RENAME) continue;
+		if (verb != FS_READ && verb != FS_READ_AT && verb != FS_WRITE && verb != FS_DELETE && verb != FS_LIST && verb != FS_MKDIR && verb != FS_RENAME) continue;
 
 		int* result_len_field = (int*)&buf;
 
@@ -412,6 +412,13 @@ fn void main() @export("main")
 		// set the field's high bit. See docs/devlog.md for the same
 		// hardening pass that added this check.
 		if (req_len < 0) req_len = 0;
+		// FS_READ_AT-only (see user.c3's own wire-format comment) — every
+		// other verb's byte 104.. means something else entirely (write
+		// data, listing output), captured unconditionally here anyway,
+		// same "grab everything before buf gets reused for the reply"
+		// discipline this whole block already follows.
+		uint* offset_field = (uint*)&buf[104];
+		uint req_offset = *offset_field;
 
 		if (verb == FS_DELETE)
 		{
@@ -538,6 +545,23 @@ fn void main() @export("main")
 				{
 					result = ext2_write(&filename, &buf[104], (uint)req_len);
 				}
+			}
+			*result_len_field = result;
+			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
+			continue;
+		}
+
+		if (verb == FS_READ_AT)
+		{
+			if (req_len > (int)(FS_MSG_MAX - 4)) req_len = (int)(FS_MSG_MAX - 4);
+			int result = -1;
+			if (fs_type == FS_TYPE_FAT32)
+			{
+				result = fat32_read_at(&filename, &buf[4], (uint)req_len, req_offset);
+			}
+			else if (fs_type == FS_TYPE_EXT2)
+			{
+				result = ext2_read_at(&filename, &buf[4], (uint)req_len, req_offset);
 			}
 			*result_len_field = result;
 			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);

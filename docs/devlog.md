@@ -4,6 +4,141 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (31) — `/bin`: a real `exec()` syscall, and three real bugs found chasing it
+
+The first real `/bin` support: a Plan-9/Unix-style `exec()` that replaces
+the *calling* process's own image in place — same pid, same page table,
+same namespace (so `/env`'s own vars survive it unchanged, matching real
+`exec()` semantics) — composing with `rfork()` exactly the way Unix
+`fork()`+`exec()` do. Getting the feature itself in place was the easy
+part; getting it to actually *work* took three separate, genuinely
+different bugs, each hiding the next one.
+
+**The feature, in shape:**
+- **`FS_READ_AT`** (`user.c3`, wire verb 26): a new, distinct verb rather
+  than widening `FS_READ` — same reasoning as `SYS_IPC_RECV_GEN` over a
+  widened `SYS_IPC_RECV` earlier this session. Real binaries are
+  70-105KB; `FS_READ`'s one-message-per-call shape (`FS_MSG_MAX`=1128
+  bytes) can't load one at all. `fat32_read_at`/`fat32_read_file_at` and
+  `ext2_read_at` (`user/fs/*.c3`) add offset-aware reads alongside the
+  existing offset-0 versions, left untouched; `fsd.c3` dispatches the
+  new verb the same shape as the old one, plus the offset field.
+- **`SYS_EXEC`** (`src/entry.c3`, syscall 24): takes an already-fully-read
+  image + size (the read happens user-side, in `user.c3`'s own `exec()`,
+  before this syscall ever runs — a failed read never risks the calling
+  process's *existing* image). Stages every new page first (a failed
+  allocation leaves the old image untouched), only then frees the old
+  image's `PAGE_U` leaves and maps the new ones, then redirects
+  execution by setting `saved_sepc = USER_BASE`.
+- **`exec()`** (`user.c3`): loops `fs_read_at()` until EOF or the
+  caller's buffer is exhausted, then calls `SYS_EXEC`. Buffer is
+  caller-owned (a large static buffer in `user.c3` itself would bloat
+  every binary that links it, whether or not it ever calls `exec()`).
+- **`runtest`** (`shell.c3`): `rfork(RFPROC)`s a child that execs
+  `bin/echod` — a real, already-built binary (`build/user/echod.bin`,
+  known behavior, already exercised at boot as pid 2), seeded onto both
+  test images by `scripts/build.sh` from the already-built binary rather
+  than writing a new one just for this.
+
+**Bug 1 — `saved_sepc` clobbered right after being set.** First real
+symptom: `runtest` panicked with an illegal-instruction trap inside what
+should have been the new image, at an offset that was legitimately
+zero-filled `.bss` in the real file on disk — meaning execution was
+landing somewhere it should never reach via normal control flow. Ruled
+out data corruption directly: a checksum of the full chunked read,
+mirroring `exec()`'s own read loop exactly, matched the real file
+byte-for-byte. The actual cause was one layer up, in `handle_trap()`
+(`src/entry.c3`): every syscall unconditionally sets
+`current_proc.saved_sepc = user_pc + 4` *after* the syscall's own switch
+case returns, to resume right past the `ecall` that made it — correct
+for every syscall except this one, where the whole point is to resume
+somewhere else entirely. `SYS_EXEC`'s own case was setting
+`saved_sepc = USER_BASE` correctly; this line ran right after and
+silently overwrote it back to the old image's own address, so execution
+kept resuming inside the *old* code (in this case the old image's own
+`.bss`, past the point that old code ever legitimately jumped to)
+instead of the new one. Fixed by capturing the syscall number before
+`handle_syscall()` runs and skipping the `+4` specifically when it was a
+successful `SYS_EXEC` — a one-line, syscall-specific exception is the
+whole fix, but it took a full checksum-verification pass to rule out
+*where it wasn't* before finding it.
+
+**Bug 2 — a real IPC race, exposed for the first time by this feature.**
+Once `exec()` correctly replaced the image, `runtest`'s own
+synchronization hung. Root cause: `SYS_IPC_RECV`'s single inbox slot per
+process has no per-sender filtering (`src/entry.c3`) — delivery happens
+the instant the slot is free, regardless of which conversation the
+receiver thinks it's in. Every earlier test's child does exactly one
+IPC conversation before reaching a stable state (`srvtest`'s child posts
+and goes straight into its serve loop); `runtest`'s child is the first
+to have a *second* conversation of its own (the `FS_READ_AT` round trips
+to `fsd`, inside `exec()`) still in flight while an outside process
+might message it. The test's own initial "ping immediately after
+rfork" could land mid-round-trip and get misread as `fsd`'s reply,
+corrupting `exec()`'s own read loop.
+
+Two-part fix. `p9_call()` (`user.c3`, the client-side request/reply
+helper every 9P-lite caller funnels through) now checks the reply's
+actual sender against `dest_pid`; a message from anyone else gets
+bounced back to *its own* sender as a new reserved verb, `P9_STRAY`,
+rather than being misread as the real reply — this protects every
+existing `p9_call` user, not just this one. A retry-with-backoff version
+of `runtest` built on top of that bounce was tried and rejected: `fsd`'s
+own round trip through `diskd` for a deep offset (this driver's
+offset-skip walks clusters/blocks one at a time — see `FS_READ_AT`'s own
+comment) can run longer than any fixed backoff, so the retries just kept
+re-winning the race against `fsd`'s real reply, forever. Fixed properly
+instead by removing the race altogether: `exec()` gained an optional
+`notify_pid` parameter — right after its last `fs_read_at()` and before
+the point of no return, it sends that pid one message. `runtest`'s
+parent does a `srvtest`-style initial sync (proving the child is alive
+before sending anything else), then blocks on exactly that one
+notification before ever messaging the child again — by the time it
+arrives, the child is guaranteed to never talk to `fsd` again, so no
+race is possible. (The child also has to report an *unsuccessful*
+`exec()` this same way — found by testing the ext2 case below: a failed
+load never sends "ready" on its own, and the parent was blocking on it
+forever.)
+
+**Bug 3 — ext2's own real scope limit, now actually reachable.**
+`runtest` against the ext2 test image (`scripts/launch64_ext2.sh`)
+didn't hang — it panicked with a store page fault, `sepc` right at the
+top of the new image's own `user.syscall` stub. `ext2_read_at`
+(`user/fs/ext2.c3`) only ever reads this driver's 12 direct blocks (no
+indirect-block chain — the same limit `ext2_read()` has always had); for
+an offset past block 11 it returned `0` (clean EOF) instead of an error,
+since nothing had ever asked it to read that far before — every existing
+fixture is well under 12KB. `echod.bin` (70KB) is the first file this
+driver was ever asked to read past that point. `exec()`'s own read loop
+trusts `0` completely and stops there, so it installed a genuinely
+truncated image — the copy itself wasn't corrupted, but `__stack_top`
+(a link-time constant baked into the binary regardless of how much of
+it actually got loaded) pointed past the pages `SYS_EXEC` had mapped.
+Fixed by having `ext2_read_at` return `-1` when the offset is genuinely
+within the file but past what this driver can reach, so `exec()` fails
+cleanly instead of installing a truncated image. `runtest` now correctly
+reports `FAILED (exec load failed)` on ext2 rather than crashing the
+kernel — a real, standing limitation of this driver (no indirect-block
+support), not something worth building out for this feature alone.
+
+**Verification:** full regression suite plus `runtest`, both filesystems
+— clean on FAT32 (`runtest: ok`, `lsproc` shows no leaked slots even run
+repeatedly in the same boot), clean *failure* on ext2 for the reason
+above. Three-boot stress batch. `fsck.vfat -n`/`e2fsck -n -f` both clean
+(FAT32's lone "free cluster summary" mismatch is the pre-existing,
+already-documented FSInfo-caching quirk this driver has always had, not
+new).
+
+**Files changed:** `user/user.c3`, `user/fsd.c3`, `user/fs/fat32.c3`,
+`user/fs/ext2.c3`, `src/entry.c3`, `src/process.c3` (`flush_tlb()` —
+`SYS_EXEC` remaps this process's own live virtual addresses without a
+`satp` write, so `switch_context`'s own TLB flush never fires for it;
+needed regardless of the three bugs above, since a stale mapping would
+otherwise let the CPU keep serving the *old* image's translations),
+`scripts/build.sh`, `user/shell.c3`.
+
+---
+
 ## 2026-08-20 (30) — EXT2TEST fixtures restored, closing out the flashing-incident recovery
 
 Follow-up to the previous entry: the full repartition there left

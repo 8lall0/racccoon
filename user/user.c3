@@ -35,6 +35,7 @@ const int SYS_IPC_REPLY    = 20; // same as SYS_IPC_SEND, plus an optional targe
 const int SYS_SRV_POST     = 21; // posts current_proc under a short name in the global srv_table — see src/entry.c3's case
 const int SYS_NS_MOUNT     = 22; // binds a posted srv_table name at a path prefix in the caller's own namespace — see src/entry.c3's case
 const int SYS_PARENT_INFO  = 23; // returns a process's parent pid/generation, if it has one — see src/entry.c3's case
+const int SYS_EXEC         = 24; // replaces the calling process's own image in place — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -62,6 +63,63 @@ fn void exit() @noreturn @export("exit") {
 // Process.generation and SYS_JOIN's case in src/entry.c3).
 fn int rfork(int flags, uint* generation_out) @export("rfork") {
     return syscall(SYS_RFORK, flags, (long)generation_out, 0);
+}
+
+// Real exec(): replaces THIS process's own image in place — same pid,
+// same page table, same namespace (and by extension /env's own vars,
+// user/envd.c3 — nothing about "which process this is" changes, only
+// what it's running), matching real Plan 9's/Unix's own exec()
+// semantics. Composes with rfork() the way Unix fork()+exec() do: to
+// run a program without replacing yourself, rfork(RFPROC) first, then
+// exec() inside the child.
+//
+// buf/buf_max are caller-owned, not a global here: user.c3 is compiled
+// into every binary (scripts/build_user.sh), so a large static buffer
+// here would bloat every server's own image — and, via
+// --set-section-flags .bss=alloc,contents already forcing real zero-
+// byte backing in every flat binary, the kernel's own embedded image
+// size too — whether or not that binary ever calls exec(). Loops
+// fs_read_at() (below) until a short read (clean EOF) or buf_max is
+// exhausted, then installs the complete image in one SYS_EXEC call —
+// the syscall itself never touches disk, so a read failure partway
+// through never risks leaving this process's own current image half-
+// replaced.
+//
+// notify_pid (0 = none) gets a single untyped message right before the
+// point of no return — after every fs_read_at() this needed is done, so
+// no more traffic to fsd will ever happen, but before SYS_EXEC actually
+// touches this process's image. A caller that wants to talk to the
+// child right after exec() succeeds (its pid is unaffected, so it's
+// still reachable) has no other way to know when that's actually safe:
+// this process's single inbox slot (src/entry.c3's SYS_IPC_RECV) has no
+// per-sender filtering, so an outside message sent too early can land
+// while a fs_read_at() call is still waiting on fsd's own reply and get
+// mistaken for it (p9_call() below now bounces those back rather than
+// misreading them, but a blind bounce-and-retry from the outside can
+// still starve fsd's real reply out indefinitely if fsd's own round
+// trip — cluster-chain walking through diskd, for a deep offset — runs
+// longer than the retry backoff guessed). Found and fixed exactly this
+// way debugging exec()'s own runtest (user/shell.c3, docs/devlog.md):
+// the retry-based version failed outright rather than just being slow.
+//
+// Only ever returns on failure (-1) — success means this process is
+// now running path's code instead of this line.
+fn int exec(char* path, char* buf, uint buf_max, int notify_pid) @export("exec") {
+    uint total = 0;
+    for (;;) {
+        if (total >= buf_max) return -1; // image bigger than the caller's own buffer
+        int chunk = (int)(buf_max - total);
+        if (chunk > (int)(FS_MSG_MAX - 4)) chunk = (int)(FS_MSG_MAX - 4);
+        int got = fs_read_at(path, &buf[total], chunk, total);
+        if (got < 0) return -1; // real error — not found, a directory
+        if (got == 0) break; // clean EOF
+        total += (uint)got;
+    }
+    if (total == 0) return -1; // empty/nonexistent file — nothing to run
+    if (notify_pid > 0) {
+        ipc_send(notify_pid, 0, "ready", 6);
+    }
+    return syscall(SYS_EXEC, (long)buf, (long)total, 0);
 }
 
 // Stack-aware wrapper around rfork(RFPROC|RFMEM): unlike calling rfork()
@@ -259,15 +317,54 @@ fn int ipc_poll_type(char* buf, int len, uint* out_type) @export("ipc_poll_type"
 const uint P9_TWALK = 1; // request: resolve a path
 const uint P9_TREAD = 2; // request: read data
 
+// Reserved verb p9_call() bounces stray senders with — see its own
+// comment. Deliberately far outside every real verb's range (P9_TWALK/
+// P9_TREAD/FS_*, all small, hand-assigned small ints) so it can never
+// collide with a genuine reply.
+const uint P9_STRAY = 0xFFFFFFFF;
+
 // Sends a 9P-lite request and blocks for the reply in one call — the
 // pattern every client actually wants, matching 9P's own synchronous
 // request/reply model. reply_verb (optional, pass null if unneeded) lets
 // the caller confirm the reply actually answers the request it sent,
 // rather than trusting the byte content alone.
+//
+// Filters by sender: SYS_IPC_RECV has a single, unfiltered inbox slot per
+// process (src/entry.c3) — delivery happens the instant the slot is free,
+// whether or not this process is actually the one "expecting" it right
+// now. A totally unrelated sender (e.g. exec()'s own caller getting
+// pinged by someone else while exec() is mid-flight, doing its own
+// p9_call round trips with fsd to load the new image) can land a message
+// in that same slot before dest_pid's real reply does, and a plain
+// ipc_recv_type() would happily hand that stray message back as if it
+// were the reply. Found the hard way debugging exec()'s runtest: an
+// early ping from the test's own parent process landed in the child's
+// inbox before fsd's real FS_READ_AT reply, got consumed here instead,
+// and the resulting garbage "reply" corrupted exec()'s read loop.
+//
+// A message from anyone but dest_pid gets bounced straight back to its
+// own sender as P9_STRAY (using the generation SYS_IPC_RECV_GEN captured,
+// so a reused pid can't be misled), then this keeps waiting for the real
+// reply — dest_pid isn't going anywhere mid-round-trip. The bounce isn't
+// just cleanup: without it the stray sender's own ipc_send() would have
+// already returned (true rendezvous — it only needed *a* consuming recv,
+// not this call's actual reply) and it would then block forever in its
+// own ipc_recv() waiting for a reply that silent discarding would never
+// send. P9_STRAY lets that sender recognize "not it, retry" instead.
 fn int p9_call(int dest_pid, uint verb, char* data, int len, char* reply_buf, int reply_len, uint* reply_verb) {
     int sent = ipc_send(dest_pid, verb, data, len);
     if (sent < 0) return sent;
-    return ipc_recv_type(reply_buf, reply_len, reply_verb);
+    for (;;) {
+        uint from_type = 0;
+        uint from_gen = 0;
+        int from = ipc_recv_type_gen(reply_buf, reply_len, &from_type, &from_gen);
+        if (from < 0) return from;
+        if (from == dest_pid) {
+            if (reply_verb != null) *reply_verb = from_type;
+            return from;
+        }
+        ipc_reply(from, P9_STRAY, reply_buf, 0, from_gen);
+    }
 }
 
 // --- Namespace: turns a path into "send to this pid", per this caller's
@@ -531,6 +628,20 @@ const uint FS_MKDIR  = 24; // byte 0..99 = path, nothing else to send; reply reu
 // protected file. Reply reuses 0..3 for 0/-1, same as FS_DELETE/
 // FS_MKDIR.
 const uint FS_RENAME = 25;
+// FS_READ_AT: same request shape as FS_READ (byte 0..99 = path, byte
+// 100..103 = max length) plus byte 104..107 = uint offset — chunked
+// reads for files bigger than one FS_MSG_MAX message, built for exec()
+// below (real binaries are 70-105KB; FS_READ alone can only ever
+// return ~1124 bytes in one call). Reply: same as FS_READ (byte 0..3 =
+// result length, byte 4.. = data) — 0 signals clean EOF (offset at or
+// past the file's end), -1 is a real error (not found, a directory).
+// A new verb rather than widening FS_READ itself: every existing
+// FS_READ caller only ever sets byte 0..103, so treating byte
+// 104..107 as a live offset on the *same* verb would mean reading
+// uninitialized stack garbage as an offset for every caller not
+// updated to know about it — same reasoning SYS_IPC_RECV_GEN
+// (src/entry.c3) used over widening SYS_IPC_RECV.
+const uint FS_READ_AT = 26;
 const uint FS_MSG_MAX = 1128;
 
 // FS_LIST: byte 0..99 = directory path ("" means the root), same as
@@ -576,6 +687,43 @@ fn int fs_read(char* filename, char* buf, int len) @export("fs_read") {
     uint reply_verb = 0;
     int from = p9_call(fsd_pid, FS_READ, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
     if (from <= 0 || reply_verb != FS_READ) return -1;
+
+    int* result_len_field = (int*)&req;
+    int result_len = *result_len_field;
+    if (result_len < 0) return result_len;
+    if (result_len > len) result_len = len;
+    for (int j = 0; j < result_len; j++) {
+        buf[j] = req[4 + j];
+    }
+    return result_len;
+}
+
+// Same shape as fs_read() above, plus offset — chunked reads for files
+// bigger than one FS_MSG_MAX message (see FS_READ_AT's own wire-format
+// comment). Returns 0 at clean EOF (offset at or past the file's end),
+// same as a plain fs_read() past the end would, not -1 — exec() below
+// relies on this to know when to stop looping.
+fn int fs_read_at(char* filename, char* buf, int len, uint offset) @export("fs_read_at") {
+    uint prefix_len = 0;
+    int fsd_pid = ns_resolve(filename, &prefix_len);
+    if (fsd_pid < 0) return -1;
+    char* stripped = &filename[prefix_len];
+
+    char[FS_MSG_MAX] req @noinit;
+    int i = 0;
+    while (stripped[i] != 0 && i < 99) {
+        req[i] = stripped[i];
+        i++;
+    }
+    req[i] = 0;
+    uint* len_field = (uint*)&req[100];
+    *len_field = (uint)len;
+    uint* offset_field = (uint*)&req[104];
+    *offset_field = offset;
+
+    uint reply_verb = 0;
+    int from = p9_call(fsd_pid, FS_READ_AT, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
+    if (from <= 0 || reply_verb != FS_READ_AT) return -1;
 
     int* result_len_field = (int*)&req;
     int result_len = *result_len_field;

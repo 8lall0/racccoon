@@ -65,6 +65,16 @@ const SYS_IPC_REPLY    = 20; // same as SYS_IPC_SEND, plus an optional target-ge
 const SYS_SRV_POST     = 21; // posts current_proc under a short name in the global srv_table — see its case below
 const SYS_NS_MOUNT     = 22; // binds a posted srv_table name at a path prefix in the caller's own namespace — see its case below
 const SYS_PARENT_INFO  = 23; // returns a process's parent pid/generation, if it has one — see its case below
+const SYS_EXEC         = 24; // replaces the calling process's own image in place — see its case below
+
+// Generous cap on the image SYS_EXEC will install — real racccoon
+// binaries (build/user/*.bin) run 70-105KB; this leaves real headroom
+// without being large enough to make a single runaway request a
+// meaningful way to exhaust physical memory. user/user.c3's own
+// exec() wrapper enforces the same bound on its own read-into-buffer
+// loop before ever reaching this syscall.
+const EXEC_MAX_IMAGE_SIZE  = 262144;
+const EXEC_MAX_IMAGE_PAGES = EXEC_MAX_IMAGE_SIZE / PAGE_SIZE;
 
 // rfork flags — Plan 9 names, this kernel's own subset. RFPROC is
 // required (rfork() without it returns -1 in this v1: real Plan 9 uses
@@ -1346,6 +1356,121 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			uint* parent_generation_out = (uint*)(uptr)f.a1;
 			if (parent_generation_out != null) *parent_generation_out = parent_queried.parent_generation;
 			f.a0 = (ulong)(iptr)parent_queried.parent_pid;
+		case SYS_EXEC:
+			// Real exec(): replaces the CALLING process's own image in
+			// place — user/user.c3's own exec() wrapper has already
+			// read the complete new image into its own memory before
+			// this ever runs, so a0/a1 here are a plain user pointer +
+			// size, not a path. Same pid, same page table, same
+			// namespace (deliberately untouched below — this is the
+			// actual point of Plan-9-style exec(): namespace, and by
+			// extension /env's own vars — user/envd.c3 — survive it
+			// unchanged, since nothing about *which process this is*
+			// changes, only what it's running). Inlined for the same
+			// reason as every other case in this switch — see
+			// SYS_EXIT's own comment.
+			char* exec_image = (char*)(uptr)f.a0;
+			uint exec_image_size = (uint)f.a1;
+			if (exec_image_size == 0 || exec_image_size > EXEC_MAX_IMAGE_SIZE)
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+
+			// Stage every new page FIRST, before touching anything
+			// about the process's current image — a failed allocation
+			// partway through must leave the old image completely
+			// intact, not half-replaced, same "fail toward not losing
+			// what's already there" discipline this session's own
+			// ext2 slot-reuse fix already established.
+			uint exec_page_count = (exec_image_size + PAGE_SIZE - 1) / PAGE_SIZE;
+			uptr[EXEC_MAX_IMAGE_PAGES] exec_staged @noinit;
+			bool exec_stage_ok = true;
+			for (uint ep = 0; ep < exec_page_count; ep++)
+			{
+				uptr exec_page = alloc_pages(1);
+				if (exec_page == 0)
+				{
+					exec_stage_ok = false;
+					for (uint fp = 0; fp < ep; fp++) free_pages(exec_staged[fp], 1);
+					break;
+				}
+				uint exec_off = ep * PAGE_SIZE;
+				uint exec_remaining = exec_image_size - exec_off;
+				uint exec_copy_size = exec_remaining < PAGE_SIZE ? exec_remaining : PAGE_SIZE;
+				mem::copy((void*)exec_page, exec_image + exec_off, (sz)exec_copy_size);
+				exec_staged[ep] = exec_page;
+			}
+			if (!exec_stage_ok)
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+
+			// Only now: free every existing PAGE_U leaf in this SAME
+			// page table (same walk SYS_EXIT/SYS_KILL already do) —
+			// not the table itself, and not the kernel-identity/PLIC
+			// mappings, since this process keeps existing, just
+			// running different code. Cleared to 0 (not just freed)
+			// so map_page below finds a clean slot to reuse at each
+			// address, the same way a never-yet-mapped one would be.
+			ulong* exec_table2 = current_proc.page_table;
+			for (uint evpn2 = 0; evpn2 < 512; evpn2++)
+			{
+				if ((exec_table2[evpn2] & PAGE_V) == 0) continue;
+				ulong* exec_table1 = (ulong*)pte_to_paddr(exec_table2[evpn2]);
+
+				for (uint evpn1 = 0; evpn1 < 512; evpn1++)
+				{
+					if ((exec_table1[evpn1] & PAGE_V) == 0) continue;
+					ulong* exec_table0 = (ulong*)pte_to_paddr(exec_table1[evpn1]);
+
+					for (uint evpn0 = 0; evpn0 < 512; evpn0++)
+					{
+						if ((exec_table0[evpn0] & PAGE_V) == 0) continue;
+						if (exec_table0[evpn0] & PAGE_U)
+						{
+							uptr exec_leaf_paddr = pte_to_paddr(exec_table0[evpn0]);
+							free_pages(exec_leaf_paddr, 1);
+							exec_table0[evpn0] = 0;
+						}
+					}
+				}
+			}
+
+			// Map the newly staged pages at USER_BASE.
+			for (uint mp = 0; mp < exec_page_count; mp++)
+			{
+				map_page(current_proc.page_table, (uptr)USER_BASE + (uptr)(mp * PAGE_SIZE), exec_staged[mp], PAGE_U | PAGE_R | PAGE_W | PAGE_X);
+			}
+
+			// This process's own page table entries for USER_BASE just
+			// changed, but unlike a normal process switch, satp itself
+			// does NOT change here (same process) — so switch_context's
+			// own sfence.vma (process.c3) never runs for this remap. The
+			// CPU can otherwise keep translating USER_BASE (and its
+			// following pages) through stale, cached TLB entries from
+			// the old image, executing whatever's left in the now-freed
+			// physical pages instead of the new ones. Confirmed the hard
+			// way: a checksum of the freshly-read image data proved
+			// byte-for-byte correct, yet execution still faulted with an
+			// illegal instruction inside what should have been the new
+			// image — the data was always right, only the CPU's own
+			// cached mapping to it was stale.
+			flush_tlb();
+
+			// Redirect execution: the standard trap-return path
+			// restores this into the real sepc CSR before sret, so the
+			// next time this process runs, it starts fresh at
+			// USER_BASE instead of resuming where the old program's
+			// ecall left off. No user-mode stack pointer needs setting
+			// here — user/user.c3's own start() sets its own sp from a
+			// link-time __stack_top constant baked into every image,
+			// as its very first instruction, so whatever the
+			// trapframe's stale sp says is irrelevant the moment a
+			// fresh image starts running.
+			current_proc.saved_sepc = USER_BASE;
+			f.a0 = 0;
 		default:
 			panic::panic("unexpected syscall");
 	}
@@ -1457,6 +1582,12 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 	}
 	else if (scause == SCAUSE_ECALL)
 	{
+		// Syscall number, captured before handle_syscall runs: SYS_EXEC's
+		// own case (below) needs to know, after the fact, whether it's
+		// the one that just ran — f.a3 is preserved unchanged through the
+		// switch (no case touches it), so reading it after the call is
+		// exactly as reliable as reading it before.
+		ulong syscall_num = f.a3;
 		handle_syscall(f);
 		// current_proc, not necessarily the same process that entered
 		// this trap: any of the blocking syscalls above (SYS_GETCHAR,
@@ -1469,7 +1600,24 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 		// is correctly this process again. user_pc is this same
 		// process's own local copy from trap entry, untouched by
 		// anything that happened to other processes in between.
-		current_proc.saved_sepc = user_pc + 4;
+		//
+		// SYS_EXEC on success is the one exception: its own case already
+		// set saved_sepc to USER_BASE (this process is about to run a
+		// completely different image, not resume the ecall it just
+		// made) — this unconditional "+4, resume right after the ecall"
+		// would silently clobber that back to the old image's own
+		// address. Found the hard way: SYS_EXEC's own staging/mapping
+		// logic was already provably correct (a byte-for-byte checksum
+		// of the loaded image matched, and per-step debug prints showed
+		// no failure at any point) yet execution kept faulting inside
+		// the *old* image's own code right after the ecall returned —
+		// this is why: the redirect was being set correctly and then
+		// overwritten before it ever took effect.
+		bool just_execd = syscall_num == SYS_EXEC && f.a0 == 0;
+		if (!just_execd)
+		{
+			current_proc.saved_sepc = user_pc + 4;
+		}
 	}
 	else
 	{

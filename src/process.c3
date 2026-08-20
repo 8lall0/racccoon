@@ -350,6 +350,20 @@ fn void switch_context(uptr* prev_sp, uptr* next_sp, ulong satp, uptr sscratch) 
     `);
 }
 
+// SYS_EXEC (entry.c3) remaps this process's own USER_BASE pages in place —
+// no satp write happens (same process, same page table physical address),
+// so switch_context's own sfence.vma (above) never fires for it. Without
+// this, the CPU can keep serving the *old* image's translations out of the
+// TLB after the remap, executing stale/freed physical pages instead of the
+// new ones. Global (not ASID-scoped) flush — this kernel doesn't use ASIDs.
+fn void flush_tlb() @naked @noinline
+{
+	asm(`
+        sfence.vma
+        ret
+    `);
+}
+
 const SSTATUS_SPIE = (1 << 5);
 const SSTATUS_SUM   = (1 << 18); // let S-mode access U-mode pages (needed for syscalls like readfile/writefile that dereference user pointers directly)
                                   // Same bit positions on RV64: sstatus's low, commonly-used bits are defined identically across XLEN in the priv spec.

@@ -12,6 +12,14 @@ int rfork_child_ran = 0; // set by rforkmemtest's child, checked by rforkmemresu
 char[4096] thread_stack;
 int thread_result = 0;
 
+// exec()'s own receive buffer for runtest below — caller-owned per
+// exec()'s own header comment (user.c3): a global here, not inside
+// user.c3 itself, so only binaries that actually call exec() pay the
+// size (matches src/entry.c3's own EXEC_MAX_IMAGE_SIZE, the kernel-
+// side cap this must be at least as large as).
+const int RUN_EXEC_BUF_MAX = 262144;
+char[RUN_EXEC_BUF_MAX] run_exec_buf;
+
 fn void thread_body(void* arg) {
     thread_result = 99;
     print("thread: running on my own stack, wrote thread_result\n");
@@ -806,6 +814,82 @@ fn void main() @export("main") {
                 }
             } else {
                 print("rfork failed\n");
+            }
+        } else if (strcmp(cmd, "runtest") == 0) {
+            // exec() (user.c3): replaces the calling process's own
+            // image in place — the first real /bin support this
+            // codebase has had. rfork(RFPROC)s a throwaway child (same
+            // shape killtest/srvtest/envtest already use) that execs
+            // "bin/echod" — a real, already-built binary
+            // (build/user/echod.bin, known behavior, already exercised
+            // at boot as pid 2), copied onto both test images by
+            // scripts/build.sh specifically for this, rather than
+            // writing a new one just to exec.
+            //
+            // Two-step handshake, not a single direct ping: this
+            // child's own exec() does real IPC round trips of its own
+            // (the FS_READ_AT calls to fsd, loading the new image)
+            // before it ever reaches echod's real loop, and this
+            // process's single inbox slot has no per-sender filtering
+            // (src/entry.c3's SYS_IPC_RECV) — a ping sent too early can
+            // land mid-round-trip and get bounced back as P9_STRAY
+            // (user.c3's p9_call). A retry-with-backoff version of this
+            // test tried exactly that and failed outright: fsd's own
+            // round trip through diskd for a deep offset can outlast
+            // any fixed backoff, so the retries just kept re-winning the
+            // race against fsd's real reply forever. Fixed properly
+            // instead: the child sends "sync" first (its very first
+            // action, same as srvtest's own child, so this can never
+            // race anything) so the parent learns its pid isn't stale;
+            // the parent's reply to that carries no information the
+            // child needs, just an ack. Then the child calls exec()
+            // with notify_pid set to this process's own pid — exec()
+            // sends exactly one more message, right after its last
+            // fs_read_at() and before the point of no return, so by the
+            // time the parent receives it, the child will never send
+            // fsd anything again and it's genuinely safe to talk to.
+            uint run_gen = 0;
+            int run_r = rfork(RFPROC, &run_gen);
+            if (run_r < 0) {
+                print("rfork failed\n");
+            } else if (run_r == 0) {
+                char[16] run_sync_buf @noinit;
+                int run_parent = ipc_recv(&run_sync_buf, 16);
+                ipc_send(run_parent, 0, "ack", 4);
+                exec("bin/echod", &run_exec_buf, RUN_EXEC_BUF_MAX, run_parent);
+                // exec() only ever returns on failure — success means
+                // this process is now running echod's own code, not
+                // this line, and exec() already sent "ready" itself
+                // right before the point of no return. On failure it
+                // never sent anything, so the parent (still waiting on
+                // that "ready") needs an explicit word here — otherwise
+                // it blocks forever on a message that will never come.
+                ipc_send(run_parent, 0, "failed", 7);
+                exit();
+            } else {
+                ipc_send(run_r, 0, "sync", 5);
+                char[16] run_ack_buf @noinit;
+                ipc_recv(&run_ack_buf, 16);
+
+                char[16] run_ready_buf @noinit;
+                ipc_recv(&run_ready_buf, 16);
+
+                if (strcmp(&run_ready_buf, "ready") != 0) {
+                    // exec() itself failed to load the image — the
+                    // child already reported this and is exiting on its
+                    // own, nothing left to kill.
+                    print("runtest: FAILED (exec load failed)\n");
+                } else {
+                    ipc_send(run_r, 0, "hi echod", 9);
+                    char[16] run_reply @noinit;
+                    int run_from = ipc_recv(&run_reply, 16);
+                    int run_killed = kill(run_r, run_gen);
+                    if (run_from == run_r && strcmp(&run_reply, "hi echod") == 0 && run_killed == 0) {
+                        print("runtest: ok\n");
+                    } else {
+                        print("runtest: FAILED\n");
+                    }
+                }
             }
         } else if (strcmp(cmd, "rforktest") == 0) {
             // Plain rfork(RFPROC): the child gets an independent copy of

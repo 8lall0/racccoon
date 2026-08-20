@@ -498,6 +498,90 @@ fn int ext2_read(char* name, char* dst, uint len)
 	return (int)bytes_read;
 }
 
+// Same lookup/direct-block shape as ext2_read above, but starts copying
+// from `offset` bytes into the file instead of from the beginning —
+// this driver's own 12-direct-block-only scope (no indirect blocks)
+// makes this simpler than FAT32's own equivalent (fat32_read_file_at):
+// no chain to walk, just index straight into block[offset /
+// ext2_block_size]. A fully separate function from ext2_read rather
+// than adding an offset parameter there, so the existing, heavily-
+// exercised offset-0 read path stays completely untouched. Built for
+// exec()'s own chunked reads (user/user.c3) — see fat32_read_file_at's
+// own comment for why a single ext2_read() isn't enough for a real
+// 70-105KB binary. Returns 0 (not -1) once `offset` reaches or passes
+// the file's own size — the "clean EOF" signal exec()'s chunked-read
+// loop watches for, distinct from -1's "something is actually wrong."
+fn int ext2_read_at(char* name, char* dst, uint len, uint offset)
+{
+	uint dir_inode;
+	if (!ext2_resolve_dir(name, &dir_inode)) return -1;
+	char* leaf = ext2_leaf_name(name);
+
+	uint inode_num;
+	uint dummy_sector;
+	uint dummy_offset;
+	uint mode;
+	if (!ext2_find_in_dir(dir_inode, leaf, &inode_num, &dummy_sector, &dummy_offset, &mode)) return -1;
+	if ((mode & EXT2_S_IFDIR) != 0) return -1;
+
+	Ext2_inode_info inode;
+	if (!ext2_read_inode(inode_num, &inode)) return -1;
+
+	if (offset >= inode.size) return 0;
+
+	uint remaining = inode.size - offset;
+	uint read_len = len;
+	if (read_len > remaining) read_len = remaining;
+
+	uint start_block = offset / ext2_block_size;
+	uint offset_in_block = offset % ext2_block_size;
+
+	// This driver only ever reads direct blocks 0..11 (see this file's
+	// own header comment and ext2_read()'s "v1 only reads [0..11]") —
+	// no indirect-block chain to walk beyond that. offset >= inode.size
+	// above already caught genuine EOF; reaching here with start_block
+	// past the last direct block means the file legitimately continues
+	// but this driver can't reach the rest, a real error (-1), not 0
+	// ("clean EOF" — exec()'s own chunked-read loop, user/user.c3,
+	// trusts 0 completely and stops there, thinking the whole file is
+	// in hand). Found the hard way: echod.bin (70KB) is the first file
+	// this driver was ever asked to read past 12*block_size — every
+	// existing test fixture is well under that. Returning 0 here let
+	// exec() silently truncate the image at ~12KB and install it
+	// anyway, corrupting nothing in the read itself but leaving
+	// __stack_top (a link-time constant baked into the binary's own
+	// code, unrelated to how much of it actually got loaded) pointing
+	// outside the pages SYS_EXEC went on to map — a page fault, not
+	// against exec()'s own read path at all.
+	if (start_block >= 12) return -1;
+
+	uint bytes_read = 0;
+	for (uint b = start_block; b < 12 && bytes_read < read_len; b++)
+	{
+		uint block = inode.block[b];
+		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
+		if (block == 0)
+		{
+			for (uint i = 0; i < EXT2_MAX_BLOCK_SIZE; i++) block_buf[i] = 0;
+		}
+		else if (!ext2_read_block(block, &block_buf))
+		{
+			return (int)bytes_read;
+		}
+
+		uint skip = (b == start_block) ? offset_in_block : 0;
+		uint available = ext2_block_size - skip;
+		uint chunk = read_len - bytes_read;
+		if (chunk > available) chunk = available;
+		for (uint i = 0; i < chunk; i++)
+		{
+			dst[bytes_read + i] = block_buf[skip + i];
+		}
+		bytes_read += chunk;
+	}
+	return (int)bytes_read;
+}
+
 fn void ext2_mount()
 {
 	char[SECTOR_SIZE] sb_sector @noinit;

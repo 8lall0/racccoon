@@ -43,6 +43,13 @@ LLC=${LLC:-llc}
   mcopy -i build/disk.img disk/subdir/nested.txt ::nestdir/inner.txt
   mmd -i build/disk.img ::nestdir/innerdir
   mcopy -i build/disk.img disk/subdir/nested.txt ::nestdir/innerdir/inner2.txt
+  # disk's own bin/ — exercises exec() (user/user.c3's own chunked-read
+  # SYS_EXEC wrapper, see docs/devlog.md): a real, already-built binary
+  # (build/user/echod.bin — known behavior, already exercised at boot as
+  # pid 2) copied in as the payload, rather than writing a new one just
+  # for this test.
+  mmd -i build/disk.img ::bin
+  mcopy -i build/disk.img build/user/echod.bin ::bin/echod
 
   echo "==> Building disk image (ext2, for scripts/launch64_ext2.sh)..."
   # Additional, not a replacement — build/disk.img (FAT32) above stays
@@ -74,6 +81,10 @@ LLC=${LLC:-llc}
   debugfs -w -R "write disk-ext2/subdir/nested.txt nestdir/inner.txt" build/disk_ext2.img > /dev/null
   debugfs -w -R "mkdir nestdir/innerdir" build/disk_ext2.img > /dev/null
   debugfs -w -R "write disk-ext2/subdir/nested.txt nestdir/innerdir/inner2.txt" build/disk_ext2.img > /dev/null
+  # disk_ext2's own bin/ — same exec()-testing purpose as disk.img's own
+  # bin/ above.
+  debugfs -w -R "mkdir bin" build/disk_ext2.img > /dev/null
+  debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_ext2.img > /dev/null
 
   echo "==> Building disk image (dual FAT32+ext2, for scripts/launch64_dual.sh)..."
   # Third test image — exercises fsd/fsd2 mounting two filesystems at once
