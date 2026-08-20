@@ -1,5 +1,7 @@
 module user;
 
+import std::racccoon::mem;
+
 // fsd: the file system, moved out of the trusted kernel into its own
 // user-mode process (microkernel plan phase 5 — see docs/devlog.md).
 // It's a 9P-lite-style client of diskd/sdd (phase 4) for raw sector I/O,

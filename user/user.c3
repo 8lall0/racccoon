@@ -1,6 +1,7 @@
 module user;
 
-import std::atomic::types;
+import std::racccoon::atomic;
+import std::racccoon::fmt;
 
 // Linker script symbol - declared as extern so C3 knows about it,
 // @cname ensures no mangling
@@ -498,7 +499,7 @@ fn void print(char* s) {
 // more than two digits.
 fn void print_uint(uint n) @export("print_uint") {
     char[10] digits @noinit; // uint::max is 10 digits
-    int count = format_uint(n, &digits);
+    int count = fmt::format_uint(n, &digits);
     for (int i = 0; i < count; i++) {
         putchar(digits[i]);
     }

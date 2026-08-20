@@ -5,6 +5,19 @@ set -e
 LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
 LLVM_LLD=${LLVM_LLD:-/opt/riscv/bin/ld.lld}
 
+# std::racccoon::{mem,atomic,fmt} — the freestanding (NO_LIBC) pieces
+# every user-mode binary needs, adapted from the real c3 stdlib
+# (mem/atomic) or original (fmt) — see docs/devlog.md. Used to live as
+# vendored copies under user/ (one per project needing them); now
+# sourced from the 8lall0/c3c fork's own stdlib tree
+# (lib/std/_nolibc/racccoon/), where any project can `import
+# std::racccoon::mem;` etc. Passed as plain source file arguments (same
+# as user/user.c3 always has been) rather than requiring
+# --use-stdlib=yes: that flag pulls in far more of the real stdlib
+# (std::io, libc.os, ...) than this freestanding link step can handle —
+# confirmed by testing, not assumed.
+RACCCOON_STD_DIR=${RACCCOON_STD_DIR:-/home/blallo/Workspace/c3c/lib/std/_nolibc/racccoon}
+
 ROOT="$(dirname "$0")/.."
 cd "$ROOT"
 
@@ -62,10 +75,10 @@ build_user_program() {
   echo "==> Done: build/user/$name.bin.o"
 }
 
-build_user_program shell user/user.c3 user/atomic.c3 user/mem.c3 user/fmt.c3 user/shell.c3
-build_user_program echod user/user.c3 user/atomic.c3 user/mem.c3 user/fmt.c3 user/echod.c3
-build_user_program diskd user/user.c3 user/atomic.c3 user/mem.c3 user/fmt.c3 user/diskd.c3
-build_user_program sdd user/user.c3 user/atomic.c3 user/mem.c3 user/fmt.c3 user/sdd.c3
-build_user_program fsd user/user.c3 user/atomic.c3 user/mem.c3 user/fmt.c3 user/fsd.c3 user/fs/fat32.c3 user/fs/ext2.c3
-build_user_program procd user/user.c3 user/atomic.c3 user/mem.c3 user/fmt.c3 user/procd.c3
-build_user_program envd user/user.c3 user/atomic.c3 user/mem.c3 user/fmt.c3 user/envd.c3
+build_user_program shell user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 user/shell.c3
+build_user_program echod user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 user/echod.c3
+build_user_program diskd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 user/diskd.c3
+build_user_program sdd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 user/sdd.c3
+build_user_program fsd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 user/fsd.c3 user/fs/fat32.c3 user/fs/ext2.c3
+build_user_program procd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 user/procd.c3
+build_user_program envd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 user/envd.c3

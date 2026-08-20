@@ -1,5 +1,7 @@
 module user;
 
+import std::racccoon::fmt;
+
 int rfork_shared_value = 0;
 int rfork_child_ran = 0; // set by rforkmemtest's child, checked by rforkmemresult
 
@@ -621,7 +623,7 @@ fn void main() @export("main") {
                     kt_ctl_path[kt_pos] = kt_prefix[kt_pos];
                     kt_pos++;
                 }
-                int kt_digits = format_uint((uint)kt_r, &kt_status_path[kt_pos]);
+                int kt_digits = fmt::format_uint((uint)kt_r, &kt_status_path[kt_pos]);
                 for (int kd = 0; kd < kt_digits; kd++) {
                     kt_ctl_path[kt_pos + kd] = kt_status_path[kt_pos + kd];
                 }

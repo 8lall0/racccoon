@@ -1,5 +1,8 @@
 module user;
 
+import std::racccoon::mem;
+import std::racccoon::fmt;
+
 // /proc: a synthetic filesystem server (see docs/devlog.md) — speaks the
 // same FS_READ/FS_LIST/FS_WRITE wire protocol fsd.c3 already does (verbs
 // 20/21/23, user.c3), but backed by live process state instead of disk
@@ -96,7 +99,7 @@ fn void main() @export("main") {
                     if (proc_info(pid, &state, &gen) == 0)
                     {
                         char* rec = &buf[4 + count * 36];
-                        int n = format_uint((uint)pid, rec);
+                        int n = fmt::format_uint((uint)pid, rec);
                         rec[n] = 0;
                         rec[32] = 1; // directory
                         count++;
@@ -198,11 +201,11 @@ fn void main() @export("main") {
         {
             int pos = 4;
             pos = procd_append_str(&buf, pos, "pid: ");
-            pos += format_uint(pid_val, &buf[pos]);
+            pos += fmt::format_uint(pid_val, &buf[pos]);
             pos = procd_append_str(&buf, pos, "\nstate: ");
             pos = procd_append_str(&buf, pos, state == 1 ? "RUNNABLE" : "BLOCKED");
             pos = procd_append_str(&buf, pos, "\ngeneration: ");
-            pos += format_uint(gen, &buf[pos]);
+            pos += fmt::format_uint(gen, &buf[pos]);
             pos = procd_append_str(&buf, pos, "\n");
             *result_len_field = pos - 4;
         }

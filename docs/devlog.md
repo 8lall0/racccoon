@@ -4,6 +4,78 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (27) — Moving the stdlib adaptation into std::racccoon, in a real c3c fork
+
+Took the previous entry's `user/mem.c3`/`user/atomic.c3`/`user/fmt.c3`
+one step further: instead of vendoring copies per-project, they now
+live as `std::racccoon::mem`/`std::racccoon::atomic`/`std::racccoon::fmt`
+in a real c3c stdlib tree — the user's own fork
+(github.com/8lall0/c3c) — reachable via a plain `import` like any other
+stdlib module, no more per-binary file-list copying.
+
+**The fork was stale first**: `origin/master` had zero commits of its
+own (a plain mirror that fell behind, not a real divergent fork) —
+turned out to be a clean ancestor of upstream's own `v0.8.3` tag, so
+fast-forwarding it was risk-free and landed on the *exact* commit
+racccoon's system-installed `c3c` already builds with (confirmed by
+git hash, not just version string). Rebuilt natively (`cmake`+`ninja`,
+already available — no need for the fork's own Docker-based
+`build.sh`) after fixing a stale `CMakeCache` (wrong compiler paths)
+and an LLVM version conflict (auto-detected LLVM 20 instead of the
+system's actual 22.1.8, explicit `-DLLVM_DIR` fixed it) — confirmed
+byte-identical version/hash/LLVM-version parity with the system binary
+before touching anything else.
+
+**New module, `lib/std/_nolibc/racccoon/`**: same content as the three
+vendored files, moved under `std::racccoon::*` names (couldn't reuse
+`std::atomic::types`/`std::core::mem` — those names are already taken
+by the real modules in the same tree), gated `@feat(NO_LIBC)` matching
+`std::nolibc`/`std::core::mem`'s own convention — confirmed empirically
+(not assumed) that `NO_LIBC` is exactly the feature racccoon's user-mode
+binaries already activate under their existing `--link-libc=no` flag.
+
+**A real trap avoided**: the first instinct was "enable `--use-stdlib`
+for user-mode binaries" — testing that directly showed it pulls in far
+more of the real stdlib than expected (`std::io`, `libc.os`,
+`std::math`, a dozen other modules), none of which this freestanding
+link step can handle. The actual fix needed no flag change at all:
+passing the new files as explicit source arguments — exactly how
+`user/user.c3` has always been included — works under the *existing*
+`--use-stdlib=no`, producing only the object files actually needed.
+Verified the compiled output directly: real RV64 atomic instructions
+(`lr.w.aqrl`/`sc.w.rl`/`amoadd.w.aqrl`), correctly exported
+`memcpy`/`memset`/`memcmp` symbols.
+
+**Wired in**: `scripts/build_user.sh` gained a `RACCCOON_STD_DIR`
+variable (overridable, defaulting to the fork's checkout path — a real,
+disclosed machine-specific dependency, not portable elsewhere without
+setting it) pointing at the new module; every `build_user_program` call
+now sources `atomic.c3`/`mem.c3`/`fmt.c3` from there instead of `user/`.
+`user/atomic.c3`/`mem.c3`/`fmt.c3` deleted. Every consuming file needed
+an explicit `import std::racccoon::...` (unlike `std::core::mem`,
+`std::racccoon` isn't implicitly visible) and its call sites qualified
+(`fmt::format_uint`, not bare `format_uint` — `mem::copy`/`mem::set`
+were already qualified).
+
+**Verified**: full regression suite clean on both filesystems
+(`mutextest` specifically exercises the real hardware atomics through
+the new module), a 10-boot stress batch clean, `e2fsck -n -f`/
+`fsck.vfat -n` clean after.
+
+**Scope note**: the c3c fork itself is left with these new files
+uncommitted, deliberately — that's the user's own repository and their
+call when to commit there, not something to do automatically alongside
+a racccoon commit.
+
+**Files changed:** `scripts/build_user.sh` (`RACCCOON_STD_DIR`, source
+lists updated), `user/atomic.c3`/`mem.c3`/`fmt.c3` (deleted),
+`user/user.c3`/`procd.c3`/`shell.c3`/`envd.c3`/`fsd.c3`/`diskd.c3`/
+`fs/ext2.c3` (imports added, call sites qualified). Outside this repo:
+`~/Workspace/c3c` fast-forwarded to `v0.8.3`, new
+`lib/std/_nolibc/racccoon/{mem,atomic,fmt}.c3` (uncommitted there).
+
+---
+
 ## 2026-08-20 (26) — Revisiting the c3 stdlib adaptation: mem::copy/set, and consolidating format_uint
 
 Returned to an early-session goal (adapting the real c3 stdlib into

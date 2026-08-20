@@ -1,5 +1,7 @@
 module user;
 
+import std::racccoon::mem;
+
 // ext2 backend for fsd (see user/fsd.c3's own header comment for the
 // generic core / backend split). Standard, stable public spec (the
 // original ext2 on-disk format, unchanged by ext3/ext4's later journal/

@@ -1,5 +1,7 @@
 module user;
 
+import std::racccoon::mem;
+
 // diskd: the virtio-blk driver, moved out of the trusted kernel into its
 // own user-mode process (microkernel plan phase 4 — see docs/devlog.md).
 // It's the only process with the device's MMIO mapped into its page
