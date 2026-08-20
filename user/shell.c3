@@ -692,6 +692,72 @@ fn void main() @export("main") {
                 print("killtest: bogus ctl command ");
                 print(kt_bogus_result < 0 && kt_echod_after >= 0 ? "correctly rejected, echod still alive\n" : "WRONGLY accepted or echod harmed\n");
             }
+        } else if (strcmp(cmd, "srvtest") == 0) {
+            // Proves the real srv-post + mount two-step end to end:
+            // srv_post() (a running server registers itself under a short
+            // name in the kernel's global srv_table) and ns_mount() (any
+            // process binds that name at a path prefix in its *own*
+            // namespace) — the dynamic counterpart to the four static
+            // prefixes create_process() has always populated every
+            // process with.
+            //
+            // rfork(RFPROC) a child that posts itself as "echo2" and then
+            // serves like echod (ipc_recv_type_gen/ipc_reply, this
+            // session's own generation-safe reply path) — same inline
+            // child shape killtest/rforktest already use.
+            uint srv_gen = 0;
+            int srv_r = rfork(RFPROC, &srv_gen);
+            if (srv_r < 0) {
+                print("rfork failed\n");
+            } else if (srv_r == 0) {
+                srv_post("echo2");
+                for (;;) {
+                    char[64] srv_buf @noinit;
+                    uint srv_verb = 0;
+                    uint srv_from_gen = 0;
+                    int srv_from = ipc_recv_type_gen(&srv_buf, 64, &srv_verb, &srv_from_gen);
+                    if (srv_from <= 0) continue;
+                    ipc_reply(srv_from, srv_verb, &srv_buf, 64, srv_from_gen);
+                }
+            } else {
+                // No synchronization between rfork() returning here and
+                // the child's first instruction — the child may not have
+                // posted yet. This can NOT be closed with a bare busy-
+                // retry on ns_mount() the way killtest's spin-child gets
+                // away with: the timer interrupt only fires once per full
+                // real second (arm_timer(board::TIMEBASE_HZ),
+                // src/entry.c3) — a tight loop of nothing but fast,
+                // non-blocking syscalls can easily finish before a single
+                // tick ever occurs, so the child would never actually get
+                // scheduled (confirmed the hard way: an earlier version
+                // of this test spun 100000 iterations and still never
+                // observed the post). A direct message to the child's own
+                // already-known pid (srv_r, from rfork's own return value
+                // — not through the namespace) sidesteps the timer
+                // entirely: SYS_IPC_SEND's blocking rendezvous wait calls
+                // the kernel's internal yield() on every failed check,
+                // the same mechanism every other blocking-IPC test in
+                // this suite already relies on for real scheduling. Since
+                // srv_post() is the child's very first statement, by the
+                // time it reaches its own ipc_recv_type_gen() to consume
+                // this sync message, the post has already happened.
+                ipc_send(srv_r, 0, "sync", 5);
+                char[16] srv_sync_reply @noinit;
+                ipc_recv(&srv_sync_reply, 16);
+
+                int srv_mounted = ns_mount("/srv/echo2/", "echo2");
+                int srv_pid = ns_resolve("/srv/echo2/", null);
+                ipc_send(srv_pid, 0, "hi echo2", 9);
+                char[16] srv_reply @noinit;
+                int srv_from2 = ipc_recv(&srv_reply, 16);
+                int srv_unmounted = ns_unmount("/srv/echo2/");
+                int srv_killed = kill(srv_r, srv_gen);
+                if (srv_mounted == 0 && srv_pid > 0 && srv_from2 > 0 && strcmp(&srv_reply, "hi echo2") == 0 && srv_unmounted == 0 && srv_killed == 0) {
+                    print("srvtest: ok\n");
+                } else {
+                    print("srvtest: FAILED\n");
+                }
+            }
         } else if (strcmp(cmd, "rforktest") == 0) {
             // Plain rfork(RFPROC): the child gets an independent copy of
             // this process's address space (src/entry.c3's SYS_RFORK,

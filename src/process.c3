@@ -81,10 +81,41 @@ int fsd2_pid = 0;
 // already call.
 int procd_pid = 0;
 
-const NS_MOUNTS_MAX = 5;   // Small fixed table — four real entries now
-                            // ("/srv/echo/" -> echod, "" -> fsd, "/2/"
-                            // -> fsd2, "/proc/" -> procd), one spare.
+const NS_MOUNTS_MAX = 8;   // Four static entries at boot ("/srv/echo/" ->
+                            // echod, "" -> fsd, "/2/" -> fsd2, "/proc/" ->
+                            // procd) plus real headroom for SYS_NS_MOUNT
+                            // (below) to add dynamically-posted ones at
+                            // runtime — was 5 (one spare) before dynamic
+                            // mounting existed to actually use the room.
 const NS_PREFIX_MAX = 32;  // Longest path prefix a mount entry can match.
+
+// A small, kernel-global (not per-process — discoverable *by name*,
+// unlike Mount below) registry of servers that have posted themselves via
+// SYS_SRV_POST (src/entry.c3) — the "srv" half of the real Plan 9
+// post+mount two-step SYS_NS_MOUNT (also src/entry.c3) is the other half
+// of. Deliberately separate from Mount/namespace: posting is global and
+// name-keyed ("any process, anywhere, that knows the name can find it"),
+// mounting is per-process and path-keyed (today's existing namespace
+// model, unchanged) — the two only meet at SYS_NS_MOUNT, which looks a
+// name up here and adds a *path* binding into the calling process's own
+// namespace, same as create_process's static population already does,
+// just at runtime and by explicit request instead of unconditionally.
+const SRV_MAX = 8;        // Small fixed table, same sizing philosophy as NS_MOUNTS_MAX.
+const SRV_NAME_MAX = 16;  // Short identifiers ("echo2"), not paths — no need for NS_PREFIX_MAX's 32.
+
+// pid == 0 marks an unused slot, same convention as Mount.server_pid.
+// generation is captured at post time and re-checked at every
+// SYS_NS_MOUNT lookup, same generation-safety pattern
+// Mount.server_generation's own comment explains — a posting process that
+// has since exited and had its slot reused must never be silently handed
+// back as if it were still the same server.
+struct Srv_entry
+{
+	char[SRV_NAME_MAX] name;
+	int                pid;
+	uint               generation;
+}
+Srv_entry[SRV_MAX] srv_table;
 
 // One binding in a process's namespace: any path starting with `prefix`
 // resolves to `server_pid`. A zero server_pid marks an unused slot.

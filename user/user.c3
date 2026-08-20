@@ -31,6 +31,8 @@ const int SYS_PROC_INFO  = 17; // returns another process's state/generation —
 const int SYS_KILL       = 18; // kills another process by pid (+ optional generation check) — see src/entry.c3's case
 const int SYS_IPC_RECV_GEN = 19; // same as SYS_IPC_RECV, plus the sender's generation — see src/entry.c3's case
 const int SYS_IPC_REPLY    = 20; // same as SYS_IPC_SEND, plus an optional target-generation check — see src/entry.c3's case
+const int SYS_SRV_POST     = 21; // posts current_proc under a short name in the global srv_table — see src/entry.c3's case
+const int SYS_NS_MOUNT     = 22; // binds a posted srv_table name at a path prefix in the caller's own namespace — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -286,6 +288,27 @@ fn int ns_resolve(char* path, uint* out_prefix_len) @export("ns_resolve") {
 // sandbox itself without affecting its parent or siblings.
 fn int ns_unmount(char* prefix) @export("ns_unmount") {
     return syscall(SYS_NS_UNMOUNT, (long)prefix, 0, 0);
+}
+
+// Posts this process under name in the kernel's global srv_table
+// (src/process.c3) — the "srv" half of the real Plan 9 post+mount
+// two-step; pair with ns_mount() below. Always posts self (no pid
+// argument). Idempotent: posting the same name again just rebinds the
+// existing entry (e.g. after a restart) rather than failing. Returns 0
+// on success, -1 if the table is genuinely full.
+fn int srv_post(char* name) @export("srv_post") {
+    return syscall(SYS_SRV_POST, (long)name, 0, 0);
+}
+
+// Looks srv_name up in the global srv_table and, if it names a still-live
+// server, binds it at prefix in *this* process's own namespace — the
+// "mount" half of the two-step, the dynamic counterpart to the static
+// prefixes create_process() already populates every process with.
+// Idempotent by exact prefix, same as ns_unmount()'s own matching.
+// Returns 0 on success, -1 if srv_name isn't currently posted (or its
+// poster has since exited) or this process's own namespace is full.
+fn int ns_mount(char* prefix, char* srv_name) @export("ns_mount") {
+    return syscall(SYS_NS_MOUNT, (long)prefix, (long)srv_name, 0);
 }
 
 // Blocks until the process with this pid no longer exists — e.g. a

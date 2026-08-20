@@ -4,6 +4,91 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (23) — Real srv-post + mount: dynamic namespace binding
+
+The last piece explicitly deferred when `/srv`/`/tmp`/`/proc` were built:
+the namespace has always been populated exactly once, identically for
+every process, at `create_process()` time — no way for a server to
+register itself at runtime, no way for a client to bind it afterward.
+`SYS_NS_UNMOUNT` already existed (remove one of the *caller's own*
+mounts by exact prefix), but there was never an add-a-new-binding
+counterpart.
+
+### The two-step
+
+A new, small **kernel-global** registry (`src/process.c3`) — deliberately
+separate from `Mount`/namespace, which is per-process and path-keyed:
+posted servers are discoverable *by name*, globally.
+
+```c3
+struct Srv_entry { char[SRV_NAME_MAX] name; int pid; uint generation; }
+Srv_entry[SRV_MAX] srv_table;
+```
+
+**`SYS_SRV_POST`** (next free syscall number, 21) posts `current_proc`
+under a short name — always self, no pid argument, matching Plan 9's
+"you post your own connection" semantics. Idempotent by name, same
+"already exists is fine" shape as `fat32_mkdir`'s own `/tmp` auto-create:
+posting the same name again just rebinds the entry in place.
+
+**`SYS_NS_MOUNT`** (22) looks the name up, validates it's still live
+(the exact same `proc_by_pid` + generation-match check `SYS_NS_RESOLVE`
+already does for existing mounts — a stale/dead post is treated as "not
+found," never silently handed back), and adds `prefix -> (pid,
+generation)` into the *calling* process's own namespace. Idempotent by
+exact prefix, same convention `SYS_NS_UNMOUNT` already uses.
+`NS_MOUNTS_MAX` grew 5->8: the 4 static mounts left only 1 spare slot,
+not enough real headroom for dynamically-added ones.
+
+### A real bug in the first version of the test, not the feature
+
+`srvtest` (new shell command) `rfork(RFPROC)`s a child that posts itself
+as `"echo2"` and serves like echod. The first version had the parent
+busy-retry `ns_mount()` up to 100000 times, betting on real preemption
+(the same reasoning `killtest`'s spin-child relies on) to eventually let
+the child run and post. It silently never worked: `srv_mounted` stayed
+`-1` every time, `ns_resolve` fell through to the `""` catch-all (fsd),
+the parent's `ipc_send`/`ipc_recv` round-trip against the *wrong* pid
+left it permanently blocked — and because a permanently-blocked parent
+plus its still-serving-nothing child left zero runnable non-idle
+processes, `kernel_main`'s own respawn loop silently spun up a *fresh*
+shell, which is what kept accepting the next typed command with no
+visible hang or crash at all.
+
+Root cause, found by adding checkpoint prints: the timer interrupt only
+fires once per full real *second* (`arm_timer(board::TIMEBASE_HZ)`,
+`src/entry.c3`) — a tight loop of nothing but fast, non-blocking
+`ns_mount()` syscalls can easily finish well under that, so the child
+never got a single scheduling opportunity. `killtest`'s own spin-child
+gets away with a bare loop only because the *parent* side there makes
+several real blocking `fs_read`/`fs_write` calls to fsd in between,
+which is what actually drives scheduling — not the timer, and not
+`killtest`'s spin loop itself.
+
+**Fixed** by replacing the retry loop with a direct message to the
+child's own already-known pid (`srv_r`, straight from `rfork`'s return
+value — no namespace involved) before ever touching `ns_mount`.
+`SYS_IPC_SEND`'s blocking rendezvous wait calls the kernel's internal
+`yield()` on every failed check — the same mechanism every other
+blocking-IPC test in this suite already relies on for real scheduling.
+Since `srv_post()` is the child's very first statement, by the time it
+reaches its own `ipc_recv_type_gen()` to consume this sync message, the
+post has already happened — `ns_mount` then succeeds on the very first
+try, no retry needed at all.
+
+**Verified**: full regression suite (`srvtest` included) clean on both
+filesystems, `srvtest` run repeatedly back-to-back with `lsproc`
+confirming no leaked process slots (the `kill()` cleanup at the end
+genuinely works), a 10-boot stress batch (`srvtest` twice per boot plus
+the rest of the self-cleaning suite) clean, `e2fsck -n -f`/`fsck.vfat -n`
+clean after.
+
+**Files changed:** `src/process.c3` (`Srv_entry`/`srv_table`,
+`NS_MOUNTS_MAX` 5->8), `src/entry.c3` (`SYS_SRV_POST`, `SYS_NS_MOUNT`),
+`user/user.c3` (`srv_post()`, `ns_mount()`), `user/shell.c3` (`srvtest`).
+
+---
+
 ## 2026-08-20 (22) — Rename-cycle detection, both backends
 
 The last confirmed, still-open gap on the list from the last few

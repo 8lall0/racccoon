@@ -62,6 +62,8 @@ const SYS_PROC_INFO  = 17; // procd-only in practice, but open to any caller —
 const SYS_KILL       = 18; // procd-only in practice (the /proc/<pid>/ctl write path), open to any caller — see its case below
 const SYS_IPC_RECV_GEN = 19; // same as SYS_IPC_RECV, plus the sender's generation — see its case below
 const SYS_IPC_REPLY    = 20; // same as SYS_IPC_SEND, plus an optional target-generation check — see its case below
+const SYS_SRV_POST     = 21; // posts current_proc under a short name in the global srv_table — see its case below
+const SYS_NS_MOUNT     = 22; // binds a posted srv_table name at a path prefix in the caller's own namespace — see its case below
 
 // rfork flags — Plan 9 names, this kernel's own subset. RFPROC is
 // required (rfork() without it returns -1 in this v1: real Plan 9 uses
@@ -1221,6 +1223,97 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			kill_target.state = PROC_UNUSED;
 			kill_target.pid = 0;
 			f.a0 = 0;
+		case SYS_SRV_POST:
+			// Posts current_proc (always self — no pid argument; there's
+			// no reason to let one process post another's pid even in a
+			// kernel with no general permission model, since "post"
+			// fundamentally means "here is my own connection") under a
+			// short name in the global srv_table (src/process.c3) — the
+			// "srv" half of the real Plan 9 post+mount two-step
+			// SYS_NS_MOUNT (below) is the other half of. Idempotent by
+			// name, same "already exists is fine" shape as
+			// fat32_mkdir/ext2_mkdir's own /tmp auto-create: an existing
+			// entry with this exact name is rebound in place (e.g. after
+			// a server restart) rather than refused.
+			char* post_name = (char*)(uptr)f.a0;
+			int post_free_slot = -1;
+			int post_result = -1;
+			for (int ps = 0; ps < SRV_MAX; ps++)
+			{
+				if (srv_table[ps].pid == 0)
+				{
+					if (post_free_slot == -1) post_free_slot = ps;
+					continue;
+				}
+				if (str_eq(&srv_table[ps].name[0], post_name))
+				{
+					srv_table[ps].pid = current_proc.pid;
+					srv_table[ps].generation = current_proc.generation;
+					post_result = 0;
+					break;
+				}
+			}
+			if (post_result != 0 && post_free_slot != -1)
+			{
+				str_copy(&srv_table[post_free_slot].name[0], post_name, SRV_NAME_MAX);
+				srv_table[post_free_slot].pid = current_proc.pid;
+				srv_table[post_free_slot].generation = current_proc.generation;
+				post_result = 0;
+			}
+			f.a0 = (ulong)(iptr)post_result;
+		case SYS_NS_MOUNT:
+			// Looks srv_name up in srv_table and, if it names a still-live
+			// server (same proc_by_pid + generation-match check
+			// SYS_NS_RESOLVE already does for existing mounts — a
+			// stale/dead post is treated as "not found," never silently
+			// handed back), adds prefix -> (pid, generation) into the
+			// *calling* process's own namespace — the "mount" half of the
+			// two-step. Idempotent by exact prefix (str_eq, same
+			// convention SYS_NS_UNMOUNT already uses): an existing entry
+			// with this same prefix is rebound in place rather than
+			// refused or duplicated.
+			char* mount_prefix = (char*)(uptr)f.a0;
+			char* mount_srv_name = (char*)(uptr)f.a1;
+			int mount_srv_pid = 0;
+			uint mount_srv_generation = 0;
+			for (int ms = 0; ms < SRV_MAX; ms++)
+			{
+				if (srv_table[ms].pid == 0) continue;
+				if (!str_eq(&srv_table[ms].name[0], mount_srv_name)) continue;
+				Process* mount_srv_target = proc_by_pid(srv_table[ms].pid);
+				if (!mount_srv_target || mount_srv_target.generation != srv_table[ms].generation) break;
+				mount_srv_pid = srv_table[ms].pid;
+				mount_srv_generation = srv_table[ms].generation;
+				break;
+			}
+			int mount_result = -1;
+			if (mount_srv_pid != 0)
+			{
+				int mount_free_slot = -1;
+				for (int mm = 0; mm < NS_MOUNTS_MAX; mm++)
+				{
+					if (current_proc.namespace[mm].server_pid == 0)
+					{
+						if (mount_free_slot == -1) mount_free_slot = mm;
+						continue;
+					}
+					if (str_eq(&current_proc.namespace[mm].prefix[0], mount_prefix))
+					{
+						current_proc.namespace[mm].server_pid = mount_srv_pid;
+						current_proc.namespace[mm].server_generation = mount_srv_generation;
+						mount_result = 0;
+						break;
+					}
+				}
+				if (mount_result != 0 && mount_free_slot != -1)
+				{
+					str_copy(&current_proc.namespace[mount_free_slot].prefix[0], mount_prefix, NS_PREFIX_MAX);
+					current_proc.namespace[mount_free_slot].server_pid = mount_srv_pid;
+					current_proc.namespace[mount_free_slot].server_generation = mount_srv_generation;
+					mount_result = 0;
+				}
+			}
+			f.a0 = (ulong)(iptr)mount_result;
 		default:
 			panic::panic("unexpected syscall");
 	}
