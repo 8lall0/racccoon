@@ -377,11 +377,24 @@ fn void user_entry() @naked @noinline @noreturn
 	// user/user.ld's base address. `li` with a small constant like this
 	// compiles the same way regardless of XLEN, so this function is
 	// otherwise unchanged from the RV32 version.
+	//
+	// a0/a1 explicitly zeroed: user/user.c3's start() (this process's
+	// very first instruction after sret) stashes a0/a1 as argc/its own
+	// argv blob address — SYS_EXEC (entry.c3) sets both deliberately for
+	// an exec()'d process, but this path is for a brand new process
+	// create_process() is booting for the first time, where a0/a1 would
+	// otherwise still hold whatever the kernel's own boot-time code last
+	// left in the physical registers. Zeroing here is what makes
+	// get_argv() (user.c3) reliably report argc=0 for every
+	// create_process()'d server (echod, diskd, fsd, procd, envd, shell)
+	// instead of reading that leftover garbage as if it meant something.
 	asm(`
         li t0, 0x1000000
         csrw sepc, t0
         li t1, 0x40020
         csrw sstatus, t1
+        li a0, 0
+        li a1, 0
         sret
     `);
 }

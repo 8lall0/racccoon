@@ -4,6 +4,94 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (34) — `argv` confirmed on real Milk-V Duo hardware
+
+Follow-up to the previous entry: `argvtest: ok` and `runtest: ok` on
+the real C906 core (`DUOBOOT`/FAT32), `lsproc` clean afterward (only
+the six always-on servers plus the shell, no leaked slots from either
+test's own child). The register-repurposing (`a0`/`a1` as `argc`/argv
+base instead of a syscall return value), the `just_execd` check's
+`>= 0` adjustment, and `user_entry()`'s explicit zeroing all hold
+outside QEMU's emulation, not just on it.
+
+**Files changed:** none (hardware verification only).
+
+---
+
+## 2026-08-20 (33) — `argv` at exec() time
+
+Closes a gap the exec() plan flagged explicitly out of scope: a
+freshly-exec'd process previously had no way to learn what it was
+supposed to do beyond `/env` — no `argc`/`argv` at all.
+
+**Wire format**: `exec()`'s caller already owns a buffer the image gets
+read into (`user.c3`) — argv strings get packed right after the image
+content, in that same buffer, NUL-separated (`"foo\0bar\0"` for
+`argc=2`). Real pointers wouldn't survive being copied into a brand new
+address space, so a flat, self-describing blob is the only thing that
+can cross that boundary. `exec()` gained two parameters (`char** argv`,
+`int argc`); the one existing caller (`runtest`, `shell.c3`) now passes
+`null, 0`, unchanged behavior.
+
+**`SYS_EXEC`** (`src/entry.c3`) stages the argv blob as a second,
+smaller pass of the same page-staging loop already used for the image
+(new `EXEC_MAX_ARGV_SIZE`, 4096 bytes — plenty for real CLI args), maps
+it right after the image's own last page (`ARGV_BASE`), and hands the
+new process `argc`/`ARGV_BASE` via `a0`/`a1` — repurposing the same
+registers a normal syscall would use for its return value, safe here
+because control never returns to the caller on success (the
+`saved_sepc` redirect from last session's own fix means that
+return-value-reading code never executes). This needed one adjustment
+to that same fix: `handle_trap()`'s `just_execd` check used to test
+`f.a0 == 0` to detect a successful `SYS_EXEC`; now that `f.a0` carries
+`argc` (which can legitimately be nonzero), the check became
+`(long)f.a0 >= 0` — a real failure still sets `-1`, so the distinction
+still holds.
+
+**Getting it into a real `main()`**: existing binaries' `main()`
+signatures stay untouched — most don't care about argv, and this
+codebase has no default-parameter syntax to make an extra param free.
+`start()` (`user.c3`, naked asm, already confirmed to leave `a0`/`a1`
+untouched from `sret` through to `call main`) stashes both into two new
+globals before calling `main()`. A new, opt-in `get_argv()` lazily
+parses that blob into a small static pointer array on demand — only a
+caller that actually wants its own argv reaches for it.
+
+**Boot-time processes needed a real fix, not just an omission**:
+`user_entry()` (`src/process.c3` — the trampoline `create_process()`
+uses for a never-yet-run process) never touched `a0`/`a1` before its own
+`sret`, leaving whatever the kernel's own boot-time code last put there
+in the physical registers. Every `create_process()`'d server would have
+read that leftover garbage as if it were a real argv blob pointer.
+Fixed by explicitly zeroing both there, so every boot-time process
+(echod, diskd, fsd, procd, envd, shell) gets a deterministic `argc=0`.
+
+**Test**: `echod.c3` now calls `get_argv()` at startup; if `argc > 0`,
+`argv[0]` replaces its hardcoded `P9_TREAD` canned reply (its raw-echo
+behavior, what `runtest` checks, is unchanged either way). New shell
+command `argvtest` — same `rfork`+sync+`exec`+"ready" handshake
+`runtest` already established, reused rather than duplicated in spirit
+(each is its own small copy, this codebase's own established pattern
+for inline `rfork()` test children) — execs `bin/echod` with one real
+argument, then confirms it actually arrived via a `P9_TREAD` round trip
+matching that argument, not just that `exec()` returned success.
+`p9test` (the existing command exercising `P9_TREAD` against boot-time
+echod, pid 2, argc=0) still gets the original hardcoded reply,
+confirming `user_entry()`'s zeroing holds.
+
+**Verification**: full regression suite plus `argvtest`/`runtest`, both
+run repeatedly in the same boot with `lsproc` showing no leaked slots
+afterward; a three-boot stress batch; `fsck.vfat -n`/`e2fsck -n -f`
+clean on both test images; `argvtest` on ext2 fails the same clean way
+`runtest` already does there (the driver's own 12-direct-block limit,
+`echod.bin` exceeds it — a pre-existing, documented limitation, not new
+here).
+
+**Files changed:** `user/user.c3`, `src/entry.c3`, `src/process.c3`,
+`user/echod.c3`, `user/shell.c3`.
+
+---
+
 ## 2026-08-20 (32) — `exec()`/`runtest` confirmed on real Milk-V Duo hardware
 
 Follow-up to the previous entry: built `kernel_duo.elf`, packaged

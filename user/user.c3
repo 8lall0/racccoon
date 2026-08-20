@@ -102,9 +102,18 @@ fn int rfork(int flags, uint* generation_out) @export("rfork") {
 // way debugging exec()'s own runtest (user/shell.c3, docs/devlog.md):
 // the retry-based version failed outright rather than just being slow.
 //
+// argv (argc entries, null/0 for none) rides in the same buf, packed
+// right after the image content as NUL-separated strings ("foo\0bar\0"
+// for argc=2) — the simplest encoding that survives being copied as a
+// flat byte blob into the new process's own address space; real
+// pointers wouldn't survive that copy. SYS_EXEC (src/entry.c3) stages
+// this blob as its own pages, mapped right after the image's own last
+// page, and hands the new process argc/its base address via a0/a1 at
+// entry — see get_argv() below for the other end of this.
+//
 // Only ever returns on failure (-1) — success means this process is
 // now running path's code instead of this line.
-fn int exec(char* path, char* buf, uint buf_max, int notify_pid) @export("exec") {
+fn int exec(char* path, char* buf, uint buf_max, int notify_pid, char** argv, int argc) @export("exec") {
     uint total = 0;
     for (;;) {
         if (total >= buf_max) return -1; // image bigger than the caller's own buffer
@@ -116,10 +125,26 @@ fn int exec(char* path, char* buf, uint buf_max, int notify_pid) @export("exec")
         total += (uint)got;
     }
     if (total == 0) return -1; // empty/nonexistent file — nothing to run
+
+    uint argv_len = 0;
+    for (int i = 0; i < argc; i++) {
+        char* arg = argv[i];
+        uint j = 0;
+        while (arg[j] != 0) {
+            if (total + argv_len >= buf_max) return -1; // argv too big for this buffer
+            buf[total + argv_len] = arg[j];
+            argv_len++;
+            j++;
+        }
+        if (total + argv_len >= buf_max) return -1;
+        buf[total + argv_len] = 0;
+        argv_len++;
+    }
+
     if (notify_pid > 0) {
         ipc_send(notify_pid, 0, "ready", 6);
     }
-    return syscall(SYS_EXEC, (long)buf, (long)total, 0);
+    return syscall4(SYS_EXEC, (long)buf, (long)total, (long)argv_len, (long)argc);
 }
 
 // Stack-aware wrapper around rfork(RFPROC|RFMEM): unlike calling rfork()
@@ -920,9 +945,46 @@ fn int strcmp(char* a, char* b) {
     return (int)(char)*a - (int)(char)*b;
 }
 
+// argc/the argv blob's own base address, as SYS_EXEC (src/entry.c3)
+// hands them off in a0/a1 at the very first instruction that runs in a
+// freshly exec'd image. start() below stashes them here before calling
+// main() — a0/a1 are caller-saved in the RISC-V ABI, so anything main()
+// itself calls is free to clobber them; this is the only point they can
+// still be trusted. create_process() (src/process.c3's user_entry())
+// explicitly zeroes both for every boot-time process, so exec_argc
+// reads 0 there too, not garbage.
+int exec_argc @export("exec_argc");
+char* exec_argv_blob @export("exec_argv_blob");
+
+// Opt-in: most binaries don't call this (their main() takes no
+// parameters, unchanged by this feature) — only a caller that actually
+// wants its own exec()-time argv reaches for it. Lazily reparses
+// exec_argv_blob (NUL-separated strings, exec()'s own wire format,
+// user.c3's exec() above) into a small static pointer array on every
+// call — cheap enough not to need caching. Returns 0 (argv_out unset)
+// if this process wasn't exec'd with any arguments.
+char*[32] argv_storage @noinit;
+fn int get_argv(char*** argv_out) @export("get_argv") {
+    if (exec_argc <= 0 || exec_argv_blob == null) return 0;
+    int count = exec_argc;
+    if (count > 32) count = 32;
+    char* p = exec_argv_blob;
+    for (int i = 0; i < count; i++) {
+        argv_storage[i] = p;
+        while (*p != 0) p++;
+        p++;
+    }
+    *argv_out = &argv_storage;
+    return count;
+}
+
 fn void start() @section(".text.start") @naked @nostrip @used @export("start") {
     asm(`
         la sp, __stack_top
+        la t0, exec_argc
+        sw a0, 0(t0)
+        la t0, exec_argv_blob
+        sd a1, 0(t0)
         call main
         call exit
     `);

@@ -76,6 +76,13 @@ const SYS_EXEC         = 24; // replaces the calling process's own image in plac
 const EXEC_MAX_IMAGE_SIZE  = 262144;
 const EXEC_MAX_IMAGE_PAGES = EXEC_MAX_IMAGE_SIZE / PAGE_SIZE;
 
+// argv blob cap (user/user.c3's exec(), NUL-separated strings packed
+// right after the image in the same buffer) — one page is plenty for
+// real CLI args, and keeps this a small, fixed second staging pass
+// distinct from the image's own.
+const EXEC_MAX_ARGV_SIZE  = 4096;
+const EXEC_MAX_ARGV_PAGES = EXEC_MAX_ARGV_SIZE / PAGE_SIZE;
+
 // rfork flags — Plan 9 names, this kernel's own subset. RFPROC is
 // required (rfork() without it returns -1 in this v1: real Plan 9 uses
 // that combination to change the *caller's* own group membership in
@@ -1371,7 +1378,14 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// SYS_EXIT's own comment.
 			char* exec_image = (char*)(uptr)f.a0;
 			uint exec_image_size = (uint)f.a1;
-			if (exec_image_size == 0 || exec_image_size > EXEC_MAX_IMAGE_SIZE)
+			// argv blob (user/user.c3's exec(), NUL-separated strings) —
+			// packed right after the image content in this same buffer.
+			// syscall4's own 4th real argument lands in a4, not a3 (a3 is
+			// always the syscall number — see syscall4's own comment,
+			// user.c3).
+			uint exec_argv_len = (uint)f.a2;
+			int exec_argc = (int)f.a4;
+			if (exec_image_size == 0 || exec_image_size > EXEC_MAX_IMAGE_SIZE || exec_argv_len > EXEC_MAX_ARGV_SIZE)
 			{
 				f.a0 = (ulong)(-1);
 				break;
@@ -1403,6 +1417,35 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			if (!exec_stage_ok)
 			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+
+			// Same staging discipline, second pass, for the (usually
+			// much smaller) argv blob — a separate array so a failure
+			// here can still roll back the image pages already staged
+			// above without touching the old image at all.
+			uint argv_page_count = (exec_argv_len + PAGE_SIZE - 1) / PAGE_SIZE;
+			uptr[EXEC_MAX_ARGV_PAGES] argv_staged @noinit;
+			bool argv_stage_ok = true;
+			for (uint ap = 0; ap < argv_page_count; ap++)
+			{
+				uptr argv_page = alloc_pages(1);
+				if (argv_page == 0)
+				{
+					argv_stage_ok = false;
+					for (uint fp = 0; fp < ap; fp++) free_pages(argv_staged[fp], 1);
+					break;
+				}
+				uint argv_off = ap * PAGE_SIZE;
+				uint argv_remaining = exec_argv_len - argv_off;
+				uint argv_copy_size = argv_remaining < PAGE_SIZE ? argv_remaining : PAGE_SIZE;
+				mem::copy((void*)argv_page, exec_image + exec_image_size + argv_off, (sz)argv_copy_size);
+				argv_staged[ap] = argv_page;
+			}
+			if (!argv_stage_ok)
+			{
+				for (uint fp = 0; fp < exec_page_count; fp++) free_pages(exec_staged[fp], 1);
 				f.a0 = (ulong)(-1);
 				break;
 			}
@@ -1444,6 +1487,15 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				map_page(current_proc.page_table, (uptr)USER_BASE + (uptr)(mp * PAGE_SIZE), exec_staged[mp], PAGE_U | PAGE_R | PAGE_W | PAGE_X);
 			}
 
+			// argv's own pages, right after the image's own last mapped
+			// page — exec_page_count is already a whole number of pages,
+			// so this is exactly contiguous, no gap.
+			uptr exec_argv_base = (uptr)USER_BASE + (uptr)(exec_page_count * PAGE_SIZE);
+			for (uint avp = 0; avp < argv_page_count; avp++)
+			{
+				map_page(current_proc.page_table, exec_argv_base + (uptr)(avp * PAGE_SIZE), argv_staged[avp], PAGE_U | PAGE_R | PAGE_W);
+			}
+
 			// This process's own page table entries for USER_BASE just
 			// changed, but unlike a normal process switch, satp itself
 			// does NOT change here (same process) — so switch_context's
@@ -1470,7 +1522,20 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// trapframe's stale sp says is irrelevant the moment a
 			// fresh image starts running.
 			current_proc.saved_sepc = USER_BASE;
-			f.a0 = 0;
+			// argc/argv's own base address, handed off via a0/a1 exactly
+			// the way a normal syscall would hand back a return value —
+			// safe to repurpose them for this instead, since control
+			// never returns to the caller on success (the redirect above
+			// means the syscall-wrapper code that would have read a0 as
+			// a return value never executes). user/user.c3's start()
+			// stashes both before ever calling main(); get_argv() reads
+			// them from there. exec_argc is always >= 0 here (a real
+			// error already returned -1 and broken out above), so
+			// handle_trap()'s own just_execd check below tests
+			// "(long)f.a0 >= 0" rather than "== 0" to tell this success
+			// path apart from that failure one.
+			f.a0 = (ulong)exec_argc;
+			f.a1 = (ulong)exec_argv_base;
 		default:
 			panic::panic("unexpected syscall");
 	}
@@ -1613,7 +1678,11 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 		// the *old* image's own code right after the ecall returned —
 		// this is why: the redirect was being set correctly and then
 		// overwritten before it ever took effect.
-		bool just_execd = syscall_num == SYS_EXEC && f.a0 == 0;
+		// f.a0 carries argc on a successful SYS_EXEC now (0 or more, see
+		// that case's own comment), not a plain 0 return value — a real
+		// failure still sets it to (ulong)(-1), so "non-negative" is the
+		// right success test, not "== 0" (argc can genuinely be nonzero).
+		bool just_execd = syscall_num == SYS_EXEC && (long)f.a0 >= 0;
 		if (!just_execd)
 		{
 			current_proc.saved_sepc = user_pc + 4;

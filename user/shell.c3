@@ -856,7 +856,7 @@ fn void main() @export("main") {
                 char[16] run_sync_buf @noinit;
                 int run_parent = ipc_recv(&run_sync_buf, 16);
                 ipc_send(run_parent, 0, "ack", 4);
-                exec("bin/echod", &run_exec_buf, RUN_EXEC_BUF_MAX, run_parent);
+                exec("bin/echod", &run_exec_buf, RUN_EXEC_BUF_MAX, run_parent, null, 0);
                 // exec() only ever returns on failure — success means
                 // this process is now running echod's own code, not
                 // this line, and exec() already sent "ready" itself
@@ -888,6 +888,51 @@ fn void main() @export("main") {
                         print("runtest: ok\n");
                     } else {
                         print("runtest: FAILED\n");
+                    }
+                }
+            }
+        } else if (strcmp(cmd, "argvtest") == 0) {
+            // Same rfork+sync+exec+ready handshake as runtest above
+            // (see its own comment for why each step's there) — the
+            // difference is this one execs bin/echod with one real
+            // argument, then checks it actually reached the new image
+            // via a P9_TREAD round trip instead of runtest's untyped
+            // ping: echod's own main() (echod.c3) replaces its
+            // hardcoded P9_TREAD reply with argv[0] whenever argc > 0,
+            // so a matching reply is concrete, observable proof argv
+            // made it across exec(), not just that exec() succeeded.
+            char* av_arg = "argvtest-marker";
+
+            uint av_gen = 0;
+            int av_r = rfork(RFPROC, &av_gen);
+            if (av_r < 0) {
+                print("rfork failed\n");
+            } else if (av_r == 0) {
+                char[16] av_sync_buf @noinit;
+                int av_parent = ipc_recv(&av_sync_buf, 16);
+                ipc_send(av_parent, 0, "ack", 4);
+                exec("bin/echod", &run_exec_buf, RUN_EXEC_BUF_MAX, av_parent, &av_arg, 1);
+                ipc_send(av_parent, 0, "failed", 7);
+                exit();
+            } else {
+                ipc_send(av_r, 0, "sync", 5);
+                char[16] av_ack_buf @noinit;
+                ipc_recv(&av_ack_buf, 16);
+
+                char[16] av_ready_buf @noinit;
+                ipc_recv(&av_ready_buf, 16);
+
+                if (strcmp(&av_ready_buf, "ready") != 0) {
+                    print("argvtest: FAILED (exec load failed)\n");
+                } else {
+                    char[64] av_reply @noinit;
+                    uint av_reply_verb = 0;
+                    int av_from = p9_call(av_r, P9_TREAD, null, 0, &av_reply, 64, &av_reply_verb);
+                    int av_killed = kill(av_r, av_gen);
+                    if (av_from == av_r && av_reply_verb == P9_TREAD && strcmp(&av_reply, av_arg) == 0 && av_killed == 0) {
+                        print("argvtest: ok\n");
+                    } else {
+                        print("argvtest: FAILED\n");
                     }
                 }
             }
