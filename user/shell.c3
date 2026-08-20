@@ -936,6 +936,55 @@ fn void main() @export("main") {
                     }
                 }
             }
+        } else if (strcmp(cmd, "pathtest") == 0) {
+            // exec_path() (user.c3): resolves a bare name ("echod")
+            // against /env/PATH — a real $PATH-style search list —
+            // instead of exec()'s own exact-path requirement. Sets
+            // /env/PATH to a search list with a deliberately WRONG
+            // first prefix ("nonexistent/:bin/") before rfork(), so the
+            // child inherits it (same lazy-inheritance envtest already
+            // proved works) — success here is only possible if
+            // exec_path() genuinely tried the first prefix, failed, and
+            // moved to the second, not just that the (correct-by-
+            // default) fallback still works. Same rfork+sync+exec+
+            // "ready" handshake runtest/argvtest already established.
+            fs_write("/env/PATH", "nonexistent/:bin/", 17);
+
+            uint pt_gen = 0;
+            int pt_r = rfork(RFPROC, &pt_gen);
+            if (pt_r < 0) {
+                print("rfork failed\n");
+            } else if (pt_r == 0) {
+                char[16] pt_sync_buf @noinit;
+                int pt_parent = ipc_recv(&pt_sync_buf, 16);
+                ipc_send(pt_parent, 0, "ack", 4);
+                exec_path("echod", &run_exec_buf, RUN_EXEC_BUF_MAX, pt_parent, null, 0);
+                ipc_send(pt_parent, 0, "failed", 7);
+                exit();
+            } else {
+                ipc_send(pt_r, 0, "sync", 5);
+                char[16] pt_ack_buf @noinit;
+                ipc_recv(&pt_ack_buf, 16);
+
+                char[16] pt_ready_buf @noinit;
+                ipc_recv(&pt_ready_buf, 16);
+
+                fs_delete("/env/PATH");
+
+                if (strcmp(&pt_ready_buf, "ready") != 0) {
+                    print("pathtest: FAILED (exec load failed)\n");
+                } else {
+                    ipc_send(pt_r, 0, "hi echod", 9);
+                    char[16] pt_reply @noinit;
+                    int pt_from = ipc_recv(&pt_reply, 16);
+                    int pt_killed = kill(pt_r, pt_gen);
+                    if (pt_from == pt_r && strcmp(&pt_reply, "hi echod") == 0 && pt_killed == 0) {
+                        print("pathtest: ok\n");
+                    } else {
+                        print("pathtest: FAILED\n");
+                    }
+                }
+            }
         } else if (strcmp(cmd, "rforktest") == 0) {
             // Plain rfork(RFPROC): the child gets an independent copy of
             // this process's address space (src/entry.c3's SYS_RFORK,

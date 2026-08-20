@@ -4,6 +4,68 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-20 (36) — `exec_path()`/`pathtest` confirmed on real Milk-V Duo hardware
+
+Follow-up to the previous entry: `pathtest: ok` on the real C906 core
+(`DUOBOOT`/FAT32), alongside `runtest`/`argvtest` re-confirmed in the
+same boot, `lsproc` clean afterward. The deliberately-wrong-first-
+prefix search (`"nonexistent/:bin/"`) genuinely exercises multi-prefix
+resolution on real hardware, not just QEMU's own timing.
+
+**Files changed:** none (hardware verification only).
+
+---
+
+## 2026-08-20 (35) — `$PATH`-style `/bin` lookup for `exec()`
+
+Closes the last item the exec() plan flagged explicitly out of scope:
+`runtest`/`argvtest` both hardcode `"bin/echod"` — there was no way to
+name a program by its bare filename and have it resolved against a
+real search list.
+
+**`exec_path()`** (`user.c3`) is a separate function, not a mode of
+`exec()` itself — matching Unix's own split between `execve()` (exact
+path) and `execvp()` (`$PATH`-searched); `exec()` keeps its current,
+unambiguous "run exactly this file" meaning. It tries a colon-separated
+search list of directory prefixes in order, building each full
+candidate path and calling the existing `exec()` with it — since
+`exec()` only ever returns on failure, the loop naturally moves to the
+next prefix.
+
+**The search list is `/env/PATH`**, not a new mechanism: real Plan 9
+doesn't have `$PATH` at all (it uses namespace binds/union directories,
+which this kernel's filesystem backends don't support), but `$PATH`-
+style search is what was actually asked for, and this session already
+built exactly the right per-process configuration mechanism for it
+(`/env`, `user/envd.c3` — including lazy inheritance across `rfork()`).
+Reusing it beats inventing a second one. No `/env/PATH` set falls back
+to a single hardcoded default, `"bin/"` — matching every existing test
+fixture's own path exactly, so callers that never touch `/env/PATH` see
+identical behavior for free. (One small wrinkle: `envd.c3`'s own
+`ENV_VALUE_MAX` isn't actually reachable from `user.c3` — each server
+is its own separate `c3c` compilation, scripts/build_user.sh builds
+each from its own source list, and `user.c3` is the only file they all
+share. `exec_path()` has to carry its own matching constant,
+`PATH_VAR_MAX`, rather than importing the real one.)
+
+**Test**: new shell command `pathtest` sets `/env/PATH` to
+`"nonexistent/:bin/"` — a deliberately wrong first prefix — before
+`rfork()`, so the child inherits it, then calls
+`exec_path("echod", ...)`. Success is only possible if `exec_path()`
+genuinely tried the first prefix, failed, and moved to the second, not
+just that the correct-by-default fallback still works.
+
+**Verification**: full regression suite plus `pathtest`/`runtest`/
+`argvtest`, `pathtest` run repeatedly with `lsproc` showing no leaked
+slots; a three-boot stress batch; `fsck.vfat -n`/`e2fsck -n -f` clean;
+`pathtest` fails the same clean way on ext2 that `runtest`/`argvtest`
+already do there (the driver's pre-existing 12-direct-block limit, not
+a new gap).
+
+**Files changed:** `user/user.c3`, `user/shell.c3`.
+
+---
+
 ## 2026-08-20 (34) — `argv` confirmed on real Milk-V Duo hardware
 
 Follow-up to the previous entry: `argvtest: ok` and `runtest: ok` on

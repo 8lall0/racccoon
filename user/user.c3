@@ -147,6 +147,73 @@ fn int exec(char* path, char* buf, uint buf_max, int notify_pid, char** argv, in
     return syscall4(SYS_EXEC, (long)buf, (long)total, (long)argv_len, (long)argc);
 }
 
+// exec(), but resolves `name` against a real search list instead of
+// requiring a full path — the way a shell actually looks up commands.
+// A separate function, not a mode of exec() itself: exec() keeps its
+// current, unambiguous meaning ("run exactly this file"), matching
+// Unix's own split between execve() (exact path) and execvp()
+// ($PATH-searched).
+//
+// The search list itself is /env/PATH (user/envd.c3) — a
+// colon-separated list of directory prefixes ("bin/:/2/bin/"), reusing
+// this session's own per-process configuration mechanism (including its
+// lazy inheritance across rfork()) rather than inventing a second one.
+// Real Plan 9 doesn't have $PATH at all — it uses namespace binds/union
+// directories instead — but this kernel's filesystem backends don't
+// support those, and $PATH-style search is what was actually asked for.
+// No /env/PATH set means a single hardcoded default, "bin/" — matching
+// every existing test fixture's own bin/echod path exactly, so callers
+// that never touch /env/PATH see identical behavior for free.
+//
+// Only ever returns on failure (-1, every prefix in the search list
+// failed) — same "only returns on failure" contract as exec() itself.
+//
+// PATH_VAR_MAX must match user/envd.c3's own ENV_VALUE_MAX (also 64) —
+// can't share the real constant, envd.c3 is its own separate
+// compilation (scripts/build_user.sh builds each server from its own
+// source list; user.c3 is the only file every one of them shares).
+const int PATH_VAR_MAX = 64;
+fn int exec_path(char* name, char* buf, uint buf_max, int notify_pid, char** argv, int argc) @export("exec_path") {
+    char[PATH_VAR_MAX] path_var @noinit;
+    int path_len = fs_read("/env/PATH", &path_var, PATH_VAR_MAX - 1); // leave room for the NUL below
+    char* search;
+    if (path_len <= 0) {
+        search = "bin/";
+    } else {
+        path_var[path_len] = 0;
+        search = &path_var;
+    }
+
+    char[128] candidate @noinit;
+    int start = 0;
+    for (;;) {
+        int i = start;
+        while (search[i] != 0 && search[i] != ':') i++;
+
+        if (i > start) {
+            int ci = 0;
+            for (int k = start; k < i && ci < 100; k++) {
+                candidate[ci] = search[k];
+                ci++;
+            }
+            int ni = 0;
+            while (name[ni] != 0 && ci < 127) {
+                candidate[ci] = name[ni];
+                ci++;
+                ni++;
+            }
+            candidate[ci] = 0;
+
+            exec(&candidate, buf, buf_max, notify_pid, argv, argc);
+            // exec() only returns on failure — try the next prefix.
+        }
+
+        if (search[i] == 0) break;
+        start = i + 1;
+    }
+    return -1;
+}
+
 // Stack-aware wrapper around rfork(RFPROC|RFMEM): unlike calling rfork()
 // directly, this is actually safe to use for "spawn a thread." Bare
 // RFMEM shares the live user stack, not just the address space — the
