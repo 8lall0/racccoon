@@ -114,6 +114,16 @@ struct Fs9_fid_entry
 	bool opened;
 	bool is_dir;
 	uint inode_num; // ext2 inode number — a genuinely stable identity, unlike a path (survives a rename elsewhere, unlike ext2_cache_path)
+	// Added for P9_CREATE/P9_WRITE/P9_REMOVE (see docs/devlog.md): a fid
+	// only remembers the resolved inode above, not which directory entry
+	// points at it — P9_REMOVE needs dir_inode/entry_sector/entry_offset
+	// to clear that entry via ext2_delete_resolved(), without re-walking
+	// a path a second time. has_entry is false only for a bare root fid
+	// (P9_ATTACH never sets it) — root has no entry of its own to remove.
+	uint parent_inode;
+	uint entry_sector;
+	uint entry_offset;
+	bool has_entry;
 }
 Fs9_fid_entry[FS9_FID_MAX] fs9_fids;
 
@@ -418,7 +428,8 @@ fn void main() @export("main")
 		// same verbs), handled and replied to here before any of the
 		// FS_*-specific parsing below, then `continue`s straight back
 		// to the top of this loop.
-		if (verb == P9_ATTACH || verb == P9_WALK || verb == P9_OPEN || verb == P9_READ || verb == P9_CLUNK)
+		if (verb == P9_ATTACH || verb == P9_WALK || verb == P9_OPEN || verb == P9_READ || verb == P9_CLUNK
+			|| verb == P9_CREATE || verb == P9_WRITE || verb == P9_REMOVE)
 		{
 			if (fs_type != FS_TYPE_EXT2)
 			{
@@ -439,6 +450,7 @@ fn void main() @export("main")
 					fs9_fids[fid].opened = false;
 					fs9_fids[fid].is_dir = true;
 					fs9_fids[fid].inode_num = EXT2_ROOT_INODE;
+					fs9_fids[fid].has_entry = false; // root has no directory entry of its own
 					result = 0;
 				}
 				int* result_field = (int*)&buf[0];
@@ -457,15 +469,19 @@ fn void main() @export("main")
 					&& newfid < (uint)FS9_FID_MAX && !fs9_fids[newfid].used)
 				{
 					uint new_inode;
-					uint dummy_sector;
-					uint dummy_offset;
+					uint new_entry_sector;
+					uint new_entry_offset;
 					uint mode;
-					if (ext2_find_in_dir(fs9_fids[fid].inode_num, name, &new_inode, &dummy_sector, &dummy_offset, &mode))
+					if (ext2_find_in_dir(fs9_fids[fid].inode_num, name, &new_inode, &new_entry_sector, &new_entry_offset, &mode))
 					{
 						fs9_fids[newfid].used = true;
 						fs9_fids[newfid].opened = false;
 						fs9_fids[newfid].is_dir = (mode & EXT2_S_IFDIR) != 0;
 						fs9_fids[newfid].inode_num = new_inode;
+						fs9_fids[newfid].parent_inode = fs9_fids[fid].inode_num;
+						fs9_fids[newfid].entry_sector = new_entry_sector;
+						fs9_fids[newfid].entry_offset = new_entry_offset;
+						fs9_fids[newfid].has_entry = true;
 						result = 0;
 					}
 				}
@@ -506,7 +522,7 @@ fn void main() @export("main")
 				int p9_reply_len = 4 + (result_len > 0 ? result_len : 0);
 				ipc_reply(from, P9_READ, &buf, p9_reply_len, from_gen);
 			}
-			else // P9_CLUNK
+			else if (verb == P9_CLUNK)
 			{
 				uint* fid_field = (uint*)&buf[0];
 				uint fid = *fid_field;
@@ -519,6 +535,141 @@ fn void main() @export("main")
 				int* result_field = (int*)&buf[0];
 				*result_field = result;
 				ipc_reply(from, P9_CLUNK, &buf, 4, from_gen);
+			}
+			else if (verb == P9_CREATE)
+			{
+				// Wire format: fid (4 bytes) + name (null-terminated,
+				// same 32-byte-max convention P9_WALK's own name field
+				// uses — see user.c3's p9_create wrapper).
+				uint* fid_field = (uint*)&buf[0];
+				uint fid = *fid_field;
+				char* name = &buf[4];
+				int result = -1;
+				if (fid < (uint)FS9_FID_MAX && fs9_fids[fid].used && fs9_fids[fid].is_dir)
+				{
+					uint requester_uid = 0xFFFFFFFF;
+					proc_info(from, null, null, (int*)&requester_uid);
+					uint dir_inode = fs9_fids[fid].inode_num;
+					uint new_inode_num;
+					if (ext2_create_file(dir_inode, name, &new_inode_num, requester_uid))
+					{
+						uint new_entry_sector;
+						uint new_entry_offset;
+						uint mode;
+						// Same "create then re-find for the entry's own
+						// position" two-step ext2_write's own
+						// "doesn't exist yet" branch already uses —
+						// ext2_create_file doesn't hand back where the
+						// new entry landed, only the inode number.
+						if (ext2_find_in_dir(dir_inode, name, &new_inode_num, &new_entry_sector, &new_entry_offset, &mode))
+						{
+							// The fid transforms in place — real 9P's
+							// own actual Tcreate semantics, not a
+							// separate newfid — and comes back already
+							// open, matching Tcreate's own contract
+							// (no separate Topen needed after).
+							fs9_fids[fid].parent_inode = dir_inode;
+							fs9_fids[fid].inode_num = new_inode_num;
+							fs9_fids[fid].is_dir = false;
+							fs9_fids[fid].entry_sector = new_entry_sector;
+							fs9_fids[fid].entry_offset = new_entry_offset;
+							fs9_fids[fid].has_entry = true;
+							fs9_fids[fid].opened = true;
+							result = 0;
+						}
+					}
+				}
+				int* result_field = (int*)&buf[0];
+				*result_field = result;
+				ipc_reply(from, P9_CREATE, &buf, 4, from_gen);
+			}
+			else if (verb == P9_WRITE)
+			{
+				// Wire format: fid (4) + offset (4) + count (4) + data
+				// at byte 12.. — see user.c3's p9_write wrapper. Offset
+				// must be exactly 0: ext2_write_file (below) has no
+				// offset parameter at all, it always replaces a file's
+				// entire content from the start — see this entry's own
+				// devlog write-up for why genuine offset-aware partial
+				// writes stay explicit future work rather than silently
+				// producing wrong data for a nonzero offset.
+				uint* fid_field = (uint*)&buf[0];
+				uint* p9_offset_field = (uint*)&buf[4];
+				uint* p9_count_field = (uint*)&buf[8];
+				uint fid = *fid_field;
+				uint p9_offset = *p9_offset_field;
+				uint p9_count = *p9_count_field;
+				int result = -1;
+				if (fid < (uint)FS9_FID_MAX && fs9_fids[fid].used && fs9_fids[fid].opened
+					&& !fs9_fids[fid].is_dir && p9_offset == 0)
+				{
+					if (p9_count > FS_MSG_MAX - 12) p9_count = FS_MSG_MAX - 12;
+					uint requester_uid = 0xFFFFFFFF;
+					proc_info(from, null, null, (int*)&requester_uid);
+					// Re-read fresh rather than trust anything cached
+					// on the fid — same "re-derive, don't trust stale
+					// state" discipline P9_READ already follows.
+					Ext2_inode_info inode;
+					if (ext2_read_inode(fs9_fids[fid].inode_num, &inode) && ext2_write_allowed(&inode, requester_uid))
+					{
+						uint written = ext2_write_file(&inode, &buf[12], p9_count);
+						inode.size = written;
+						if (ext2_write_inode(fs9_fids[fid].inode_num, &inode)) result = (int)written;
+					}
+				}
+				int* result_field = (int*)&buf[0];
+				*result_field = result;
+				ipc_reply(from, P9_WRITE, &buf, 4, from_gen);
+			}
+			else // P9_REMOVE
+			{
+				uint* fid_field = (uint*)&buf[0];
+				uint fid = *fid_field;
+				int result = -1;
+				if (fid < (uint)FS9_FID_MAX && fs9_fids[fid].used)
+				{
+					// The dangling-fid safety check this entry's own
+					// devlog write-up is about: fids resolve to a
+					// stable inode, not a path, so removing this
+					// inode while another fid still references it
+					// would let that fid keep reading/writing
+					// freed-and-possibly-reallocated blocks. Rejected
+					// outright — no on-disk removal is even attempted,
+					// so (unlike a genuine attempt below) the fid
+					// stays open and the caller can retry once the
+					// other fid is clunked.
+					bool dangling = false;
+					for (uint i = 0; i < (uint)FS9_FID_MAX; i++)
+					{
+						if (i == fid) continue;
+						if (fs9_fids[i].used && fs9_fids[i].inode_num == fs9_fids[fid].inode_num)
+						{
+							dangling = true;
+							break;
+						}
+					}
+					if (!dangling)
+					{
+						if (fs9_fids[fid].has_entry)
+						{
+							uint requester_uid = 0xFFFFFFFF;
+							proc_info(from, null, null, (int*)&requester_uid);
+							Ext2_inode_info inode;
+							if (ext2_read_inode(fs9_fids[fid].inode_num, &inode))
+							{
+								result = ext2_delete_resolved(fs9_fids[fid].parent_inode, fs9_fids[fid].inode_num, fs9_fids[fid].entry_sector, fs9_fids[fid].entry_offset, inode.mode, requester_uid);
+							}
+						}
+						// Matches real 9P's own Tremove contract
+						// exactly: a genuinely attempted removal
+						// consumes the fid regardless of whether it
+						// actually succeeded.
+						fs9_fids[fid].used = false;
+					}
+				}
+				int* result_field = (int*)&buf[0];
+				*result_field = result;
+				ipc_reply(from, P9_REMOVE, &buf, 4, from_gen);
 			}
 			continue;
 		}

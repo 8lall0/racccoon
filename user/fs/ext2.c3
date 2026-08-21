@@ -1564,6 +1564,18 @@ fn int ext2_delete(char* name, uint requester_uid)
 	uint entry_offset;
 	uint mode;
 	if (!ext2_find_in_dir(dir_inode, leaf, &inode_num, &entry_sector, &entry_offset, &mode)) return -1;
+
+	return ext2_delete_resolved(dir_inode, inode_num, entry_sector, entry_offset, mode, requester_uid);
+}
+
+// Shared tail of ext2_delete, extracted so a fid-based caller (fsd's
+// own P9_REMOVE dispatch) can reuse it directly once it already holds
+// a resolved inode/entry position from an earlier walk/create — no
+// need to re-resolve a path through ext2_resolve_dir/ext2_find_in_dir
+// a second time, mirroring ext2_read_at's own split into
+// ext2_read_inode_at.
+fn int ext2_delete_resolved(uint dir_inode, uint inode_num, uint entry_sector, uint entry_offset, uint mode, uint requester_uid)
+{
 	if (fs_is_protected_entry(entry_sector, entry_offset)) return -1;
 
 	Ext2_inode_info inode;

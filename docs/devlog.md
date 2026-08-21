@@ -4,6 +4,92 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (59) — Real 9P writes against fsd: Tcreate, Tremove, Twrite (offset-0 only)
+
+Follow-up to entry 56 (real 9P read-only against `fsd`). Three new
+verbs, same wire discipline as `P9_ATTACH`/`P9_WALK`/`P9_OPEN`/
+`P9_READ`/`P9_CLUNK`: `P9_CREATE`, `P9_WRITE`, `P9_REMOVE` (verbs 8-10,
+`user/user.c3`), with matching `p9_create`/`p9_write`/`p9_remove`
+client wrappers and `fsd.c3` dispatch, ext2 only.
+
+`P9_WRITE` is deliberately narrow: `ext2_write_file()` (the existing
+helper both this and the path-based `ext2_write()` use) has no offset
+parameter at all — it always replaces a file's entire content from the
+start. Rather than build genuine offset-aware partial writes (real
+future work), `P9_WRITE` just exposes that same existing capability
+through a fid: **offset must be exactly 0**, anything else is rejected
+outright rather than silently writing the wrong bytes.
+
+`P9_CREATE` reuses `ext2_create_file()` directly (already takes a
+directory inode, not a path) and transforms the fid in place — real
+9P's own actual `Tcreate` semantics: no separate `newfid`, and the fid
+comes back already open, matching `Tcreate`'s own "no `Topen` needed
+after" contract. Files only — a `DMDIR`-style bit for directory
+creation stays out of scope.
+
+`P9_REMOVE` needed one real design decision entry 56 never had to
+face: fids resolve to a stable inode number (deliberately, so they
+survive a rename elsewhere) rather than a path. Removing a file while
+*another* fid still holds the same inode open would let that fid keep
+reading/writing freed-and-possibly-reallocated blocks — real
+corruption, not just a stale error. Fixed with an explicit scan of
+`fs9_fids[]` before any removal proceeds: if any other slot is `used`
+with the same `inode_num`, the request is rejected outright and the
+fid stays open (no on-disk removal was even attempted, so unlike a
+genuine attempt this doesn't consume it — confirmed with
+`p9fswritetest` itself, which retries the same `p9_remove` call again
+after clunking the blocking fid and expects it to then succeed). A
+*genuinely attempted* removal, by contrast, consumes the fid
+regardless of whether `ext2_delete_resolved()` itself succeeds —
+matching real 9P's own `Tremove` contract exactly.
+
+`Fs9_fid_entry` gained `parent_inode`/`entry_sector`/`entry_offset`/
+`has_entry` — `P9_WALK` already computed a new entry's directory
+position via `ext2_find_in_dir()` but discarded it; now captured so
+`P9_REMOVE` never needs to re-walk a path at removal time. `has_entry`
+is false only for a bare root fid (`P9_ATTACH` never sets it) — root
+has no entry of its own to remove.
+
+`ext2_delete()`'s own tail (everything past path resolution) is
+extracted into `ext2_delete_resolved(dir_inode, inode_num,
+entry_sector, entry_offset, mode, requester_uid)`, mirroring entry 56's
+own `ext2_read_at` → `ext2_read_inode_at` split exactly. `ext2_delete()`
+itself keeps its path-resolution prefix and delegates — zero behavior
+change for its existing caller (`/bin/rm`).
+
+New `p9fswritetest` (`user/shell.c3`): create-then-immediately-write-
+then-read, the offset-0-only rejection, and the dangling-fid safety
+check with two real, independently-attached fids on the same inode
+(walk fails before create, create-and-write-and-read round-trips,
+non-zero-offset write rejected, a second fid opens the file, remove is
+rejected while that fid is open, remove succeeds once it's clunked).
+
+**Verification**: `p9fswritetest: ok` on both the ext2-only and
+dual-mount images. Full regression clean: `p9fstest`, `/bin/rm` (path-
+based delete unaffected by the `ext2_delete_resolved` extraction),
+`fspermtest`, `mounttest`, `pathtest`/`pathtest2`, `permtest`,
+`elftest`/`elftest2`, `sandboxtest`, `p9realtest`, `p9test`, `nstest`,
+`pstest`, `bigreadtest`, `runtest2`, `argvtest`/`argvtest2`. Three
+consecutive boots against the same persistent `disk_dual.img` (running
+`p9fswritetest`/`p9fstest`/`fspermtest` each time) all `ok` — confirms
+create+write+remove leaves the filesystem in a stable, re-testable
+state, not accumulating drift. `e2fsck -n -f` clean on `disk_ext2.img`
+and both halves of `disk_dual.img` after the stress run, no errors or
+warnings.
+
+**Real Milk-V Duo hardware confirmation**: `p9fswritetest: ok`,
+`p9fstest: ok`, `lsproc` clean (`2/` through `7/`, no leaked
+processes). Unlike entry 58's own `fspermtest` gap, both new test
+commands target the root mount (`ns_resolve("")`) exclusively — real
+hardware's only mount post-entry-53 — so this is the first write-path
+9P work in this series confirmed genuinely working on real hardware,
+not just QEMU's dual-mount image.
+
+**Files changed:** `user/fs/ext2.c3`, `user/fsd.c3`, `user/user.c3`,
+`user/shell.c3`.
+
+---
+
 ## 2026-08-21 (58) — Fix `ext2_rename`'s missing ownership check
 
 Surfaced during entry 56's own research: every other mutating ext2 verb

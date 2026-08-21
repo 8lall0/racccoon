@@ -380,6 +380,48 @@ fn void main() @export("main") {
             } else {
                 print("p9fstest: FAILED\n");
             }
+        } else if (strcmp(cmd, "p9fswritetest") == 0) {
+            // Follow-up to p9fstest above: real writes against fsd
+            // (Tcreate, Tremove full, Twrite offset-0 only — see
+            // docs/devlog.md). Exercises create-then-immediately-
+            // write-then-read, the offset-0-only restriction, and the
+            // dangling-fid safety check with two real, independently-
+            // attached fids on the same inode.
+            int p9w_pid = ns_resolve("", null);
+            char[40] p9w_buf @noinit;
+
+            int p9w_attach1 = p9_attach(p9w_pid, 1); // fid 1 = root
+
+            int p9w_walk_missing = p9_walk(p9w_pid, 1, 2, "p9wtest.txt"); // must fail — doesn't exist yet
+
+            int p9w_create = p9_create(p9w_pid, 1, "p9wtest.txt"); // fid 1 transforms into the new (already-open) file
+
+            int p9w_write = p9_write(p9w_pid, 1, 0, "hello from real 9p write\n", 26);
+
+            int p9w_read = p9_read(p9w_pid, 1, 0, 40, &p9w_buf);
+            p9w_buf[p9w_read >= 0 ? p9w_read : 0] = 0;
+            bool p9w_read_ok = p9w_read == 26 && strcmp(&p9w_buf, "hello from real 9p write\n") == 0;
+
+            int p9w_write_bad_offset = p9_write(p9w_pid, 1, 4, "x", 1); // must fail — offset-0-only restriction
+
+            int p9w_attach2 = p9_attach(p9w_pid, 2); // fid 2 = root, independently
+            int p9w_walk2 = p9_walk(p9w_pid, 2, 3, "p9wtest.txt"); // fid 3, a second fid on the same inode
+            int p9w_open3 = p9_open(p9w_pid, 3);
+
+            int p9w_remove_dangling = p9_remove(p9w_pid, 1); // must FAIL — fid 3 still has it open
+            int p9w_clunk3 = p9_clunk(p9w_pid, 3);
+            int p9w_remove_ok = p9_remove(p9w_pid, 1); // now succeeds — fid 1 consumed either way
+            int p9w_clunk2 = p9_clunk(p9w_pid, 2);
+
+            if (p9w_attach1 == 0 && p9w_walk_missing < 0 && p9w_create == 0
+                && p9w_write == 26 && p9w_read_ok && p9w_write_bad_offset < 0
+                && p9w_attach2 == 0 && p9w_walk2 == 0 && p9w_open3 == 0
+                && p9w_remove_dangling < 0 && p9w_clunk3 == 0
+                && p9w_remove_ok == 0 && p9w_clunk2 == 0) {
+                print("p9fswritetest: ok\n");
+            } else {
+                print("p9fswritetest: FAILED\n");
+            }
         } else if (strcmp(cmd, "nstest") == 0) {
             // Direct namespace-resolution smoke test: prove ns_resolve
             // itself works, independent of the 9P-lite/fsd layers built

@@ -427,6 +427,14 @@ const uint P9_OPEN   = 5; // request: mark a fid ready for reading
 const uint P9_READ   = 6; // request: real offset-based read from an opened fid
 const uint P9_CLUNK  = 7; // request: release a fid
 
+// Real writes against fsd (Tcreate/Tremove full, Twrite offset-0 only)
+// — see docs/devlog.md. Same "different verb-number spaces never need
+// global uniqueness" reasoning as the five verbs above; just the next
+// free small ints after P9_CLUNK.
+const uint P9_CREATE = 8;  // request: create a file in a directory fid, transforming it into the new (already-open) file
+const uint P9_WRITE  = 9;  // request: write to an opened fid — offset must be exactly 0 (see fsd.c3's own dispatch comment)
+const uint P9_REMOVE = 10; // request: remove a fid's file — always consumes the fid (unless rejected outright by fsd's own dangling-fid safety check)
+
 // Reserved verb p9_call() bounces stray senders with — see its own
 // comment. Deliberately far outside every real verb's range (P9_TWALK/
 // P9_TREAD/FS_*, all small, hand-assigned small ints) so it can never
@@ -551,6 +559,53 @@ fn int p9_clunk(int dest_pid, uint fid) @export("p9_clunk") {
     uint reply_verb = 0;
     int from = p9_call(dest_pid, P9_CLUNK, &req, 4, &req, 4, &reply_verb);
     if (from <= 0 || reply_verb != P9_CLUNK) return -1;
+    int* result_field = (int*)&req;
+    return *result_field;
+}
+
+// P9_CREATE/P9_WRITE/P9_REMOVE — same thin-wrapper shape as the five
+// above. See fsd.c3's own dispatch for the exact wire layout each
+// matches.
+
+fn int p9_create(int dest_pid, uint fid, char* name) @export("p9_create") {
+    char[36] req @noinit;
+    uint* fid_field = (uint*)&req[0];
+    *fid_field = fid;
+    int i = 0;
+    while (name[i] != 0 && i < 31) { req[4 + i] = name[i]; i++; }
+    req[4 + i] = 0;
+    uint reply_verb = 0;
+    int from = p9_call(dest_pid, P9_CREATE, &req, 36, &req, 36, &reply_verb);
+    if (from <= 0 || reply_verb != P9_CREATE) return -1;
+    int* result_field = (int*)&req;
+    return *result_field;
+}
+
+fn int p9_write(int dest_pid, uint fid, uint offset, char* data, uint count) @export("p9_write") {
+    char[FS_MSG_MAX] req @noinit;
+    uint* fid_field = (uint*)&req[0];
+    uint* offset_field = (uint*)&req[4];
+    uint* count_field = (uint*)&req[8];
+    *fid_field = fid;
+    *offset_field = offset;
+    uint write_len = count;
+    if (write_len > FS_MSG_MAX - 12) write_len = FS_MSG_MAX - 12;
+    *count_field = write_len;
+    for (uint i = 0; i < write_len; i++) req[12 + i] = data[i];
+    uint reply_verb = 0;
+    int from = p9_call(dest_pid, P9_WRITE, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
+    if (from <= 0 || reply_verb != P9_WRITE) return -1;
+    int* result_field = (int*)&req;
+    return *result_field;
+}
+
+fn int p9_remove(int dest_pid, uint fid) @export("p9_remove") {
+    char[4] req @noinit;
+    uint* fid_field = (uint*)&req[0];
+    *fid_field = fid;
+    uint reply_verb = 0;
+    int from = p9_call(dest_pid, P9_REMOVE, &req, 4, &req, 4, &reply_verb);
+    if (from <= 0 || reply_verb != P9_REMOVE) return -1;
     int* result_field = (int*)&req;
     return *result_field;
 }
