@@ -1194,30 +1194,37 @@ fn void main() @export("main") {
             // "wait for the child to be genuinely, fully done" this
             // needs.
             //
-            // "/mnt/fs2/" prefix on every path here, not bare filenames —
-            // found the hard way testing this on real Duo hardware,
-            // back when both DUOBOOT/FAT32 and EXT2TEST/ext2 were
-            // simultaneously mounted (see docs/devlog.md): an
-            // unprefixed path resolves through the "" catch-all mount
-            // (src/process.c3's default namespace), which binds to
-            // whichever fsd was created *first* — FAT32 has no uid
-            // concept at all to enforce, so a bare path silently
-            // "succeeded" without ever reaching ext2 at all. Real
-            // hardware no longer mounts FAT32 as anything racccoon's
-            // own fsd touches (see this entry's own Plan9-style
-            // reorganization), so this specific failure mode is now
-            // structurally impossible there — "/mnt/fs2/" stays the
-            // convention regardless, since QEMU's own dual-mount image
-            // (scripts/launch64_dual.sh) still has a real second mount
-            // this test needs to target unambiguously.
-            fs_write("/mnt/fs2/owner_only.txt", "root content", 12);
+            // Bare (root-mount) paths — NOT the old "/mnt/fs2/"-prefixed
+            // form this test originally used. That prefix existed for a
+            // real reason (see git history): the old topology could
+            // have FAT32 and ext2 mounted simultaneously, and an
+            // unprefixed path resolving through the "" catch-all might
+            // land on whichever fsd was created first — FAT32 has no
+            // uid concept, so a bare path could silently bypass ext2's
+            // checks entirely. Entry 53's Plan9-style reorganization
+            // removed that ambiguity structurally: "" now *always*
+            // means ext2, everywhere real 9P work in this project
+            // targets it (root is ext2-exclusive on real hardware, and
+            // the first partition on every QEMU image that has one) —
+            // the same reasoning p9fstest/p9fswritetest already rely
+            // on. The old "/mnt/fs2/" prefix instead became entry 58's
+            // own documented real-hardware gap: since entry 53, real
+            // hardware never spawns a second fsd at all, so
+            // "/mnt/fs2/" doesn't resolve to anything there, and every
+            // call here failed at ns_resolve() *before* ever reaching
+            // ext2's own permission checks — a false-looking "correctly
+            // denied" that actually meant "unreachable". Root paths fix
+            // that at the source: the exact same mount this test's
+            // checks now exercise is genuinely reachable on every
+            // topology this project tests against.
+            fs_write("owner_only.txt", "root content", 12);
             // A real two-entry tree, not a bare empty dir — an empty
             // dir wouldn't exercise ext2_delete_dir_contents' own child
             // walk at all, so wouldn't actually prove recursive-delete
             // ownership enforcement (see ext2_delete_recursive's own
             // comment).
-            fs_mkdir("/mnt/fs2/owner_only_dir");
-            fs_write("/mnt/fs2/owner_only_dir/inner.txt", "root content", 12);
+            fs_mkdir("owner_only_dir");
+            fs_write("owner_only_dir/inner.txt", "root content", 12);
 
             uint fp_gen = 0;
             int fp_r = rfork(RFPROC, &fp_gen);
@@ -1228,41 +1235,41 @@ fn void main() @export("main") {
                 print("fspermtest: setuid(42) ");
                 print(fp_su == 0 ? "ok\n" : "FAILED\n");
 
-                int fp_write1 = fs_write("/mnt/fs2/owner_only.txt", "attacker content", 17);
+                int fp_write1 = fs_write("owner_only.txt", "attacker content", 17);
                 print("fspermtest: overwrite root-owned file as non-owner ");
                 print(fp_write1 < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
 
-                int fp_del1 = fs_delete("/mnt/fs2/owner_only.txt");
+                int fp_del1 = fs_delete("owner_only.txt");
                 print("fspermtest: delete root-owned file as non-owner ");
                 print(fp_del1 < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
 
-                int fp_ren1 = fs_rename("/mnt/fs2/owner_only.txt", "/mnt/fs2/stolen.txt");
+                int fp_ren1 = fs_rename("owner_only.txt", "stolen.txt");
                 print("fspermtest: rename root-owned file as non-owner ");
                 print(fp_ren1 < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
 
-                int fp_write2 = fs_write("/mnt/fs2/attacker_owned.txt", "mine", 4);
+                int fp_write2 = fs_write("attacker_owned.txt", "mine", 4);
                 print("fspermtest: create own file ");
                 print(fp_write2 >= 0 ? "ok\n" : "FAILED\n");
 
-                int fp_write3 = fs_write("/mnt/fs2/attacker_owned.txt", "mine still", 10);
+                int fp_write3 = fs_write("attacker_owned.txt", "mine still", 10);
                 print("fspermtest: overwrite own file ");
                 print(fp_write3 >= 0 ? "ok\n" : "FAILED\n");
 
-                int fp_ren2 = fs_rename("/mnt/fs2/attacker_owned.txt", "/mnt/fs2/attacker_renamed.txt");
+                int fp_ren2 = fs_rename("attacker_owned.txt", "attacker_renamed.txt");
                 print("fspermtest: rename own file ");
                 print(fp_ren2 >= 0 ? "ok\n" : "FAILED\n");
 
-                int fp_del2 = fs_delete("/mnt/fs2/attacker_renamed.txt");
+                int fp_del2 = fs_delete("attacker_renamed.txt");
                 print("fspermtest: delete own file ");
                 print(fp_del2 >= 0 ? "ok\n" : "FAILED\n");
 
-                int fp_delr1 = fs_delete_recursive("/mnt/fs2/owner_only_dir");
+                int fp_delr1 = fs_delete_recursive("owner_only_dir");
                 print("fspermtest: recursive-delete root-owned dir as non-owner ");
                 print(fp_delr1 < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
 
-                fs_mkdir("/mnt/fs2/attacker_owned_dir");
-                fs_write("/mnt/fs2/attacker_owned_dir/inner.txt", "mine", 4);
-                int fp_delr2 = fs_delete_recursive("/mnt/fs2/attacker_owned_dir");
+                fs_mkdir("attacker_owned_dir");
+                fs_write("attacker_owned_dir/inner.txt", "mine", 4);
+                int fp_delr2 = fs_delete_recursive("attacker_owned_dir");
                 print("fspermtest: recursive-delete own dir ");
                 print(fp_delr2 >= 0 ? "ok\n" : "FAILED\n");
 
@@ -1271,21 +1278,21 @@ fn void main() @export("main") {
                 join(fp_r, fp_gen);
 
                 char[32] fp_readback @noinit;
-                int fp_len = fs_read("/mnt/fs2/owner_only.txt", &fp_readback, 32);
+                int fp_len = fs_read("owner_only.txt", &fp_readback, 32);
                 if (fp_len >= 0) fp_readback[fp_len] = 0;
                 bool fp_intact = fp_len == 12 && strcmp(&fp_readback, "root content") == 0;
 
                 char[32] fp_dir_readback @noinit;
-                int fp_dir_len = fs_read("/mnt/fs2/owner_only_dir/inner.txt", &fp_dir_readback, 32);
+                int fp_dir_len = fs_read("owner_only_dir/inner.txt", &fp_dir_readback, 32);
                 if (fp_dir_len >= 0) fp_dir_readback[fp_dir_len] = 0;
                 bool fp_dir_intact = fp_dir_len == 12 && strcmp(&fp_dir_readback, "root content") == 0;
 
-                int fp_write_root = fs_write("/mnt/fs2/owner_only.txt", "root content v2", 16);
-                int fp_del_root = fs_delete("/mnt/fs2/owner_only.txt");
+                int fp_write_root = fs_write("owner_only.txt", "root content v2", 16);
+                int fp_del_root = fs_delete("owner_only.txt");
                 // Root's own legitimate recursive-delete path, exercising
                 // requester_uid == 0 still working unchanged through the
                 // new checks — also this test's own cleanup.
-                int fp_delr_root = fs_delete_recursive("/mnt/fs2/owner_only_dir");
+                int fp_delr_root = fs_delete_recursive("owner_only_dir");
 
                 if (fp_intact && fp_dir_intact && fp_write_root >= 0 && fp_del_root >= 0 && fp_delr_root >= 0) {
                     print("fspermtest: ok\n");

@@ -4,6 +4,54 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (60) — Fix `fspermtest`'s real-hardware gap: retarget to root
+
+Closes entry 58's own documented gap. `fspermtest` always targeted
+`/mnt/fs2/`, for a real historical reason: the old topology could have
+FAT32 and ext2 mounted simultaneously, and an unprefixed path
+resolving through the `""` catch-all might land on whichever `fsd` was
+created first — FAT32 has no uid concept, so a bare path could
+silently bypass ext2's own checks entirely. Entry 53's Plan9-style
+reorganization already removed that ambiguity structurally (`""` is
+ext2-exclusive on real hardware, and the first partition on every
+QEMU image that has one), but `fspermtest` itself was never updated to
+take advantage of it — so entry 58 found the opposite problem instead:
+real hardware, since entry 53, never spawns a second `fsd` at all,
+meaning every `/mnt/fs2/`-prefixed call in this test failed at
+`ns_resolve()` *before ever reaching ext2's own permission checks*. The
+"correctly denied" results this produced on real hardware were a false
+positive from an unreachable namespace, not genuine confirmation of
+anything.
+
+**Fix**: every path in `fspermtest` (`user/shell.c3`) switched from
+`/mnt/fs2/`-prefixed to bare (root-mount). Same reasoning
+`p9fstest`/`p9fswritetest` already rely on — `""` unambiguously means
+ext2 wherever this project's real 9P work targets it now. No `ext2.c3`
+or `fsd.c3` changes needed — this was a test-targeting gap, not an
+enforcement gap; the permission checks themselves (`ext2_write_allowed`
+and friends) were already correct, just unreachable from where the
+test poked at them.
+
+**Verification**: `fspermtest: ok` on QEMU's dual-mount image (now
+against partition 1, the root mount, instead of partition 2) and,
+notably, on the single-partition ext2-only image too — the topology
+closest to real hardware's own single-`fsd` layout, which this test
+literally could not exercise meaningfully before. Full regression
+(`runtest2`, `argvtest2`, `mounttest`, `bigreadtest` — all still
+`/mnt/fs2/`-targeted, untouched, still `ok`) confirms the retarget
+didn't disturb anything relying on the second mount. Three-boot stress
+batch, `e2fsck -n -f` clean on both partitions.
+
+**Real Milk-V Duo hardware confirmation**: `fspermtest: ok`, every
+individual check line showing genuine allow/deny behavior (not a
+namespace-resolution short-circuit) — the first real confirmation that
+ext2's own permission enforcement, including entry 58's own rename fix,
+actually works on real hardware. `lsproc` clean (`2/` through `7/`).
+
+**Files changed:** `user/shell.c3`.
+
+---
+
 ## 2026-08-21 (59) — Real 9P writes against fsd: Tcreate, Tremove, Twrite (offset-0 only)
 
 Follow-up to entry 56 (real 9P read-only against `fsd`). Three new
