@@ -395,7 +395,7 @@ fn void main() @export("main") {
 
             int p9w_walk_missing = p9_walk(p9w_pid, 1, 2, "p9wtest.txt"); // must fail — doesn't exist yet
 
-            int p9w_create = p9_create(p9w_pid, 1, "p9wtest.txt"); // fid 1 transforms into the new (already-open) file
+            int p9w_create = p9_create(p9w_pid, 1, "p9wtest.txt", 0); // fid 1 transforms into the new (already-open) file
 
             int p9w_write = p9_write(p9w_pid, 1, 0, "hello from real 9p write\n", 26);
 
@@ -459,6 +459,57 @@ fn void main() @export("main") {
                 print("p9fswritetest: ok\n");
             } else {
                 print("p9fswritetest: FAILED\n");
+            }
+        } else if (strcmp(cmd, "p9mkdirtest") == 0) {
+            // mkdir via real 9P (P9_CREATE's perm gaining P9_DMDIR —
+            // see docs/devlog.md): creates a real directory through a
+            // fid, walks into it independently (proving it's a real
+            // directory entry, not just local fid state), creates and
+            // writes a file inside it, then exercises P9_REMOVE's
+            // existing non-empty-directory refusal and eventual
+            // success — all of that reused unchanged from
+            // ext2_delete_resolved (entry 59), since it already
+            // branches on a directory's own mode regardless of
+            // whether the directory was made via a path (ext2_mkdir)
+            // or, as here, a fid.
+            int p9m_pid = ns_resolve("", null);
+            char[32] p9m_buf @noinit;
+
+            int p9m_attach1 = p9_attach(p9m_pid, 1); // fid 1 = root
+            int p9m_mkdir = p9_create(p9m_pid, 1, "p9dirtest", P9_DMDIR); // fid 1 transforms into the new dir, NOT opened
+
+            int p9m_attach2 = p9_attach(p9m_pid, 2); // fid 2 = root, independently
+            int p9m_walk = p9_walk(p9m_pid, 2, 3, "p9dirtest"); // fid 3 — walks the SAME entry from scratch
+
+            int p9m_create_inner = p9_create(p9m_pid, 3, "inner.txt", 0); // fid 3 transforms into "p9dirtest/inner.txt", already open
+            int p9m_write_inner = p9_write(p9m_pid, 3, 0, "nested content\n", 15);
+            int p9m_read_inner = p9_read(p9m_pid, 3, 0, 32, &p9m_buf);
+            p9m_buf[p9m_read_inner >= 0 ? p9m_read_inner : 0] = 0;
+            bool p9m_read_inner_ok = p9m_read_inner == 15 && strcmp(&p9m_buf, "nested content\n") == 0;
+
+            // Matches real Tremove's own contract (entry 59): a
+            // genuine removal attempt consumes the fid regardless of
+            // whether it actually succeeds — so fid 1 is gone after
+            // this next call even though it fails. The final
+            // successful removal below needs a fresh fid on the same
+            // directory, walked again from fid 2.
+            int p9m_remove_nonempty = p9_remove(p9m_pid, 1); // must FAIL — p9dirtest still has inner.txt in it
+            int p9m_remove_inner = p9_remove(p9m_pid, 3); // removes inner.txt
+
+            int p9m_walk2 = p9_walk(p9m_pid, 2, 4, "p9dirtest"); // fid 4 — a fresh reference to the same directory
+            int p9m_remove_dir = p9_remove(p9m_pid, 4); // now succeeds — p9dirtest is empty
+
+            int p9m_clunk2 = p9_clunk(p9m_pid, 2);
+
+            if (p9m_attach1 == 0 && p9m_mkdir == 0
+                && p9m_attach2 == 0 && p9m_walk == 0
+                && p9m_create_inner == 0 && p9m_write_inner == 15 && p9m_read_inner_ok
+                && p9m_remove_nonempty < 0 && p9m_remove_inner == 0
+                && p9m_walk2 == 0 && p9m_remove_dir == 0
+                && p9m_clunk2 == 0) {
+                print("p9mkdirtest: ok\n");
+            } else {
+                print("p9mkdirtest: FAILED\n");
             }
         } else if (strcmp(cmd, "nstest") == 0) {
             // Direct namespace-resolution smoke test: prove ns_resolve

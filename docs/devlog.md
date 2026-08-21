@@ -4,6 +4,78 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (62) — mkdir via real 9P: `P9_CREATE` gains a `DMDIR` perm bit
+
+Closes entry 59's other explicit deferral: `P9_CREATE` only ever made
+regular files. Real 9P's own `Tcreate` takes a `perm` argument with a
+`DMDIR` bit that tells the server to create a directory instead —
+closed that gap the same way rather than inventing a separate verb.
+
+**`ext2_mkdir_resolved()`** (`user/fs/ext2.c3`), extracted from
+`ext2_mkdir()`'s own tail — same pattern as `ext2_read_inode_at`
+(entry 56) and `ext2_delete_resolved` (entry 59): everything past path
+resolution (the "already exists" check, inode/block allocation,
+`.`/`..` entries, linking into the parent) operates purely on a
+directory inode and a name, never touching a path string. `ext2_mkdir`
+itself keeps its path-resolution prefix and delegates — zero behavior
+change for its existing caller (`/bin/mkdir`).
+
+**`fsd.c3`'s `P9_CREATE` dispatch**: wire format gains a `perm` field
+(`fid(4) + perm(4) + name(32)`, was `fid(4) + name(32)` — `name` shifts
+from byte 4 to byte 8). `perm & P9_DMDIR` (new constant, `0x80000000`
+— the real Plan9 value) selects `ext2_mkdir_resolved()` instead of
+`ext2_create_file()`; the fid transform sets `is_dir`/`opened` from
+`want_dir` instead of hardcoding them — a directory fid comes back
+*not* opened (`P9_OPEN` already rejects directories, and only
+`P9_WALK`/`P9_REMOVE` ever touch a directory fid, neither checks
+`opened`), matching `P9_ATTACH`'s own root-fid convention.
+
+**`P9_REMOVE` needed zero changes** — the actual payoff of entry 59's
+own extraction being generic rather than filename-tied:
+`ext2_delete_resolved()` already branches on `mode & EXT2_S_IFDIR`
+(non-empty-directory refusal, parent `links_count` fixup,
+`ext2_dec_used_dirs()`), regardless of whether the directory came from
+a path or a fid.
+
+**A real test-design bug found and fixed while writing `p9mkdirtest`,
+not a dispatch bug**: the test's first draft tried to remove a
+non-empty directory (expecting `-1`), then remove the file inside it,
+then retry removing the directory *using the same fid*. That retry
+kept failing. Root cause, found via targeted debug prints (temporarily
+added to `ext2_delete_resolved` and the `P9_REMOVE` dispatch, removed
+once diagnosed): entry 59's own `P9_REMOVE` design deliberately
+consumes the fid on *any* genuine attempt, success or failure — matching
+real `Tremove`'s own contract exactly, already relied on by
+`p9fswritetest`'s own dangling-fid check. The first (failed, "not
+empty") removal attempt had already consumed the fid; the second call
+found an unused fid and never reached the dispatch at all. Fixed in
+the test, not the driver: the final successful removal walks a *fresh*
+fid to the same directory (`p9_walk` again from the still-live root
+fid) rather than reusing the one already spent on the earlier
+rejection.
+
+**Verification**: `p9mkdirtest: ok` on both images — real directory
+create, an independent walk into it (proving a genuine directory
+entry, not just local fid state), a nested file created/written/read
+inside it, the non-empty-directory rejection, and eventual successful
+removal once empty. Full regression clean (`p9fstest`,
+`p9fswritetest`, `fspermtest`, `/bin/mkdir`/`/bin/rm` — confirms
+`ext2_mkdir_resolved`'s extraction is a no-op for its path-based
+caller — `mounttest`, `runtest2`/`argvtest2`/`bigreadtest`). Three-boot
+stress batch, `e2fsck -n -f` clean on `disk_ext2.img` and both
+`disk_dual.img` halves — no errors or warnings, despite directory
+linking/bookkeeping being more structurally sensitive than a plain
+file write.
+
+**Real Milk-V Duo hardware confirmation**: `p9mkdirtest: ok`,
+`p9fswritetest: ok`, `p9fstest: ok`, `lsproc` clean (`2/` through
+`7/`).
+
+**Files changed:** `user/fs/ext2.c3`, `user/fsd.c3`, `user/user.c3`,
+`user/shell.c3`.
+
+---
+
 ## 2026-08-21 (61) — Genuine offset-aware `Twrite`
 
 Follow-up to entry 59, closing its own explicitly-deferred restriction:

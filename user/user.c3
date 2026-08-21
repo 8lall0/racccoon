@@ -431,9 +431,15 @@ const uint P9_CLUNK  = 7; // request: release a fid
 // — see docs/devlog.md. Same "different verb-number spaces never need
 // global uniqueness" reasoning as the five verbs above; just the next
 // free small ints after P9_CLUNK.
-const uint P9_CREATE = 8;  // request: create a file in a directory fid, transforming it into the new (already-open) file
+const uint P9_CREATE = 8;  // request: create a file (or, with P9_DMDIR set in perm, a directory) in a directory fid, transforming it into the new fid
 const uint P9_WRITE  = 9;  // request: real pwrite()-style offset-aware write to an opened fid — no holes past the current end (see fsd.c3's own dispatch comment)
 const uint P9_REMOVE = 10; // request: remove a fid's file — always consumes the fid (unless rejected outright by fsd's own dangling-fid safety check)
+
+// The real Plan9 DMDIR bit (0x80000000) — set in P9_CREATE's own perm
+// argument to create a directory instead of a regular file. Matches
+// real 9P's own Tcreate exactly, rather than inventing a separate verb
+// for what's really the same request with one bit different.
+const uint P9_DMDIR = 0x80000000;
 
 // Reserved verb p9_call() bounces stray senders with — see its own
 // comment. Deliberately far outside every real verb's range (P9_TWALK/
@@ -567,15 +573,19 @@ fn int p9_clunk(int dest_pid, uint fid) @export("p9_clunk") {
 // above. See fsd.c3's own dispatch for the exact wire layout each
 // matches.
 
-fn int p9_create(int dest_pid, uint fid, char* name) @export("p9_create") {
-    char[36] req @noinit;
+// perm: 0 for a regular file, P9_DMDIR to create a directory instead
+// — matches real 9P's own Tcreate argument exactly.
+fn int p9_create(int dest_pid, uint fid, char* name, uint perm) @export("p9_create") {
+    char[40] req @noinit;
     uint* fid_field = (uint*)&req[0];
+    uint* perm_field = (uint*)&req[4];
     *fid_field = fid;
+    *perm_field = perm;
     int i = 0;
-    while (name[i] != 0 && i < 31) { req[4 + i] = name[i]; i++; }
-    req[4 + i] = 0;
+    while (name[i] != 0 && i < 31) { req[8 + i] = name[i]; i++; }
+    req[8 + i] = 0;
     uint reply_verb = 0;
-    int from = p9_call(dest_pid, P9_CREATE, &req, 36, &req, 36, &reply_verb);
+    int from = p9_call(dest_pid, P9_CREATE, &req, 40, &req, 40, &reply_verb);
     if (from <= 0 || reply_verb != P9_CREATE) return -1;
     int* result_field = (int*)&req;
     return *result_field;

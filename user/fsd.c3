@@ -538,12 +538,19 @@ fn void main() @export("main")
 			}
 			else if (verb == P9_CREATE)
 			{
-				// Wire format: fid (4 bytes) + name (null-terminated,
-				// same 32-byte-max convention P9_WALK's own name field
-				// uses — see user.c3's p9_create wrapper).
+				// Wire format: fid (4) + perm (4) + name (null-
+				// terminated, same 32-byte-max convention P9_WALK's
+				// own name field uses — see user.c3's p9_create
+				// wrapper). perm & P9_DMDIR selects a real directory
+				// create instead of a file — the real Plan9 DMDIR bit,
+				// matching this project's existing care about real 9P
+				// semantics elsewhere in this series.
 				uint* fid_field = (uint*)&buf[0];
+				uint* perm_field = (uint*)&buf[4];
 				uint fid = *fid_field;
-				char* name = &buf[4];
+				uint perm = *perm_field;
+				bool want_dir = (perm & P9_DMDIR) != 0;
+				char* name = &buf[8];
 				int result = -1;
 				if (fid < (uint)FS9_FID_MAX && fs9_fids[fid].used && fs9_fids[fid].is_dir)
 				{
@@ -551,30 +558,40 @@ fn void main() @export("main")
 					proc_info(from, null, null, (int*)&requester_uid);
 					uint dir_inode = fs9_fids[fid].inode_num;
 					uint new_inode_num;
-					if (ext2_create_file(dir_inode, name, &new_inode_num, requester_uid))
+					// ext2_mkdir_resolved doesn't hand back a new
+					// inode number at all (unlike ext2_create_file) —
+					// either way, the shared "create then re-find for
+					// the entry's own position" step below is what
+					// actually fills new_inode_num, same convention
+					// ext2_write's own "doesn't exist yet" branch
+					// already uses.
+					bool created = want_dir
+						? ext2_mkdir_resolved(dir_inode, name, requester_uid) == 0
+						: ext2_create_file(dir_inode, name, &new_inode_num, requester_uid);
+					if (created)
 					{
 						uint new_entry_sector;
 						uint new_entry_offset;
 						uint mode;
-						// Same "create then re-find for the entry's own
-						// position" two-step ext2_write's own
-						// "doesn't exist yet" branch already uses —
-						// ext2_create_file doesn't hand back where the
-						// new entry landed, only the inode number.
 						if (ext2_find_in_dir(dir_inode, name, &new_inode_num, &new_entry_sector, &new_entry_offset, &mode))
 						{
 							// The fid transforms in place — real 9P's
 							// own actual Tcreate semantics, not a
-							// separate newfid — and comes back already
-							// open, matching Tcreate's own contract
-							// (no separate Topen needed after).
+							// separate newfid. Only a regular file
+							// comes back open, matching Tcreate's own
+							// contract there (no separate Topen
+							// needed); "opened" has no meaning for a
+							// directory fid in this driver's own model
+							// (only P9_WALK/P9_REMOVE ever touch one,
+							// neither checks it — same reasoning
+							// P9_ATTACH's own root fid already follows).
 							fs9_fids[fid].parent_inode = dir_inode;
 							fs9_fids[fid].inode_num = new_inode_num;
-							fs9_fids[fid].is_dir = false;
+							fs9_fids[fid].is_dir = want_dir;
 							fs9_fids[fid].entry_sector = new_entry_sector;
 							fs9_fids[fid].entry_offset = new_entry_offset;
 							fs9_fids[fid].has_entry = true;
-							fs9_fids[fid].opened = true;
+							fs9_fids[fid].opened = !want_dir;
 							result = 0;
 						}
 					}

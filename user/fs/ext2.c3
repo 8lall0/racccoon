@@ -1998,6 +1998,17 @@ fn int ext2_mkdir(char* path, uint requester_uid)
 	if (!ext2_resolve_dir(path, &parent_inode)) return -1;
 	char* leaf = ext2_leaf_name(path);
 
+	return ext2_mkdir_resolved(parent_inode, leaf, requester_uid);
+}
+
+// Shared tail of ext2_mkdir, extracted so a fid-based caller (fsd's
+// own P9_CREATE dispatch, when its perm argument carries the DMDIR
+// bit) can reuse it directly once it already holds a resolved
+// directory inode from an earlier walk/attach — no need to
+// re-resolve a path through ext2_resolve_dir a second time, mirroring
+// ext2_delete's own split into ext2_delete_resolved.
+fn int ext2_mkdir_resolved(uint parent_inode, char* leaf, uint requester_uid)
+{
 	uint existing_inode;
 	uint existing_sector;
 	uint existing_offset;
