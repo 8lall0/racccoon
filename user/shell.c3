@@ -1194,6 +1194,10 @@ fn void main() @export("main") {
                 print("fspermtest: delete root-owned file as non-owner ");
                 print(fp_del1 < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
 
+                int fp_ren1 = fs_rename("/mnt/fs2/owner_only.txt", "/mnt/fs2/stolen.txt");
+                print("fspermtest: rename root-owned file as non-owner ");
+                print(fp_ren1 < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
+
                 int fp_write2 = fs_write("/mnt/fs2/attacker_owned.txt", "mine", 4);
                 print("fspermtest: create own file ");
                 print(fp_write2 >= 0 ? "ok\n" : "FAILED\n");
@@ -1202,7 +1206,11 @@ fn void main() @export("main") {
                 print("fspermtest: overwrite own file ");
                 print(fp_write3 >= 0 ? "ok\n" : "FAILED\n");
 
-                int fp_del2 = fs_delete("/mnt/fs2/attacker_owned.txt");
+                int fp_ren2 = fs_rename("/mnt/fs2/attacker_owned.txt", "/mnt/fs2/attacker_renamed.txt");
+                print("fspermtest: rename own file ");
+                print(fp_ren2 >= 0 ? "ok\n" : "FAILED\n");
+
+                int fp_del2 = fs_delete("/mnt/fs2/attacker_renamed.txt");
                 print("fspermtest: delete own file ");
                 print(fp_del2 >= 0 ? "ok\n" : "FAILED\n");
 

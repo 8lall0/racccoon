@@ -2036,7 +2036,7 @@ fn bool ext2_would_create_cycle(uint candidate_dir_inode, uint forbidden_inode)
 // entry that points at it — same "one new dirent, one removed dirent"
 // shape as fat32_rename, just without any cluster/size copying since
 // ext2's own dirent format doesn't carry either.
-fn int ext2_rename(char* old_path, char* new_path)
+fn int ext2_rename(char* old_path, char* new_path, uint requester_uid)
 {
 	ext2_cache_valid = false; // see ext2_cache_path's own comment
 	uint old_parent_inode;
@@ -2049,6 +2049,19 @@ fn int ext2_rename(char* old_path, char* new_path)
 	uint mode;
 	if (!ext2_find_in_dir(old_parent_inode, old_leaf, &inode_num, &old_entry_sector, &old_entry_offset, &mode)) return -1;
 	if (fs_is_protected_entry(old_entry_sector, old_entry_offset)) return -1;
+
+	// Same treatment ext2_delete's own comment already establishes for
+	// exactly this situation: real Unix gates rename by the *directory's*
+	// write permission, not the target's own — this driver doesn't model
+	// directory permissions at all, so the target's (source file's) own
+	// write bit is used as a simple, reasonable stand-in. Checked before
+	// any of the destination-side work below (cycle check, existing-
+	// destination check, directory-slot allocation, actual writes) — same
+	// "fail before touching anything" discipline every other mutating
+	// ext2 function already follows.
+	Ext2_inode_info old_inode;
+	if (!ext2_read_inode(inode_num, &old_inode)) return -1;
+	if (!ext2_write_allowed(&old_inode, requester_uid)) return -1;
 
 	uint new_parent_inode;
 	if (!ext2_resolve_dir(new_path, &new_parent_inode)) return -1;

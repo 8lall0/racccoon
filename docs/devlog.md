@@ -4,6 +4,60 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (58) — Fix `ext2_rename`'s missing ownership check
+
+Surfaced during entry 56's own research: every other mutating ext2 verb
+(`ext2_write`'s overwrite case, `ext2_delete`, `ext2_delete_recursive`)
+gates on `requester_uid` via `ext2_write_allowed()` — `ext2_rename`
+never looked up `requester_uid` at all. Any non-root process could
+rename (including moving into a different directory) any file
+regardless of ownership.
+
+Same treatment `ext2_delete`'s own comment already establishes for
+exactly this situation: real Unix gates rename by the *directory's*
+write permission, not the target's own — this driver doesn't model
+directory permissions at all, so the target's (source file's) own
+write bit is the stand-in, checked before any of rename's own
+destination-side work (cycle check, existing-destination check,
+directory-slot allocation, actual writes). `fsd.c3`'s `FS_RENAME`
+dispatch gained the same `proc_info()` uid lookup `FS_WRITE`/
+`FS_DELETE`/`FS_MKDIR` already have. FAT32 untouched — no uid concept
+there at all, same scoping every other permission feature in this
+project already has.
+
+`fspermtest` extended with two rename sub-checks (root-owned file,
+non-root rename attempt correctly denied; the attacker's own file,
+rename succeeds) — the existing parent-side readback check already
+doubles as an implicit denial confirmation (a wrongly-succeeded rename
+would make the original path unreadable, which the existing check
+already catches).
+
+**Verification**: `fspermtest: ok` with both new sub-checks, on the
+dual-mount image (single-mount `fspermtest` failure is the same
+pre-existing, expected "/mnt/fs2/ inactive there" limitation this test
+has always had). `/bin/mv` (root) unaffected. Three-boot stress batch,
+`e2fsck -n -f` clean.
+
+**A real, structural gap found while trying to confirm this on real
+hardware, not fixed here**: `fspermtest` targets `/mnt/fs2/`
+unconditionally — but since entry 53, real Duo hardware no longer spawns
+a second `fsd` at all, so `/mnt/fs2/` doesn't resolve to anything there.
+`fs_rename("/mnt/fs2/...")` (and every other `fspermtest` call) now
+fails at `ns_resolve()`, *before it ever reaches `fsd`/`ext2.c3` at
+all* — the "correctly denied" results this produces on real hardware
+are a false positive from the namespace not resolving, not genuine
+confirmation of any permission check. This means **ext2's own
+permission enforcement — including this entry's own new rename check —
+has not actually been exercised on real hardware since entry 53
+shipped**, only on QEMU's dual-mount image. Confirmed with the user:
+left as a known gap for now rather than retargeting `fspermtest` to
+root (real hardware's only, writable mount) in this entry — a real
+follow-up worth doing, not a silent limitation.
+
+**Files changed:** `user/fs/ext2.c3`, `user/fsd.c3`, `user/shell.c3`.
+
+---
+
 ## 2026-08-21 (57) — Quiet sdd's per-sector debug output
 
 `sdd.c3` (the real Duo SD driver) printed two full lines per sector

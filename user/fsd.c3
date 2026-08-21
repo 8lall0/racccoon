@@ -682,7 +682,12 @@ fn void main() @export("main")
 				}
 				else if (fs_type == FS_TYPE_EXT2)
 				{
-					result = ext2_rename(&filename, &new_filename);
+					// Same requester-uid lookup as FS_WRITE/FS_DELETE/
+					// FS_MKDIR's own ext2 branches, same reasoning — see
+					// their comments.
+					uint requester_uid = 0xFFFFFFFF;
+					proc_info(from, null, null, (int*)&requester_uid);
+					result = ext2_rename(&filename, &new_filename, requester_uid);
 				}
 			}
 			*result_len_field = result;
