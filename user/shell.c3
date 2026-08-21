@@ -133,6 +133,23 @@ fn void main() @export("main") {
         bool too_long = false;
         for (;;) {
             char ch = (char)getchar();
+            // 0x7F (DEL) and 0x08 (BS) — different terminal
+            // emulators/serial console tools send different bytes for
+            // Backspace, no way to know which in advance, so both are
+            // handled. Checked before the echo/full-buffer logic below
+            // (not gated behind i == 127) so a user can also backspace
+            // their way back from a genuinely full line instead of it
+            // being unconditionally abandoned — falls out of the
+            // ordering, not extra logic. The raw byte is never echoed
+            // via putchar() — "\b \b" (cursor back, blank, cursor back
+            // again) is what actually erases the character on-screen.
+            if (ch == 127 || ch == 8) {
+                if (i > 0) {
+                    i--;
+                    print("\b \b");
+                }
+                continue;
+            }
             putchar(ch);
             if (i == 127) {
                 print("\ncommand line too long\n");

@@ -4,6 +4,56 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (52) — Shell backspace/line-editing support
+
+Follow-up to the previous entry: now that the shell takes real typed
+paths and arguments instead of fixed test commands, a typo had no way
+to be corrected — `main()`'s own input loop (`user/shell.c3`) echoed
+and appended every byte literally, including whatever a Backspace
+keypress produced.
+
+**Fix**: both `0x7F` (DEL) and `0x08` (BS) are treated as backspace —
+different terminal emulators/serial console tools send different
+bytes for the same key, no way to know which in advance, so both are
+handled rather than guessing one. Checked as the very first thing in
+the loop, before the existing echo/full-buffer logic — which means a
+user can now also backspace their way back from a genuinely full
+127-character line instead of it being unconditionally abandoned the
+moment the old `i == 127` check fired; a side effect of the ordering,
+not extra logic. The raw backspace byte is never echoed as-is — `"\b
+\b"` (cursor back, blank the character, cursor back again) is the
+actual on-screen erasure; a real terminal renders this as the
+character disappearing.
+
+**Verification**: no shell command can assert on terminal echo
+behavior, so this was verified by real typed interaction through the
+paced-input QEMU harness with literal `0x7F` bytes embedded in the
+input stream — typo-then-correct (`x`, backspace, `cat hello.txt` →
+correctly executes as `cat hello.txt`, confirmed by its real output
+appearing, not a mangled command), backspace on an empty line (safely
+a no-op), and filling the line to its 127-character limit then
+backspacing all the way back to empty before typing a real command
+(proves recovery from a full line, not just a partially-full one) —
+each case's *actually-executed* command was correct in every scenario
+(confirmed by its real output), the only artifact being that raw
+`\b`/space bytes render as literal characters when a captured byte log
+is viewed as plain text outside a real terminal emulator, not a bug in
+the logic itself. Full regression (existing builtins and the previous
+entry's own `/bin/` utilities) unaffected, three-boot stress batch
+clean.
+
+**Real Milk-V Duo hardware confirmation**: typed a typo, backspaced,
+retyped correctly, in a real terminal against the real board —
+characters visibly erased on screen as expected (the one thing QEMU's
+raw-byte-log verification couldn't directly confirm), and the corrected
+command executed correctly (reached `cat`'s own real "not found" path
+for a file that was never seeded onto the real `DUOBOOT` — expected,
+not a bug). `lsproc` clean afterward.
+
+**Files changed:** `user/shell.c3`.
+
+---
+
 ## 2026-08-21 (51) — Real argv-parsing shell + fs-operation tests become `/bin/` utilities
 
 Every one of the shell's 54 commands (`user/shell.c3`) was dispatched by
