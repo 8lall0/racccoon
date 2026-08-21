@@ -432,7 +432,7 @@ const uint P9_CLUNK  = 7; // request: release a fid
 // global uniqueness" reasoning as the five verbs above; just the next
 // free small ints after P9_CLUNK.
 const uint P9_CREATE = 8;  // request: create a file in a directory fid, transforming it into the new (already-open) file
-const uint P9_WRITE  = 9;  // request: write to an opened fid — offset must be exactly 0 (see fsd.c3's own dispatch comment)
+const uint P9_WRITE  = 9;  // request: real pwrite()-style offset-aware write to an opened fid — no holes past the current end (see fsd.c3's own dispatch comment)
 const uint P9_REMOVE = 10; // request: remove a fid's file — always consumes the fid (unless rejected outright by fsd's own dangling-fid safety check)
 
 // Reserved verb p9_call() bounces stray senders with — see its own

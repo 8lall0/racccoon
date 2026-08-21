@@ -4,6 +4,76 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (61) — Genuine offset-aware `Twrite`
+
+Follow-up to entry 59, closing its own explicitly-deferred restriction:
+`P9_WRITE` only ever accepted offset 0, because `ext2_write_file()`
+(the helper it reused) has no offset parameter at all — it always
+replaces a file's content starting from block 0. Real `pwrite()`-style
+writes needed a genuinely new primitive, not just relaxing a check.
+
+**New**: `ext2_write_file_at(inode, src, len, offset)` in
+`user/fs/ext2.c3`, alongside — not replacing — `ext2_write_file`
+(still used unchanged by path-based `ext2_write()`, unrelated "replace
+the whole file" semantics). Same per-block allocation loop shape,
+generalized with a starting block index and in-block byte offset.
+
+**No holes, by design.** Every read path in this driver
+(`ext2_read_at`/`ext2_read_inode_at`) treats `inode.block[i] == 0` as
+"past the end of the file", not "a sparse hole" — letting a write
+leave a gap of unallocated blocks before new data, while `inode.size`
+claims they're valid content, would silently corrupt every future read
+of that file. So `offset > inode.size` is rejected outright (`-1`),
+same as `offset` already being at/past this driver's own
+12-direct-block cap. That still covers what actually matters:
+overwriting existing bytes anywhere in the file, and appending exactly
+at the current end to grow it.
+
+One correctness improvement made possible by building this fresh
+rather than generalizing the old function in place: a partial write
+into a block this call just freshly allocated now zero-fills the
+buffer first, rather than reading whatever stale content happens to
+already be on disk at that block number (`ext2_write_file`'s own
+existing behavior in that same situation, left untouched — a
+pre-existing quirk, not part of this fix, and not worth the regression
+risk of touching a well-exercised path-based write to fix it there
+too).
+
+`fsd.c3`'s `P9_WRITE` dispatch dropped the `offset == 0` check, calls
+the new function, and grows `inode.size` only if the write actually
+extended past the old end — never shrinks it.
+
+`p9fswritetest` extended (not replaced): a mid-file overwrite at byte
+6, an append exactly at the current end (26 → 32 bytes), and the old
+"any nonzero offset fails" check replaced with a real hole-rejection
+check (offset far past the new 32-byte end). Verifying the append case
+needed byte-range comparison instead of `strcmp`: the file's content
+has a stray trailing-null byte baked in mid-buffer, an artifact of
+entry 59's own write call passing a C string literal's length
+including its trailing null (harmless there — strcmp naturally stopped
+at the same point either side — but it would make a plain strcmp
+report a false match for the newly appended tail too).
+
+**Verification**: `p9fswritetest: ok` on both images with all three
+new checks passing. Full regression clean (`p9fstest`, `fspermtest`,
+`/bin/rm` and existing delete tests, `mounttest`, `runtest2`/
+`argvtest2`/`bigreadtest`) — confirms `ext2_write_file`/`ext2_write()`'s
+own path-based behavior is completely unaffected, a new function, not
+a modified one. Three-boot stress batch, `e2fsck -n -f` clean on
+`disk_ext2.img` and both `disk_dual.img` halves — no errors or
+warnings, despite the new partial-block-write-at-arbitrary-offset and
+append-time-allocation logic being genuinely new on-disk write paths.
+
+**Real Milk-V Duo hardware confirmation**: `p9fswritetest: ok`,
+`p9fstest: ok`, `lsproc` clean (`2/` through `7/`) — mid-file
+overwrite, append-growth, and hole-rejection all confirmed working for
+real, not just on QEMU.
+
+**Files changed:** `user/fs/ext2.c3`, `user/fsd.c3`, `user/user.c3`,
+`user/shell.c3`.
+
+---
+
 ## 2026-08-21 (60) — Fix `fspermtest`'s real-hardware gap: retarget to root
 
 Closes entry 58's own documented gap. `fspermtest` always targeted

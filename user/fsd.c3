@@ -586,13 +586,12 @@ fn void main() @export("main")
 			else if (verb == P9_WRITE)
 			{
 				// Wire format: fid (4) + offset (4) + count (4) + data
-				// at byte 12.. — see user.c3's p9_write wrapper. Offset
-				// must be exactly 0: ext2_write_file (below) has no
-				// offset parameter at all, it always replaces a file's
-				// entire content from the start — see this entry's own
-				// devlog write-up for why genuine offset-aware partial
-				// writes stay explicit future work rather than silently
-				// producing wrong data for a nonzero offset.
+				// at byte 12.. — see user.c3's p9_write wrapper. Real
+				// pwrite()-style offset-aware write, via
+				// ext2_write_file_at() — see its own comment for why
+				// writing past the current end is rejected (-1) rather
+				// than silently creating a hole, and why appending
+				// exactly at the current end is still allowed.
 				uint* fid_field = (uint*)&buf[0];
 				uint* p9_offset_field = (uint*)&buf[4];
 				uint* p9_count_field = (uint*)&buf[8];
@@ -601,7 +600,7 @@ fn void main() @export("main")
 				uint p9_count = *p9_count_field;
 				int result = -1;
 				if (fid < (uint)FS9_FID_MAX && fs9_fids[fid].used && fs9_fids[fid].opened
-					&& !fs9_fids[fid].is_dir && p9_offset == 0)
+					&& !fs9_fids[fid].is_dir)
 				{
 					if (p9_count > FS_MSG_MAX - 12) p9_count = FS_MSG_MAX - 12;
 					uint requester_uid = 0xFFFFFFFF;
@@ -612,9 +611,13 @@ fn void main() @export("main")
 					Ext2_inode_info inode;
 					if (ext2_read_inode(fs9_fids[fid].inode_num, &inode) && ext2_write_allowed(&inode, requester_uid))
 					{
-						uint written = ext2_write_file(&inode, &buf[12], p9_count);
-						inode.size = written;
-						if (ext2_write_inode(fs9_fids[fid].inode_num, &inode)) result = (int)written;
+						int written = ext2_write_file_at(&inode, &buf[12], p9_count, p9_offset);
+						if (written >= 0)
+						{
+							uint new_end = p9_offset + (uint)written;
+							if (new_end > inode.size) inode.size = new_end;
+							if (ext2_write_inode(fs9_fids[fid].inode_num, &inode)) result = written;
+						}
 					}
 				}
 				int* result_field = (int*)&buf[0];

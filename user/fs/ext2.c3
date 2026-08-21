@@ -1409,6 +1409,94 @@ fn uint ext2_write_file(Ext2_inode_info* inode, char* src, uint len)
 	return bytes_written;
 }
 
+// Real pwrite()-style offset-aware write — unlike ext2_write_file
+// above (always from byte 0, unrelated semantics: "replace the whole
+// file", still used unchanged by path-based ext2_write()), this can
+// write anywhere within the file, including growing it by appending.
+//
+// No holes, by design — not a silent limitation. Every read path in
+// this driver (ext2_read_at/ext2_read_inode_at) treats
+// inode.block[i] == 0 as "past the end of the file", not "a sparse
+// hole": letting a write leave a gap of unallocated blocks before the
+// new data, while inode.size claims they're valid content, would
+// silently corrupt every future read of this file. So offset >
+// inode.size is rejected outright (-1), same as offset already being
+// at/past this driver's own 12-direct-block cap (12 * ext2_block_size
+// — the same direct-block-only limit ext2_write_file already has).
+// That still covers both real pwrite use cases this project needs:
+// overwriting existing bytes anywhere in the file, and appending
+// exactly at the current end (offset == inode.size) to grow it.
+//
+// Same per-block allocation loop shape as ext2_write_file (allocate
+// via ext2_alloc_block() if inode.block[b] == 0, bump inode.blocks on
+// a genuinely new block), generalized with a starting block index and
+// in-block byte offset for the first block only — later blocks always
+// start at in-block offset 0. One correctness improvement over
+// ext2_write_file's own existing behavior (not touched there, only
+// built correctly here from the start): a partial write into a block
+// this call just freshly allocated zero-fills the buffer first,
+// rather than reading whatever stale content happens to already be on
+// disk at that block number — block == 0 before allocation is exactly
+// the signal that this block is new, so ext2_read_block's real
+// content there can't be trusted as "this file's own previous data".
+// A partial write into an already-existing block (a genuine mid-file
+// overwrite) still does the normal read-modify-write, preserving real
+// on-disk bytes outside the touched range.
+//
+// Returns bytes actually written (a short write, not an error, if len
+// would run past the 12-block cap — same convention ext2_write_file
+// already uses), or -1 for either invariant violation above. The
+// caller is responsible for growing inode.size (never shrinking it)
+// and writing the inode back — this function only ever touches
+// inode.block[]/inode.blocks, matching ext2_write_file's own division
+// of responsibility.
+fn int ext2_write_file_at(Ext2_inode_info* inode, char* src, uint len, uint offset)
+{
+	if (offset > inode.size) return -1;
+	uint max_offset = 12 * ext2_block_size;
+	if (offset >= max_offset) return -1;
+
+	uint bytes_written = 0;
+	uint pos = offset;
+	while (bytes_written < len && pos < max_offset)
+	{
+		uint b = pos / ext2_block_size;
+		uint boff = pos % ext2_block_size;
+
+		uint block = inode.block[b];
+		bool is_new_block = block == 0;
+		if (is_new_block)
+		{
+			block = ext2_alloc_block();
+			if (block == 0) break;
+			inode.block[b] = block;
+			inode.blocks += ext2_block_size / SECTOR_SIZE;
+		}
+
+		uint chunk = len - bytes_written;
+		if (chunk > ext2_block_size - boff) chunk = ext2_block_size - boff;
+
+		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
+		if (boff != 0 || chunk < ext2_block_size)
+		{
+			if (is_new_block)
+			{
+				for (uint i = 0; i < EXT2_MAX_BLOCK_SIZE; i++) block_buf[i] = 0;
+			}
+			else
+			{
+				if (!ext2_read_block(block, &block_buf)) break;
+			}
+		}
+		for (uint i = 0; i < chunk; i++) block_buf[boff + i] = src[bytes_written + i];
+		if (!ext2_write_block(block, &block_buf)) break;
+
+		bytes_written += chunk;
+		pos += chunk;
+	}
+	return (int)bytes_written;
+}
+
 // Shared root/owner/other write-permission check — root, the target's
 // own owner (subject to EXT2_S_IWUSR), or anyone else if EXT2_S_IWOTH
 // allows it. No group bit checked, racccoon's own process-uid model has

@@ -382,9 +382,10 @@ fn void main() @export("main") {
             }
         } else if (strcmp(cmd, "p9fswritetest") == 0) {
             // Follow-up to p9fstest above: real writes against fsd
-            // (Tcreate, Tremove full, Twrite offset-0 only — see
-            // docs/devlog.md). Exercises create-then-immediately-
-            // write-then-read, the offset-0-only restriction, and the
+            // (Tcreate, Tremove full, genuine offset-aware Twrite —
+            // see docs/devlog.md). Exercises create-then-immediately-
+            // write-then-read, a mid-file overwrite, an append that
+            // grows the file, the no-holes rejection, and the
             // dangling-fid safety check with two real, independently-
             // attached fids on the same inode.
             int p9w_pid = ns_resolve("", null);
@@ -402,7 +403,41 @@ fn void main() @export("main") {
             p9w_buf[p9w_read >= 0 ? p9w_read : 0] = 0;
             bool p9w_read_ok = p9w_read == 26 && strcmp(&p9w_buf, "hello from real 9p write\n") == 0;
 
-            int p9w_write_bad_offset = p9_write(p9w_pid, 1, 4, "x", 1); // must fail — offset-0-only restriction
+            // Mid-file overwrite: the on-disk content is actually 26
+            // bytes ("hello from real 9p write\n" is 25 real
+            // characters — the c3 string literal's own trailing null
+            // made it into the file too, since the write above passed
+            // len 26; harmless, both reads/strcmp below still line up
+            // exactly on it). Byte 6 is where "from " starts.
+            int p9w_write2 = p9_write(p9w_pid, 1, 6, "THERE", 5);
+
+            int p9w_read2 = p9_read(p9w_pid, 1, 0, 40, &p9w_buf);
+            p9w_buf[p9w_read2 >= 0 ? p9w_read2 : 0] = 0;
+            bool p9w_read2_ok = p9w_read2 == 26 && strcmp(&p9w_buf, "hello THEREreal 9p write\n") == 0;
+
+            // Append exactly at the current end (26 bytes) — grows the
+            // file to 32. The stray trailing-null byte from the
+            // original write (see above) now sits mid-buffer at index
+            // 25, which would make a plain strcmp stop early — so this
+            // check compares real byte ranges directly instead: [0,25)
+            // against the unchanged head, then [26,32) against the
+            // newly appended tail.
+            int p9w_write3 = p9_write(p9w_pid, 1, 26, " more\n", 6);
+
+            int p9w_read3 = p9_read(p9w_pid, 1, 0, 40, &p9w_buf);
+            bool p9w_read3_ok = p9w_read3 == 32;
+            if (p9w_read3_ok) {
+                char* p9w_head = "hello THEREreal 9p write\n";
+                for (int p9w_i = 0; p9w_i < 25; p9w_i++) {
+                    if (p9w_buf[p9w_i] != p9w_head[p9w_i]) { p9w_read3_ok = false; break; }
+                }
+                char* p9w_tail = " more\n";
+                for (int p9w_j = 0; p9w_j < 6; p9w_j++) {
+                    if (p9w_buf[26 + p9w_j] != p9w_tail[p9w_j]) { p9w_read3_ok = false; break; }
+                }
+            }
+
+            int p9w_write_gap = p9_write(p9w_pid, 1, 100, "gap", 3); // offset far past the (now 32-byte) end — must fail, no holes
 
             int p9w_attach2 = p9_attach(p9w_pid, 2); // fid 2 = root, independently
             int p9w_walk2 = p9_walk(p9w_pid, 2, 3, "p9wtest.txt"); // fid 3, a second fid on the same inode
@@ -414,7 +449,10 @@ fn void main() @export("main") {
             int p9w_clunk2 = p9_clunk(p9w_pid, 2);
 
             if (p9w_attach1 == 0 && p9w_walk_missing < 0 && p9w_create == 0
-                && p9w_write == 26 && p9w_read_ok && p9w_write_bad_offset < 0
+                && p9w_write == 26 && p9w_read_ok
+                && p9w_write2 == 5 && p9w_read2_ok
+                && p9w_write3 == 6 && p9w_read3_ok
+                && p9w_write_gap < 0
                 && p9w_attach2 == 0 && p9w_walk2 == 0 && p9w_open3 == 0
                 && p9w_remove_dangling < 0 && p9w_clunk3 == 0
                 && p9w_remove_ok == 0 && p9w_clunk2 == 0) {
