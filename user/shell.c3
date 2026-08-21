@@ -150,157 +150,35 @@ fn void main() @export("main") {
 
         if (too_long) continue;
 
-        char* cmd = &cmdline[0];
+        // Tokenize on spaces, in place — each token is a pointer
+        // straight into cmdline, NUL-terminated where the next space
+        // was, same "no separate storage" approach exec()'s own
+        // NUL-separated argv blob already uses (user.c3). cmd_argv/
+        // cmd_argc (everything after the command name) only matter to
+        // the /bin/ fallback branch at the very end of this chain —
+        // every builtin below ignores them, unchanged from before this
+        // tokenization existed.
+        const int SHELL_MAX_TOKENS = 8;
+        char*[SHELL_MAX_TOKENS] tokens @noinit;
+        int token_count = 0;
+        int ti = 0;
+        while (cmdline[ti] != 0 && token_count < SHELL_MAX_TOKENS) {
+            while (cmdline[ti] == ' ') ti++;
+            if (cmdline[ti] == 0) break;
+            tokens[token_count] = &cmdline[ti];
+            token_count++;
+            while (cmdline[ti] != 0 && cmdline[ti] != ' ') ti++;
+            if (cmdline[ti] == ' ') { cmdline[ti] = 0; ti++; }
+        }
+        if (token_count == 0) continue;
+
+        char* cmd = tokens[0];
+        char** cmd_argv = &tokens[1];
+        int cmd_argc = token_count - 1;
         if (strcmp(cmd, "hello") == 0) {
             print("Hello world from shell!\n");
         } else if (strcmp(cmd, "exit") == 0) {
             exit();
-        } else if (strcmp(cmd, "readfile") == 0) {
-            char[128] buf @noinit;
-            int len = fs_read("hello.txt", &buf, 128);
-            if (len >= 0) {
-                buf[len] = 0;
-                print(&buf);
-                print("\n");
-            }
-        } else if (strcmp(cmd, "readfile2") == 0) {
-            // Exercises the second, simultaneously-mounted fsd instance
-            // (see src/process.c3's fsd2_pid/docs/devlog.md) — same
-            // "/2/" prefix ns_resolve()/fs_read() strip before the
-            // request ever reaches the wire, so this is otherwise
-            // identical to readfile above, just against whatever
-            // partition board::FS_PARTITION_2_START_SECTOR names.
-            char[128] buf2 @noinit;
-            int len2 = fs_read("/2/hello.txt", &buf2, 128);
-            if (len2 >= 0) {
-                buf2[len2] = 0;
-                print(&buf2);
-                print("\n");
-            } else {
-                print("readfile2: not found (no second fsd mounted?)\n");
-            }
-        } else if (strcmp(cmd, "readsubfile") == 0) {
-            // Exercises fsd's new read-only subdirectory support (see
-            // docs/devlog.md) against mount 1 (whichever backend is
-            // mounted there — disk/subdir/nested.txt on FAT32).
-            char[128] buf3 @noinit;
-            int len3 = fs_read("subdir/nested.txt", &buf3, 128);
-            if (len3 >= 0) {
-                buf3[len3] = 0;
-                print(&buf3);
-                print("\n");
-            } else {
-                print("readsubfile: not found\n");
-            }
-        } else if (strcmp(cmd, "readsubfile2") == 0) {
-            // Same as readsubfile, against mount 2 (disk-ext2/subdir/
-            // nested.txt on ext2) — proves subdirectory support works
-            // through both backends and through the "/2/" prefix-strip.
-            char[128] buf4 @noinit;
-            int len4 = fs_read("/2/subdir/nested.txt", &buf4, 128);
-            if (len4 >= 0) {
-                buf4[len4] = 0;
-                print(&buf4);
-                print("\n");
-            } else {
-                print("readsubfile2: not found (no second fsd mounted?)\n");
-            }
-        } else if (strcmp(cmd, "ls") == 0) {
-            char[576] listbuf @noinit; // FS_LIST_ENTRY_SIZE * 16 entries
-            int count = fs_list("", &listbuf, 16);
-            if (count < 0) {
-                print("ls: failed\n");
-            } else {
-                for (int li = 0; li < count; li++) {
-                    char* rec = &listbuf[li * 36];
-                    print(rec);
-                    if (rec[32] != 0) {
-                        print("/");
-                    }
-                    print("\n");
-                }
-            }
-        } else if (strcmp(cmd, "lssub") == 0) {
-            // Same as ls, against subdir/ — proves fs_list resolves a
-            // non-root path to a directory and lists *its* entries, not
-            // just the special-cased "" root path.
-            char[576] listbuf2 @noinit;
-            int count2 = fs_list("subdir", &listbuf2, 16);
-            if (count2 < 0) {
-                print("lssub: failed\n");
-            } else {
-                for (int li2 = 0; li2 < count2; li2++) {
-                    char* rec2 = &listbuf2[li2 * 36];
-                    print(rec2);
-                    if (rec2[32] != 0) {
-                        print("/");
-                    }
-                    print("\n");
-                }
-            }
-        } else if (strcmp(cmd, "mkdirtest") == 0) {
-            // Unlike rmrtest's nestdir/ (a build-time fixture, consumed
-            // permanently once deleted — see docs/devlog.md), this
-            // creates its own fixture dynamically and cleans it back up
-            // at the end via fs_delete_recursive — safe to run more than
-            // once against the same disk image, including repeatedly in
-            // the same boot. Exercises the new directory for real (write
-            // a file into it, read it back), not just "mkdir succeeded
-            // and nothing else."
-            int made = fs_mkdir("tmp/mkdirtest_dir");
-            int made_again = fs_mkdir("tmp/mkdirtest_dir"); // must refuse: already exists
-            int wrote = fs_write("tmp/mkdirtest_dir/inner.txt", "made by mkdirtest\n", 19);
-            char[32] mkdir_buf @noinit;
-            int len = fs_read("tmp/mkdirtest_dir/inner.txt", &mkdir_buf, 32);
-            int deleted = fs_delete_recursive("tmp/mkdirtest_dir");
-            if (made == 0 && made_again < 0 && wrote >= 0 && len >= 0 && deleted == 0) {
-                print("mkdirtest: ok\n");
-            } else {
-                print("mkdirtest: FAILED\n");
-            }
-        } else if (strcmp(cmd, "renametest") == 0) {
-            // Same-directory rename — the common case. Own fixture,
-            // self-cleaning, same discipline as mkdirtest. Names kept
-            // to 8 characters or under before the extension — FAT32's
-            // 8.3 short names truncate anything longer, and "ren_a"/
-            // "ren_b" differing only in their 9th character (as
-            // "rentest_a"/"rentest_b" originally did) would truncate to
-            // the exact same short name and collide — the same class
-            // of mistake nestdir/nesteddir's own comment already
-            // documents (scripts/build.sh), made again here before
-            // being caught by this test itself failing.
-            fs_write("tmp/ren_a.txt", "renamed content\n", 17);
-            int renamed = fs_rename("tmp/ren_a.txt", "tmp/ren_b.txt");
-            char[32] ren_buf @noinit;
-            int len_new = fs_read("tmp/ren_b.txt", &ren_buf, 32);
-            int old_gone = fs_read("tmp/ren_a.txt", &ren_buf, 32); // must now fail
-            int cleanup = fs_delete("tmp/ren_b.txt");
-            if (renamed == 0 && len_new >= 0 && old_gone < 0 && cleanup == 0) {
-                print("renametest: ok\n");
-            } else {
-                print("renametest: FAILED\n");
-            }
-        } else if (strcmp(cmd, "movetest") == 0) {
-            // Cross-directory move — the "move" half of "rename/move",
-            // proving fat32_rename/ext2_rename's own directory-entry
-            // relink actually crosses two different parents, not just
-            // renaming in place. Two fresh directories, a file created
-            // in the first and moved into the second; both cleaned up
-            // recursively at the end regardless of which step failed.
-            // Same short-name discipline as renametest above.
-            fs_mkdir("tmp/mv_a");
-            fs_mkdir("tmp/mv_b");
-            fs_write("tmp/mv_a/f.txt", "moved content\n", 15);
-            int moved = fs_rename("tmp/mv_a/f.txt", "tmp/mv_b/f.txt");
-            char[32] mv_buf @noinit;
-            int len_moved = fs_read("tmp/mv_b/f.txt", &mv_buf, 32);
-            int cleanup_a = fs_delete_recursive("tmp/mv_a");
-            int cleanup_b = fs_delete_recursive("tmp/mv_b");
-            if (moved == 0 && len_moved >= 0 && cleanup_a == 0 && cleanup_b == 0) {
-                print("movetest: ok\n");
-            } else {
-                print("movetest: FAILED\n");
-            }
         } else if (strcmp(cmd, "cycletest") == 0) {
             // Proves fat32_rename/ext2_rename now refuse "moving a
             // directory into its own subtree" instead of silently
@@ -329,182 +207,6 @@ fn void main() @export("main") {
                 print("cycletest: ok\n");
             } else {
                 print("cycletest: FAILED\n");
-            }
-        } else if (strcmp(cmd, "writefile") == 0) {
-            fs_write("hello.txt", "Hello from shell!\n", 19);
-        } else if (strcmp(cmd, "newfile") == 0) {
-            // Exercises directory-entry creation specifically (writefile
-            // above only ever overwrites the already-existing hello.txt)
-            // — write, then read back through the same fs_read() path
-            // readfile uses, to confirm the new file is genuinely
-            // findable and correct, not just that the write call
-            // returned success.
-            fs_write("tmp/newtest.txt", "Created by newfile test\n", 25);
-            char[128] buf @noinit;
-            int len = fs_read("tmp/newtest.txt", &buf, 128);
-            if (len >= 0) {
-                buf[len] = 0;
-                print(&buf);
-            } else {
-                print("newfile: readback failed\n");
-            }
-        } else if (strcmp(cmd, "newfile2") == 0) {
-            // Same as newfile above, but through the "/2/" mount — proves
-            // fsd2's write path specifically (readfile2 only ever proves
-            // reads), routed through the same ns_resolve() prefix-strip
-            // as every other "/2/" request.
-            fs_write("/2/newtest2.txt", "Created by newfile2 test\n", 26);
-            char[128] buf2 @noinit;
-            int len2 = fs_read("/2/newtest2.txt", &buf2, 128);
-            if (len2 >= 0) {
-                buf2[len2] = 0;
-                print(&buf2);
-            } else {
-                print("newfile2: readback failed\n");
-            }
-        } else if (strcmp(cmd, "newsubfile") == 0) {
-            // Same as newfile, but inside subdir/ — proves the write-
-            // into-subdirectory support (fat32_write/ext2_write's own
-            // fat32_resolve_dir/ext2_resolve_dir use) on mount 1.
-            fs_write("subdir/newtest_sub.txt", "Created by newsubfile test\n", 28);
-            char[128] buf5 @noinit;
-            int len5 = fs_read("subdir/newtest_sub.txt", &buf5, 128);
-            if (len5 >= 0) {
-                buf5[len5] = 0;
-                print(&buf5);
-            } else {
-                print("newsubfile: readback failed\n");
-            }
-        } else if (strcmp(cmd, "newsubfile2") == 0) {
-            // Same as newsubfile, through the "/2/" mount — proves
-            // write-into-subdirectory on the ext2 backend too.
-            fs_write("/2/subdir/newtest_sub2.txt", "Created by newsubfile2 test\n", 29);
-            char[128] buf6 @noinit;
-            int len6 = fs_read("/2/subdir/newtest_sub2.txt", &buf6, 128);
-            if (len6 >= 0) {
-                buf6[len6] = 0;
-                print(&buf6);
-            } else {
-                print("newsubfile2: readback failed (no second fsd mounted?)\n");
-            }
-        } else if (strcmp(cmd, "deletetest") == 0) {
-            // Create a file, confirm it's there, delete it, confirm
-            // it's genuinely gone — mount 1.
-            fs_write("tmp/deletetest.txt", "temporary\n", 10);
-            char[16] buf7 @noinit;
-            int before = fs_read("tmp/deletetest.txt", &buf7, 16);
-            int del = fs_delete("tmp/deletetest.txt");
-            int after = fs_read("tmp/deletetest.txt", &buf7, 16);
-            if (before >= 0 && del == 0 && after < 0) {
-                print("deletetest: ok\n");
-            } else {
-                print("deletetest: FAILED\n");
-            }
-        } else if (strcmp(cmd, "deletetest2") == 0) {
-            // Same as deletetest, through the "/2/" mount.
-            fs_write("/2/deletetest2.txt", "temporary\n", 10);
-            char[16] buf8 @noinit;
-            int before2 = fs_read("/2/deletetest2.txt", &buf8, 16);
-            int del2 = fs_delete("/2/deletetest2.txt");
-            int after2 = fs_read("/2/deletetest2.txt", &buf8, 16);
-            if (before2 >= 0 && del2 == 0 && after2 < 0) {
-                print("deletetest2: ok\n");
-            } else {
-                print("deletetest2: FAILED\n");
-            }
-        } else if (strcmp(cmd, "deleteprotected") == 0) {
-            // Deliberately attempts to delete the one file fsd is
-            // supposed to refuse no matter what. Unlike protectedwrite,
-            // this isn't a meaningful test on QEMU's own disposable
-            // test image: a missing file and a protected file both
-            // just return -1 here, with no "was accepted" contrast to
-            // tell them apart (protectedwrite's own missing-file case
-            // instead falls through to actually creating a file,
-            // which is what makes that one still show something real
-            // on QEMU). Only the real board, with a real fip.bin, is
-            // the real test.
-            int result = fs_delete("fip.bin");
-            if (result < 0) {
-                print("deleteprotected: rejected (correct)\n");
-            } else {
-                print("deleteprotected: WARNING: delete was ACCEPTED\n");
-            }
-        } else if (strcmp(cmd, "rmdirtest") == 0) {
-            // Deletes a genuinely empty directory (emptydir/, seeded
-            // at build time — this driver has no mkdir of its own to
-            // create one on the fly) and confirms it's really gone by
-            // trying to delete it again, which should now fail (not
-            // found) — the same "before, action, after" shape
-            // deletetest uses, just via a second delete instead of a
-            // read (directories aren't readable as file content).
-            int del1 = fs_delete("emptydir");
-            int del2 = fs_delete("emptydir");
-            if (del1 == 0 && del2 < 0) {
-                print("rmdirtest: ok\n");
-            } else {
-                print("rmdirtest: FAILED\n");
-            }
-        } else if (strcmp(cmd, "rmdirtest2") == 0) {
-            // Same as rmdirtest, through the "/2/" mount.
-            int del1b = fs_delete("/2/emptydir");
-            int del2b = fs_delete("/2/emptydir");
-            if (del1b == 0 && del2b < 0) {
-                print("rmdirtest2: ok\n");
-            } else {
-                print("rmdirtest2: FAILED\n");
-            }
-        } else if (strcmp(cmd, "rmdirnonempty") == 0) {
-            // subdir/ (the existing subdirectory read/write test
-            // fixture) genuinely has content in it — confirms rmdir
-            // correctly refuses a non-empty directory rather than
-            // silently deleting its contents.
-            int nonempty_result = fs_delete("subdir");
-            if (nonempty_result < 0) {
-                print("rmdirnonempty: rejected (correct)\n");
-            } else {
-                print("rmdirnonempty: WARNING: non-empty directory was deleted\n");
-            }
-        } else if (strcmp(cmd, "rmdirnonempty2") == 0) {
-            int nonempty_result2 = fs_delete("/2/subdir");
-            if (nonempty_result2 < 0) {
-                print("rmdirnonempty2: rejected (correct)\n");
-            } else {
-                print("rmdirnonempty2: WARNING: non-empty directory was deleted\n");
-            }
-        } else if (strcmp(cmd, "rmrtest") == 0) {
-            // nestdir/ (seeded at build time — scripts/build.sh) has
-            // a file directly inside it plus a further nested
-            // subdirectory (innerdir/) with its own file — two real
-            // levels of recursion, not just "one directory with one
-            // file," so this actually exercises
-            // fat32_delete_recursive/ext2_delete_recursive recursing
-            // into a subdirectory, not just walking one level of
-            // entries. plain fs_delete (non-recursive) on the same
-            // target should still be refused first — proves the
-            // recursive path is opt-in, not a silent behavior change
-            // to the existing rmdir semantics.
-            int refused = fs_delete("nestdir");
-            int del1 = fs_delete_recursive("nestdir");
-            int del2 = fs_delete_recursive("nestdir");
-            if (refused < 0 && del1 == 0 && del2 < 0) {
-                print("rmrtest: ok\n");
-            } else {
-                print("rmrtest: FAILED\n");
-            }
-        } else if (strcmp(cmd, "protectedwrite") == 0) {
-            // Deliberately attempts to write the one file fsd is
-            // supposed to refuse no matter what (see user/fsd.c3's
-            // header comment) — the actual point of the write-
-            // protection work, not a hypothetical. -1 (rejected) is the
-            // only correct result on the real board; on QEMU's
-            // disposable test image, fip.bin doesn't exist at all, so
-            // this exercises the "create a new file" path instead —
-            // still harmless there, just not the real test.
-            int result = fs_write("fip.bin", "should never land\n", 18);
-            if (result < 0) {
-                print("protectedwrite: rejected (correct)\n");
-            } else {
-                print("protectedwrite: WARNING: write was ACCEPTED\n");
             }
         } else if (strcmp(cmd, "ping") == 0) {
             // Resolved through the namespace now — "/srv/echo/" is where
@@ -1687,9 +1389,33 @@ fn void main() @export("main") {
                 print(")\n");
             }
         } else {
-            print("unknown command: ");
-            print(cmd);
-            print("\n");
+            // Not a builtin — try /bin/<cmd> (cat/ls/write/rm/mkdir/mv,
+            // user/cat.c3 etc.), same shape runtest's own rfork()+exec()
+            // already uses, just with the tokenized cmd_argv/cmd_argc
+            // instead of a fixed argv. Bare "/bin/<cmd>", not $PATH-
+            // resolved — matches every other bin/echod reference in this
+            // file; $PATH lookup is pathtest's own, separately-tested
+            // feature (exec_path), orthogonal to this.
+            char[100] bin_path @noinit;
+            int bp_i = 0;
+            char* prefix = "/bin/";
+            while (prefix[bp_i] != 0) { bin_path[bp_i] = prefix[bp_i]; bp_i++; }
+            int bp_j = 0;
+            while (cmd[bp_j] != 0 && bp_i < 99) { bin_path[bp_i] = cmd[bp_j]; bp_i++; bp_j++; }
+            bin_path[bp_i] = 0;
+
+            uint sh_gen = 0;
+            int sh_r = rfork(RFPROC, &sh_gen);
+            if (sh_r < 0) {
+                print("rfork failed\n");
+            } else if (sh_r == 0) {
+                exec(&bin_path, &run_exec_buf, RUN_EXEC_BUF_MAX, 0, cmd_argv, cmd_argc);
+                print(cmd);
+                print(": command not found\n");
+                exit();
+            } else {
+                join(sh_r, sh_gen);
+            }
         }
     }
 }

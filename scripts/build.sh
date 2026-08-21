@@ -57,6 +57,12 @@ LLC=${LLC:-llc}
   # replacement for bin/echod — elftest execs this one specifically,
   # runtest/argvtest/pathtest keep using the flat binary unchanged.
   mcopy -i build/disk.img build/user/echod.elf ::bin/echod.elf
+  # bin/{cat,ls,write,rm,mkdir,mv} — the real, argv-taking utilities
+  # shell.c3's own /bin/ fallback branch execs (see docs/devlog.md),
+  # replacing what used to be hardcoded shell builtins.
+  for u in cat ls write rm mkdir mv; do
+    mcopy -i build/disk.img "build/user/$u.bin" "::bin/$u"
+  done
 
   # bigfile.bin — deterministic byte[i] = i % 256 pattern, 300000 bytes,
   # genuinely past ext2's own single-indirect reach even at the smallest
@@ -107,6 +113,9 @@ LLC=${LLC:-llc}
   debugfs -w -R "mkdir bin" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_ext2.img > /dev/null
+  for u in cat ls write rm mkdir mv; do
+    debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_ext2.img > /dev/null
+  done
   debugfs -w -R "write build/bigfile_fixture.bin bigfile.bin" build/disk_ext2.img > /dev/null
 
   echo "==> Building disk image (dual FAT32+ext2, for scripts/launch64_dual.sh)..."
@@ -133,6 +142,23 @@ LLC=${LLC:-llc}
   mmd -i build/disk_dual.img ::subdir
   mcopy -i build/disk_dual.img disk/subdir/*.txt ::subdir
   mmd -i build/disk_dual.img ::emptydir
+  # bin/ on the FAT32 half too — previously missing entirely (a
+  # pre-existing gap flagged but not fixed in devlog entries 45/49:
+  # every un-suffixed exec()-family test, e.g. runtest, correctly
+  # FAILED on this image since bin/echod was never seeded here).
+  # shell.c3's own /bin/ fallback branch always execs a bare
+  # "/bin/<cmd>" for the command name itself (mount 1 by default, same
+  # as every other bare-path reference in this project) — so the new
+  # cat/ls/write/rm/mkdir/mv utilities need to be reachable here even
+  # when their own *arguments* target "/2/", or they can never be
+  # found at all on this image. Fixing this now since it directly
+  # blocks verifying those utilities against the dual-mount image.
+  mmd -i build/disk_dual.img ::bin
+  mcopy -i build/disk_dual.img build/user/echod.bin ::bin/echod
+  mcopy -i build/disk_dual.img build/user/echod.elf ::bin/echod.elf
+  for u in cat ls write rm mkdir mv; do
+    mcopy -i build/disk_dual.img "build/user/$u.bin" "::bin/$u"
+  done
   dd if=/dev/zero of=build/disk_dual_ext2_part.img bs=1M count=8 status=none
   mke2fs -q -F -b 1024 build/disk_dual_ext2_part.img
   debugfs -w -R "write disk-ext2/hello.txt hello.txt" build/disk_dual_ext2_part.img > /dev/null
@@ -148,6 +174,9 @@ LLC=${LLC:-llc}
   debugfs -w -R "mkdir bin" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_ext2_part.img > /dev/null
+  for u in cat ls write rm mkdir mv; do
+    debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_ext2_part.img > /dev/null
+  done
   # bigfile.bin — same double-indirect-block fixture as the single-mount
   # ext2 image above, needed here too since bigreadtest always targets
   # "/2/bigfile.bin" (unambiguous, same reasoning as bin/echod above).

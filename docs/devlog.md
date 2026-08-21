@@ -4,6 +4,101 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (51) — Real argv-parsing shell + fs-operation tests become `/bin/` utilities
+
+Every one of the shell's 54 commands (`user/shell.c3`) was dispatched by
+comparing the *entire* input line against a fixed string — no
+tokenization, so no command could take real user-supplied arguments;
+`readfile` always read the same hardcoded path, `mkdirtest` always
+created the same hardcoded directory. Every filesystem primitive these
+commands exercised (`fs_read`/`fs_write`/`fs_delete`/
+`fs_delete_recursive`/`fs_mkdir`/`fs_rename`/`fs_list`) was already a
+real, tested, path-taking function — the hardcoding was purely in the
+shell's own dispatch layer.
+
+**Tokenization**: the command-line-reading preamble now splits on
+spaces in place (mutating the line buffer itself, same "no separate
+storage" approach `exec()`'s own NUL-separated argv blob already uses)
+into up to 8 tokens. Every *kept* builtin's own `strcmp(cmd, "...")`
+dispatch line is completely unchanged — `cmd` still means "the command
+name," just sourced from the first token instead of the whole line.
+
+**Twenty-three commands removed**, replaced by six real `/bin/`
+utilities (`user/cat.c3`, `ls.c3`, `write.c3`, `rm.c3`, `mkdir.c3`,
+`mv.c3` — same minimal skeleton every exec() target already uses,
+`get_argv()` for arguments, thin wrappers around already-tested
+primitives, no new syscalls or primitives needed anywhere):
+`readfile`/`readfile2`/`readsubfile`/`readsubfile2` → `cat <path>`;
+`ls`/`lssub` → `ls [path]`; `writefile`/`newfile`/`newfile2`/
+`newsubfile`/`newsubfile2` → `write <path> <text>` (`fs_write` already
+creates-or-overwrites transparently, so one utility covers both old
+scenarios); `deletetest`/`deletetest2`/`rmdirtest`/`rmdirtest2`/
+`rmdirnonempty`/`rmdirnonempty2`/`rmrtest` → `rm <path>` / `rm -r
+<path>`; `mkdirtest` → `mkdir <path>`; `renametest`/`movetest` → `mv
+<old> <new>` (`fs_rename` already handles same-dir rename and
+cross-dir move identically); `deleteprotected`/`protectedwrite` → no
+longer separate commands — `rm fip.bin`/`write fip.bin ...` against the
+new generic utilities exercise the identical scenario.
+
+Deliberately scoped out (confirmed with the user before starting): the
+~30 remaining commands are process/IPC mechanics (`permtest`,
+`fspermtest`, `rforktest`, `threadtest`, `mutextest`, `racetest`,
+`killtest`, `srvtest`, `nstest`, `p9test`, `sandboxtest`, ...) or
+meta-tests of exec() itself (`runtest`/`argvtest`/`pathtest`/`elftest`
+and their `2` variants) — converting a test *of* exec() into something
+exec() has to load would be architecturally awkward for no real
+benefit, and these aren't "commands with arguments" the way a
+filesystem operation is. They stay exactly as they were.
+
+**Shell's new fallback**: anything not a builtin gets `rfork()`+`exec()`
+against a bare `"/bin/<cmd>"` (not `$PATH`-resolved — matches how
+`bin/echod` is referenced everywhere else in this file, keeps this
+orthogonal to `pathtest`'s own separately-tested `exec_path` feature),
+passing the remaining tokens through as the new process's own argv. The
+shell `join()`s (already used elsewhere in this file, e.g.
+`fspermtest`) before printing its next prompt — ordinary blocking-shell
+behavior.
+
+**Found and fixed a real, previously-flagged-but-not-fixed gap while
+verifying this**: the dual-mount QEMU image's FAT32 half has *never*
+had a `bin/` directory at all (entries 45 and 49 both flagged this —
+every un-suffixed exec()-family test correctly `FAILED` there — without
+fixing it, since nothing forced the issue until now). Since the
+shell's own fallback always execs a bare `/bin/<cmd>` for the *command
+name itself* regardless of what its arguments target, the new utilities
+were completely unreachable on that image even when invoked as `cat
+/2/hello.txt` — the argument correctly targets ext2, but `cat` itself
+could never be found. Fixed by seeding `bin/echod`, `bin/echod.elf`,
+and the six new utilities onto the dual image's FAT32 half too — as a
+side effect, `runtest`/`argvtest`/`pathtest`/`elftest` (previously
+always `FAILED` there) now pass on that image for the first time.
+
+**Verification**: no self-checking "ok"/"FAILED" test commands exist
+for these six anymore — by design, they're real utilities now, not
+tests. Verified the way an actual user would: scripted interactive
+command sequences through the paced-input QEMU harness — each
+utility's happy path (`mkdir`→`write`→`cat`→`ls`→`mv`→`cat`→`rm`→`rm
+-r`), cross-directory `mv`, protected-file refusal (`rm fip.bin`/`write
+fip.bin x`), error paths (missing arguments, nonexistent files) —
+across all three QEMU images including `/2/`-prefixed invocations on
+the dual image, plus the full ~30-command kept-builtin regression suite
+(unaffected by the tokenization change). Three-boot stress batch,
+`fsck.vfat -n`/`e2fsck -n -f` clean on every image (including no
+free-cluster-count regression from entry 50's own fix).
+
+**Real Milk-V Duo hardware confirmation**: seeded all six new utilities
+onto real `DUOBOOT` and `EXT2TEST` (confirmed via `debugfs` directly
+against the device, same discipline established earlier this session).
+Full scripted sequence against both — `mkdir`/`write`/`cat`/`ls`/`mv`/
+`rm`/`rm -r` on `DUOBOOT`, `cat`/`mkdir`/`write`/`rm -r` via `/2/` on
+`EXT2TEST` — every output matched exactly, `lsproc` clean afterward.
+
+**Files changed:** `user/shell.c3`, `user/cat.c3`, `user/ls.c3`,
+`user/write.c3`, `user/rm.c3`, `user/mkdir.c3`, `user/mv.c3`,
+`scripts/build_user.sh`, `scripts/build.sh`.
+
+---
+
 ## 2026-08-21 (50) — FAT32 free-cluster-count bookkeeping (FSInfo sector)
 
 `fsck.vfat -n` flagged "Free cluster summary wrong... Auto-correcting"
