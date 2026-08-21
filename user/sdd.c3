@@ -30,6 +30,20 @@ module user;
 // iteration here (see docs/devlog.md) — this is a direct, careful port of
 // sourced values, not something exercised against real silicon yet.
 
+// Gates the two per-sector-I/O print() blocks below (sdd_block_rw's own
+// success path, and the "sdd: rw sector=..." line at the top of the
+// main loop) — real, useful bringup-era diagnostics (found real bugs
+// this way, see docs/devlog.md), but two full lines per sector adds up
+// fast against a real ext2 read path that can touch dozens of sectors
+// per exec()/9P read, and the driver's own timing has been extensively
+// verified since. Off by default; flip to true for the same level of
+// detail if a real hardware bug ever needs it again — both prints sit
+// outside the timing-sensitive window this file's own comments warn
+// about (one runs before the command is even sent, the other after the
+// transfer has already completed), so toggling this can't reintroduce
+// the FIFO-timing bug that window's own discipline exists to prevent.
+const bool SDD_VERBOSE = false;
+
 // --- Shared with the kernel / fsd — kept in sync by hand, same wire
 // protocol as user/diskd.c3.
 const uint DISKD_READ    = 10;
@@ -802,22 +816,27 @@ fn bool sdd_block_rw(char* data, uint sector, bool is_write)
 	// function (see this function's own header comment) — safe to print
 	// now, the whole block is already fully transferred. Elapsed
 	// microseconds, not raw iteration counts — genuinely meaningful now
-	// that rdtime() exists, unlike the old "N iters" figures.
-	uint ready_us = (uint)((rdtime() - ready_start) * 1000000 / SD_TIMEBASE_HZ);
-	uint done_us = (uint)((rdtime() - done_start) * 1000000 / SD_TIMEBASE_HZ);
-	print("sdd: CMD");
-	print_hex32(cmd_index);
-	print(" ok resp0=");
-	print_hex32(sd_response0);
-	print(" ready after ");
-	print_uint(ready_us);
-	print("us, int_status=");
-	print_hex32(int_status);
-	print(" transfer-complete status=");
-	print_hex32(status);
-	print(" after ");
-	print_uint(done_us);
-	print("us\n");
+	// that rdtime() exists, unlike the old "N iters" figures. Gated by
+	// SDD_VERBOSE (see its own comment) — this whole block exists only
+	// to feed the print below, safe to skip entirely when quiet.
+	if (SDD_VERBOSE)
+	{
+		uint ready_us = (uint)((rdtime() - ready_start) * 1000000 / SD_TIMEBASE_HZ);
+		uint done_us = (uint)((rdtime() - done_start) * 1000000 / SD_TIMEBASE_HZ);
+		print("sdd: CMD");
+		print_hex32(cmd_index);
+		print(" ok resp0=");
+		print_hex32(sd_response0);
+		print(" ready after ");
+		print_uint(ready_us);
+		print("us, int_status=");
+		print_hex32(int_status);
+		print(" transfer-complete status=");
+		print_hex32(status);
+		print(" after ");
+		print_uint(done_us);
+		print("us\n");
+	}
 	sd_reg_write(SD_INT_STATUS, SD_INT_ALL_MASK);
 
 	return (status & SD_INT_DATA_END) != 0;
@@ -854,9 +873,12 @@ fn void main() @export("main")
 		uint* sector_ptr = (uint*)&buf;
 		uint sector = *sector_ptr;
 
-		print("sdd: rw sector=");
-		print_hex32(sector);
-		print(is_write ? " write\n" : " read\n");
+		if (SDD_VERBOSE)
+		{
+			print("sdd: rw sector=");
+			print_hex32(sector);
+			print(is_write ? " write\n" : " read\n");
+		}
 
 		char status = 0;
 		if (!sdd_block_rw(&buf[4], sector, is_write))
