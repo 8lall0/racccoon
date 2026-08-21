@@ -268,6 +268,54 @@ fn void main() @export("main") {
             } else {
                 print("read failed\n");
             }
+        } else if (strcmp(cmd, "p9realtest") == 0) {
+            // Real 9P semantics against echod's own sandbox (see
+            // user/echod.c3) — genuine FIDs, a real walk-by-name, real
+            // offset-based reads, not p9test's own toy P9_TWALK/P9_TREAD
+            // pair above (kept completely unchanged — ping/runtest/
+            // argvtest all still depend on that exact behavior). Not
+            // hardcoding echod's own pid, same reasoning p9test already
+            // established — resolved through this process's own
+            // namespace instead.
+            int p9r_pid = ns_resolve("/srv/echo/", null);
+            char[40] p9r_buf @noinit;
+
+            int p9r_attach = p9_attach(p9r_pid, 1); // fid 1 = root
+
+            int p9r_walk1 = p9_walk(p9r_pid, 1, 2, "hello"); // fid 2 = "hello"
+            int p9r_open1 = p9_open(p9r_pid, 2);
+            int p9r_read1 = p9_read(p9r_pid, 2, 0, 32, &p9r_buf);
+            p9r_buf[p9r_read1 >= 0 ? p9r_read1 : 0] = 0;
+            bool p9r_read1_ok = p9r_read1 == 20 && strcmp(&p9r_buf, "hello from real 9p\n") == 0;
+
+            // A genuine mid-string offset read — not just "always from
+            // position 0", the exact thing the old P9_TREAD could never
+            // do (it ignores offset entirely).
+            int p9r_read2 = p9_read(p9r_pid, 2, 6, 10, &p9r_buf);
+            p9r_buf[p9r_read2 >= 0 ? p9r_read2 : 0] = 0;
+            bool p9r_read2_ok = p9r_read2 == 10 && strcmp(&p9r_buf, "from real ") == 0;
+
+            int p9r_clunk1 = p9_clunk(p9r_pid, 2);
+
+            int p9r_walk_bad = p9_walk(p9r_pid, 1, 3, "nope"); // must fail — no such name
+
+            int p9r_walk2 = p9_walk(p9r_pid, 1, 4, "motd"); // fid 4 = "motd" — a second, independently reachable node
+            int p9r_open2 = p9_open(p9r_pid, 4);
+            int p9r_read3 = p9_read(p9r_pid, 4, 0, 40, &p9r_buf);
+            p9r_buf[p9r_read3 >= 0 ? p9r_read3 : 0] = 0;
+            bool p9r_read3_ok = p9r_read3 == 38 && strcmp(&p9r_buf, "welcome to racccoon's own 9p sandbox\n") == 0;
+            int p9r_clunk2 = p9_clunk(p9r_pid, 4);
+
+            int p9r_clunk_root = p9_clunk(p9r_pid, 1);
+
+            if (p9r_attach == 0 && p9r_walk1 == 0 && p9r_open1 == 0 && p9r_read1_ok
+                && p9r_read2_ok && p9r_clunk1 == 0 && p9r_walk_bad < 0
+                && p9r_walk2 == 0 && p9r_open2 == 0 && p9r_read3_ok
+                && p9r_clunk2 == 0 && p9r_clunk_root == 0) {
+                print("p9realtest: ok\n");
+            } else {
+                print("p9realtest: FAILED\n");
+            }
         } else if (strcmp(cmd, "nstest") == 0) {
             // Direct namespace-resolution smoke test: prove ns_resolve
             // itself works, independent of the 9P-lite/fsd layers built

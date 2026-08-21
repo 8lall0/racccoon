@@ -410,6 +410,23 @@ fn int ipc_poll_type(char* buf, int len, uint* out_type) @export("ipc_poll_type"
 const uint P9_TWALK = 1; // request: resolve a path
 const uint P9_TREAD = 2; // request: read data
 
+// Real 9P semantics — FIDs, an actual walk, open/read/clunk against a
+// real (if small and synthetic) backing tree — echod's own sandbox
+// (user/echod.c3), see docs/devlog.md for why this is new verbs rather
+// than a change to P9_TWALK/P9_TREAD's own behavior above: those two
+// still mean exactly what they always have (ping/runtest/argvtest/
+// p9test all still depend on that), this is a separate, additional
+// protocol layered alongside them, not a replacement. Numbering just
+// picks up after P9_TREAD — different verb-number spaces (P9_*, FS_*,
+// SYS_*) only ever need to be unique within whatever one process's own
+// dispatch actually checks, never globally, so no collision risk with
+// unrelated verbs a completely different server understands.
+const uint P9_ATTACH = 3; // request: allocate a fid pointing at the tree's own root
+const uint P9_WALK   = 4; // request: resolve one path element from an existing fid onto a new one
+const uint P9_OPEN   = 5; // request: mark a fid ready for reading
+const uint P9_READ   = 6; // request: real offset-based read from an opened fid
+const uint P9_CLUNK  = 7; // request: release a fid
+
 // Reserved verb p9_call() bounces stray senders with — see its own
 // comment. Deliberately far outside every real verb's range (P9_TWALK/
 // P9_TREAD/FS_*, all small, hand-assigned small ints) so it can never
@@ -458,6 +475,84 @@ fn int p9_call(int dest_pid, uint verb, char* data, int len, char* reply_buf, in
         }
         ipc_reply(from, P9_STRAY, reply_buf, 0, from_gen);
     }
+}
+
+// --- Real 9P (P9_ATTACH/P9_WALK/P9_OPEN/P9_READ/P9_CLUNK) — thin
+// wrappers, same shape every other syscall/IPC wrapper in this file
+// already has: pack a fixed-offset request buffer, call p9_call(),
+// unpack the reply. See user/echod.c3's own dispatch for the server
+// side and the exact wire layout each of these matches.
+
+fn int p9_attach(int dest_pid, uint fid) @export("p9_attach") {
+    char[4] req @noinit;
+    uint* fid_field = (uint*)&req[0];
+    *fid_field = fid;
+    uint reply_verb = 0;
+    int from = p9_call(dest_pid, P9_ATTACH, &req, 4, &req, 4, &reply_verb);
+    if (from <= 0 || reply_verb != P9_ATTACH) return -1;
+    int* result_field = (int*)&req;
+    return *result_field;
+}
+
+fn int p9_walk(int dest_pid, uint fid, uint newfid, char* name) @export("p9_walk") {
+    char[40] req @noinit;
+    uint* fid_field = (uint*)&req[0];
+    uint* newfid_field = (uint*)&req[4];
+    *fid_field = fid;
+    *newfid_field = newfid;
+    int i = 0;
+    while (name[i] != 0 && i < 31) { req[8 + i] = name[i]; i++; }
+    req[8 + i] = 0;
+    uint reply_verb = 0;
+    int from = p9_call(dest_pid, P9_WALK, &req, 40, &req, 40, &reply_verb);
+    if (from <= 0 || reply_verb != P9_WALK) return -1;
+    int* result_field = (int*)&req;
+    return *result_field;
+}
+
+fn int p9_open(int dest_pid, uint fid) @export("p9_open") {
+    char[4] req @noinit;
+    uint* fid_field = (uint*)&req[0];
+    *fid_field = fid;
+    uint reply_verb = 0;
+    int from = p9_call(dest_pid, P9_OPEN, &req, 4, &req, 4, &reply_verb);
+    if (from <= 0 || reply_verb != P9_OPEN) return -1;
+    int* result_field = (int*)&req;
+    return *result_field;
+}
+
+// buf_out receives up to `count` bytes — same "clamp to what the
+// caller actually asked for" discipline fs_read()'s own reply-unpacking
+// already uses, in case the server ever returned more than requested.
+fn int p9_read(int dest_pid, uint fid, uint offset, uint count, char* buf_out) @export("p9_read") {
+    char[12] req @noinit;
+    uint* fid_field = (uint*)&req[0];
+    uint* offset_field = (uint*)&req[4];
+    uint* count_field = (uint*)&req[8];
+    *fid_field = fid;
+    *offset_field = offset;
+    *count_field = count;
+    char[64] reply @noinit;
+    uint reply_verb = 0;
+    int from = p9_call(dest_pid, P9_READ, &req, 12, &reply, 64, &reply_verb);
+    if (from <= 0 || reply_verb != P9_READ) return -1;
+    int* result_len_field = (int*)&reply;
+    int result_len = *result_len_field;
+    if (result_len < 0) return result_len;
+    if ((uint)result_len > count) result_len = (int)count;
+    for (int j = 0; j < result_len; j++) buf_out[j] = reply[4 + j];
+    return result_len;
+}
+
+fn int p9_clunk(int dest_pid, uint fid) @export("p9_clunk") {
+    char[4] req @noinit;
+    uint* fid_field = (uint*)&req[0];
+    *fid_field = fid;
+    uint reply_verb = 0;
+    int from = p9_call(dest_pid, P9_CLUNK, &req, 4, &req, 4, &reply_verb);
+    if (from <= 0 || reply_verb != P9_CLUNK) return -1;
+    int* result_field = (int*)&req;
+    return *result_field;
 }
 
 // --- Namespace: turns a path into "send to this pid", per this caller's

@@ -1,13 +1,75 @@
 module user;
 
 // Minimal IPC test server. Started out as a pure echo (proving two
-// processes can exchange a message at all — see docs/devlog.md); now
-// also speaks the first two 9P-lite verbs (P9_TWALK/P9_TREAD, defined in
-// user.c3), to prove the protocol layer works over the same raw
-// primitive. Anything else — including the untyped (type 0) messages
-// shell.c3's "ping"/"runtest" commands still send — falls through to
-// the original raw echo, so those keep working unchanged.
+// processes can exchange a message at all — see docs/devlog.md); then
+// learned the first two 9P-lite verbs (P9_TWALK/P9_TREAD, defined in
+// user.c3) as a fake/toy pair (P9_TWALK never actually walks anything,
+// P9_TREAD ignores offset entirely) — those two are kept completely
+// unchanged (ping/runtest/argvtest/p9test all still depend on that
+// exact behavior). Real 9P semantics — FIDs, a genuine walk, open/
+// offset-based-read/clunk against a real (if small and synthetic)
+// backing tree — now live alongside them as a separate set of verbs
+// (P9_ATTACH/P9_WALK/P9_OPEN/P9_READ/P9_CLUNK), see docs/devlog.md.
+// Anything else — including the untyped (type 0) messages shell.c3's
+// "ping"/"runtest" commands still send — falls through to the
+// original raw echo, so those keep working unchanged too.
+
+// A flat, tiny, read-only, in-memory tree — real enough to exercise
+// genuine walk/open/read/clunk (multiple named nodes, real
+// offset-based reads), without needing a real backing store (that's
+// fsd's own job, a separate, much larger migration, not this).
+struct P9_node
+{
+    char[32] name;
+    char* content; // null for the root (a directory, has no content of its own)
+    uint content_len;
+}
+
+const int P9_NODE_ROOT = 0;
+P9_node[3] p9_tree;
+
+// Populated via explicit field assignment, not a struct-array literal
+// — this codebase has no precedent for that syntax anywhere; every
+// existing struct gets populated this way (e.g. create_process()'s own
+// Mount population, src/process.c3). Two real files with distinct,
+// known content — enough to prove walk-by-name actually discriminates
+// between them, and long enough to prove offset-based reads for real
+// (reading from the middle, not just position 0).
+fn void p9_init_tree()
+{
+    p9_tree[P9_NODE_ROOT].content = null;
+    p9_tree[P9_NODE_ROOT].content_len = 0;
+
+    char* hello_name = "hello";
+    int hi = 0;
+    while (hello_name[hi] != 0) { p9_tree[1].name[hi] = hello_name[hi]; hi++; }
+    p9_tree[1].name[hi] = 0;
+    p9_tree[1].content = "hello from real 9p\n";
+    p9_tree[1].content_len = 20;
+
+    char* motd_name = "motd";
+    int mi = 0;
+    while (motd_name[mi] != 0) { p9_tree[2].name[mi] = motd_name[mi]; mi++; }
+    p9_tree[2].name[mi] = 0;
+    p9_tree[2].content = "welcome to racccoon's own 9p sandbox\n";
+    p9_tree[2].content_len = 38;
+}
+
+// Zero-initialized by default (used = false for every slot at boot) —
+// same "no @noinit means zero-init" convention established elsewhere
+// this session (e.g. ext2_cache_valid/fat32_cache_valid).
+const int P9_FID_MAX = 8;
+struct P9_fid_entry
+{
+    bool used;
+    int node;    // index into p9_tree; meaningless if !used
+    bool opened;
+}
+P9_fid_entry[P9_FID_MAX] p9_fids;
+
 fn void main() @export("main") {
+    p9_init_tree();
+
     // If exec()'d with an argument (user/shell.c3's argvtest), argv[0]
     // replaces the hardcoded P9_TREAD reply below — concrete, observable
     // proof argv actually reached this process, not just that exec()
@@ -37,6 +99,93 @@ fn void main() @export("main") {
             // No real namespace yet (that's a later phase) — just prove
             // the path made it across by handing it straight back.
             ipc_reply(from, P9_TWALK, &buf, 64, from_gen);
+        } else if (verb == P9_ATTACH) {
+            uint* fid_field = (uint*)&buf[0];
+            uint fid = *fid_field;
+            int result = -1;
+            if (fid < (uint)P9_FID_MAX && !p9_fids[fid].used) {
+                p9_fids[fid].used = true;
+                p9_fids[fid].node = P9_NODE_ROOT;
+                p9_fids[fid].opened = false;
+                result = 0;
+            }
+            int* result_field = (int*)&buf[0];
+            *result_field = result;
+            ipc_reply(from, P9_ATTACH, &buf, 4, from_gen);
+        } else if (verb == P9_WALK) {
+            uint* fid_field = (uint*)&buf[0];
+            uint* newfid_field = (uint*)&buf[4];
+            uint fid = *fid_field;
+            uint newfid = *newfid_field;
+            char* name = &buf[8];
+            int result = -1;
+            if (fid < (uint)P9_FID_MAX && p9_fids[fid].used
+                && newfid < (uint)P9_FID_MAX && !p9_fids[newfid].used
+                && p9_fids[fid].node == P9_NODE_ROOT) {
+                // Flat tree: only the root has children, matched by
+                // name — real subdirectories are out of scope for this
+                // sandbox (see this file's own header comment).
+                for (int n = 1; n < 3; n++) {
+                    if (strcmp(name, &p9_tree[n].name[0]) == 0) {
+                        p9_fids[newfid].used = true;
+                        p9_fids[newfid].node = n;
+                        p9_fids[newfid].opened = false;
+                        result = 0;
+                        break;
+                    }
+                }
+            }
+            int* result_field = (int*)&buf[0];
+            *result_field = result;
+            ipc_reply(from, P9_WALK, &buf, 4, from_gen);
+        } else if (verb == P9_OPEN) {
+            uint* fid_field = (uint*)&buf[0];
+            uint fid = *fid_field;
+            int result = -1;
+            if (fid < (uint)P9_FID_MAX && p9_fids[fid].used && p9_fids[fid].node != P9_NODE_ROOT) {
+                p9_fids[fid].opened = true;
+                result = 0;
+            }
+            int* result_field = (int*)&buf[0];
+            *result_field = result;
+            ipc_reply(from, P9_OPEN, &buf, 4, from_gen);
+        } else if (verb == P9_READ) {
+            uint* fid_field = (uint*)&buf[0];
+            uint* offset_field = (uint*)&buf[4];
+            uint* count_field = (uint*)&buf[8];
+            uint fid = *fid_field;
+            uint offset = *offset_field;
+            uint count = *count_field;
+            int result_len = -1;
+            uint reply_len = 4;
+            if (fid < (uint)P9_FID_MAX && p9_fids[fid].used && p9_fids[fid].opened) {
+                P9_node* node = &p9_tree[p9_fids[fid].node];
+                if (offset >= node.content_len) {
+                    result_len = 0;
+                } else {
+                    uint avail = node.content_len - offset;
+                    uint chunk = count;
+                    if (chunk > avail) chunk = avail;
+                    if (chunk > 60) chunk = 60; // buf is 64 bytes, 4 reserved for result_len
+                    for (uint i = 0; i < chunk; i++) buf[4 + i] = node.content[offset + i];
+                    result_len = (int)chunk;
+                    reply_len = 4 + chunk;
+                }
+            }
+            int* result_len_field = (int*)&buf[0];
+            *result_len_field = result_len;
+            ipc_reply(from, P9_READ, &buf, (int)reply_len, from_gen);
+        } else if (verb == P9_CLUNK) {
+            uint* fid_field = (uint*)&buf[0];
+            uint fid = *fid_field;
+            int result = -1;
+            if (fid < (uint)P9_FID_MAX && p9_fids[fid].used) {
+                p9_fids[fid].used = false;
+                result = 0;
+            }
+            int* result_field = (int*)&buf[0];
+            *result_field = result;
+            ipc_reply(from, P9_CLUNK, &buf, 4, from_gen);
         } else {
             ipc_reply(from, verb, &buf, 64, from_gen);
         }

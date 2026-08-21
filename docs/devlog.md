@@ -4,6 +4,70 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (54) — Real 9P semantics (FID/Twalk/Topen/Tread/Tclunk), against echod's own sandbox
+
+Today's "9P-lite" (`P9_TWALK`/`P9_TREAD`, introduced 2026-08-15) was
+never real 9P — confirmed by research this round: `echod`, the only
+server that speaks these verbs, has no backing store at all.
+`P9_TWALK` never walks anything (echod just echoes the raw path bytes
+straight back); `P9_TREAD` returns a hardcoded canned string, ignoring
+offset entirely. No FID exists anywhere in the codebase (every
+operation re-sends a full path or uses a bare pid, no persistent open
+handle). The real file server (`fsd`, backed by FAT32/ext2) was built
+later on an entirely separate, non-9P verb set (`FS_READ`/`FS_WRITE`/
+etc.) that never got folded back into 9P. The original 2026-08-15 entry
+explicitly deferred "real path resolution" to a later phase — this
+entry is that phase, 2026-08-15's own unfinished "next up."
+
+**Lands in `echod`'s own sandbox, not a migration of `fsd`**, confirmed
+with the user — a small, in-memory, read-only synthetic tree (`hello`/
+`motd`, distinct known content), genuinely exercising real FID/walk/
+open/read/clunk semantics, without the much larger risk of migrating
+the real file server. Uses racccoon's own existing IPC framing
+(`msg_type` carries the verb, structured C3 fields at fixed byte
+offsets in `msg_data` — same convention `FS_*` verbs already use), not
+real 9P's own byte-level wire encoding (size/type/tag header) — nothing
+outside this kernel could ever speak real 9P over an actual byte
+stream, so reinventing that framing here would be pure ceremony with no
+interoperability benefit.
+
+**New verbs, not a change to `P9_TWALK`/`P9_TREAD`'s own behavior**:
+`P9_ATTACH`/`P9_WALK`/`P9_OPEN`/`P9_READ`/`P9_CLUNK` (`user/user.c3`)
+sit alongside the existing two, completely untouched — `runtest`/
+`argvtest` specifically use `P9_TREAD` to verify `exec()`'s own
+argv-passing plumbing, an unrelated use case that would have broken had
+`P9_TREAD` suddenly required a walked-and-opened FID.
+
+`echod`'s own new state (`user/echod.c3`): a 3-node flat tree (root +
+`hello` + `motd`) and an 8-slot FID table, both populated/reset the way
+every other struct in this codebase is — explicit field assignment, not
+a struct-array literal (confirmed by grep: no precedent for that syntax
+anywhere in this project). `P9_WALK` does a real name lookup against the
+tree; `P9_OPEN` marks a FID ready; `P9_READ` does a genuine
+offset-based slice into the matched node's own content (proven with a
+real mid-string read, not just "always from position 0" — the exact
+thing the old `P9_TREAD` could never do); `P9_CLUNK` frees the slot.
+
+New shell command `p9realtest` (not `p9test2` — this session's own `2`
+suffix already means "targets the non-default mount," an unrelated
+concept) exercises the whole set: two simultaneously-open FIDs, a real
+negative walk (`"nope"`, must fail), and two independent offset reads
+against two different nodes.
+
+**Verification**: `p9realtest: ok` on all three QEMU images. Full
+regression of every existing 9P-lite user (`ping`/`runtest`/
+`argvtest`/`p9test`) unchanged. Three-boot stress batch clean (no
+filesystem state involved at all — echod's own tree/FID table are
+purely in-memory, reset fresh every boot).
+
+**Real Milk-V Duo hardware confirmation**: `p9realtest: ok`, full
+regression of `ping`/`runtest`/`argvtest`/`p9test` unchanged, `lsproc`
+clean.
+
+**Files changed:** `user/user.c3`, `user/echod.c3`, `user/shell.c3`.
+
+---
+
 ## 2026-08-21 (53) — ext2 becomes root everywhere; FAT32 becomes boot-only; real `/mnt` binding
 
 Plan9-style filesystem reorganization. Root is ext2 now, both on real
