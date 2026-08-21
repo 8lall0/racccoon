@@ -146,7 +146,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		// idle/echod/the storage driver, created before this line, don't
 		// and don't need to (see process.c3's create_process).
 		Process* fsd_proc = create_process((void*)&_binary_fsd_bin_start, (uint)((uptr)&_binary_fsd_bin_end - (uptr)&_binary_fsd_bin_start));
-		setup_fsd_mappings(fsd_proc, board::FS_PARTITION_START_SECTOR);
+		setup_fsd_mappings(fsd_proc, board::FS_PARTITION_START_SECTOR, false);
 		fsd_pid = fsd_proc.pid;
 		io::print("fsd created\n");
 
@@ -163,7 +163,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		if (board::HAS_SECOND_FS_PARTITION)
 		{
 			Process* fsd2_proc = create_process((void*)&_binary_fsd_bin_start, (uint)((uptr)&_binary_fsd_bin_end - (uptr)&_binary_fsd_bin_start));
-			setup_fsd_mappings(fsd2_proc, board::FS_PARTITION_2_START_SECTOR);
+			setup_fsd_mappings(fsd2_proc, board::FS_PARTITION_2_START_SECTOR, true);
 			fsd2_pid = fsd2_proc.pid;
 			io::print("fsd2 created\n");
 		}

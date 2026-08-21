@@ -653,8 +653,12 @@ fn int diskd_info(uptr* vq_paddr_out, uptr* req_paddr_out) @export("diskd_info")
 // kernel-only module (see user/sdd.c3's own header comment), so this is
 // fsd's only way to learn this board-specific fact despite being one
 // board-agnostic user binary compiled identically for every target.
-fn int fs_partition_info(uint* start_sector_out) @export("fs_partition_info") {
-    return syscall(SYS_FS_PARTITION_INFO, (long)start_sector_out, 0, 0);
+// is_secondary_out (optional, null if the caller doesn't care) answers
+// whether this is the second, simultaneously-mounted fsd instance —
+// same "can't see board:: directly" reasoning applies (see
+// src/process.c3's Process.is_secondary_fs for the full explanation).
+fn int fs_partition_info(uint* start_sector_out, bool* is_secondary_out) @export("fs_partition_info") {
+    return syscall(SYS_FS_PARTITION_INFO, (long)start_sector_out, (long)is_secondary_out, 0);
 }
 
 ulong rdtime_tmp @export("rdtime_tmp");

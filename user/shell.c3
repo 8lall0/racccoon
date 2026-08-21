@@ -274,7 +274,7 @@ fn void main() @export("main") {
             // on top of it. Four mounts today (src/process.c3's
             // create_process): "/srv/echo/" -> echod (pid 2), "" -> fsd
             // (catch-all for anything that doesn't start with "/" —
-            // which is every plain filename, "nope" included), "/2/" ->
+            // which is every plain filename, "nope" included), "/mnt/fs2/" ->
             // fsd2, "/proc/" -> procd.
             int pid_root = ns_resolve("/srv/echo/anything", null);
             print("resolve /srv/echo/anything -> pid ");
@@ -619,18 +619,15 @@ fn void main() @export("main") {
                 }
             }
         } else if (strcmp(cmd, "runtest2") == 0) {
-            // Same as runtest above, but "/2/bin/echod" — the second
-            // mount, not the default one. Exists specifically to
-            // exercise mount 2 unambiguously: found the hard way
-            // (fspermtest, docs/devlog.md) that a bare, unprefixed
-            // path resolves through the "" catch-all mount
-            // (src/process.c3's default namespace), which binds to
-            // whichever fsd was created *first* — on real Duo
-            // hardware that's always DUOBOOT/FAT32, not EXT2TEST/ext2,
-            // any time both are mounted. runtest's own bare
-            // "bin/echod" only ever reached mount 2 on QEMU's
-            // single-mount ext2 image, by accident of ext2 being the
-            // only mount there.
+            // Same as runtest above, but "/mnt/fs2/bin/echod" — the second
+            // mount, not the default (root) one. Exists specifically to
+            // exercise mount 2 unambiguously, same reasoning fspermtest's
+            // own comment explains in full — real Duo hardware no longer
+            // has this ambiguity at all (root is ext2-exclusive now, see
+            // this entry's own Plan9-style reorganization, docs/devlog.md),
+            // but QEMU's own dual-mount image still has a real second
+            // mount this needs to target on purpose, not by accident of
+            // whatever happens to be default.
             uint rt2_gen = 0;
             int rt2_r = rfork(RFPROC, &rt2_gen);
             if (rt2_r < 0) {
@@ -639,7 +636,7 @@ fn void main() @export("main") {
                 char[16] rt2_sync_buf @noinit;
                 int rt2_parent = ipc_recv(&rt2_sync_buf, 16);
                 ipc_send(rt2_parent, 0, "ack", 4);
-                exec("/2/bin/echod", &run_exec_buf, RUN_EXEC_BUF_MAX, rt2_parent, null, 0);
+                exec("/mnt/fs2/bin/echod", &run_exec_buf, RUN_EXEC_BUF_MAX, rt2_parent, null, 0);
                 ipc_send(rt2_parent, 0, "failed", 7);
                 exit();
             } else {
@@ -710,7 +707,7 @@ fn void main() @export("main") {
                 }
             }
         } else if (strcmp(cmd, "elftest2") == 0) {
-            // Same as elftest above, but "/2/bin/echod.elf" — see
+            // Same as elftest above, but "/mnt/fs2/bin/echod.elf" — see
             // runtest2's own comment for why this needs its own,
             // explicitly mount-2-targeted variant.
             uint el2_gen = 0;
@@ -721,7 +718,7 @@ fn void main() @export("main") {
                 char[16] el2_sync_buf @noinit;
                 int el2_parent = ipc_recv(&el2_sync_buf, 16);
                 ipc_send(el2_parent, 0, "ack", 4);
-                exec("/2/bin/echod.elf", &run_exec_buf, RUN_EXEC_BUF_MAX, el2_parent, null, 0);
+                exec("/mnt/fs2/bin/echod.elf", &run_exec_buf, RUN_EXEC_BUF_MAX, el2_parent, null, 0);
                 ipc_send(el2_parent, 0, "failed", 7);
                 exit();
             } else {
@@ -792,7 +789,7 @@ fn void main() @export("main") {
                 }
             }
         } else if (strcmp(cmd, "argvtest2") == 0) {
-            // Same as argvtest above, but "/2/bin/echod" — see
+            // Same as argvtest above, but "/mnt/fs2/bin/echod" — see
             // runtest2's own comment for why this needs its own,
             // explicitly mount-2-targeted variant.
             char* av2_arg = "argvtest2-marker";
@@ -805,7 +802,7 @@ fn void main() @export("main") {
                 char[16] av2_sync_buf @noinit;
                 int av2_parent = ipc_recv(&av2_sync_buf, 16);
                 ipc_send(av2_parent, 0, "ack", 4);
-                exec("/2/bin/echod", &run_exec_buf, RUN_EXEC_BUF_MAX, av2_parent, &av2_arg, 1);
+                exec("/mnt/fs2/bin/echod", &run_exec_buf, RUN_EXEC_BUF_MAX, av2_parent, &av2_arg, 1);
                 ipc_send(av2_parent, 0, "failed", 7);
                 exit();
             } else {
@@ -881,11 +878,11 @@ fn void main() @export("main") {
             }
         } else if (strcmp(cmd, "pathtest2") == 0) {
             // Same as pathtest above, but every /env/PATH segment
-            // "/2/"-prefixed, so exec_path() builds candidates against
-            // mount 2 specifically ("/2/nonexistent/echod" then
-            // "/2/bin/echod") — see runtest2's own comment for why
+            // "/mnt/fs2/"-prefixed, so exec_path() builds candidates against
+            // mount 2 specifically ("/mnt/fs2/nonexistent/echod" then
+            // "/mnt/fs2/bin/echod") — see runtest2's own comment for why
             // this needs its own, explicitly mount-2-targeted variant.
-            fs_write("/env/PATH", "/2/nonexistent/:/2/bin/", 23);
+            fs_write("/env/PATH", "/mnt/fs2/nonexistent/:/mnt/fs2/bin/", 35);
 
             uint pt2_gen = 0;
             int pt2_r = rfork(RFPROC, &pt2_gen);
@@ -1043,31 +1040,30 @@ fn void main() @export("main") {
             // "wait for the child to be genuinely, fully done" this
             // needs.
             //
-            // "/2/" prefix on every path here, not bare filenames —
-            // found the hard way testing this on real Duo hardware:
-            // an unprefixed path resolves through the "" catch-all
-            // mount (src/process.c3's default namespace), which binds
-            // to whichever fsd was created *first* — DUOBOOT/FAT32 on
-            // this board, not EXT2TEST/ext2 — any time both are
-            // mounted at once. FAT32 has no uid concept at all to
-            // enforce (by design, this feature's own scope), so every
-            // attempt silently "succeeded": not a bug in the
-            // enforcement logic itself, this test just wasn't actually
-            // reaching ext2. QEMU's own single-mount ext2 test image
-            // (scripts/launch64_ext2.sh) made the bare-path version
-            // look correct purely by accident — ext2 happened to be
-            // the only, and therefore default, mount there. "/2/"
-            // reaches ext2 unambiguously on any dual-mount setup (real
-            // hardware, or QEMU's own scripts/launch64_dual.sh), the
-            // same convention readfile2/newfile2/etc. already use.
-            fs_write("/2/owner_only.txt", "root content", 12);
+            // "/mnt/fs2/" prefix on every path here, not bare filenames —
+            // found the hard way testing this on real Duo hardware,
+            // back when both DUOBOOT/FAT32 and EXT2TEST/ext2 were
+            // simultaneously mounted (see docs/devlog.md): an
+            // unprefixed path resolves through the "" catch-all mount
+            // (src/process.c3's default namespace), which binds to
+            // whichever fsd was created *first* — FAT32 has no uid
+            // concept at all to enforce, so a bare path silently
+            // "succeeded" without ever reaching ext2 at all. Real
+            // hardware no longer mounts FAT32 as anything racccoon's
+            // own fsd touches (see this entry's own Plan9-style
+            // reorganization), so this specific failure mode is now
+            // structurally impossible there — "/mnt/fs2/" stays the
+            // convention regardless, since QEMU's own dual-mount image
+            // (scripts/launch64_dual.sh) still has a real second mount
+            // this test needs to target unambiguously.
+            fs_write("/mnt/fs2/owner_only.txt", "root content", 12);
             // A real two-entry tree, not a bare empty dir — an empty
             // dir wouldn't exercise ext2_delete_dir_contents' own child
             // walk at all, so wouldn't actually prove recursive-delete
             // ownership enforcement (see ext2_delete_recursive's own
             // comment).
-            fs_mkdir("/2/owner_only_dir");
-            fs_write("/2/owner_only_dir/inner.txt", "root content", 12);
+            fs_mkdir("/mnt/fs2/owner_only_dir");
+            fs_write("/mnt/fs2/owner_only_dir/inner.txt", "root content", 12);
 
             uint fp_gen = 0;
             int fp_r = rfork(RFPROC, &fp_gen);
@@ -1078,33 +1074,33 @@ fn void main() @export("main") {
                 print("fspermtest: setuid(42) ");
                 print(fp_su == 0 ? "ok\n" : "FAILED\n");
 
-                int fp_write1 = fs_write("/2/owner_only.txt", "attacker content", 17);
+                int fp_write1 = fs_write("/mnt/fs2/owner_only.txt", "attacker content", 17);
                 print("fspermtest: overwrite root-owned file as non-owner ");
                 print(fp_write1 < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
 
-                int fp_del1 = fs_delete("/2/owner_only.txt");
+                int fp_del1 = fs_delete("/mnt/fs2/owner_only.txt");
                 print("fspermtest: delete root-owned file as non-owner ");
                 print(fp_del1 < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
 
-                int fp_write2 = fs_write("/2/attacker_owned.txt", "mine", 4);
+                int fp_write2 = fs_write("/mnt/fs2/attacker_owned.txt", "mine", 4);
                 print("fspermtest: create own file ");
                 print(fp_write2 >= 0 ? "ok\n" : "FAILED\n");
 
-                int fp_write3 = fs_write("/2/attacker_owned.txt", "mine still", 10);
+                int fp_write3 = fs_write("/mnt/fs2/attacker_owned.txt", "mine still", 10);
                 print("fspermtest: overwrite own file ");
                 print(fp_write3 >= 0 ? "ok\n" : "FAILED\n");
 
-                int fp_del2 = fs_delete("/2/attacker_owned.txt");
+                int fp_del2 = fs_delete("/mnt/fs2/attacker_owned.txt");
                 print("fspermtest: delete own file ");
                 print(fp_del2 >= 0 ? "ok\n" : "FAILED\n");
 
-                int fp_delr1 = fs_delete_recursive("/2/owner_only_dir");
+                int fp_delr1 = fs_delete_recursive("/mnt/fs2/owner_only_dir");
                 print("fspermtest: recursive-delete root-owned dir as non-owner ");
                 print(fp_delr1 < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
 
-                fs_mkdir("/2/attacker_owned_dir");
-                fs_write("/2/attacker_owned_dir/inner.txt", "mine", 4);
-                int fp_delr2 = fs_delete_recursive("/2/attacker_owned_dir");
+                fs_mkdir("/mnt/fs2/attacker_owned_dir");
+                fs_write("/mnt/fs2/attacker_owned_dir/inner.txt", "mine", 4);
+                int fp_delr2 = fs_delete_recursive("/mnt/fs2/attacker_owned_dir");
                 print("fspermtest: recursive-delete own dir ");
                 print(fp_delr2 >= 0 ? "ok\n" : "FAILED\n");
 
@@ -1113,21 +1109,21 @@ fn void main() @export("main") {
                 join(fp_r, fp_gen);
 
                 char[32] fp_readback @noinit;
-                int fp_len = fs_read("/2/owner_only.txt", &fp_readback, 32);
+                int fp_len = fs_read("/mnt/fs2/owner_only.txt", &fp_readback, 32);
                 if (fp_len >= 0) fp_readback[fp_len] = 0;
                 bool fp_intact = fp_len == 12 && strcmp(&fp_readback, "root content") == 0;
 
                 char[32] fp_dir_readback @noinit;
-                int fp_dir_len = fs_read("/2/owner_only_dir/inner.txt", &fp_dir_readback, 32);
+                int fp_dir_len = fs_read("/mnt/fs2/owner_only_dir/inner.txt", &fp_dir_readback, 32);
                 if (fp_dir_len >= 0) fp_dir_readback[fp_dir_len] = 0;
                 bool fp_dir_intact = fp_dir_len == 12 && strcmp(&fp_dir_readback, "root content") == 0;
 
-                int fp_write_root = fs_write("/2/owner_only.txt", "root content v2", 16);
-                int fp_del_root = fs_delete("/2/owner_only.txt");
+                int fp_write_root = fs_write("/mnt/fs2/owner_only.txt", "root content v2", 16);
+                int fp_del_root = fs_delete("/mnt/fs2/owner_only.txt");
                 // Root's own legitimate recursive-delete path, exercising
                 // requester_uid == 0 still working unchanged through the
                 // new checks — also this test's own cleanup.
-                int fp_delr_root = fs_delete_recursive("/2/owner_only_dir");
+                int fp_delr_root = fs_delete_recursive("/mnt/fs2/owner_only_dir");
 
                 if (fp_intact && fp_dir_intact && fp_write_root >= 0 && fp_del_root >= 0 && fp_delr_root >= 0) {
                     print("fspermtest: ok\n");
@@ -1143,9 +1139,9 @@ fn void main() @export("main") {
             // reach even at QEMU's own smallest 1024-byte block size
             // (12 + 256 = 268 blocks = 268KB; this fixture is 300KB) —
             // the first file this driver has ever been asked to read
-            // that far. "/2/" prefix, unambiguous on real hardware —
-            // same reasoning fspermtest's own header comment already
-            // established. Reads via fs_read_at in chunks, same shape
+            // that far. "/mnt/fs2/" prefix, unambiguously targeting the
+            // second mount — same reasoning fspermtest's own header
+            // comment already established. Reads via fs_read_at in chunks, same shape
             // exec()'s own loop uses (user/user.c3), then verifies
             // every single byte against the known pattern — not just
             // that some plausible-looking bytes came back, since a
@@ -1158,7 +1154,7 @@ fn void main() @export("main") {
                 if (br_total >= (uint)BIGFILE_SIZE) break;
                 int br_chunk = (int)((uint)BIGFILE_SIZE - br_total);
                 if (br_chunk > 1024) br_chunk = 1024;
-                int br_got = fs_read_at("/2/bigfile.bin", &bigread_buf[br_total], br_chunk, br_total);
+                int br_got = fs_read_at("/mnt/fs2/bigfile.bin", &bigread_buf[br_total], br_chunk, br_total);
                 if (br_got < 0) { br_read_ok = false; break; }
                 if (br_got == 0) break;
                 br_total += (uint)br_got;
@@ -1187,6 +1183,35 @@ fn void main() @export("main") {
                     print_uint(br_mismatch_at);
                 }
                 print(")\n");
+            }
+        } else if (strcmp(cmd, "mounttest") == 0) {
+            // Proves srv_post()/ns_mount()/ns_unmount() (src/entry.c3)
+            // genuinely work at runtime, not just as the boot-time
+            // plumbing create_process() already uses once, statically,
+            // for the default "/mnt/fs2/" binding (src/process.c3).
+            // fsd2 already srv_post()s itself as "fs2" once it mounts
+            // (user/fsd.c3) — this unmounts the default binding,
+            // confirms it's really gone, then re-establishes it by name
+            // through the exact same syscalls any user process could
+            // call itself, and confirms that works too. Entirely
+            // post-boot, manually triggered — no race with fsd2's own
+            // startup the way rebuilding this at boot time would have
+            // (see src/process.c3's own comment on why the default stays
+            // static).
+            char[32] mt_buf @noinit;
+            int mt_before = fs_read("/mnt/fs2/hello.txt", &mt_buf, 32);
+
+            int mt_unmounted = ns_unmount("/mnt/fs2/");
+            int mt_after_unmount = fs_read("/mnt/fs2/hello.txt", &mt_buf, 32);
+
+            int mt_remounted = ns_mount("/mnt/fs2/", "fs2");
+            int mt_after_remount = fs_read("/mnt/fs2/hello.txt", &mt_buf, 32);
+
+            if (mt_before >= 0 && mt_unmounted == 0 && mt_after_unmount < 0
+                && mt_remounted == 0 && mt_after_remount >= 0) {
+                print("mounttest: ok\n");
+            } else {
+                print("mounttest: FAILED\n");
             }
         } else if (strcmp(cmd, "rforktest") == 0) {
             // Plain rfork(RFPROC): the child gets an independent copy of

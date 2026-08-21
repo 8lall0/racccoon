@@ -108,6 +108,11 @@ LLC=${LLC:-llc}
   debugfs -w -R "write disk-ext2/subdir/nested.txt nestdir/inner.txt" build/disk_ext2.img > /dev/null
   debugfs -w -R "mkdir nestdir/innerdir" build/disk_ext2.img > /dev/null
   debugfs -w -R "write disk-ext2/subdir/nested.txt nestdir/innerdir/inner2.txt" build/disk_ext2.img > /dev/null
+  # mnt/ — a real, initially-empty directory, Plan9-style (see
+  # docs/devlog.md and build/disk_dual_root_part.img's own comment
+  # below for the full reasoning) — this image is ext2-only, so it's
+  # the realistic single-mount default topology real hardware now has.
+  debugfs -w -R "mkdir mnt" build/disk_ext2.img > /dev/null
   # disk_ext2's own bin/ — same exec()-testing purpose as disk.img's own
   # bin/ above.
   debugfs -w -R "mkdir bin" build/disk_ext2.img > /dev/null
@@ -118,47 +123,59 @@ LLC=${LLC:-llc}
   done
   debugfs -w -R "write build/bigfile_fixture.bin bigfile.bin" build/disk_ext2.img > /dev/null
 
-  echo "==> Building disk image (dual FAT32+ext2, for scripts/launch64_dual.sh)..."
+  echo "==> Building disk image (dual ext2+ext2, for scripts/launch64_dual.sh)..."
   # Third test image — exercises fsd/fsd2 mounting two filesystems at once
-  # (see docs/devlog.md's multi-mount entry, src/kernel.c3's conditional
-  # fsd2 spawn gated on board::HAS_SECOND_FS_PARTITION). One flat image,
-  # two independent filesystems at fixed byte offsets, no MBR/partition
-  # table — mirrors how the Duo reads two real partitions off one card
-  # with no partition-table parsing in fsd.c3 either way. The FAT32 half
-  # MUST start at sector 0, not some other offset: fsd's own
-  # FS_PARTITION_START_SECTOR (boards/qemu/board.c3) is one fixed constant
-  # shared with the default disk.img above, which is whole-disk FAT32 from
-  # sector 0 — a different offset here would just mean the first fsd finds
-  # nothing (confirmed the hard way while building this image: an earlier
-  # attempt put FAT32 at sector 2048 and got exactly that). ext2 goes at
-  # sector 18432, matching FS_PARTITION_2_START_SECTOR. 9MiB FAT32 (sized
-  # so it never writes past sector 18432) + 8MiB ext2, 20MiB file total.
-  # The ext2 half is built in a scratch file first (mke2fs has no
-  # offset option) then `dd`'d into place at sector 18432.
-  rm -f build/disk_dual.img build/disk_dual_ext2_part.img
+  # (src/kernel.c3's conditional fsd2 spawn, gated on
+  # board::HAS_SECOND_FS_PARTITION). One flat image, two independent
+  # ext2 filesystems at fixed byte offsets, no MBR/partition table —
+  # mirrors how the Duo reads two real partitions off one card with no
+  # partition-table parsing in fsd.c3 either way.
+  #
+  # Both ext2, not FAT32+ext2 like this image used to be — this
+  # project's own Plan9-style reorganization (docs/devlog.md) makes ext2
+  # root everywhere and FAT32 boot-partition-only everywhere; QEMU has
+  # no boot-ROM-reads-a-partition step to mirror (it loads the kernel
+  # ELF directly via -kernel), so FAT32 has no structural role in this
+  # image anymore. disk.img above stays FAT32-only, on its own, purely
+  # as ongoing regression coverage for the FAT32 backend itself.
+  #
+  # Partition 1 (root) MUST start at sector 0 — fsd's own
+  # FS_PARTITION_START_SECTOR (boards/qemu/board.c3) is one fixed
+  # constant shared with the default disk.img above (confirmed the hard
+  # way while first building this image with FAT32: a different offset
+  # here just means the first fsd finds nothing). Partition 2 (bound at
+  # "/mnt/fs2/" — user/shell.c3) goes at sector 18432, matching
+  # FS_PARTITION_2_START_SECTOR. Both built as scratch files first
+  # (mke2fs has no offset option) then `dd`'d into place.
+  rm -f build/disk_dual.img build/disk_dual_root_part.img build/disk_dual_ext2_part.img
   dd if=/dev/zero of=build/disk_dual.img bs=1M count=20 status=none
-  mkfs.vfat -F 32 build/disk_dual.img 9216 > /dev/null
-  mcopy -i build/disk_dual.img disk/*.txt ::
-  mmd -i build/disk_dual.img ::subdir
-  mcopy -i build/disk_dual.img disk/subdir/*.txt ::subdir
-  mmd -i build/disk_dual.img ::emptydir
-  # bin/ on the FAT32 half too — previously missing entirely (a
-  # pre-existing gap flagged but not fixed in devlog entries 45/49:
-  # every un-suffixed exec()-family test, e.g. runtest, correctly
-  # FAILED on this image since bin/echod was never seeded here).
-  # shell.c3's own /bin/ fallback branch always execs a bare
-  # "/bin/<cmd>" for the command name itself (mount 1 by default, same
-  # as every other bare-path reference in this project) — so the new
-  # cat/ls/write/rm/mkdir/mv utilities need to be reachable here even
-  # when their own *arguments* target "/2/", or they can never be
-  # found at all on this image. Fixing this now since it directly
-  # blocks verifying those utilities against the dual-mount image.
-  mmd -i build/disk_dual.img ::bin
-  mcopy -i build/disk_dual.img build/user/echod.bin ::bin/echod
-  mcopy -i build/disk_dual.img build/user/echod.elf ::bin/echod.elf
+
+  dd if=/dev/zero of=build/disk_dual_root_part.img bs=1M count=8 status=none
+  mke2fs -q -F -b 1024 build/disk_dual_root_part.img
+  debugfs -w -R "write disk-ext2/hello.txt hello.txt" build/disk_dual_root_part.img > /dev/null
+  debugfs -w -R "mkdir subdir" build/disk_dual_root_part.img > /dev/null
+  debugfs -w -R "write disk-ext2/subdir/nested.txt subdir/nested.txt" build/disk_dual_root_part.img > /dev/null
+  debugfs -w -R "mkdir emptydir" build/disk_dual_root_part.img > /dev/null
+  debugfs -w -R "mkdir nestdir" build/disk_dual_root_part.img > /dev/null
+  debugfs -w -R "write disk-ext2/subdir/nested.txt nestdir/inner.txt" build/disk_dual_root_part.img > /dev/null
+  debugfs -w -R "mkdir nestdir/innerdir" build/disk_dual_root_part.img > /dev/null
+  debugfs -w -R "write disk-ext2/subdir/nested.txt nestdir/innerdir/inner2.txt" build/disk_dual_root_part.img > /dev/null
+  # mnt/ — a real, initially-empty directory, Plan9-style: an ordinary
+  # place other services get mounted onto (see docs/devlog.md), nothing
+  # structurally special about it. The actual "/mnt/fs2/" binding is
+  # namespace-prefix resolution (intercepts before this directory's own
+  # listing is ever consulted) — this exists purely so `ls /mnt`/`ls
+  # mnt` behaves sensibly, not because anything reads its contents.
+  debugfs -w -R "mkdir mnt" build/disk_dual_root_part.img > /dev/null
+  debugfs -w -R "mkdir bin" build/disk_dual_root_part.img > /dev/null
+  debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_root_part.img > /dev/null
+  debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_root_part.img > /dev/null
   for u in cat ls write rm mkdir mv; do
-    mcopy -i build/disk_dual.img "build/user/$u.bin" "::bin/$u"
+    debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_root_part.img > /dev/null
   done
+  dd if=build/disk_dual_root_part.img of=build/disk_dual.img bs=512 seek=0 conv=notrunc status=none
+  rm -f build/disk_dual_root_part.img
+
   dd if=/dev/zero of=build/disk_dual_ext2_part.img bs=1M count=8 status=none
   mke2fs -q -F -b 1024 build/disk_dual_ext2_part.img
   debugfs -w -R "write disk-ext2/hello.txt hello.txt" build/disk_dual_ext2_part.img > /dev/null
@@ -167,10 +184,10 @@ LLC=${LLC:-llc}
   debugfs -w -R "mkdir emptydir" build/disk_dual_ext2_part.img > /dev/null
   # bin/echod, bin/echod.elf — the exec()-family "2" test variants
   # (runtest2/argvtest2/pathtest2/elftest2, shell.c3) need these
-  # reachable at "/2/bin/echod"/"/2/bin/echod.elf" specifically, not
-  # just via the default (mount 1) namespace — see docs/devlog.md for
-  # why an unprefixed path can't be trusted to reach mount 2 whenever
-  # a mount 1 also exists.
+  # reachable at "/mnt/fs2/bin/echod"/"/mnt/fs2/bin/echod.elf"
+  # specifically, not just via the default (root) namespace — see
+  # docs/devlog.md for why an unprefixed path can't be trusted to reach
+  # the second mount whenever a root mount also exists.
   debugfs -w -R "mkdir bin" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_ext2_part.img > /dev/null
@@ -179,7 +196,7 @@ LLC=${LLC:-llc}
   done
   # bigfile.bin — same double-indirect-block fixture as the single-mount
   # ext2 image above, needed here too since bigreadtest always targets
-  # "/2/bigfile.bin" (unambiguous, same reasoning as bin/echod above).
+  # "/mnt/fs2/bigfile.bin" (unambiguous, same reasoning as bin/echod above).
   debugfs -w -R "write build/bigfile_fixture.bin bigfile.bin" build/disk_dual_ext2_part.img > /dev/null
   dd if=build/disk_dual_ext2_part.img of=build/disk_dual.img bs=512 seek=18432 conv=notrunc status=none
   rm -f build/disk_dual_ext2_part.img

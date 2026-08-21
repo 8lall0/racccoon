@@ -259,6 +259,14 @@ struct Process
 	// setup_diskd_mappings()/setup_sdd_mappings() below.
 	uint fs_partition_start;
 
+	// fsd-only, same "set by setup_fsd_mappings, handed back via a
+	// SYS_FS_PARTITION_INFO out-pointer" shape as fs_partition_start
+	// above — lets fsd.c3 (user-space, can't see the kernel-only board
+	// module) tell whether it's the root fsd or the second one, needed
+	// to decide whether to srv_post() itself for real /mnt binding (see
+	// user/fsd.c3's own comment).
+	bool is_secondary_fs;
+
 	char[STACK_SIZE] stack; // Kernel stack
 }
 
@@ -598,11 +606,17 @@ fn Process* create_process(void* image, uint image_size)
 	proc.namespace[1].server_pid = fsd_pid;
 	proc.namespace[1].server_generation = mount_generation(fsd_pid);
 
-	// "/2/" — the second, simultaneously-mounted fsd instance (see
-	// fsd2_pid's own comment above). Same "harmless 0 for any process
-	// created before it exists" pattern as namespace[1] — SYS_NS_RESOLVE
-	// (entry.c3) already skips any mount with server_pid == 0.
-	str_copy(&proc.namespace[2].prefix[0], "/2/", NS_PREFIX_MAX);
+	// "/mnt/fs2/" — the second, simultaneously-mounted fsd instance (see
+	// fsd2_pid's own comment above), Plan9-style: an ordinary directory
+	// other services get mounted onto, not root itself (see
+	// docs/devlog.md). Same "harmless 0 for any process created before
+	// it exists" pattern as namespace[1] — SYS_NS_RESOLVE (entry.c3)
+	// already skips any mount with server_pid == 0. This default binding
+	// stays statically set here rather than raced against fsd2's own
+	// boot-time mount via a real ns_mount() call — see user/fsd.c3's own
+	// comment for why fsd2 also srv_post()s itself under "fs2", proven
+	// genuinely rebindable post-boot by shell.c3's own mounttest.
+	str_copy(&proc.namespace[2].prefix[0], "/mnt/fs2/", NS_PREFIX_MAX);
 	proc.namespace[2].server_pid = fsd2_pid;
 	proc.namespace[2].server_generation = mount_generation(fsd2_pid);
 
@@ -626,6 +640,7 @@ fn Process* create_process(void* image, uint image_size)
 	}
 
 	proc.fs_partition_start = 0; // meaningful only once setup_fsd_mappings() sets it
+	proc.is_secondary_fs = false; // same — meaningful only once setup_fsd_mappings() sets it
 
 	return proc;
 }
@@ -635,11 +650,16 @@ fn Process* create_process(void* image, uint image_size)
 // HAS_SECOND_FS_PARTITION, the second), to tell it which partition it
 // owns. No MMIO/paging work needed here, unlike setup_diskd_mappings/
 // setup_sdd_mappings below — fsd never touches hardware directly, it
-// only needs this one fact, handed back via SYS_FS_PARTITION_INFO
-// (entry.c3) reading current_proc.fs_partition_start.
-fn void setup_fsd_mappings(Process* proc, uint partition_start)
+// only needs these two facts, handed back via SYS_FS_PARTITION_INFO
+// (entry.c3) reading current_proc.fs_partition_start/is_secondary_fs.
+// is_secondary is a plain bool kernel.c3 already knows unambiguously
+// at each of its own two call sites (its own code is what conditionally
+// creates the second instance at all) — see is_secondary_fs's own
+// comment for why fsd.c3 needs this at all.
+fn void setup_fsd_mappings(Process* proc, uint partition_start, bool is_secondary)
 {
 	proc.fs_partition_start = partition_start;
+	proc.is_secondary_fs = is_secondary;
 }
 
 // Called once, right after create_process() spawns diskd (see kernel.c3),

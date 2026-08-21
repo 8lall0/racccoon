@@ -301,7 +301,8 @@ fn void fs_reserve_protection_summary()
 
 fn void fs_mount()
 {
-	if (fs_partition_info(&fs_partition_start) < 0)
+	bool is_secondary = false;
+	if (fs_partition_info(&fs_partition_start, &is_secondary) < 0)
 	{
 		fs_panic("failed to get partition info");
 	}
@@ -334,6 +335,15 @@ fn void fs_mount()
 		ext2_mkdir("tmp", 0); // owned by root — this is fsd itself creating it, at mount time, not on any particular requester's behalf
 		ext2_reserve_protected(&FS_PROTECTED_NAME);
 		fs_reserve_protection_summary();
+		// Real Plan9-style bind/mount, for real: only the *second* fsd
+		// instance ever announces itself — the root fsd never needs a
+		// name, it's already reachable via the unchanged "" catch-all.
+		// This is what create_process()'s own default "/mnt/fs2/" ->
+		// fsd2_pid binding (src/process.c3) is itself just one static
+		// use of — shell.c3's own mounttest proves the same name is
+		// genuinely re-mountable later via real ns_unmount()/ns_mount()
+		// syscalls, not just boot-time plumbing.
+		if (is_secondary) srv_post("fs2");
 		return;
 	}
 	if (fat32_probe())
@@ -345,6 +355,8 @@ fn void fs_mount()
 		fat32_mkdir("tmp");
 		fat32_reserve_protected(&FS_PROTECTED_NAME);
 		fs_reserve_protection_summary();
+		// See the ext2 branch's own comment above — same reasoning.
+		if (is_secondary) srv_post("fs2");
 		return;
 	}
 

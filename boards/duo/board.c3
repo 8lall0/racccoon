@@ -123,28 +123,26 @@ const bool HAS_BLOCK_DEVICE = true;
 const bool HAS_SD_BLOCK     = true;
 const bool HAS_VIRTIO_BLOCK = false;
 
-// fsd.c3 (see its own header comment) adds this to every logical sector
-// number before touching the card — the real, physical start sector of
-// the DUOBOOT FAT32 partition, confirmed via `sfdisk`/`lsblk` against
-// the actual card. fsd mounts this *same* partition, the one holding
-// this board's own bootable fip.bin — safe even though fsd now supports
-// writes because of the structural reserved-sector-range protection
-// fs_mount() builds at startup (see user/fsd.c3's own header comment),
-// not because reading is the only thing fsd can do anymore. Repartitioned
-// to a smaller 1GiB (unchanged start sector) during real-hardware ext2
-// verification — see docs/devlog.md — to make room for the second, ext2
-// EXT2TEST partition below, now actually used by a second, simultaneously
-// mounted fsd instance (see kernel.c3's own spawn code).
-const uint FS_PARTITION_START_SECTOR = 2048;
+// fsd mounts EXT2TEST (ext2) as this board's own root — the real,
+// physical start sector, confirmed via `sfdisk`/`lsblk` against the
+// actual card. DUOBOOT (FAT32, sector 2048) deliberately isn't this
+// value anymore: it stays physically on the SD card purely for the
+// SoC's own boot ROM, which reads fip.bin from it via its own
+// independent FAT32 walk before racccoon's kernel even starts —
+// already fully decoupled from anything fsd does (confirmed via
+// scripts/flash_duo.sh's own header comment) — racccoon's own fsd
+// simply never mounts it. Matches this project's own Plan9-style
+// reorganization (see docs/devlog.md): ext2 is root everywhere, FAT32
+// is boot-partition-only everywhere, and this board only ever needed
+// one fsd instance in the first place — HAS_SECOND_FS_PARTITION below
+// reflects that now.
+const uint FS_PARTITION_START_SECTOR = 2099200;
 
-// The real EXT2TEST partition created alongside DUOBOOT during the same
-// repartition — see FS_PARTITION_START_SECTOR's own comment. Confirmed
-// via the same `sfdisk`/`lsblk` session, not assumed. HAS_SECOND_FS_
-// PARTITION gates kernel.c3's second create_process() call the same way
-// HAS_BLOCK_DEVICE gates the first storage driver + fsd — see
-// docs/devlog.md for why exactly two static mounts, not a general N.
-const bool HAS_SECOND_FS_PARTITION = true;
-const uint FS_PARTITION_2_START_SECTOR = 2099200;
+// No second fsd on this board — see FS_PARTITION_START_SECTOR's own
+// comment. DUOBOOT stays on the card at sector 2048 for the boot ROM's
+// own sake, but racccoon's own namespace has nothing bound to it.
+const bool HAS_SECOND_FS_PARTITION = false;
+const uint FS_PARTITION_2_START_SECTOR = 2048;
 
 // Same register formulas as boards/qemu/board.c3 — see this file's own
 // PLIC_BASE comment for why these are unverified rather than assumed

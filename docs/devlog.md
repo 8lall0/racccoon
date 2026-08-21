@@ -4,6 +4,114 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (53) — ext2 becomes root everywhere; FAT32 becomes boot-only; real `/mnt` binding
+
+Plan9-style filesystem reorganization. Root is ext2 now, both on real
+Milk-V Duo hardware and in QEMU's own dual-mount test topology —
+previously FAT32 was "root" purely because it happened to be whichever
+fsd got created first (`create_process()`'s own `""` catch-all binding
+to `fsd_pid`), the exact bug-prone pattern this whole session kept
+working around (`/2/`-prefix requirements, real-hardware bare paths
+defaulting to the wrong filesystem, etc.). FAT32 becomes boot-partition-
+only everywhere: on real hardware `DUOBOOT` stays physically on the SD
+card (the SoC's own boot ROM reads `fip.bin` from it via its own
+independent FAT32 walk, already fully decoupled from racccoon's kernel
+— confirmed via `scripts/flash_duo.sh`'s own header comment) but
+`fsd` never mounts it anymore; on QEMU it has no structural role to
+mirror at all (QEMU loads the kernel ELF directly via `-kernel`, no
+boot-ROM-reads-a-partition step exists there), so `disk.img`
+(FAT32-only) stays purely as ongoing regression coverage for the
+backend itself, never anyone's root or dual-mount partner.
+
+**Real Duo hardware**: `boards/duo/board.c3` now points
+`FS_PARTITION_START_SECTOR` at `EXT2TEST` (was `DUOBOOT`), and
+`HAS_SECOND_FS_PARTITION` is `false` — only one `fsd` process exists.
+Since filesystem type is auto-probed by content (`ext2_probe()` first),
+not partition position, that one `fsd` correctly mounts ext2 with zero
+`fsd.c3`/`ext2.c3` changes. This retires the single biggest source of
+real-hardware pain this session kept hitting: with only one fsd, every
+bare path now reaches ext2 directly, no more "which fsd was created
+first" ambiguity to work around.
+
+**`/mnt/fs2/`, not `/2/`**: matches Plan9's own convention — `/mnt` is
+just an ordinary directory (root's own `bin/` now has a real, sibling
+`mnt/` directory too, initially empty) that other services get mounted
+onto, nothing structurally special about it, same as this project's own
+`/srv`/`/proc`/`/env` are already name-keyed IPC-backed namespace
+prefixes mirroring Plan9 already. `create_process()`'s default namespace
+still statically binds this at boot (slot 2, renamed from `"/2/"`) —
+deliberately not raced against `fsd2`'s own boot-time mount via a real
+`ns_mount()` call instead: there's no `yield()`/`sleep()` syscall in
+this kernel to wait on safely, and trading a small, already-safe
+hardcoded default for a real chance of an intermittent missing mount
+isn't a good trade for a cosmetic rename. (This isn't actually in
+tension with "real Plan9-style" — even a real Plan9 `init` establishes
+its own starting namespace directly, not via a race against its own
+children.)
+
+**Proving `srv_post()`/`ns_mount()`/`ns_unmount()` work for real, not
+just as boot-time plumbing**: these syscalls already existed (this
+session's own earlier work) but were never genuinely exercised
+end-to-end. `fsd.c3` now calls `srv_post("fs2")` right after mounting,
+*only* when it's the second instance — `fsd.c3` is user-space and can't
+see `board::` (kernel-only module) to know that about itself, so this
+required extending the existing `SYS_FS_PARTITION_INFO`/
+`fs_partition_info()` mechanism with a second optional out-pointer
+(same convention `SYS_NS_RESOLVE`/`SYS_RFORK` already use), fed by a new
+`Process.is_secondary_fs` field `kernel.c3` sets unambiguously at each
+of its own two `setup_fsd_mappings()` call sites — it already knows
+which is which, since its own code is what conditionally creates the
+second instance at all. New shell command `mounttest`: reads through
+the default mount, `ns_unmount("/mnt/fs2/")`, confirms the read now
+fails, `ns_mount("/mnt/fs2/", "fs2")` re-adds it by name through the
+exact syscalls any user process could call itself, confirms the read
+works again. Entirely post-boot, manually triggered — no race with
+`fsd2`'s own startup, since by the time anything types a shell command
+it's had many scheduler rounds to finish.
+
+**QEMU's `disk_dual.img`** is rebuilt as two ext2 partitions instead of
+FAT32+ext2 — partition 1 (root) gets the same fixture set
+`disk_ext2.img`'s own root already has plus the new `mnt/` directory;
+partition 2 (bound at `/mnt/fs2/`) reuses the existing ext2-half
+construction essentially unchanged (it was already ext2, only partition
+1 was what changed). Every remaining `"/2/"` reference in
+`user/shell.c3` becomes `"/mnt/fs2/"` — command *names* stay unchanged
+(`runtest2`, `argvtest2`, `pathtest2`, `elftest2`, `fspermtest`,
+`bigreadtest` — the `2` still means "targets the non-default mount,"
+regardless of that mount's prefix string). Found two stale comments
+citing the old real-hardware "DUOBOOT/FAT32 wins by creation order"
+bug (now structurally impossible there) and one referencing
+already-removed `readfile2`/`newfile2` commands from an earlier entry
+— fixed in place; historical devlog entries themselves are not
+retroactively edited (same discipline already established).
+
+**Verification**: on the new dual-ext2 image, `runtest`/`argvtest`/
+`pathtest`/`elftest` (root, now ext2 instead of FAT32) and
+`runtest2`/`argvtest2`/`pathtest2`/`elftest2`/`fspermtest`/`bigreadtest`
+(now via `/mnt/fs2/`) all `ok`, new `mounttest: ok`, full regression of
+every process/IPC-mechanism builtin and the `/bin/` utilities against
+both mounts (confirming `cat`/`ls`/`write`/`rm`/`mkdir`/`mv` work
+against ext2-as-root now, lowercase filenames preserved as expected,
+unlike FAT32's uppercase 8.3 names). Single-mount images unaffected —
+confirms the conditional `srv_post()` correctly never fires when there's
+no real second mount (`fs_type` stays `FS_TYPE_NONE`). Three-boot stress
+batch, `e2fsck -n -f` clean on every ext2 image, `fsck.vfat -n` clean on
+the untouched FAT32-only image.
+
+**Real Milk-V Duo hardware confirmation**: `cat hello.txt` (bare, no
+prefix) now correctly reaches ext2 directly — the long-standing "bare
+path hits whichever fsd was created first" issue is structurally gone
+on this board, not just avoided. `lsproc` shows `2/`-`7/` only (one
+fewer than QEMU's `2/`-`8/`, exactly the expected shift from no longer
+spawning a second `fsd`) — clean, no leaked slots. `ls mnt` correctly
+shows nothing (a genuinely empty directory).
+
+**Files changed:** `boards/duo/board.c3`, `src/process.c3`,
+`src/kernel.c3`, `src/entry.c3`, `user/user.c3`, `user/fsd.c3`,
+`user/shell.c3`, `scripts/build.sh`, `scripts/launch64_dual.sh`.
+
+---
+
 ## 2026-08-21 (52) — Shell backspace/line-editing support
 
 Follow-up to the previous entry: now that the shell takes real typed

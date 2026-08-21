@@ -869,6 +869,15 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// constant can't answer this the same way for both.
 			uint* fs_partition_out = (uint*)(uptr)f.a0;
 			*fs_partition_out = current_proc.fs_partition_start;
+			// a1 is a second, optional out-pointer (same "null means
+			// the caller doesn't care" convention SYS_NS_RESOLVE/
+			// SYS_RFORK already use) — see is_secondary_fs's own
+			// comment (process.c3) for why fsd.c3 needs this at all.
+			bool* fs_is_secondary_out = (bool*)(uptr)f.a1;
+			if (fs_is_secondary_out != null)
+			{
+				*fs_is_secondary_out = current_proc.is_secondary_fs;
+			}
 		case SYS_RFORK:
 			// Inline for the same reason as every other case in this
 			// switch — see SYS_EXIT's comment. See process.c3's
