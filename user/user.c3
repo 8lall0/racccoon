@@ -37,6 +37,7 @@ const int SYS_NS_MOUNT     = 22; // binds a posted srv_table name at a path pref
 const int SYS_PARENT_INFO  = 23; // returns a process's parent pid/generation, if it has one — see src/entry.c3's case
 const int SYS_EXEC         = 24; // replaces the calling process's own image in place — see src/entry.c3's case
 const int SYS_SETUID       = 25; // sets the caller's own uid, only while still root — see src/entry.c3's case
+const int SYS_NS_MOUNT_WAIT = 26; // SYS_NS_MOUNT, but blocks (bounded by a retry count) until the target actually posts — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -661,6 +662,20 @@ fn int srv_post(char* name) @export("srv_post") {
 // poster has since exited) or this process's own namespace is full.
 fn int ns_mount(char* prefix, char* srv_name) @export("ns_mount") {
     return syscall(SYS_NS_MOUNT, (long)prefix, (long)srv_name, 0);
+}
+
+// Same as ns_mount() above, but blocks — retrying up to max_attempts
+// times (yielding between each) — for a server that hasn't posted
+// itself yet but is expected to soon (a dynamically-spawned driver
+// still finishing its own hardware init, for instance). A plain retry
+// count, not a wall-clock timeout — see SYS_NS_MOUNT_WAIT's own case
+// (src/entry.c3) for why: a real time-CSR deadline crashed here,
+// combining read_reg("time") with other locals surviving across
+// repeated calls inside a loop. Returns 0 once bound, -1 if every
+// attempt failed — same convention every other ns_*/srv_* wrapper
+// already uses.
+fn int ns_mount_wait(char* prefix, char* srv_name, ulong max_attempts) @export("ns_mount_wait") {
+    return syscall(SYS_NS_MOUNT_WAIT, (long)prefix, (long)srv_name, (long)max_attempts);
 }
 
 // Blocks until the process with this pid no longer exists — e.g. a

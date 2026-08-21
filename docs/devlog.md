@@ -4,6 +4,129 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (63) — Hot-plug plumbing (`SYS_NS_MOUNT_WAIT`), and a real kernel interrupt-safety bug found along the way
+
+USB support (goal: mass storage with real hot-plug) needs a way for a
+driver spawned *after* boot to announce itself and have some other
+process wait until it's actually ready to bind — something this kernel
+had no mechanism for at all. `fsd.c3`'s own binding to its disk driver
+is a hardcoded, boot-time-only constant (`DISKD_PID = 3`); `SYS_NS_MOUNT`
+binds a namespace prefix to whatever's *currently* posted, with no
+retry; `mounttest` (the one existing proof `srv_post`/`ns_mount` work
+post-boot) deliberately only ever mounts something *already* posted
+well before the command runs, avoiding exactly this race. There's also
+no user-mode `yield()`/`sleep()` syscall, so a client-side retry loop
+has no safe way to wait.
+
+**`SYS_NS_MOUNT_WAIT`** (`src/entry.c3`, syscall 26): same
+`(prefix, srv_name)` as `SYS_NS_MOUNT`, plus a `max_attempts` retry
+count. Blocks — same `PROC_RUNNABLE`-throughout polling shape as
+`SYS_JOIN` (never `PROC_BLOCKED`: nothing would ever clear that for
+this condition) — retrying a new shared `ns_mount_try()` helper
+(`src/process.c3`, extracted from `SYS_NS_MOUNT`'s own previously-inline
+lookup+bind logic, zero behavior change for its existing caller) until
+it succeeds or the attempts run out. `user/user.c3` gets the
+`ns_mount_wait()` wrapper; `user/shell.c3` gets `hotplugtest`, which
+spawns a "late driver" child that posts itself only after a real,
+unpredictable delay, and races a real `ns_mount_wait()` call against it
+— proving the wait genuinely blocks and retries, not just checks once,
+plus a second call against a name nothing ever posts, proving it gives
+up rather than hanging forever.
+
+**A real, previously-undiscovered kernel bug, found building this**:
+`hotplugtest` reproducibly corrupted the parent's own execution —
+not a crash, the parent appeared to silently re-execute its own code
+from an earlier point. Root-caused, by elimination across five isolated
+variants, to a fresh `rfork()` child getting its first scheduling turn
+while the parent is still open inside a *different* blocking syscall.
+`sstatus`'s `SPIE` bit (what every `sret` restores the live `SIE`/
+interrupt-enable bit from) is a single, unbanked hardware register;
+`switch_context()` (the cooperative stack-swap `yield()` uses) never
+touches it, only a genuine trap-entry/`sret` pair does. `fork_entry()`
+(`src/process.c3`) — a brand-new child's synthetic "first ever" resume
+path, entirely separate from the shared `kernel_entry` trap-exit tail —
+never touched `sstatus` at all: its `sret` fired using whatever the
+*most recent real trap entry anywhere in the system* happened to leave
+in that shared register, which, with the parent mid-syscall, was still
+the parent's own "interrupts were on" snapshot from *before* it entered
+that syscall — globally re-enabling interrupts while the parent's own
+wait still assumed they were off, letting a timer interrupt land
+mid-syscall (exactly what this kernel's whole preemption-safety design,
+`enable_timer_interrupts()`'s own comment, says should be impossible).
+Latent until now because nothing before combined "spawn a new process"
+with "immediately enter a *different* blocking syscall."
+
+**Fix**: a new `blocking_depth` counter (`src/process.c3`) plus
+`Process.in_blocking_wait`, incremented/decremented around all six
+blocking syscalls' own poll loops (`SYS_JOIN`, `SYS_GETCHAR`,
+`SYS_IPC_RECV`/`_GEN`, `SYS_FUTEX_WAIT`, `SYS_NS_MOUNT_WAIT`).
+`fork_entry()` consults it live, at the exact moment its own `sret` is
+about to fire, forcing `SPIE` off whenever it's nonzero — checked live,
+not baked in at `SYS_RFORK` time (seriously considered and rejected:
+`blocking_depth` can change *after* `rfork()` returns but *before* the
+child's first real turn, exactly hotplugtest's own scenario). `SYS_KILL`
+decrements the counter if it kills a target that was genuinely mid a
+counted wait, closing a real leak risk (a killed process's own
+increment would otherwise never come back down).
+
+**A wrong first attempt, corrected before shipping**: the first version
+also forced `SPIE` off at `handle_trap()`'s own end (the *shared*
+trap-exit tail every ordinary syscall returns through), reasoning that
+*any* process's eventual natural `sret` could equally use a stale
+`sstatus` snapshot if another process was still blocked elsewhere.
+Wrong in practice: `blocking_depth` is *effectively always* nonzero
+during normal operation — every idle server (`echod`/`fsd`/`procd`/
+`envd`) sits *permanently* blocked in `SYS_IPC_RECV` waiting for its
+next client, which is its normal steady state, not a transient window.
+Gating the shared tail on it disabled real timer-interrupt preemption
+for the *entire system*, forever, from early in boot onward — found
+directly when `hotplugtest` itself started reproducibly hanging with
+that version in place (a syscall-free spinning child, once nothing
+could ever forcibly preempt it, simply never gave the CPU back).
+Reverted that part: the shared tail's own `sret` already correctly
+restores `SIE` from *that specific process's own* `sstatus` snapshot,
+captured at *that same trap's* own entry — already safe by the
+existing, proven invariant. Forcing `SPIE` off is only ever needed for
+a *synthetic* `sret` with no real corresponding trap-entry of its own,
+which only happens in `fork_entry()`.
+
+**Also fixed in `hotplugtest` itself**: the "late driver" child
+originally spun in a bare `for(;;){}` after posting — a design bug in
+its own right, independent of the kernel fix: a real driver would
+eventually make *some* syscall (an actual I/O wait), never spin
+forever with zero syscalls at all. Once the kernel correctly stopped
+letting a mid-syscall parent get preempted by an unrelated process's
+stale interrupt state, a truly syscall-free child had no way to ever
+give the CPU back. Changed to block on a real `ipc_recv()` for a
+message nobody sends — a realistic idle-wait, and one that yields
+through the same safe, `blocking_depth`-covered mechanism every other
+blocking wait already uses.
+
+**Verification**: `hotplugtest: ok` repeatedly (12+ consecutive
+invocations across fresh boots, no failures) on all three QEMU images.
+Full regression clean: `mounttest` (confirms `ns_mount_try`'s extraction
+is a no-op), `rforktest`, `threadtest`/`threadjointest`, `killtest`,
+`permtest`, `srvtest`, `racetest`/`mutextest` (`SYS_FUTEX_WAIT`/`WAKE`),
+`ping`/`p9test` (`SYS_IPC_RECV`), `p9fstest`/`p9fswritetest`/
+`p9mkdirtest`/`fspermtest`, `runtest2`/`argvtest2`/`pathtest2`/
+`bigreadtest`/`elftest2`, full shell suite. Explicitly re-verified the
+leak-safety path (a throwaway diagnostic command, not committed): killed
+a process genuinely mid-`SYS_JOIN`, confirmed `blocking_depth`
+decremented correctly rather than leaking. Three-boot stress batch,
+`e2fsck -n -f` clean on both `disk_dual.img` halves.
+
+**Real Milk-V Duo hardware confirmation**: `hotplugtest: ok`,
+`killtest`/`permtest`/`p9fswritetest` all still `ok`, `lsproc` clean
+(`2/` through `7/`, no leaked children). `mounttest: FAILED` on real
+hardware is expected and unrelated — real hardware has never spawned a
+second `fsd` (entry 53), so `mounttest`'s own `/mnt/fs2/` cycle has
+never been reachable there; not a regression from this entry.
+
+**Files changed:** `src/entry.c3`, `src/process.c3`, `user/user.c3`,
+`user/shell.c3`.
+
+---
+
 ## 2026-08-21 (62) — mkdir via real 9P: `P9_CREATE` gains a `DMDIR` perm bit
 
 Closes entry 59's other explicit deferral: `P9_CREATE` only ever made

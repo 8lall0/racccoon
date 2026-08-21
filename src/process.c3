@@ -267,8 +267,64 @@ struct Process
 	// user/fsd.c3's own comment).
 	bool is_secondary_fs;
 
+	// True while this process is inside one of the handful of blocking,
+	// multi-yield() syscalls (SYS_JOIN/SYS_GETCHAR/SYS_IPC_RECV[_GEN]/
+	// SYS_FUTEX_WAIT/SYS_NS_MOUNT_WAIT, entry.c3) — set right before that
+	// syscall's own poll loop, cleared right after. Not derived from
+	// `state`: SYS_JOIN/SYS_GETCHAR/SYS_NS_MOUNT_WAIT deliberately stay
+	// PROC_RUNNABLE throughout their own loops (see SYS_JOIN's own
+	// comment for why), so PROC_BLOCKED alone can't tell "is this
+	// specific process mid one of these waits" reliably. Exists purely
+	// so SYS_KILL can decrement the matching global blocking_depth
+	// (below) if it kills a process while this is true — otherwise a
+	// killed process's own increment would leak forever, permanently
+	// wedging interrupt delivery for the whole system. See
+	// blocking_depth's own comment for the real bug this closes.
+	bool in_blocking_wait;
+
 	char[STACK_SIZE] stack; // Kernel stack
 }
+
+// How many processes, system-wide, are currently inside one of the
+// blocking, multi-yield() syscalls (see Process.in_blocking_wait's own
+// comment for the exact list). Real bug this exists to fix, found
+// building hot-plug support (docs/devlog.md): sstatus's SPIE bit — what
+// every sret restores the live SIE bit from — is a single, unbanked
+// hardware register; switch_context() (yield()'s own cooperative stack
+// swap) never touches it, only a genuine trap-entry/sret pair does. A
+// freshly-rfork()'d child's own *synthetic* first sret (fork_entry()
+// below never touched sstatus at all before this fix) has no real,
+// corresponding trap-entry of its own to restore SPIE from — it just
+// inherits whatever the global register currently holds, which could be
+// another process's still-open blocking wait's own "interrupts were on
+// before I entered this syscall" snapshot, incorrectly re-enabling
+// interrupts early. fork_entry() (below) consults this live, at the
+// exact moment its own sret is about to fire, forcing SPIE off whenever
+// it's nonzero — checked live, not baked in earlier (e.g. at SYS_RFORK
+// time), since this can change after rfork() returns but before the
+// child's first real turn.
+//
+// Deliberately NOT also consulted at kernel_entry's own shared trap-exit
+// tail (handle_trap()'s end, entry.c3) — tried that first, found the
+// hard way it's wrong: blocking_depth is *effectively always* nonzero
+// during normal operation (echod/fsd/procd/envd — every idle server —
+// sit permanently blocked in SYS_IPC_RECV waiting for their next
+// client; that's their normal steady state, not a transient window).
+// Gating the shared tail on it disabled real timer-interrupt preemption
+// for the *entire system*, forever, from very early in boot onward —
+// confirmed directly when hotplugtest itself started hanging with that
+// version in place. The shared tail's own sret already correctly
+// restores SIE from *that specific process's own* sstatus snapshot,
+// auto-captured at *that same trap's* own entry — already safe by the
+// existing, proven invariant (enable_timer_interrupts()'s own comment,
+// entry.c3): SIE only actually needs forcing off for a synthetic sret
+// with no real corresponding trap-entry of its own, which only ever
+// happens in fork_entry().
+// @export: fork_entry()'s own raw asm (below) reads this directly by
+// its bare linker name — same reason read_reg_tmp/write_sepc_tmp
+// (entry.c3) are exported, without it the symbol gets the usual
+// module-mangled name (`kernel.blocking_depth`) asm can't reference.
+int blocking_depth @export("blocking_depth") = 0;
 
 // Moved here from the now-deleted src/fs.c3 (its tar-parsing logic moved
 // to user/fsd.c3, phase 5 of the microkernel plan) — these two are still
@@ -319,6 +375,56 @@ fn Process* proc_by_pid(int pid)
 	Process* p = &procs[pid - 1];
 	if (p.pid != pid || p.state == PROC_UNUSED) return null;
 	return p;
+}
+
+// One attempt at "look srv_name up in srv_table and, if it names a
+// still-live server, bind it at prefix in current_proc's own
+// namespace" — the shared logic SYS_NS_MOUNT (entry.c3) and
+// SYS_NS_MOUNT_WAIT (entry.c3, a retry loop around this exact same
+// attempt) both need. A stale/dead post (the poster's own generation
+// no longer matches — same check SYS_NS_RESOLVE already uses for
+// existing mounts) is treated as "not found," never bound. Idempotent
+// by exact prefix, same as SYS_NS_UNMOUNT's own matching: an existing
+// entry with this prefix is rebound in place rather than duplicated.
+fn bool ns_mount_try(char* prefix, char* srv_name)
+{
+	int srv_pid = 0;
+	uint srv_generation = 0;
+	for (int i = 0; i < SRV_MAX; i++)
+	{
+		if (srv_table[i].pid == 0) continue;
+		if (!str_eq(&srv_table[i].name[0], srv_name)) continue;
+		Process* target = proc_by_pid(srv_table[i].pid);
+		if (!target || target.generation != srv_table[i].generation) break;
+		srv_pid = srv_table[i].pid;
+		srv_generation = srv_table[i].generation;
+		break;
+	}
+	if (srv_pid == 0) return false;
+
+	int free_slot = -1;
+	for (int m = 0; m < NS_MOUNTS_MAX; m++)
+	{
+		if (current_proc.namespace[m].server_pid == 0)
+		{
+			if (free_slot == -1) free_slot = m;
+			continue;
+		}
+		if (str_eq(&current_proc.namespace[m].prefix[0], prefix))
+		{
+			current_proc.namespace[m].server_pid = srv_pid;
+			current_proc.namespace[m].server_generation = srv_generation;
+			return true;
+		}
+	}
+	if (free_slot != -1)
+	{
+		str_copy(&current_proc.namespace[free_slot].prefix[0], prefix, NS_PREFIX_MAX);
+		current_proc.namespace[free_slot].server_pid = srv_pid;
+		current_proc.namespace[free_slot].server_generation = srv_generation;
+		return true;
+	}
+	return false;
 }
 
 // RV64 port: sd/ld instead of sw/lw, 8*N offsets instead of 4*N — every
@@ -446,6 +552,15 @@ fn void fork_entry() @naked @noinline @noreturn
         addi t0, sp, 8 * 31
         ld t0, 0(t0)
         csrw sepc, t0
+
+        csrr t0, sstatus
+        la t1, blocking_depth
+        lw t1, 0(t1)
+        beqz t1, 1f
+        li t2, -33
+        and t0, t0, t2
+    1:
+        csrw sstatus, t0
 
         ld ra,  8 * 0(sp)
         ld gp,  8 * 1(sp)
@@ -575,6 +690,11 @@ fn Process* create_process(void* image, uint image_size)
 	// Every boot-time server is root — same explicit-zero-init reasoning
 	// as parent_pid above. See Process.uid's own comment.
 	proc.uid = 0;
+	// Same explicit-zero-init reasoning as parent_pid/uid above — a
+	// reused slot must never inherit a stale `true` left behind by a
+	// previous occupant that happened to be killed mid a blocking wait.
+	// See Process.in_blocking_wait's own comment.
+	proc.in_blocking_wait = false;
 
 	// Default namespace: "/srv/echo/" resolves to echod, which is always
 	// pid 2 (see kernel.c3 — it's the first process spawned after idle,

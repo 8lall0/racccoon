@@ -1471,6 +1471,63 @@ fn void main() @export("main") {
             } else {
                 print("mounttest: FAILED\n");
             }
+        } else if (strcmp(cmd, "hotplugtest") == 0) {
+            // Proves ns_mount_wait() (src/entry.c3) genuinely closes the
+            // gap mounttest above deliberately avoids: mounttest only
+            // ever mounts something *already* posted well before the
+            // command runs — this spawns a "late driver" child that
+            // posts itself only after a real, unpredictable delay (a
+            // genuine busy-loop — there's no sleep() syscall in user
+            // mode), and races a real ns_mount_wait() call against it
+            // from the parent, proving the wait actually blocks and
+            // retries rather than just checking once. A second call
+            // against a name nothing ever posts proves the give-up path
+            // works too — it stops rather than hanging forever.
+            //
+            // ns_mount_wait's own third argument is a plain retry count,
+            // not a wall-clock timeout — see its own comment
+            // (src/entry.c3's SYS_NS_MOUNT_WAIT case) for the real bug
+            // that drove that choice: a wall-clock version crashed here,
+            // combining read_reg("time") with other locals surviving
+            // across repeated calls inside a loop.
+            const ulong HP_SUCCESS_MAX_ATTEMPTS = 200000; // generous — each attempt yields, giving the child real CPU time to finish its own delay
+            const ulong HP_FAIL_MAX_ATTEMPTS = 20;         // small on purpose — this path exists to prove it gives up, not to spend real test time waiting
+
+            uint hp_gen = 0;
+            int hp_r = rfork(RFPROC, &hp_gen);
+            if (hp_r < 0) {
+                print("rfork failed\n");
+            } else if (hp_r == 0) {
+                for (uint hp_i = 0; hp_i < 5000000; hp_i++) { }
+                srv_post("latesrv");
+                // Blocks on a real message nobody will ever send, rather
+                // than a bare for(;;){} spin — matches how a real driver
+                // would actually idle (an eventual genuine I/O wait, not
+                // a busy loop with zero syscalls), and, unlike a plain
+                // spin, yields the CPU through the same safe,
+                // blocking_depth-covered mechanism every other blocking
+                // wait in this kernel already uses. A syscall-free spin
+                // loop turned out to be a real design bug in this test,
+                // not just an inconvenience: once blocking_depth's own
+                // fix (src/entry.c3 / process.c3) correctly stops timer
+                // interrupts from firing while any process is mid a
+                // blocking wait, nothing would ever forcibly preempt a
+                // child that never yields on its own — a genuine
+                // deadlock, found directly by hitting it once this fix
+                // landed.
+                char[16] hp_child_buf @noinit;
+                ipc_recv(&hp_child_buf, 16);
+            } else {
+                int hp_wait_ok = ns_mount_wait("/mnt/late/", "latesrv", HP_SUCCESS_MAX_ATTEMPTS);
+                int hp_wait_fail = ns_mount_wait("/mnt/never/", "nope_never_posts", HP_FAIL_MAX_ATTEMPTS);
+                int hp_killed = kill(hp_r, hp_gen);
+
+                if (hp_wait_ok == 0 && hp_wait_fail < 0 && hp_killed == 0) {
+                    print("hotplugtest: ok\n");
+                } else {
+                    print("hotplugtest: FAILED\n");
+                }
+            }
         } else if (strcmp(cmd, "rforktest") == 0) {
             // Plain rfork(RFPROC): the child gets an independent copy of
             // this process's address space (src/entry.c3's SYS_RFORK,

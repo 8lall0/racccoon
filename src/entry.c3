@@ -67,6 +67,7 @@ const SYS_NS_MOUNT     = 22; // binds a posted srv_table name at a path prefix i
 const SYS_PARENT_INFO  = 23; // returns a process's parent pid/generation, if it has one — see its case below
 const SYS_EXEC         = 24; // replaces the calling process's own image in place — see its case below
 const SYS_SETUID       = 25; // sets the caller's own uid, only while still root — see its case below
+const SYS_NS_MOUNT_WAIT = 26; // SYS_NS_MOUNT, but blocks (bounded by a retry count) until the target actually posts — see its case below
 
 // Generous cap on the image SYS_EXEC will install — real racccoon
 // binaries (build/user/*.bin) run 70-105KB; this leaves real headroom
@@ -177,6 +178,11 @@ macro write_csr(String $reg, value)
 
 const SIE_SEIE     = (1 << 9);  // sie: supervisor external interrupt enable
 const SSTATUS_SIE  = (1 << 1);  // sstatus: global supervisor interrupt enable
+// SSTATUS_SPIE (what sret restores SIE from — see handle_trap's own end,
+// below) is process.c3's own const, not redeclared here: unlike
+// DISKD_READ/etc across the separate user-mode binaries, entry.c3 and
+// process.c3 compile into one shared kernel module, so a duplicate name
+// is a real conflict, not a harmless copy.
 const SCOUNTEREN_TM = (1 << 1); // scounteren: lets U-mode execute rdtime without trapping
 
 fn void enable_external_interrupts()
@@ -440,6 +446,8 @@ fn void handle_syscall(Trap_frame* f) @noinline
 		case SYS_PUTCHAR:
 			board::console_putchar((int)f.a0);
 		case SYS_GETCHAR:
+			current_proc.in_blocking_wait = true;
+			blocking_depth++;
 			for (;;)
 			{
 				int ch = board::console_getchar();
@@ -450,6 +458,8 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				}
 				yield();
 			}
+			current_proc.in_blocking_wait = false;
+			blocking_depth--;
 		case SYS_EXIT:
 			// Inlined rather than factored into a process.c3 function on
 			// purpose: a call to a moderately complex freshly-defined
@@ -656,6 +666,8 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			char* recv_buf       = (char*)(uptr)f.a0;
 			int recv_len         = (int)f.a1;
 			uint* recv_type_out  = (uint*)(uptr)f.a2;
+			current_proc.in_blocking_wait = true;
+			blocking_depth++;
 			for (;;)
 			{
 				if (current_proc.has_message)
@@ -688,6 +700,8 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				current_proc.state = PROC_BLOCKED;
 				yield();
 			}
+			current_proc.in_blocking_wait = false;
+			blocking_depth--;
 		case SYS_IPC_RECV_GEN:
 			// Same shape as SYS_IPC_RECV above (kept as a full,
 			// separate copy, same reasoning as SYS_IPC_REPLY's own
@@ -707,6 +721,8 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			int recv_gen_len         = (int)f.a1;
 			uint* recv_gen_type_out  = (uint*)(uptr)f.a2;
 			uint* recv_gen_from_generation_out = (uint*)(uptr)f.a4;
+			current_proc.in_blocking_wait = true;
+			blocking_depth++;
 			for (;;)
 			{
 				if (current_proc.has_message)
@@ -739,6 +755,8 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				current_proc.state = PROC_BLOCKED;
 				yield();
 			}
+			current_proc.in_blocking_wait = false;
+			blocking_depth--;
 		case SYS_IPC_POLL:
 			// Non-blocking counterpart to SYS_IPC_RECV: checks once,
 			// never sets PROC_BLOCKED, never yields. Exists for diskd's
@@ -1000,6 +1018,13 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			*(--child_sp) = (uptr)&fork_entry;
 
 			child.has_message = false;
+			// Same reused-slot reasoning as has_message above — a
+			// previous occupant of this slot could have been killed
+			// while genuinely mid a blocking wait (SYS_KILL's own
+			// leak-safety check, below in this same file, only cleans up
+			// blocking_depth itself, not this per-process flag). See
+			// Process.in_blocking_wait's own comment (process.c3).
+			child.in_blocking_wait = false;
 			child.pid   = child_i + 1;
 			child.generation++;
 			child.sp    = (uptr)child_sp;
@@ -1088,6 +1113,8 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// its own process's state — so setting PROC_BLOCKED here
 			// would make this process permanently unschedulable the
 			// moment it's set, even after the joined pid actually exits.
+			current_proc.in_blocking_wait = true;
+			blocking_depth++;
 			for (;;)
 			{
 				Process* join_target = proc_by_pid(join_pid);
@@ -1095,6 +1122,8 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				if (join_target.generation != join_generation) break;
 				yield();
 			}
+			current_proc.in_blocking_wait = false;
+			blocking_depth--;
 			f.a0 = 0;
 		case SYS_FUTEX_WAIT:
 			// Blocks while the user-space word at addr still equals
@@ -1117,6 +1146,8 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				break;
 			}
 			current_proc.futex_addr = (uptr)futex_addr;
+			current_proc.in_blocking_wait = true;
+			blocking_depth++;
 			for (;;)
 			{
 				// PROC_BLOCKED, not PROC_RUNNABLE the way SYS_JOIN
@@ -1127,6 +1158,8 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				yield();
 				if (current_proc.futex_addr == 0) break;
 			}
+			current_proc.in_blocking_wait = false;
+			blocking_depth--;
 			f.a0 = 0;
 		case SYS_FUTEX_WAKE:
 			// Wakes every process currently blocked on this exact
@@ -1245,6 +1278,27 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				break;
 			}
 
+			// Leak-safety half of blocking_depth's own fix
+			// (process.c3): this kill tears kill_target down regardless
+			// of what it was doing (the same "any other process
+			// currently blocked... is left blocked forever" gap this
+			// case already accepts, just below) — without this, a
+			// target killed while genuinely mid one of the blocking
+			// waits that incremented blocking_depth would leak that
+			// increment permanently. blocking_depth is only ever
+			// consulted by fork_entry()'s own check now (not
+			// kernel_entry's shared tail — see blocking_depth's own
+			// comment for why not), so a leak here wouldn't wedge the
+			// whole system, just make every future freshly-rfork()'d
+			// child's own first sret conservatively start with
+			// interrupts off — still worth closing cleanly rather than
+			// leaving an ever-growing counter. kill_target.in_blocking_wait
+			// isn't reset here: the slot is about to become PROC_UNUSED
+			// and gets explicitly reset on its next reuse (SYS_RFORK's
+			// own child.in_blocking_wait = false, create_process()'s
+			// equivalent).
+			if (kill_target.in_blocking_wait) blocking_depth--;
+
 			// Same page-table-teardown-if-not-shared logic as
 			// SYS_EXIT above, just targeting kill_target instead of
 			// current_proc — see that case's own comment for the
@@ -1352,57 +1406,75 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			f.a0 = (ulong)(iptr)post_result;
 		case SYS_NS_MOUNT:
 			// Looks srv_name up in srv_table and, if it names a still-live
-			// server (same proc_by_pid + generation-match check
-			// SYS_NS_RESOLVE already does for existing mounts — a
-			// stale/dead post is treated as "not found," never silently
-			// handed back), adds prefix -> (pid, generation) into the
-			// *calling* process's own namespace — the "mount" half of the
-			// two-step. Idempotent by exact prefix (str_eq, same
-			// convention SYS_NS_UNMOUNT already uses): an existing entry
-			// with this same prefix is rebound in place rather than
-			// refused or duplicated.
+			// server, adds prefix -> (pid, generation) into the *calling*
+			// process's own namespace — the "mount" half of the two-step.
+			// The actual lookup+bind logic lives in ns_mount_try()
+			// (process.c3), shared with SYS_NS_MOUNT_WAIT below (a retry
+			// loop around this exact same single attempt).
 			char* mount_prefix = (char*)(uptr)f.a0;
 			char* mount_srv_name = (char*)(uptr)f.a1;
-			int mount_srv_pid = 0;
-			uint mount_srv_generation = 0;
-			for (int ms = 0; ms < SRV_MAX; ms++)
+			f.a0 = (ulong)(iptr)(ns_mount_try(mount_prefix, mount_srv_name) ? 0 : -1);
+		case SYS_NS_MOUNT_WAIT:
+			// Same as SYS_NS_MOUNT, but blocks — retrying ns_mount_try()
+			// in a loop — until either it succeeds or max_attempts retries
+			// have all failed. Closes a real gap SYS_NS_MOUNT alone has no
+			// answer for: a dynamically-spawned server (an unpredictable
+			// pid, no fixed boot-time slot — see SYS_RFORK above) posts
+			// itself at some unpredictable time after its own init
+			// finishes, and a client that tries to mount it too early
+			// would otherwise just fail outright with no way to wait for
+			// "not yet, but soon."
+			//
+			// Bounded by a plain retry count, not a wall-clock deadline —
+			// found the hard way, real hardware/QEMU testing this session:
+			// an earlier version computed a time-CSR deadline via
+			// read_reg("time") (see arm_timer's own, much simpler,
+			// single-call use of it above) and re-read it on every loop
+			// iteration, alongside mw_prefix/mw_srv_name kept live across
+			// each read — read_reg's own comment already documents that
+			// its asm() block's real register effects aren't visible to
+			// the compiler ("the previous version... silently clobbered");
+			// combining it with other locals surviving across repeated
+			// calls inside a loop reproduced exactly that class of
+			// corruption, crashing with a garbage pointer dereference
+			// inside ns_mount_try itself. A plain iteration count
+			// sidesteps read_reg entirely — less precise than a real
+			// wall-clock timeout, but correctness beats precision here,
+			// and every call site fully controls its own patience via how
+			// large a count it passes.
+			//
+			// Same PROC_RUNNABLE-throughout polling shape as SYS_JOIN
+			// above, not PROC_BLOCKED: nothing would ever explicitly clear
+			// that state for this condition (the poster doesn't know or
+			// care who might be waiting), so setting it would hang this
+			// process forever even once the target actually posts.
+			// yield() between checks is the same cooperative context-
+			// switch SYS_JOIN's own loop already uses, safe to call
+			// repeatedly from inside a syscall handler.
+			//
+			// blocking_depth (process.c3) tracking below is what actually
+			// found and fixes a real, separate kernel bug this syscall
+			// exposed: a freshly-rfork()'d child getting its first
+			// scheduling turn while this loop is still open could
+			// incorrectly re-enable global interrupts early (fork_entry's
+			// own synthetic first sret never touched sstatus at all
+			// before this fix) — see blocking_depth's own comment for the
+			// full mechanism.
+			char* mw_prefix = (char*)(uptr)f.a0;
+			char* mw_srv_name = (char*)(uptr)f.a1;
+			ulong mw_max_attempts = f.a2;
+			bool mw_ok = false;
+			current_proc.in_blocking_wait = true;
+			blocking_depth++;
+			for (ulong mw_i = 0; mw_i < mw_max_attempts; mw_i++)
 			{
-				if (srv_table[ms].pid == 0) continue;
-				if (!str_eq(&srv_table[ms].name[0], mount_srv_name)) continue;
-				Process* mount_srv_target = proc_by_pid(srv_table[ms].pid);
-				if (!mount_srv_target || mount_srv_target.generation != srv_table[ms].generation) break;
-				mount_srv_pid = srv_table[ms].pid;
-				mount_srv_generation = srv_table[ms].generation;
-				break;
+				mw_ok = ns_mount_try(mw_prefix, mw_srv_name);
+				if (mw_ok) break;
+				yield();
 			}
-			int mount_result = -1;
-			if (mount_srv_pid != 0)
-			{
-				int mount_free_slot = -1;
-				for (int mm = 0; mm < NS_MOUNTS_MAX; mm++)
-				{
-					if (current_proc.namespace[mm].server_pid == 0)
-					{
-						if (mount_free_slot == -1) mount_free_slot = mm;
-						continue;
-					}
-					if (str_eq(&current_proc.namespace[mm].prefix[0], mount_prefix))
-					{
-						current_proc.namespace[mm].server_pid = mount_srv_pid;
-						current_proc.namespace[mm].server_generation = mount_srv_generation;
-						mount_result = 0;
-						break;
-					}
-				}
-				if (mount_result != 0 && mount_free_slot != -1)
-				{
-					str_copy(&current_proc.namespace[mount_free_slot].prefix[0], mount_prefix, NS_PREFIX_MAX);
-					current_proc.namespace[mount_free_slot].server_pid = mount_srv_pid;
-					current_proc.namespace[mount_free_slot].server_generation = mount_srv_generation;
-					mount_result = 0;
-				}
-			}
-			f.a0 = (ulong)(iptr)mount_result;
+			current_proc.in_blocking_wait = false;
+			blocking_depth--;
+			f.a0 = (ulong)(iptr)(mw_ok ? 0 : -1);
 		case SYS_PARENT_INFO:
 			// Read-only, no permission check — same reasoning as
 			// SYS_PROC_INFO above. Returns the given pid's parent_pid
@@ -2013,4 +2085,24 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 	// needs to read per-process state rather than just trust the
 	// hardware register survived whatever this trap's own handling did.
 	write_sepc(current_proc.saved_sepc);
+
+	// No blocking_depth check here, deliberately — see its own comment
+	// (process.c3) for why not: an earlier version of this fix also
+	// forced SPIE off here whenever blocking_depth was nonzero, but
+	// blocking_depth is *effectively always* nonzero during normal
+	// operation (echod/fsd/procd/envd — every idle server — sit
+	// permanently blocked in SYS_IPC_RECV waiting for their next
+	// client; that's their normal steady state, not a transient
+	// window). Gating this shared tail on it would have disabled real
+	// timer-interrupt preemption for the *entire system*, forever, from
+	// very early in boot onward — found directly, real hardware/QEMU
+	// testing this session, when hotplugtest itself started hanging
+	// once this was in place. The kernel_entry tail's own sret already
+	// correctly restores SIE from *this process's own* sstatus snapshot
+	// (auto-captured at *this same trap's* own entry) — safe by the
+	// existing, already-proven invariant (enable_timer_interrupts()'s
+	// own comment above): SIE only actually needs forcing off for a
+	// *synthetic* sret with no real corresponding trap-entry of its
+	// own, which only ever happens in fork_entry() (process.c3) — never
+	// here.
 }
