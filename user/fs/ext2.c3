@@ -1533,9 +1533,8 @@ fn bool ext2_dir_is_empty(Ext2_inode_info* dir)
 // by the *directory's* write permission, not the target's own — this
 // driver doesn't model directory permissions at all, so the target's
 // own write bit is used as a simple, reasonable stand-in.
-// ext2_delete_recursive (below) is unchanged — explicit v1 scope, not
-// silently dropped: enforcing this correctly there would mean
-// checking every file it touches, not just the top-level target.
+// ext2_delete_recursive (below) enforces the same check against every
+// file it touches, not just a top-level target — see its own comment.
 fn int ext2_delete(char* name, uint requester_uid)
 {
 	ext2_cache_valid = false; // see ext2_cache_path's own comment

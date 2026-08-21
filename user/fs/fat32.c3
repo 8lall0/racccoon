@@ -35,7 +35,19 @@ const uint FAT32_BPB_NUM_FATS            = 0x10; // u8
 const uint FAT32_BPB_TOTAL_SECTORS_32    = 0x20; // u32, the only valid total-volume-size field in FAT32 (the u16 field @0x13 is always 0)
 const uint FAT32_BPB_FAT_SIZE_32         = 0x24; // u32, sectors per FAT
 const uint FAT32_BPB_ROOT_CLUSTER        = 0x2C; // u32
+const uint FAT32_BPB_FSINFO_SECTOR       = 0x30; // u16, sector number (partition-relative, same convention every other BPB-derived sector number here uses) of the FSInfo sector
 const uint FAT32_BPB_SIGNATURE_OFFSET    = 0x1FE; // u16, must be 0xAA55 (little-endian 0x55,0xAA)
+
+// FSInfo sector field offsets — free_count is a *hint*, not
+// authoritative data (a real reader must be able to recompute it; see
+// fat32_mount()'s own fallback), which is why fsck.vfat auto-corrects
+// rather than errors when it's stale. next_free (offset 0x1EC) is real
+// spec but unused here — fat32_alloc_cluster's own linear scan doesn't
+// use a next-free hint, so nothing reads or writes it.
+const uint FAT32_FSINFO_LEAD_SIG   = 0x000; // u32, must be 0x41615252
+const uint FAT32_FSINFO_STRUC_SIG  = 0x1E4; // u32, must be 0x61417272
+const uint FAT32_FSINFO_FREE_COUNT = 0x1E8; // u32, 0xFFFFFFFF means "unknown," must be recomputed
+const uint FAT32_FSINFO_TRAIL_SIG  = 0x1FC; // u32, must be 0xAA550000
 
 // Directory entry (32 bytes) field offsets.
 const uint FAT32_DIRENT_SIZE           = 32;
@@ -64,6 +76,8 @@ uint fat32_root_cluster;
 uint fat32_num_fats;      // needed by the write path to mirror every FAT update across all copies
 uint fat32_fat_size_32;   // sectors per FAT copy — same
 uint fat32_total_clusters; // upper bound for fat32_alloc_cluster()'s scan
+uint fat32_fsinfo_sector; // partition-relative, same convention as fat32_fat_start_sector etc.
+uint fat32_free_count;    // kept in sync with every alloc/free (fat32_alloc_cluster/fat32_free_cluster_chain), written back to the FSInfo sector on each change — see fat32_write_free_count's own comment
 
 // exec()'s own chunked-read fast path (user/user.c3's exec(), FS_READ_AT)
 // — same shape and reasoning as ext2's own ext2_cache_* (user/fs/ext2.c3,
@@ -648,10 +662,36 @@ fn uint fat32_alloc_cluster()
 		if (fat32_next_cluster(cluster) == 0)
 		{
 			if (!fat32_write_fat_entry(cluster, FAT32_EOC_MIN)) return 0;
+			fat32_free_count -= 1;
+			fat32_write_free_count(); // best-effort — see its own comment
 			return cluster;
 		}
 	}
 	return 0;
+}
+
+// Writes fat32_free_count back to the FSInfo sector — called by
+// fat32_alloc_cluster/fat32_free_cluster_chain after they change it, and
+// once at mount time after fat32_mount() establishes the starting value
+// (either trusted from disk or freshly recomputed). Return value is
+// deliberately never propagated as its caller's own failure: by the
+// time either call site above calls this, the *authoritative* state —
+// the FAT table entry itself — has already been successfully written.
+// free_count is explicitly a hint (fsck.vfat recomputes and silently
+// corrects it, never errors on a stale one), and failing the whole
+// alloc/free operation because this secondary write failed would be
+// strictly worse — the caller would believe the alloc/free itself never
+// happened while the real, authoritative FAT entry already changed,
+// exactly the kind of inconsistency this driver works to avoid
+// everywhere else. Best-effort here is the correctness-preserving
+// choice, not a shortcut.
+fn bool fat32_write_free_count()
+{
+	char[SECTOR_SIZE] fsinfo_buf @noinit;
+	if (!fs_read_sector(fat32_fsinfo_sector, &fsinfo_buf)) return false;
+	uint* free_count_field = (uint*)&fsinfo_buf[FAT32_FSINFO_FREE_COUNT];
+	*free_count_field = fat32_free_count;
+	return fs_write_sector(fat32_fsinfo_sector, &fsinfo_buf);
 }
 
 // Walks dir_cluster's own chain (root or a subdirectory — see
@@ -896,12 +936,19 @@ fn int fat32_write(char* name, char* src, uint len)
 fn bool fat32_free_cluster_chain(uint first_cluster)
 {
 	uint cluster = first_cluster;
+	uint freed_count = 0;
 	while (cluster != 0 && cluster < FAT32_EOC_MIN)
 	{
 		uint next = fat32_next_cluster(cluster);
 		if (!fat32_write_fat_entry(cluster, 0)) return false;
+		freed_count += 1;
 		cluster = next;
 	}
+	// One write for the whole chain, not one per cluster — see
+	// fat32_write_free_count's own comment for why its failure isn't
+	// propagated here either.
+	fat32_free_count += freed_count;
+	fat32_write_free_count();
 	return true;
 }
 
@@ -1497,6 +1544,7 @@ fn void fat32_mount()
 	uint*  fat_size_32         = (uint*)&boot_sector[FAT32_BPB_FAT_SIZE_32];
 	uint*  root_cluster        = (uint*)&boot_sector[FAT32_BPB_ROOT_CLUSTER];
 	uint*  total_sectors_32    = (uint*)&boot_sector[FAT32_BPB_TOTAL_SECTORS_32];
+	ushort* fsinfo_sector_field = (ushort*)&boot_sector[FAT32_BPB_FSINFO_SECTOR];
 
 	// `& 0xFF` rather than a straight (uint) cast: char's signedness in
 	// this dialect isn't relied on elsewhere in this codebase, and
@@ -1510,6 +1558,41 @@ fn void fat32_mount()
 	fat32_data_start_sector   = fat32_fat_start_sector + fat32_num_fats * fat32_fat_size_32;
 	fat32_root_cluster        = *root_cluster;
 	fat32_total_clusters      = (*total_sectors_32 - fat32_data_start_sector) / fat32_sectors_per_cluster;
+	fat32_fsinfo_sector       = (uint)*fsinfo_sector_field;
+
+	// Establish fat32_free_count — trusted from the FSInfo sector if its
+	// signatures check out and it isn't the explicit "unknown" sentinel,
+	// otherwise recomputed once here via the same linear-scan shape
+	// fat32_alloc_cluster uses to find one free entry, just counting all
+	// of them instead of stopping at the first. Not every real-world
+	// FAT32 volume populates FSInfo correctly, so this fallback matters
+	// for more than just defensiveness. Either way, persist the result
+	// immediately (fat32_write_free_count) so a freshly-recomputed value
+	// is on disk from the start, not only ever in memory.
+	char[SECTOR_SIZE] fsinfo_buf @noinit;
+	bool fsinfo_ok = false;
+	if (fs_read_sector(fat32_fsinfo_sector, &fsinfo_buf))
+	{
+		uint* lead_sig  = (uint*)&fsinfo_buf[FAT32_FSINFO_LEAD_SIG];
+		uint* struc_sig = (uint*)&fsinfo_buf[FAT32_FSINFO_STRUC_SIG];
+		uint* trail_sig = (uint*)&fsinfo_buf[FAT32_FSINFO_TRAIL_SIG];
+		uint* free_count_field = (uint*)&fsinfo_buf[FAT32_FSINFO_FREE_COUNT];
+		if (*lead_sig == 0x41615252 && *struc_sig == 0x61417272 && *trail_sig == 0xAA550000 && *free_count_field != 0xFFFFFFFF)
+		{
+			fat32_free_count = *free_count_field;
+			fsinfo_ok = true;
+		}
+	}
+	if (!fsinfo_ok)
+	{
+		uint count = 0;
+		for (uint cluster = 2; cluster < fat32_total_clusters + 2; cluster++)
+		{
+			if (fat32_next_cluster(cluster) == 0) count += 1;
+		}
+		fat32_free_count = count;
+	}
+	fat32_write_free_count();
 
 	print("fsd: FAT32 mounted, partition_start=");
 	print_uint(fs_partition_start);

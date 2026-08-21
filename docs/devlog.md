@@ -4,6 +4,69 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (50) — FAT32 free-cluster-count bookkeeping (FSInfo sector)
+
+`fsck.vfat -n` flagged "Free cluster summary wrong... Auto-correcting"
+after essentially every write/delete test all session, on every FAT32
+image. Root cause: `user/fs/fat32.c3` never touched the FAT32 FSInfo
+sector at all — `fat32_mount()` never even parsed `BPB_FSInfo` (the BPB
+field naming that sector), and neither `fat32_alloc_cluster()` nor
+`fat32_free_cluster_chain()` updated it. Purely cosmetic — FSInfo's own
+`free_count` is a *hint*, not authoritative data, which is exactly why
+`fsck.vfat` silently recomputes and corrects it rather than erroring —
+but this project has treated a clean fsck as a real correctness bar all
+along (same class of gap already fixed for ext2's own
+`bg_used_dirs_count`/`links_count`).
+
+**Fix**: a new `fat32_free_count` global, established at mount time
+(trusted from FSInfo if its three signatures check out and it isn't the
+explicit `0xFFFFFFFF` "unknown" sentinel, otherwise recomputed once via
+the same linear-scan shape `fat32_alloc_cluster` already uses to find
+one free entry — not every real-world FAT32 volume populates FSInfo
+correctly, so this fallback matters for more than defensiveness), kept
+in sync by `fat32_alloc_cluster`/`fat32_free_cluster_chain` and written
+back via a new `fat32_write_free_count()` helper.
+
+Deliberately **not** the same failure-propagation discipline
+`bg_used_dirs_count` (ext2's own equivalent) uses: by the time either
+call site writes the count back, the *authoritative* state — the FAT
+table entry itself — has already changed successfully. Failing the
+whole alloc/free because this secondary, hint-only write failed would
+be strictly worse than a stale hint: the caller would believe the
+operation itself never happened while the real FAT entry already did,
+exactly the inconsistency this driver otherwise works to avoid. Written
+back best-effort instead.
+
+**Verification**: no functional/shell-visible behavior change — this is
+pure on-disk bookkeeping, so the actual test is `fsck.vfat -n` itself.
+Full regression suite unaffected on `disk.img` and the dual image's own
+FAT32 half; after a batch of writes/deletes/mkdir/rename/move, `fsck.vfat
+-n` reports the free-cluster count *matching* what it independently
+computes on both — no more "Free cluster summary wrong." Three-boot
+stress batch (`runtest`/`elftest`/`newfile`/`deletetest`, the same
+repeatable set every earlier stress batch this session used — a
+`mkdirtest`/`renametest`/`movetest`/`rmdirtest` sequence isn't
+idempotent when repeated back-to-back on an already-mutated persistent
+image across separate boots, unrelated to this fix, confirmed by the
+single earlier run succeeding cleanly) stayed clean throughout. The
+mount-time "recompute via full scan" fallback path has no exercising
+fixture (every QEMU image here is built via `mkfs.vfat`, which does
+populate FSInfo correctly) — verified by code review, stated plainly as
+an accepted gap rather than silently skipped.
+
+**Real Milk-V Duo hardware confirmation**: `newfile`/`deletetest`/
+`lsproc` all behave identically on the board (no functional change
+expected or found). Pulled the SD card back to the host afterward —
+`sudo fsck.vfat -n /dev/sdc1` reports no "Free cluster summary wrong"
+at all (two unrelated, pre-existing notes: a harmless boot-sector-vs-
+backup byte difference, and the dirty bit — set because this project's
+own workflow always power-cycles without a clean unmount, not something
+this entry touches).
+
+**Files changed:** `user/fs/fat32.c3`.
+
+---
+
 ## 2026-08-21 (49) — FAT32 chunked-read caching (exec() over FAT32)
 
 Entry 46 fixed this exact bug class for `ext2_read_at`, flagging
