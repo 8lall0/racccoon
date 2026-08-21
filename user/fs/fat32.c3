@@ -7,12 +7,16 @@ module user;
 // reverse-engineered the way this project's SDHCI register maps were.
 //
 // v1 scope, deliberately limited: 8.3 short filenames only (long
-// filename / LFN directory entries are skipped, not parsed), no
-// caching — every call walks the relevant directory fresh (root, or a
-// subdirectory reached via fat32_resolve_dir — see its own comment)
-// and follows the matched file's cluster chain on demand, since
-// there's no reasonable fixed-size cache for "however many files
-// happen to be on someone's real SD card."
+// filename / LFN directory entries are skipped, not parsed). No
+// general, whole-filesystem cache — every call still walks the
+// relevant directory fresh (root, or a subdirectory reached via
+// fat32_resolve_dir — see its own comment) and follows the matched
+// file's cluster chain on demand, since there's no reasonable
+// fixed-size cache for "however many files happen to be on someone's
+// real SD card." The one exception is fat32_read_at's own single-slot
+// exec()-loop cache (fat32_cache_path and friends, below) — narrowly
+// scoped to "the one file the current chunked read is working through,"
+// not a general directory/file cache; see its own comment.
 //
 // Write support (create, overwrite, grow — see fat32_write()) started
 // read-only-only and was extended deliberately — see user/fsd.c3's own
@@ -60,6 +64,26 @@ uint fat32_root_cluster;
 uint fat32_num_fats;      // needed by the write path to mirror every FAT update across all copies
 uint fat32_fat_size_32;   // sectors per FAT copy — same
 uint fat32_total_clusters; // upper bound for fat32_alloc_cluster()'s scan
+
+// exec()'s own chunked-read fast path (user/user.c3's exec(), FS_READ_AT)
+// — same shape and reasoning as ext2's own ext2_cache_* (user/fs/ext2.c3,
+// see its own comment), plus a second piece FAT32 specifically needs:
+// unlike ext2's i_block[] array (an O(1) index lookup), FAT32 has no way
+// to reach cluster N except by following N links from a known start, so
+// caching just the file's identity (first_cluster/file_size) isn't
+// enough to avoid re-walking the whole chain from scratch on every
+// ~1124-byte chunk — fat32_cache_resume_offset/fat32_cache_resume_cluster
+// remember the furthest cluster boundary the walk has reached so far,
+// a live cursor fat32_read_file_at advances as it goes (see its own
+// comment), not just a value set once per call. Every FAT32 mutation
+// (fat32_write/delete/delete_recursive/mkdir/rename) invalidates this
+// unconditionally, same reasoning ext2's own cache invalidation uses.
+bool      fat32_cache_valid;
+char[100] fat32_cache_path;      // exact bytes — 100 matches fsd.c3's own filename wire-field size, same precedent ext2_cache_path uses
+uint      fat32_cache_first_cluster;
+uint      fat32_cache_file_size;
+uint      fat32_cache_resume_offset;  // cluster-aligned: a multiple of cluster_size
+uint      fat32_cache_resume_cluster; // the cluster containing fat32_cache_resume_offset
 
 fn bool fat32_probe()
 {
@@ -397,18 +421,42 @@ fn int fat32_read(char* name, char* dst, uint len)
 // reads (user/user.c3) — real binaries (70-105KB) are far larger than
 // one FS_MSG_MAX (1128 bytes) IPC message, so loading one needs
 // repeated calls advancing this offset, not a single fat32_read().
+//
+// Resumes from fat32_cache_resume_cluster/fat32_cache_resume_offset
+// (fat32_read_at's own cache, see its declaration's comment) instead of
+// always walking from first_cluster — the skip-phase loop below only
+// runs at all for however far past the cached position `offset` still
+// reaches, zero times once a file's already been resolved once and
+// subsequent chunks land in the same cluster the cache already points
+// at. Only ever called from fat32_read_at, so reads/writes that cache's
+// global fields directly rather than threading them through as
+// parameters — same shape ext2_cache_* uses.
 fn uint fat32_read_file_at(uint first_cluster, char* dst, uint len, uint offset)
 {
 	uint cluster_size = fat32_sectors_per_cluster * SECTOR_SIZE;
-	uint cluster = first_cluster;
 
-	uint clusters_to_skip = offset / cluster_size;
-	for (uint i = 0; i < clusters_to_skip && cluster != 0 && cluster < FAT32_EOC_MIN; i++)
+	uint cluster;
+	uint cluster_start_offset; // the file offset `cluster`'s own first byte sits at
+	if (offset >= fat32_cache_resume_offset)
 	{
-		cluster = fat32_next_cluster(cluster);
+		cluster = fat32_cache_resume_cluster;
+		cluster_start_offset = fat32_cache_resume_offset;
+	}
+	else
+	{
+		cluster = first_cluster;
+		cluster_start_offset = 0;
 	}
 
-	uint offset_in_cluster = offset % cluster_size;
+	while (cluster_start_offset + cluster_size <= offset && cluster != 0 && cluster < FAT32_EOC_MIN)
+	{
+		cluster = fat32_next_cluster(cluster);
+		cluster_start_offset += cluster_size;
+	}
+	fat32_cache_resume_cluster = cluster;
+	fat32_cache_resume_offset = cluster_start_offset;
+
+	uint offset_in_cluster = offset - cluster_start_offset;
 	uint sectors_to_skip = offset_in_cluster / SECTOR_SIZE;
 	uint skip_in_sector = offset_in_cluster % SECTOR_SIZE; // only ever applies to the first sector actually read
 
@@ -435,7 +483,19 @@ fn uint fat32_read_file_at(uint first_cluster, char* dst, uint len, uint offset)
 			bytes_read += chunk;
 			at_start = false;
 		}
+		// Deliberately checked *before* advancing (unlike a plain
+		// unconditional advance at the bottom of the loop, which would
+		// still run once more here purely as a structural side effect
+		// of the outer while's own re-check): caching a cluster this
+		// call never actually needed to reach would overshoot past
+		// wherever the *next* call's own offset lands, turning every
+		// future call into a cache miss instead of a hit — see this
+		// function's own header comment.
+		if (bytes_read >= len) break;
 		cluster = fat32_next_cluster(cluster);
+		cluster_start_offset += cluster_size;
+		fat32_cache_resume_cluster = cluster;
+		fat32_cache_resume_offset = cluster_start_offset;
 	}
 	return bytes_read;
 }
@@ -448,23 +508,49 @@ fn uint fat32_read_file_at(uint first_cluster, char* dst, uint len, uint offset)
 // or a directory).
 fn int fat32_read_at(char* name, char* dst, uint len, uint offset)
 {
-	uint dir_cluster;
-	if (!fat32_resolve_dir(name, &dir_cluster)) return -1;
-	char* leaf = fat32_leaf_name(name);
-
-	char[11] name11 @noinit;
-	fat32_name_to_8_3(leaf, &name11);
-
 	uint first_cluster;
 	uint file_size;
-	uint dummy_sector;
-	uint dummy_offset;
-	char attr;
-	if (!fat32_find_in_dir(dir_cluster, &name11, &first_cluster, &file_size, &dummy_sector, &dummy_offset, &attr))
+
+	// Cache hit: exec()'s own chunked-read loop (user/user.c3) calls
+	// this repeatedly for the same path — see fat32_cache_path's own
+	// comment.
+	if (fat32_cache_valid && strcmp(name, &fat32_cache_path) == 0)
 	{
-		return -1;
+		first_cluster = fat32_cache_first_cluster;
+		file_size = fat32_cache_file_size;
 	}
-	if ((attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0) return -1;
+	else
+	{
+		uint dir_cluster;
+		if (!fat32_resolve_dir(name, &dir_cluster)) return -1;
+		char* leaf = fat32_leaf_name(name);
+
+		char[11] name11 @noinit;
+		fat32_name_to_8_3(leaf, &name11);
+
+		uint dummy_sector;
+		uint dummy_offset;
+		char attr;
+		if (!fat32_find_in_dir(dir_cluster, &name11, &first_cluster, &file_size, &dummy_sector, &dummy_offset, &attr))
+		{
+			return -1;
+		}
+		if ((attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0) return -1;
+
+		uint fc_i = 0;
+		while (name[fc_i] != 0 && fc_i < 99) { fat32_cache_path[fc_i] = name[fc_i]; fc_i++; }
+		fat32_cache_path[fc_i] = 0;
+		fat32_cache_first_cluster = first_cluster;
+		fat32_cache_file_size = file_size;
+		// A newly-cached file has no walk history yet — must start
+		// fat32_read_file_at's own resume point from this file's own
+		// beginning, not wherever the *previous* cached file's cluster
+		// walk happened to leave off.
+		fat32_cache_resume_offset = 0;
+		fat32_cache_resume_cluster = first_cluster;
+		fat32_cache_valid = true;
+	}
+
 	if (offset >= file_size) return 0;
 
 	uint remaining = file_size - offset;
@@ -765,6 +851,7 @@ fn bool fat32_update_entry_size(uint entry_sector, uint entry_offset, uint new_s
 // time regardless of what this function does afterward.
 fn int fat32_write(char* name, char* src, uint len)
 {
+	fat32_cache_valid = false; // see fat32_cache_path's own comment
 	uint dir_cluster;
 	if (!fat32_resolve_dir(name, &dir_cluster)) return -1;
 	char* leaf = fat32_leaf_name(name);
@@ -878,6 +965,7 @@ fn bool fat32_dir_is_empty(uint dir_cluster)
 // corruption risk, not just a leak.
 fn int fat32_delete(char* name)
 {
+	fat32_cache_valid = false; // see fat32_cache_path's own comment
 	uint dir_cluster;
 	if (!fat32_resolve_dir(name, &dir_cluster)) return -1;
 	char* leaf = fat32_leaf_name(name);
@@ -992,6 +1080,7 @@ fn bool fat32_delete_dir_contents(uint dir_cluster, int depth)
 // protected part.
 fn int fat32_delete_recursive(char* name)
 {
+	fat32_cache_valid = false; // see fat32_cache_path's own comment
 	uint dir_cluster;
 	if (!fat32_resolve_dir(name, &dir_cluster)) return -1;
 	char* leaf = fat32_leaf_name(name);
@@ -1124,6 +1213,7 @@ fn bool fat32_list(char* path, char* out_buf, int max_entries, int* out_count)
 // something this driver invented.
 fn int fat32_mkdir(char* path)
 {
+	fat32_cache_valid = false; // see fat32_cache_path's own comment
 	uint parent_cluster;
 	if (!fat32_resolve_dir(path, &parent_cluster)) return -1;
 	char* leaf = fat32_leaf_name(path);
@@ -1283,6 +1373,7 @@ fn bool fat32_would_create_cycle(uint candidate_dir_cluster, uint forbidden_clus
 // cycle), closing what used to be a genuine known gap here.
 fn int fat32_rename(char* old_path, char* new_path)
 {
+	fat32_cache_valid = false; // see fat32_cache_path's own comment
 	uint old_parent_cluster;
 	if (!fat32_resolve_dir(old_path, &old_parent_cluster)) return -1;
 	char* old_leaf = fat32_leaf_name(old_path);

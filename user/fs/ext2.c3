@@ -128,8 +128,9 @@ const uint EXT2_INODE_BLOCKS      = 28; // u32 — count of 512-byte sectors thi
                                           // caught by e2fsck as "i_blocks is 8,
                                           // should be 24" on the root directory.
 const uint EXT2_INODE_BLOCK       = 40; // u32 x 15 (i_block[0..14]) — direct
-                                          // [0..11] plus single-indirect [12]; [13..14]
-                                          // (double/triple indirect) still unread, v1
+                                          // [0..11], single/double/triple indirect
+                                          // [12..14] (read path only — see
+                                          // ext2_resolve_block's own comment)
 
 const uint EXT2_S_IFREG = 0x8000; // regular file bit in i_mode
 const uint EXT2_S_IFDIR = 0x4000; // directory bit in i_mode
@@ -703,10 +704,10 @@ fn int ext2_read(char* name, char* dst, uint len)
 
 // Same lookup shape as ext2_read above, but starts copying from
 // `offset` bytes into the file instead of from the beginning — reads
-// through direct blocks (0..11) and, past those, the single-indirect
-// block (see ext2_resolve_block's own comment for both this driver's
-// real reach and why double/triple indirect still stay out of scope,
-// same as ext2_write). A fully separate function from ext2_read rather
+// through direct blocks (0..11) and, past those, single/double/triple
+// indirect (see ext2_resolve_block's own comment for this driver's real
+// reach — write, unlike read, stays direct-blocks-only, see ext2_write's
+// own comment). A fully separate function from ext2_read rather
 // than adding an offset parameter there, so the existing, heavily-
 // exercised offset-0 read path stays completely untouched. Built for
 // exec()'s own chunked reads (user/user.c3) — see fat32_read_file_at's

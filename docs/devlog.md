@@ -4,6 +4,79 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (49) — FAT32 chunked-read caching (exec() over FAT32)
+
+Entry 46 fixed this exact bug class for `ext2_read_at`, flagging
+FAT32's own `fat32_read_at`/`fat32_read_file_at` (`user/fs/fat32.c3`) as
+having the same problem — arguably worse. On every `exec()` chunk call,
+`fat32_read_at` redid the directory walk from root (same cost class
+ext2 had), and `fat32_read_file_at` *also* re-walked the FAT cluster
+chain from `first_cluster` every single call — `offset / cluster_size`
+clusters walked from scratch each time. Unlike ext2's old bug (roughly
+constant per-chunk overhead), this one grows *with* offset: chunk K
+walks ~K times further than chunk 1, so total cost across one file read
+was quadratic in chunk count. On real Duo hardware `DUOBOOT` (FAT32) is
+the *default* mount, so every `exec()` there paid this.
+
+**Fix**: a `fat32_cache_*` single-slot cache, same path/identity shape
+entry 46 already established for ext2 (`fat32_cache_path`/
+`fat32_cache_first_cluster`/`fat32_cache_file_size`), plus a second
+piece FAT32 specifically needs — `fat32_cache_resume_offset`/
+`fat32_cache_resume_cluster`, a live cluster-walk cursor, since FAT32
+has no O(1) "index → block" math the way ext2's `i_block[]` gives for
+free; reaching cluster N always means following N links from a known
+start. `fat32_read_file_at` resumes from the cached cluster instead of
+`first_cluster` when `offset` is at or past it, falling back to a full
+walk otherwise (a backward seek, never a pattern `exec()` produces, but
+kept correct regardless).
+
+Found a real bug in-flight while implementing this, before it ever
+reached a test: the natural-looking version — advance the cache in
+lockstep with the existing loop's own unconditional `cluster =
+fat32_next_cluster(cluster)` — silently defeats itself. That line runs
+one cluster *past* wherever a call actually needed to stop, as a pure
+structural side effect of the original loop shape (harmless there,
+since `cluster` was just a discarded local); caching that same
+one-cluster-ahead value would mean every call's own cache write
+overshoots past where the *next* call's own offset lands, turning
+every subsequent call into a cache miss — defeating the entire
+optimization for the common case (many small chunks inside one larger
+cluster). Fixed by checking `bytes_read >= len` *before* advancing/
+caching, not after. Caught by tracing through the design during
+planning, not by a failing test.
+
+**Invalidation**: same 5-site unconditional pattern entries 46/47
+already established for ext2 — `fat32_write`/`fat32_delete`/
+`fat32_delete_recursive`/`fat32_mkdir`/`fat32_rename` each invalidate
+as their first statement.
+
+Also updated this file's own header comment, which flatly claimed "no
+caching" — now scoped to say what's actually true: no *general*
+whole-filesystem cache, but this one narrow exec()-loop exception.
+
+**Verification**: `runtest`/`argvtest`/`pathtest`/`elftest` (the
+un-suffixed variants, hitting FAT32 by default) all `ok` on QEMU's
+`disk.img`; a FAT32 mutation immediately followed by `runtest`/`elftest`
+in the same boot confirms no stale cache. Full regression suite on all
+three QEMU images — the dual-mount image's own FAT32-default tests
+correctly `FAILED (exec load failed)` there, the same pre-existing
+fixture gap entry 45 already documented (that image's FAT32 half was
+never seeded with `bin/echod`), not a regression. Three-boot stress
+batch, `fsck.vfat -n` clean (same pre-existing free-cluster-count
+cosmetic warning this project has always had, untouched by this entry),
+`e2fsck -n -f` clean on the unaffected ext2 images.
+
+**Real Milk-V Duo hardware confirmation**: `runtest`/`argvtest`/
+`pathtest`/`elftest` all `ok` against real `DUOBOOT` — each completed
+immediately, without the long multi-second burst of repeated sector
+reads entry 46 had to explain away for ext2 before its own fix; visible
+confirmation this fixes the same real slowness for FAT32, which is the
+*default* mount on this board. `lsproc` clean afterward.
+
+**Files changed:** `user/fs/fat32.c3`.
+
+---
+
 ## 2026-08-21 (48) — ext2: double- and triple-indirect block support (read-only)
 
 Extends `ext2_resolve_block` (`user/fs/ext2.c3`) past its previous
