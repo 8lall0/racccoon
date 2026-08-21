@@ -744,10 +744,27 @@ fn int ext2_read_at(char* name, char* dst, uint len, uint offset)
 		ext2_cache_valid = true;
 	}
 
+	return ext2_read_inode_at(inode_num, dst, len, offset);
+}
+
+// The actual read logic, extracted from ext2_read_at's own tail so a
+// caller that already has a real inode number — fsd.c3's own P9_READ
+// dispatch, resolved once at P9_WALK time via a fid, a genuinely
+// stable identity unlike a path string — can read directly, skipping
+// path resolution entirely. ext2_read_at itself (path-based, used by
+// exec()'s own chunked read loop and everything else) keeps its own
+// cache/resolve logic unchanged and just delegates here once it has
+// inode_num — same behavior as before this was split out, byte for
+// byte.
+fn int ext2_read_inode_at(uint inode_num, char* dst, uint len, uint offset)
+{
 	Ext2_inode_info inode;
 	if (!ext2_read_inode(inode_num, &inode)) return -1;
-	// Only IFDIR guard on the cache-hit path (which never runs
-	// ext2_find_in_dir) — redundant but harmless on a miss.
+	// Only real IFDIR guard for a caller that skipped ext2_find_in_dir
+	// entirely (fsd.c3's own P9_READ) — redundant but harmless for
+	// ext2_read_at's own two callers above (cache hit already trusted
+	// this same check once; a miss already refused via find_in_dir's
+	// own mode).
 	if ((inode.mode & EXT2_S_IFDIR) != 0) return -1;
 
 	if (offset >= inode.size) return 0;

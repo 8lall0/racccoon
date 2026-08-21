@@ -97,6 +97,26 @@ const int FS_TYPE_FAT32 = 1;
 const int FS_TYPE_EXT2  = 2;
 int fs_type = FS_TYPE_NONE;
 
+// Real 9P (read-only), against ext2 only — see docs/devlog.md. No new
+// verb constants or client wrappers needed: P9_ATTACH/P9_WALK/
+// P9_OPEN/P9_READ/P9_CLUNK and their user.c3 wrappers already exist
+// (built for echod.c3's own sandbox, entries 54/55) and work against
+// any pid — the actual point of building the protocol generically
+// first. This is just fsd's own dispatch for those same verbs, gated
+// to fs_type == FS_TYPE_EXT2 throughout (every one of these five verbs
+// returns -1 otherwise — FAT32 isn't part of this project's own real
+// deployment topology anymore, entry 53, and an unmounted second
+// instance already degrades everything else the same way).
+const int FS9_FID_MAX = 8; // matches echod's own P9_FID_MAX precedent
+struct Fs9_fid_entry
+{
+	bool used;
+	bool opened;
+	bool is_dir;
+	uint inode_num; // ext2 inode number — a genuinely stable identity, unlike a path (survives a rename elsewhere, unlike ext2_cache_path)
+}
+Fs9_fid_entry[FS9_FID_MAX] fs9_fids;
+
 fn void fs_panic(char* msg)
 {
 	print("fsd: ");
@@ -391,6 +411,118 @@ fn void main() @export("main")
 		uint from_gen = 0;
 		int from = ipc_recv_type_gen(&buf, FS_MSG_MAX, &verb, &from_gen);
 		if (from <= 0) continue;
+
+		// Real 9P (read-only, ext2 only) — entirely separate wire
+		// layout from FS_*'s own (fid/newfid/name/offset/count at fixed
+		// offsets, exactly what echod.c3 already established for these
+		// same verbs), handled and replied to here before any of the
+		// FS_*-specific parsing below, then `continue`s straight back
+		// to the top of this loop.
+		if (verb == P9_ATTACH || verb == P9_WALK || verb == P9_OPEN || verb == P9_READ || verb == P9_CLUNK)
+		{
+			if (fs_type != FS_TYPE_EXT2)
+			{
+				int* p9_fail_field = (int*)&buf;
+				*p9_fail_field = -1;
+				ipc_reply(from, verb, &buf, 4, from_gen);
+				continue;
+			}
+
+			if (verb == P9_ATTACH)
+			{
+				uint* fid_field = (uint*)&buf[0];
+				uint fid = *fid_field;
+				int result = -1;
+				if (fid < (uint)FS9_FID_MAX && !fs9_fids[fid].used)
+				{
+					fs9_fids[fid].used = true;
+					fs9_fids[fid].opened = false;
+					fs9_fids[fid].is_dir = true;
+					fs9_fids[fid].inode_num = EXT2_ROOT_INODE;
+					result = 0;
+				}
+				int* result_field = (int*)&buf[0];
+				*result_field = result;
+				ipc_reply(from, P9_ATTACH, &buf, 4, from_gen);
+			}
+			else if (verb == P9_WALK)
+			{
+				uint* fid_field = (uint*)&buf[0];
+				uint* newfid_field = (uint*)&buf[4];
+				uint fid = *fid_field;
+				uint newfid = *newfid_field;
+				char* name = &buf[8];
+				int result = -1;
+				if (fid < (uint)FS9_FID_MAX && fs9_fids[fid].used && fs9_fids[fid].is_dir
+					&& newfid < (uint)FS9_FID_MAX && !fs9_fids[newfid].used)
+				{
+					uint new_inode;
+					uint dummy_sector;
+					uint dummy_offset;
+					uint mode;
+					if (ext2_find_in_dir(fs9_fids[fid].inode_num, name, &new_inode, &dummy_sector, &dummy_offset, &mode))
+					{
+						fs9_fids[newfid].used = true;
+						fs9_fids[newfid].opened = false;
+						fs9_fids[newfid].is_dir = (mode & EXT2_S_IFDIR) != 0;
+						fs9_fids[newfid].inode_num = new_inode;
+						result = 0;
+					}
+				}
+				int* result_field = (int*)&buf[0];
+				*result_field = result;
+				ipc_reply(from, P9_WALK, &buf, 4, from_gen);
+			}
+			else if (verb == P9_OPEN)
+			{
+				uint* fid_field = (uint*)&buf[0];
+				uint fid = *fid_field;
+				int result = -1;
+				if (fid < (uint)FS9_FID_MAX && fs9_fids[fid].used && !fs9_fids[fid].is_dir)
+				{
+					fs9_fids[fid].opened = true;
+					result = 0;
+				}
+				int* result_field = (int*)&buf[0];
+				*result_field = result;
+				ipc_reply(from, P9_OPEN, &buf, 4, from_gen);
+			}
+			else if (verb == P9_READ)
+			{
+				uint* fid_field = (uint*)&buf[0];
+				uint* p9_offset_field = (uint*)&buf[4];
+				uint* p9_count_field = (uint*)&buf[8];
+				uint fid = *fid_field;
+				uint p9_offset = *p9_offset_field;
+				uint p9_count = *p9_count_field;
+				int result_len = -1;
+				if (fid < (uint)FS9_FID_MAX && fs9_fids[fid].used && fs9_fids[fid].opened)
+				{
+					if (p9_count > FS_MSG_MAX - 4) p9_count = FS_MSG_MAX - 4;
+					result_len = ext2_read_inode_at(fs9_fids[fid].inode_num, &buf[4], p9_count, p9_offset);
+				}
+				int* result_len_field2 = (int*)&buf[0];
+				*result_len_field2 = result_len;
+				int p9_reply_len = 4 + (result_len > 0 ? result_len : 0);
+				ipc_reply(from, P9_READ, &buf, p9_reply_len, from_gen);
+			}
+			else // P9_CLUNK
+			{
+				uint* fid_field = (uint*)&buf[0];
+				uint fid = *fid_field;
+				int result = -1;
+				if (fid < (uint)FS9_FID_MAX && fs9_fids[fid].used)
+				{
+					fs9_fids[fid].used = false;
+					result = 0;
+				}
+				int* result_field = (int*)&buf[0];
+				*result_field = result;
+				ipc_reply(from, P9_CLUNK, &buf, 4, from_gen);
+			}
+			continue;
+		}
+
 		if (verb != FS_READ && verb != FS_READ_AT && verb != FS_WRITE && verb != FS_DELETE && verb != FS_LIST && verb != FS_MKDIR && verb != FS_RENAME) continue;
 
 		int* result_len_field = (int*)&buf;

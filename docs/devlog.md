@@ -4,6 +4,102 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (57) — Quiet sdd's per-sector debug output
+
+`sdd.c3` (the real Duo SD driver) printed two full lines per sector
+I/O unconditionally — `"sdd: rw sector=..."` before every command,
+`"sdd: CMDxx ok resp0=... ready after ..."` after every successful
+transfer. Real, useful bringup-era diagnostics (found real bugs this
+way), but with a real ext2 read path routinely touching dozens of
+sectors per `exec()`/9P read, it had become pure noise now that the
+driver's own timing has been extensively verified this session.
+
+New `SDD_VERBOSE` const, off by default, gates both blocks. Confirmed
+safe to toggle without risk: both prints already sit outside the
+timing-sensitive window this file's own comments warn about (the
+FIFO-shallow bug that window's discipline exists to prevent) — one runs
+before the command is even sent, the other after the transfer has
+already fully completed.
+
+**Real Milk-V Duo hardware confirmation**: ran the next full real-
+hardware test round with `SDD_VERBOSE` off — the serial output is
+completely clean of `sdd:` lines, a direct, visible before/after
+contrast against every prior real-hardware round this session.
+
+**Files changed:** `user/sdd.c3`.
+
+---
+
+## 2026-08-21 (56) — Real 9P (read-only) against fsd — the real file server, ext2 only
+
+Follow-up to entries 54/55 (real 9P against `echod`'s toy sandbox) —
+lands the same protocol against `fsd`, the real file server backed by
+ext2, scoped to read-only (`Twalk`/`Topen`/`Tread`/`Tclunk`) and ext2
+only. `Twrite`/`Tcreate`/`Tremove`/`Trename` raise real semantic
+questions (what does an open fid mean across a rename/delete of its own
+target — a scenario that can't occur in today's stateless-per-call
+`FS_*` model, so there's no existing behavior to preserve, only a new
+one to design) deliberately left for a later entry. FAT32 excluded —
+it's boot-partition-only now (entry 53), not part of this project's own
+real deployment topology.
+
+**The actual payoff of building the protocol generically against
+`echod` first**: no new verb constants, no new client wrapper functions
+needed at all. `P9_ATTACH`/`P9_WALK`/`P9_OPEN`/`P9_READ`/`P9_CLUNK`
+(`user/user.c3`) and their client wrappers already exist and already
+work against *any* pid — real 9P's own "same protocol, any server"
+property, for real. `fsd.c3` just needed its own dispatch for these
+already-defined verbs, addressed to `fsd`'s own pid instead of
+`echod`'s.
+
+`fsd.c3` gains an 8-slot FID table (`Fs9_fid_entry`: `used`/`opened`/
+`is_dir`/`inode_num`) — an ext2 inode number is a genuinely stable
+identity, unlike a path string (survives a rename elsewhere, unlike
+`ext2_cache_path`). `P9_WALK` calls the *existing* `ext2_find_in_dir`,
+which already takes an arbitrary directory inode, not just root — so
+this is hierarchical for free, no separate "add subdirectories" phase
+needed the way `echod`'s own from-scratch synthetic tree required.
+Every one of the five verbs returns `-1` when `fs_type != FS_TYPE_EXT2`
+(FAT32, or an unmounted second instance) — same graceful-degrade shape
+every existing `FS_*` verb already has.
+
+`ext2_read_at`'s own tail (offset/EOF handling, the indirect-block
+resolution loop) is extracted into a new `ext2_read_inode_at(inode_num,
+...)`, taking an inode number directly — `ext2_read_at` itself (path-
+based, still used unchanged by `exec()`'s own chunked read loop and
+everything downstream) keeps its own cache/resolve logic and just
+delegates once it has `inode_num`; `fsd.c3`'s new `P9_READ` dispatch
+calls the same shared helper directly, skipping path resolution
+entirely since it already has `fid.inode_num` from the walk. Pure
+extraction, zero behavior change for existing callers — confirmed by
+the full regression suite passing unchanged.
+
+New shell command `p9fstest` walks real, on-disk data — a root-level
+file, then a real subdirectory, then a file inside it (genuine two-level
+descent against the actual filesystem, not a synthetic tree) — and a
+negative walk against a nonexistent name.
+
+Surfaced, unrelated, not fixed here: `ext2_rename` never looks up
+`requester_uid` at all, unlike every other mutating verb (write/delete/
+mkdir) — a real, pre-existing permission gap, flagged to the user,
+left alone for this entry.
+
+**Verification**: `p9fstest: ok` on the ext2-only and dual-mount
+(ext2 root) images; correctly `FAILED` on the FAT32-only image (every
+verb returns `-1`, confirms the gate works, nothing crashes). Full
+regression — `exec()`-dependent tests, every `/bin/` utility, the
+entire existing shell suite, `mounttest`, `p9realtest` — all
+unaffected, confirming the `ext2_read_at` extraction is a genuine
+no-op. Three-boot stress batch, `e2fsck -n -f` clean.
+
+**Real Milk-V Duo hardware confirmation**: `p9fstest: ok` against the
+real, single, ext2-exclusive `fsd` (entry 53's own topology), full
+regression (`runtest`/`elftest`) unaffected, `lsproc` clean.
+
+**Files changed:** `user/fs/ext2.c3`, `user/fsd.c3`, `user/shell.c3`.
+
+---
+
 ## 2026-08-21 (55) — Real subdirectories in echod's 9P sandbox
 
 Follow-up to the previous entry: `echod`'s own synthetic 9P tree was

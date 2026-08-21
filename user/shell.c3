@@ -334,6 +334,52 @@ fn void main() @export("main") {
             } else {
                 print("p9realtest: FAILED\n");
             }
+        } else if (strcmp(cmd, "p9fstest") == 0) {
+            // Same real 9P verbs as p9realtest above, this time against
+            // fsd — the real file server, backed by real ext2 data, not
+            // a synthetic tree (see docs/devlog.md). No new client
+            // functions needed: p9_attach/p9_walk/p9_open/p9_read/
+            // p9_clunk already work against any pid, the actual point
+            // of building the protocol generically against echod's own
+            // sandbox first. Read-only, ext2 only — fails cleanly
+            // (every call returns -1) on a FAT32-only mount, confirmed
+            // separately, not part of this test's own ok/FAILED check.
+            int p9f_pid = ns_resolve("", null);
+            char[40] p9f_buf @noinit;
+
+            int p9f_attach = p9_attach(p9f_pid, 1); // fid 1 = ext2 root inode
+
+            int p9f_walk_hello = p9_walk(p9f_pid, 1, 2, "hello.txt"); // fid 2, a real root-level fixture
+            int p9f_open_hello = p9_open(p9f_pid, 2);
+            int p9f_read_hello = p9_read(p9f_pid, 2, 0, 32, &p9f_buf);
+            p9f_buf[p9f_read_hello >= 0 ? p9f_read_hello : 0] = 0;
+            bool p9f_read_hello_ok = p9f_read_hello == 17 && strcmp(&p9f_buf, "Hello from ext2!\n") == 0;
+            int p9f_clunk_hello = p9_clunk(p9f_pid, 2);
+
+            int p9f_walk_subdir = p9_walk(p9f_pid, 1, 3, "subdir"); // fid 3, a real directory
+            int p9f_open_subdir = p9_open(p9f_pid, 3); // must FAIL — subdir is a directory
+            int p9f_walk_nested = p9_walk(p9f_pid, 3, 4, "nested.txt"); // fid 4, walked FROM subdir (fid 3), not root
+            int p9f_open_nested = p9_open(p9f_pid, 4);
+            int p9f_read_nested = p9_read(p9f_pid, 4, 0, 40, &p9f_buf);
+            p9f_buf[p9f_read_nested >= 0 ? p9f_read_nested : 0] = 0;
+            bool p9f_read_nested_ok = p9f_read_nested == 32 && strcmp(&p9f_buf, "Hello from an ext2 subdirectory!") == 0;
+            int p9f_clunk_nested = p9_clunk(p9f_pid, 4);
+            int p9f_clunk_subdir = p9_clunk(p9f_pid, 3);
+
+            int p9f_walk_bad = p9_walk(p9f_pid, 1, 5, "nope.txt"); // must fail — no such file
+
+            int p9f_clunk_root = p9_clunk(p9f_pid, 1);
+
+            if (p9f_attach == 0 && p9f_walk_hello == 0 && p9f_open_hello == 0 && p9f_read_hello_ok
+                && p9f_clunk_hello == 0
+                && p9f_walk_subdir == 0 && p9f_open_subdir < 0 && p9f_walk_nested == 0
+                && p9f_open_nested == 0 && p9f_read_nested_ok && p9f_clunk_nested == 0
+                && p9f_clunk_subdir == 0
+                && p9f_walk_bad < 0 && p9f_clunk_root == 0) {
+                print("p9fstest: ok\n");
+            } else {
+                print("p9fstest: FAILED\n");
+            }
         } else if (strcmp(cmd, "nstest") == 0) {
             // Direct namespace-resolution smoke test: prove ns_resolve
             // itself works, independent of the 9P-lite/fsd layers built
