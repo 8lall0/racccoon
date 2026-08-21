@@ -14,31 +14,42 @@ module user;
 // "ping"/"runtest" commands still send — falls through to the
 // original raw echo, so those keep working unchanged too.
 
-// A flat, tiny, read-only, in-memory tree — real enough to exercise
-// genuine walk/open/read/clunk (multiple named nodes, real
-// offset-based reads), without needing a real backing store (that's
-// fsd's own job, a separate, much larger migration, not this).
+// A small, real (if synthetic), in-memory tree — genuinely
+// hierarchical (root, two direct files, one subdirectory with its own
+// file inside), enough to exercise real walk/open/read/clunk
+// (multiple named nodes, real offset-based reads, real multi-element
+// walk composed from repeated single-element P9_WALK calls, exactly
+// how real 9P's own Twalk descends), without needing a real backing
+// store (that's fsd's own job, a separate, much larger migration, not
+// this).
 struct P9_node
 {
     char[32] name;
-    char* content; // null for the root (a directory, has no content of its own)
+    char* content; // null for a directory — has no content of its own
     uint content_len;
+    int parent;    // index into p9_tree; -1 for root, which has none
+    bool is_dir;
 }
 
 const int P9_NODE_ROOT = 0;
-P9_node[3] p9_tree;
+P9_node[5] p9_tree;
 
 // Populated via explicit field assignment, not a struct-array literal
 // — this codebase has no precedent for that syntax anywhere; every
 // existing struct gets populated this way (e.g. create_process()'s own
-// Mount population, src/process.c3). Two real files with distinct,
-// known content — enough to prove walk-by-name actually discriminates
-// between them, and long enough to prove offset-based reads for real
-// (reading from the middle, not just position 0).
+// Mount population, src/process.c3). hello/motd: two real files with
+// distinct, known content, directly under root — enough to prove
+// walk-by-name actually discriminates between them, and long enough to
+// prove offset-based reads for real (reading from the middle, not just
+// position 0). docs/readme: a real subdirectory with its own file
+// inside, only reachable by walking root -> docs -> readme — proves
+// P9_WALK is genuinely hierarchical, not just a flat one-level lookup.
 fn void p9_init_tree()
 {
     p9_tree[P9_NODE_ROOT].content = null;
     p9_tree[P9_NODE_ROOT].content_len = 0;
+    p9_tree[P9_NODE_ROOT].parent = -1;
+    p9_tree[P9_NODE_ROOT].is_dir = true;
 
     char* hello_name = "hello";
     int hi = 0;
@@ -46,6 +57,8 @@ fn void p9_init_tree()
     p9_tree[1].name[hi] = 0;
     p9_tree[1].content = "hello from real 9p\n";
     p9_tree[1].content_len = 20;
+    p9_tree[1].parent = P9_NODE_ROOT;
+    p9_tree[1].is_dir = false;
 
     char* motd_name = "motd";
     int mi = 0;
@@ -53,6 +66,26 @@ fn void p9_init_tree()
     p9_tree[2].name[mi] = 0;
     p9_tree[2].content = "welcome to racccoon's own 9p sandbox\n";
     p9_tree[2].content_len = 38;
+    p9_tree[2].parent = P9_NODE_ROOT;
+    p9_tree[2].is_dir = false;
+
+    char* docs_name = "docs";
+    int di = 0;
+    while (docs_name[di] != 0) { p9_tree[3].name[di] = docs_name[di]; di++; }
+    p9_tree[3].name[di] = 0;
+    p9_tree[3].content = null;
+    p9_tree[3].content_len = 0;
+    p9_tree[3].parent = P9_NODE_ROOT;
+    p9_tree[3].is_dir = true;
+
+    char* readme_name = "readme";
+    int ri = 0;
+    while (readme_name[ri] != 0) { p9_tree[4].name[ri] = readme_name[ri]; ri++; }
+    p9_tree[4].name[ri] = 0;
+    p9_tree[4].content = "real 9p, genuinely hierarchical\n";
+    p9_tree[4].content_len = 32;
+    p9_tree[4].parent = 3;
+    p9_tree[4].is_dir = false;
 }
 
 // Zero-initialized by default (used = false for every slot at boot) —
@@ -121,12 +154,17 @@ fn void main() @export("main") {
             int result = -1;
             if (fid < (uint)P9_FID_MAX && p9_fids[fid].used
                 && newfid < (uint)P9_FID_MAX && !p9_fids[newfid].used
-                && p9_fids[fid].node == P9_NODE_ROOT) {
-                // Flat tree: only the root has children, matched by
-                // name — real subdirectories are out of scope for this
-                // sandbox (see this file's own header comment).
-                for (int n = 1; n < 3; n++) {
-                    if (strcmp(name, &p9_tree[n].name[0]) == 0) {
+                && p9_tree[p9_fids[fid].node].is_dir) {
+                // Genuinely hierarchical: any node whose own parent is
+                // fid's current node, matched by name — the same code
+                // path already finds hello/motd under root also finds
+                // readme under docs, just parameterized by fid's own
+                // current node instead of hardcoded to root. Composing
+                // repeated single-element walks (root -> docs, then
+                // docs -> readme) is exactly how real 9P's own Twalk
+                // descends.
+                for (int n = 1; n < 5; n++) {
+                    if (p9_tree[n].parent == p9_fids[fid].node && strcmp(name, &p9_tree[n].name[0]) == 0) {
                         p9_fids[newfid].used = true;
                         p9_fids[newfid].node = n;
                         p9_fids[newfid].opened = false;
@@ -142,7 +180,7 @@ fn void main() @export("main") {
             uint* fid_field = (uint*)&buf[0];
             uint fid = *fid_field;
             int result = -1;
-            if (fid < (uint)P9_FID_MAX && p9_fids[fid].used && p9_fids[fid].node != P9_NODE_ROOT) {
+            if (fid < (uint)P9_FID_MAX && p9_fids[fid].used && !p9_tree[p9_fids[fid].node].is_dir) {
                 p9_fids[fid].opened = true;
                 result = 0;
             }

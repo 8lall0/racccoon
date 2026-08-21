@@ -306,12 +306,30 @@ fn void main() @export("main") {
             bool p9r_read3_ok = p9r_read3 == 38 && strcmp(&p9r_buf, "welcome to racccoon's own 9p sandbox\n") == 0;
             int p9r_clunk2 = p9_clunk(p9r_pid, 4);
 
+            // Real, genuinely hierarchical walk — root -> docs ->
+            // readme, two separate single-element P9_WALK calls
+            // composed, exactly how real 9P's own Twalk descends. docs
+            // (fid 5) is a directory: opening it directly must fail.
+            int p9r_walk_docs = p9_walk(p9r_pid, 1, 5, "docs");
+            int p9r_open_docs = p9_open(p9r_pid, 5); // must FAIL — docs is a directory
+            int p9r_walk_readme = p9_walk(p9r_pid, 5, 6, "readme"); // walked FROM docs, not root
+            int p9r_open_readme = p9_open(p9r_pid, 6);
+            int p9r_read_readme = p9_read(p9r_pid, 6, 0, 40, &p9r_buf);
+            p9r_buf[p9r_read_readme >= 0 ? p9r_read_readme : 0] = 0;
+            bool p9r_read_readme_ok = p9r_read_readme == 32 && strcmp(&p9r_buf, "real 9p, genuinely hierarchical\n") == 0;
+            int p9r_clunk_readme = p9_clunk(p9r_pid, 6);
+            int p9r_clunk_docs = p9_clunk(p9r_pid, 5);
+
             int p9r_clunk_root = p9_clunk(p9r_pid, 1);
 
             if (p9r_attach == 0 && p9r_walk1 == 0 && p9r_open1 == 0 && p9r_read1_ok
                 && p9r_read2_ok && p9r_clunk1 == 0 && p9r_walk_bad < 0
                 && p9r_walk2 == 0 && p9r_open2 == 0 && p9r_read3_ok
-                && p9r_clunk2 == 0 && p9r_clunk_root == 0) {
+                && p9r_clunk2 == 0
+                && p9r_walk_docs == 0 && p9r_open_docs < 0 && p9r_walk_readme == 0
+                && p9r_open_readme == 0 && p9r_read_readme_ok && p9r_clunk_readme == 0
+                && p9r_clunk_docs == 0
+                && p9r_clunk_root == 0) {
                 print("p9realtest: ok\n");
             } else {
                 print("p9realtest: FAILED\n");

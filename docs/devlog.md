@@ -4,6 +4,43 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-21 (55) — Real subdirectories in echod's 9P sandbox
+
+Follow-up to the previous entry: `echod`'s own synthetic 9P tree was
+flat — only the root had children, enforced directly in `P9_WALK`'s
+own dispatch (`fid must be root`), and `P9_OPEN` rejected opening
+`P9_NODE_ROOT` specifically. Real 9P's own `Twalk` is inherently
+hierarchical — a client walks one path element at a time, composing
+calls to descend arbitrarily deep — a flat tree never exercised that.
+
+`P9_node` (`user/echod.c3`) gains `parent`/`is_dir`; the tree grows
+from 3 nodes to 5 — `hello`/`motd` unchanged under root, plus a new
+`docs` subdirectory containing its own `readme` file, reachable only by
+walking `root → docs → readme`. `P9_WALK`'s own dispatch generalizes
+from "fid must be root" to "fid must point at a directory," and the
+child search from "any node under root" to "any node whose own parent
+matches fid's current node" — the exact same code path that already
+found `hello`/`motd` under root now also finds `readme` under `docs`,
+parameterized instead of hardcoded. `P9_OPEN` generalizes the same way
+(reject any directory, not just root specifically).
+
+`p9realtest` (`user/shell.c3`) extended, not a new command — two more
+`p9_walk()` calls composed in sequence (`root → docs`, then `docs →
+readme`), confirming opening `docs` directly fails (it's a directory)
+and the final read reaches genuinely nested content.
+
+**Verification**: `p9realtest: ok` on all three QEMU images with the
+new two-level walk included, full regression of `ping`/`runtest`/
+`argvtest`/`p9test` unchanged, three-boot stress batch clean.
+
+**Real Milk-V Duo hardware confirmation**: `p9realtest: ok` (including
+the new two-level walk), full regression of `ping`/`runtest`/
+`argvtest`/`p9test` unchanged, `lsproc` clean.
+
+**Files changed:** `user/echod.c3`, `user/shell.c3`.
+
+---
+
 ## 2026-08-21 (54) — Real 9P semantics (FID/Twalk/Topen/Tread/Tclunk), against echod's own sandbox
 
 Today's "9P-lite" (`P9_TWALK`/`P9_TREAD`, introduced 2026-08-15) was
