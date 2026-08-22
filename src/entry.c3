@@ -68,6 +68,7 @@ const SYS_PARENT_INFO  = 23; // returns a process's parent pid/generation, if it
 const SYS_EXEC         = 24; // replaces the calling process's own image in place — see its case below
 const SYS_SETUID       = 25; // sets the caller's own uid, only while still root — see its case below
 const SYS_NS_MOUNT_WAIT = 26; // SYS_NS_MOUNT, but blocks (bounded by a retry count) until the target actually posts — see its case below
+const SYS_YIELD         = 27; // voluntarily gives up the rest of this process's timeslice once — see its case below
 
 // Generous cap on the image SYS_EXEC will install — real racccoon
 // binaries (build/user/*.bin) run 70-105KB; this leaves real headroom
@@ -1475,6 +1476,28 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			current_proc.in_blocking_wait = false;
 			blocking_depth--;
 			f.a0 = (ulong)(iptr)(mw_ok ? 0 : -1);
+		case SYS_YIELD:
+			// Plain, single, unconditional yield() — for a process that
+			// needs to busy-wait on something with no syscall of its
+			// own (a hardware register poll, a real-time delay), so it
+			// can stay cooperatively preemptible instead of a syscall-
+			// free spin that nothing can ever switch away from. Found
+			// necessary building usbd.c3 (docs/devlog.md): this
+			// kernel's own pre-existing, accepted design means SIE
+			// stays globally disabled for as long as *any* process is
+			// idling inside SYS_GETCHAR (the shell's own normal resting
+			// state waiting for a keystroke) — so a genuinely
+			// syscall-free loop elsewhere can never be preempted once
+			// the shell reaches its idle prompt, a real, total
+			// deadlock, not just a missed-scheduling-slice
+			// inefficiency. Not one of the blocking_depth-counted
+			// waits (process.c3) — this trap's own sret is a real,
+			// single, ordinary trap-entry/exit pair reflecting this
+			// process's own genuine state, no staleness risk the way a
+			// multi-yield loop held open across an unrelated process's
+			// own scheduling would have.
+			yield();
+			f.a0 = 0;
 		case SYS_PARENT_INFO:
 			// Read-only, no permission check — same reasoning as
 			// SYS_PROC_INFO above. Returns the given pid's parent_pid

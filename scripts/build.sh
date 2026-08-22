@@ -242,6 +242,7 @@ LLC=${LLC:-llc}
     build/user/fsd.bin.o \
     build/user/procd.bin.o \
     build/user/envd.bin.o \
+    build/user/usbd.bin.o \
     -T src/kernel.ld \
     -Map=build/kernel.map \
     -o build/kernel.elf

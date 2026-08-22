@@ -116,6 +116,19 @@ const uptr SD_CLOCK_PAGE  = 0;
 // convention on the Duo.
 const uint IRQ_SDHCI = 0;
 
+// process.c3's setup_usbd_mappings references these unconditionally,
+// same reasoning as the SD_* constants above — QEMU's riscv64 virt
+// machine has no DWC2 equivalent at all (its own USB path, if any, is
+// PCIe+XHCI — a completely different controller, later phase), so 0 is
+// fine, never dereferenced since HAS_USB is false here.
+const uptr USB_MMIO_BASE     = 0;
+const uptr USB_TOP_CTRL_PAGE = 0;
+const uptr USB_TOP_RST_PAGE  = 0;
+const uptr USB_CLK_PAGE      = 0;
+const uptr USB_PINMUX_PAGE   = 0;
+const uint IRQ_USB           = 0;
+const bool HAS_USB           = false;
+
 // Real, confirmed timebase-frequency, not guessed — extracted directly
 // from this exact qemu-system-riscv64 binary via
 // `-machine virt,dumpdtb=...` + `dtc` (same sourcing already used for

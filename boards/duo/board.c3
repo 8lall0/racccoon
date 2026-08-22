@@ -123,6 +123,53 @@ const bool HAS_BLOCK_DEVICE = true;
 const bool HAS_SD_BLOCK     = true;
 const bool HAS_VIRTIO_BLOCK = false;
 
+// USB host controller (Synopsys DesignWare USB2 OTG core, "DWC2") —
+// see user/usbd.c3 for the driver (Phase 1: host-mode bring-up + HPRT
+// connect/disconnect polling only, no enumeration/transfers/interrupts
+// yet). Sourced directly from duo-buildroot-sdk's own U-Boot driver
+// (drivers/usb/host/dwc2.c/.h — the generic DWC2 host driver CV1800B's
+// devicetree binds to unmodified) and the SoC-specific TOP-block
+// registers it also touches (board/cvitek/cv180x/board.c,
+// cv180x_reg.h) — real, confirmed offsets, not reverse-engineered.
+//
+// The devicetree's own second `reg` range for this device (0x03006000,
+// labeled "USB 2.0 PHY" in the source) is never actually written by
+// any driver in that SDK — not mapped here at all. The real
+// SoC-specific registers this driver needs live in the separate TOP
+// control block instead, at the two small offsets below.
+const uptr USB_MMIO_BASE     = 0x04340000; // DWC2 core — GOTGCTL/GAHBCFG/GUSBCFG/GRSTCTL/GINTSTS/GSNPSID/HCFG/HPRT0 all fit in the first 4KB page
+const uptr USB_TOP_CTRL_PAGE = 0x03000000; // REG_TOP_USB_PHY_CTRL @ +0x48 (same physical page SD_TOP_PAGE above also maps, for unrelated registers — independent per-process page tables, no conflict)
+const uptr USB_TOP_RST_PAGE  = 0x03003000; // REG_TOP_SOFT_RST @ +0x0 (RST_USB, bit11)
+// The USB PHY's own reference clocks — clk_125m_usb/clk_33k_usb
+// (REG_CLK_EN_1 bits 30/31) and clk_12m_usb (REG_CLK_EN_2 bit 0),
+// confirmed via duo-buildroot-sdk's own Linux clock driver
+// (drivers/clk/cvitek/clk-cv180x.c) and the devicetree's own
+// clock-controller node (base 0x03002000, same physical page
+// SD_CLOCK_PAGE above also maps, for its own unrelated PLL register —
+// independent per-process page tables, no conflict). NOT documented
+// in the real CV1800B/CV1801B datasheet's own clk_en_1 register table
+// at all (which lists bits 31:30 as "Reserved" — the Linux driver is
+// the more trustworthy, proven-on-real-silicon source here). Separate
+// from clk_axi4_usb/clk_apb_usb (REG_CLK_EN_1 bits 28/29, confirmed
+// enabled by default in the datasheet — those feed the DWC2 core's
+// own digital register access, already working; these three feed the
+// analog PHY itself).
+const uptr USB_CLK_PAGE      = 0x03002000;
+// PAD_USB_VBUS_DET function-select register (PINMUX_BASE+0xac, same
+// physical page SD_PINMUX_PAGE above also maps, for unrelated SDIO0
+// pad registers — independent per-process page tables, no conflict).
+// U-Boot's own board_init() calls pinmux_config(PINMUX_USB) for every
+// boot, unconditionally (not gated behind USB gadget/host mode) —
+// found by reading board.c3/cv180x_reg_fmux_gpio.h directly this
+// round, after two straight real-hardware failures (USB3 drive, then
+// a genuine USB2-only Xbox 360 controller) with no HPRT0.PRTCONNSTS
+// reaction at all despite every DWC2-core and TOP-block VBUS/clock bit
+// already being set — this driver had never touched pinmux at all
+// until now.
+const uptr USB_PINMUX_PAGE   = 0x03001000;
+const uint IRQ_USB           = 30; // declared, deliberately NOT wired into plic_init() yet — see IRQ_SDHCI's own claim-storm lesson above; Phase 1 polls HPRT0 instead
+const bool HAS_USB           = true;
+
 // fsd mounts EXT2TEST (ext2) as this board's own root — the real,
 // physical start sector, confirmed via `sfdisk`/`lsblk` against the
 // actual card. DUOBOOT (FAT32, sector 2048) deliberately isn't this

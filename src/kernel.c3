@@ -48,6 +48,8 @@ extern char[] _binary_procd_bin_start @cname("_binary_procd_bin_start");
 extern char[] _binary_procd_bin_end @cname("_binary_procd_bin_end");
 extern char[] _binary_envd_bin_start @cname("_binary_envd_bin_start");
 extern char[] _binary_envd_bin_end @cname("_binary_envd_bin_end");
+extern char[] _binary_usbd_bin_start @cname("_binary_usbd_bin_start");
+extern char[] _binary_usbd_bin_end @cname("_binary_usbd_bin_end");
 
 fn void boot() @naked @export("boot") @section(".text.boot") @noinline @nostrip @used
 {
@@ -192,9 +194,50 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	envd_pid = envd_proc.pid;
 	io::print("envd created\n");
 
-	// Single call site for create_process(shell), used for both the
-	// initial spawn and every respawn once idle notices nothing else is
-	// runnable.
+	// The shell — created explicitly here, BEFORE usbd below, not left
+	// to the lazy "idle notices nothing else is runnable" path the
+	// final loop below still handles for every later respawn. Real bug
+	// found bringing usbd up on real hardware (docs/devlog.md): every
+	// boot-time server up to this point (echod/diskd-or-sdd/fsd/fsd2/
+	// procd/envd) eventually reaches a genuine PROC_BLOCKED wait
+	// (SYS_IPC_RECV), so the chain of yield() calls each one's own
+	// init-then-block sequence triggers always eventually cascades
+	// back to idle_proc (this function, mid its own final loop) —
+	// which is the ONLY place that lazily creates the shell. usbd is
+	// the first process in this project's history that never reaches
+	// a genuine block at all (it stays PROC_RUNNABLE forever, just
+	// yielding — the same deliberate shape SYS_GETCHAR/SYS_JOIN
+	// already use) — once it's scheduled, that cascade-back-to-idle
+	// never happens again, so the lazy path would never fire and the
+	// shell would never get created at all, a real, total, silent
+	// deadlock (confirmed directly: real hardware hung right after
+	// usbd's own "polling HPRT0" message, before ever printing a shell
+	// prompt). Creating the shell explicitly, before usbd, sidesteps
+	// this: once both exist, they're both "permanently runnable, only
+	// yielding" in the same sense (matching SYS_GETCHAR's own idle
+	// wait), and the round-robin scan already correctly alternates
+	// between any number of such processes — the same shape that
+	// already works fine for e.g. hotplugtest's own dangling-fid race.
+	create_process((void*)&_binary_shell_bin_start, (uint)((uptr)&_binary_shell_bin_end - (uptr)&_binary_shell_bin_start));
+	io::print("shell created\n");
+
+	// usbd (the USB host-controller driver, user/usbd.c3) — Duo only
+	// (board::HAS_USB; QEMU's own riscv64 virt machine has no DWC2
+	// equivalent). Spawned last, after every other server (including
+	// the shell above): unlike diskd/fsd, nothing hardcodes usbd's pid
+	// yet (Phase 1 is bring-up + HPRT polling only, no IPC clients), so
+	// there's no fixed-slot convention to preserve by spawning it
+	// earlier.
+	if (board::HAS_USB)
+	{
+		Process* usbd_proc = create_process((void*)&_binary_usbd_bin_start, (uint)((uptr)&_binary_usbd_bin_end - (uptr)&_binary_usbd_bin_start));
+		setup_usbd_mappings(usbd_proc);
+		io::print("usbd created\n");
+	}
+
+	// Single call site for create_process(shell) below (a *respawn*
+	// only now — the initial spawn is explicit above), used once idle
+	// notices nothing else is runnable (e.g. the shell itself exiting).
 	for (;;)
 	{
 		bool shell_running = false;

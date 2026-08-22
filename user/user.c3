@@ -38,6 +38,7 @@ const int SYS_PARENT_INFO  = 23; // returns a process's parent pid/generation, i
 const int SYS_EXEC         = 24; // replaces the calling process's own image in place — see src/entry.c3's case
 const int SYS_SETUID       = 25; // sets the caller's own uid, only while still root — see src/entry.c3's case
 const int SYS_NS_MOUNT_WAIT = 26; // SYS_NS_MOUNT, but blocks (bounded by a retry count) until the target actually posts — see src/entry.c3's case
+const int SYS_YIELD         = 27; // voluntarily gives up the rest of this process's timeslice once — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -676,6 +677,21 @@ fn int ns_mount(char* prefix, char* srv_name) @export("ns_mount") {
 // already uses.
 fn int ns_mount_wait(char* prefix, char* srv_name, ulong max_attempts) @export("ns_mount_wait") {
     return syscall(SYS_NS_MOUNT_WAIT, (long)prefix, (long)srv_name, (long)max_attempts);
+}
+
+// Voluntarily gives up the rest of this process's timeslice once —
+// there's no general-purpose sleep()/yield() in this kernel otherwise
+// (every other blocking syscall needs a real condition to wait for).
+// For a process busy-waiting on something with no syscall of its own
+// (a hardware register poll, a real-time delay via rdtime()) so it
+// stays cooperatively preemptible instead of a syscall-free spin —
+// see SYS_YIELD's own case (src/entry.c3) for why that matters: this
+// kernel's own design means a genuinely syscall-free loop can never be
+// preempted once some other process is idling in SYS_GETCHAR (the
+// shell's own normal resting state), a real deadlock, not just an
+// inefficiency.
+fn void yield() @export("yield") {
+    syscall(SYS_YIELD, 0, 0, 0);
 }
 
 // Blocks until the process with this pid no longer exists — e.g. a

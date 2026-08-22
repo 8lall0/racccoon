@@ -4,6 +4,170 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-22 (64) — USB Phase 1: DWC2 host-mode bring-up, real on the Duo
+
+Goal: bring the Duo's actual USB host controller (Synopsys DesignWare
+USB2 OTG, "DWC2", at `0x04340000`) into host mode and get
+`HPRT0.PRTCONNSTS` to genuinely react to a device plugging in — Phase 1
+of the USB mass-storage roadmap (entry 63's `SYS_NS_MOUNT_WAIT` was
+Phase 0). Real-hardware-only; QEMU's `virt` machine has no DWC2
+equivalent, so there's no dev-loop here — every iteration is a full
+build+flash+power-cycle round trip on the real Duo. This ended up being
+by far the longest single bring-up in this project's history —
+somewhere north of twenty real-hardware round trips — and the final
+root causes were genuinely subtle enough that no amount of *reading*
+the register reference tables would have found them; it took finding
+and diffing against the actual vendor kernel driver.
+
+### The other bug this surfaced: `usbd` breaks the boot-time shell
+
+Before any USB register work mattered at all, the shell stopped
+appearing at boot the moment `usbd` was spawned — a real scheduler bug,
+not a USB bug. `kernel_main` runs as `idle_proc` itself and creates
+every boot-time server sequentially without ever yielding; the shell
+has always been created lazily, inside `idle_proc`'s own final
+`for(;;)` loop, only once nothing else is `PROC_RUNNABLE`. Every prior
+boot-time server eventually reaches a genuine `SYS_IPC_RECV`-driven
+`PROC_BLOCKED` state, and each one's own blocking call hands control to
+the next-created server in the chain — a "cascading yield()" that,
+once the last server blocks, falls back to `idle_proc`, which then
+notices nothing is runnable and creates the shell. `usbd` is the first
+process in this project's history that never genuinely blocks — it
+only polls hardware and calls `yield()`, staying `PROC_RUNNABLE`
+forever — which permanently breaks the cascade once it's scheduled,
+since `idle_proc` (where shell-creation lives) can never be reached
+again via the round-robin scan. Fixed by moving shell creation to be
+explicit in `kernel.c3`, right after `envd` and before `usbd`'s own
+spawn, instead of relying on the lazy fallback. Also added `SYS_YIELD`
+(syscall 27, a plain unconditional `yield()`) for `usbd`'s own
+busy-wait loops — not the actual fix, but a real correctness
+improvement kept anyway.
+
+### Register facts confirmed, in the order that mattered
+
+Every fix below is sourced from real files in the local
+`duo-buildroot-sdk` checkout, not guessed — but the session's own
+research process is worth recording, because several plausible-looking
+leads turned out to be dead ends, and the two fixes that actually
+mattered were found only by escalating from "read the datasheet" to
+"read U-Boot" to "read the real vendor Linux driver and its own
+shipped rootfs scripts."
+
+**Baseline bring-up** (all correct, none of this was the bug): PHY
+reference clocks `clk_125m_usb`/`clk_33k_usb`/`clk_12m_usb`
+(`REG_CLK_EN_1` bits 30/31, `REG_CLK_EN_2` bit 0 — sourced from the
+Linux clock driver, since the datasheet's own table lists those bits
+as "Reserved"); `RST_USB` toggle (`REG_TOP_SOFT_RST` bit 11);
+`PAD_USB_VBUS_DET` pinmux (`PINMUX_BASE+0xac`, function 0); the ECO
+`RX_FLUSH` errata bit (`REG_TOP_USB_ECO` @ `TOP_BASE+0xB4`, bit 7,
+found in U-Boot's `board_usb_init()`); `GAHBCFG` programming
+(`HBURSTLEN_INCR4` + `DMAENABLE`, matching the devicetree's own
+`g-use-dma;` property — never written by this driver before this
+session); `PCGCCTL` cleared to 0 ("Restart the Phy Clock," U-Boot's own
+`dwc_otg_core_host_init()`'s first step, never touched before either).
+
+**Dead ends, explicitly ruled out** (so a future session doesn't
+re-chase them): `GOTGCTL.CONIDSTS` — spent a full round flipping the
+TOP-block `usb_phy_ctrl_reg`'s ID-value bit in both directions to try
+to make this DWC2-core status bit read "host"; it never budged either
+way, and it turned out the real vendor driver never reads it at all —
+host mode there comes entirely from `GUSBCFG.FORCEHOSTMODE`. The
+devicetree's second `reg` range (`0x03006000`, "USB 2.0 PHY") —
+confirmed via the actual vendor Linux `dwc2/platform.c` glue
+(`cviusb_dev.phy_regs`) that this block is real and genuinely mapped,
+but only ever touched by BC1.2 charger-detection code, which is
+explicitly gated to device mode (`if (!id_override) return -EPERM;`)
+— irrelevant to host mode. An external hub-reset GPIO mechanism
+(`GPIO_HUBPORT_EN`/`ROLESEL`/`HUBRST`, found in `/etc/uhubon.sh`) —
+real, but only wired up in that script's `case` statement for *other*
+Cvitek chip variants (cv1821/cv1826/cv1835/cv1838); the plain
+`cv180x`/Duo version of that same script defines the functions but
+never calls them, confirming the Duo itself has no such external
+switch to worry about.
+
+**The actual TOP-block fix**: the exact register value to write for
+host mode was always available straight from
+`/mnt/system/usb-host.sh` (the vendor rootfs's own one-liner,
+`echo host > /proc/cviusb/otg_role`) and its real kernel-side handler,
+`dwc2_set_hw_id()` (`linux_5.10/drivers/usb/dwc2/platform.c`) — which
+writes `(read & ~0xC0) | 0x40` to `usb_phy_ctrl_reg`: clear bits 6-7,
+set bit 6 only. This driver's own earlier value (`0x43`, also setting
+`EXTERNAL_VBUSVALID`/`DRIVE_VBUS`, bits 0-1) was this project's own
+inference from the datasheet's field table, never confirmed by any
+real driver, and wrong — replaced with the vendor's exact byte value.
+
+**The actual core-reset fix**: this driver's own `GSNPSID` reads back
+as exactly `0x4f54420a` — which is bit-for-bit
+`DWC2_CORE_REV_4_20a`, the real Linux driver's own named constant for
+this exact silicon revision (`linux_5.10/drivers/usb/dwc2/core.h`).
+For cores at or above that revision, the real `dwc2_core_reset()`
+does something this driver never did: after seeing
+`GRSTCTL_CSFTRST_DONE` set, it performs an explicit **write-back** —
+read `GRSTCTL`, clear `CSFTRST`, set `CSFTRST_DONE`, write it back —
+before polling `AHBIDLE` (which Linux also polls *after* the reset
+completes, not before, the reverse of this driver's original
+ordering). Rewrote `usb_core_reset()` to match this exactly. This was
+the fix that took `HPRT0` from permanently frozen at `0x00000000`
+(regardless of any other register written, TOP-block or DWC2-core) to
+genuinely live and responsive.
+
+**Two more real-hardware-only findings, after `HPRT0` came alive**:
+the `GOTGCTL` VBUS-valid override (`VbvalidOvEn`/`VbvalidOvVal`,
+another of this driver's own datasheet-only inferences, never in the
+vendor driver) turned out to force the port into a permanent false
+"connected" latch — removed. So did an unconditional port-reset pulse
+performed immediately after port-power, before any real settle time —
+Phase 1's own stated scope (connect/disconnect polling only, no
+enumeration) never actually needed a reset here at all; replaced with
+a plain 100ms settle delay and a W1C-bit clear before the polling loop
+starts.
+
+### The final, real confirmation
+
+With the above, a genuinely clean two-state result across separate
+boots: SD-card-only boot (no USB IO board attached) shows
+`HPRT0=0x00001000`, `prtconnsts=0`, `prtlnsts=0` (SE0 — correctly
+disconnected); boot with the Duo's official USB&Ethernet IO board
+attached shows `prtconnsts=1`, `prtlnsts=1` (idle full-speed J-state),
+consistent and unchanging across multiple boots. That "unchanging"
+property was itself briefly alarming — plugging/unplugging a USB drive
+into the IO board's own downstream ports never changed anything — until
+realizing the IO board's "4x USB" spec implies an onboard hub, and
+`HPRT0` can only ever see the single device on the Duo's own root
+port: the hub itself, not whatever's plugged into its downstream side.
+Seeing the hub connect is a completely valid, real connect-detection
+event (a hub is a real, standard-compliant USB device) — the
+two-boot-state comparison above is that confirmation, since a live
+attach/detach test wasn't physically possible (the IO board's header
+also carries the serial console's own UART3 TX/RX, pins 6/7).
+
+Detecting an actual downstream *device* behind that hub — as opposed
+to the hub's own connection — needs real hub-class enumeration
+(`SET_CONFIGURATION` on the hub, then `GET_PORT_STATUS` class requests
+per downstream port), which is out of scope for Phase 1's bare
+`HPRT0`-polling design. That's real, necessary Phase 2+ work, not a
+bug in what's here.
+
+**Verification**: QEMU regression clean (`HAS_USB=false` there,
+`usbd` correctly never spawns, shell/diskd/fsd/fsd2/procd/envd all
+create normally). Real Duo hardware: `usbd`'s own diagnostic prints
+confirm `GSNPSID`/`GHWCFG2` sane, `GINTSTS.CURMODE`/`GOTGCTL.CONIDSTS`
+both correctly report host mode, `HPRT0` genuinely tracks real
+connect/disconnect state across the two-boot-state comparison above.
+`hotplugtest`/`lsproc` both still clean alongside `usbd`'s own polling
+loop (confirms the shell-creation-reorder fix holds).
+
+**Files changed:** `src/entry.c3` (`SYS_YIELD`), `src/process.c3`
+(`setup_usbd_mappings`, `usbd_pid`), `src/kernel.c3` (explicit shell
+creation before `usbd`'s spawn), `boards/duo/board.c3` /
+`boards/qemu/board.c3` (`USB_*` constants), `user/user.c3` (`yield()`
+wrapper), `user/usbd.c3` (new — the driver itself), `scripts/
+build_user.sh`, `scripts/build.sh`, `scripts/build_duo.sh`.
+
+Not yet committed — working tree has all of the above, pending review.
+
+---
+
 ## 2026-08-21 (63) — Hot-plug plumbing (`SYS_NS_MOUNT_WAIT`), and a real kernel interrupt-safety bug found along the way
 
 USB support (goal: mass storage with real hot-plug) needs a way for a

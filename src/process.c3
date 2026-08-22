@@ -58,6 +58,12 @@ uptr diskd_req_paddr;
 // way diskd does — see setup_sdd_mappings below.
 int sdd_pid = 0;
 
+// The USB host-controller driver process (see user/usbd.c3) — Duo
+// only (board::HAS_USB), unused this phase (no interrupt routing, no
+// IPC clients yet — Phase 1 is bring-up + HPRT polling only), kept for
+// whenever a later phase needs it, same as diskd_pid/sdd_pid above.
+int usbd_pid = 0;
+
 // The filesystem server (see user/fsd.c3) — 0 until created, consulted
 // only by create_process below to populate every new process's default
 // namespace. Unlike diskd, fsd is meant to be reached by ordinary
@@ -847,6 +853,26 @@ fn void setup_sdd_mappings(Process* proc)
 	map_device_page(proc.page_table, board::SD_CLOCK_PAGE, board::SD_CLOCK_PAGE, PAGE_U | PAGE_R | PAGE_W);
 
 	sdd_pid = proc.pid;
+}
+
+fn void setup_usbd_mappings(Process* proc)
+{
+	map_device_page(proc.page_table, board::USB_MMIO_BASE, board::USB_MMIO_BASE, PAGE_U | PAGE_R | PAGE_W);
+
+	// TOP-block one-time bring-up registers (see board.c3's own comment
+	// on these two) — separate pages from USB_MMIO_BASE and from each
+	// other, same "map every page the driver touches individually"
+	// shape as setup_sdd_mappings above.
+	map_device_page(proc.page_table, board::USB_TOP_CTRL_PAGE, board::USB_TOP_CTRL_PAGE, PAGE_U | PAGE_R | PAGE_W);
+	map_device_page(proc.page_table, board::USB_TOP_RST_PAGE, board::USB_TOP_RST_PAGE, PAGE_U | PAGE_R | PAGE_W);
+	// The USB PHY's own reference clocks — see board::USB_CLK_PAGE's
+	// own comment for why these are needed and where they came from.
+	map_device_page(proc.page_table, board::USB_CLK_PAGE, board::USB_CLK_PAGE, PAGE_U | PAGE_R | PAGE_W);
+	// PAD_USB_VBUS_DET pinmux function-select — see board::USB_PINMUX_PAGE's
+	// own comment.
+	map_device_page(proc.page_table, board::USB_PINMUX_PAGE, board::USB_PINMUX_PAGE, PAGE_U | PAGE_R | PAGE_W);
+
+	usbd_pid = proc.pid;
 }
 
 Process* current_proc; // Currently running process
