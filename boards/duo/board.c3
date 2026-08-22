@@ -182,6 +182,13 @@ const bool HAS_USB           = true;
 // rxdesclistaddr/txdesclistaddr) — both comfortably within the first
 // 8KB, this board's own devicetree node reserves a full 64KB window.
 const uptr ETH_MMIO_BASE     = 0x04070000;
+// The MAC's own DMA register block (Ethernet Phase 2: real packet
+// TX/RX — user/net/dwmac.c3's own ETH_DMA_BASE) — a genuinely
+// separate 4KB page from ETH_MMIO_BASE above, not covered by that
+// mapping alone; found the hard way on real hardware (a store page
+// fault at exactly 0x04071000, ethd's very first DMA_BUS_MODE soft-
+// reset write) before this page was ever mapped.
+const uptr ETH_DMA_PAGE      = 0x04071000;
 // The embedded Ethernet PHY's own register block — genuinely separate
 // hardware from the MAC above, SoC-internal (this board's physical
 // RJ45 port, per the IO board's own pinout, is wired through this,

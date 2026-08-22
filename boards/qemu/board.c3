@@ -155,6 +155,7 @@ const bool HAS_VIRTIO_NET    = true;
 // DesignWare MAC or embedded PHY at all, never dereferenced since
 // HAS_ETH_MAC is false here.
 const uptr ETH_MMIO_BASE = 0;
+const uptr ETH_DMA_PAGE  = 0;
 const uptr ETH_PHY_PAGE  = 0;
 const uptr ETH_CLK_PAGE  = 0;
 const uptr ETH_LED_PINMUX_PAGE = 0;

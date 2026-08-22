@@ -4,6 +4,97 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-22 (72) — Ethernet Phase 2: real packet TX/RX + ARP/ICMP, confirmed transmitting on real hardware
+
+Direct follow-on to Ethernet Phase 1 (entries 67-71): link sensing
+worked, but neither `ethd` (real Duo) nor `netd` (QEMU virtio-net)
+ever moved an actual packet. This phase adds real bidirectional TX/RX
+on both targets plus a minimal hand-rolled ARP + ICMP echo layer, so
+an external device can ping the board — no DHCP, no TCP/UDP, no
+routing, same narrow phased scoping every earlier phase used. Static
+config: Duo `192.168.1.70/24` gateway `192.168.1.1` (no DHCP client
+exists yet); QEMU `10.0.2.15/24` gateway `10.0.2.2` (SLIRP's own
+default virtual subnet for `-netdev user`).
+
+**New shared layer**: `user/net/eth_proto.c3` — transport-agnostic
+ARP request/reply and ICMP echo request/reply, working on raw
+Ethernet frame bytes only (no virtio/DMA knowledge), used by both
+`netd.c3` and `ethd.c3`. Every multi-byte field goes through explicit
+big-endian byte helpers, never a wide-integer cast through a `char*` —
+this CPU is little-endian, the wire isn't.
+
+**QEMU (`netd.c3`)**: populates the RX/TX virtqueues Phase 1 already
+configured but never used — one RX buffer permanently posted and
+re-armed after each frame, one TX buffer reused per send, completion
+detected by directly polling `used.index` (no interrupt reliance, same
+busy-polled convention every other driver here already uses).
+`SYS_NETD_INFO` widened (2 out-params to 3) for the new packet-buffer
+page.
+
+**Real Duo (`dwmac.c3` + `ethd.c3`)**: a genuine DW MAC DMA descriptor
+ring, sourced from `duo-buildroot-sdk`'s own
+`u-boot-2021.10/drivers/net/designware.c/.h` — deliberately simplified
+to one self-chained TX descriptor and one self-chained RX descriptor
+(a valid degenerate one-entry ring) rather than the real driver's
+16-entry chain, matching this codebase's own one-outstanding-transfer
+discipline everywhere else (USB's single host channel, diskd/sdd's one
+request at a time). New syscall `SYS_ETHD_INFO` hands back a single
+uncached (`map_device_page`) DMA region — same real-DMA-cache-
+incoherency fix USB Phase 2 already established, this being only the
+second driver (after usbd) doing genuine DMA against real hardware.
+
+**Real hardware bring-up, several real bugs found in order**:
+1. A genuine store page fault at `0x04071000` — `setup_ethd_mappings`
+   only ever mapped `ETH_MMIO_BASE` (the MAC's own registers), never
+   the DMA register block at `+0x1000`, a completely separate page.
+   New `board::ETH_DMA_PAGE` constant, mapped alongside.
+2. The self-test's own ARP request went out before the link had
+   actually come up — auto-negotiation (just restarted a few steps
+   earlier) needs real time, and the self-test used to run
+   immediately after DMA init with no wait at all. Fixed with a
+   bounded (5s) wait-for-link-up before attempting it.
+3. `MII_PORTSELECT` (MAC_CONF bit 15) was never touched — the real
+   driver's own comment is explicit: "When a MII PHY is used, we must
+   set the PS bit for the DMA reset to succeed" (the converse holds
+   for RMII, this board's own real interface). Left at whatever it
+   powered up as, this can silently break the whole datapath under an
+   otherwise-correct-looking register sequence. Now explicitly cleared
+   right before the DMA soft reset, matching the real driver exactly.
+4. RX/TX enable (`MAC_CONF |= RXENABLE|TXENABLE`) was happening
+   *before* `eth_dma_init()`, backwards from the real driver's own
+   ordering (`designware_eth_init()`, then a separate, later
+   `designware_eth_enable()`). Reordered.
+5. `FLUSHTXFIFO|STOREFORWARD` and `RXSTART|TXSTART` were combined into
+   one `DMA_CONTROL` write; the real driver does two genuinely separate
+   writes. Split, even though both reach the same final register value
+   — the flush needs a little real wall-clock time to at least begin
+   settling before TXSTART is asserted, which a single combined write
+   gives it none of.
+6. The MAC address was being written *before* `eth_dma_init()`'s own
+   DMA soft reset — but "Soft reset above clears HW address
+   registers. So we have to set it here once again," per the real
+   driver's own comment; the DMA block's reset genuinely does clear
+   the MAC's own ADDR0HI/LO filter registers on this IP. Moved to
+   after.
+
+**Verified**: QEMU's own startup self-test (ARP + ping to the SLIRP
+gateway) passes cleanly — `ARP resolve of gateway ok`, `ping to
+gateway ok` — full round trip, checksums included, confirming the
+whole mechanism (frame building, virtqueue TX/RX, checksum
+computation, ARP/ICMP parsing) is correct. On real Duo hardware, the
+self-test's own ARP-to-gateway still times out, but a live `tcpdump`
+capture on another machine on the same LAN caught the real frame:
+`02:00:00:00:00:01 > ff:ff:ff:ff:ff:ff, ARP, Request who-has
+192.168.1.1 tell 192.168.1.70` — well-formed, reaching the wire.
+The router itself never replies to it (visibly alive and doing ARP
+fine with other devices moments later), the classic signature of a
+consumer router's IP-MAC-binding/ARP-defense feature silently
+dropping traffic from a device using a static IP it never DHCP-
+assigned — a router-configuration question, not a driver bug. Real
+end-to-end validation (a genuine ping from another device on the same
+LAN, which doesn't need the router's own IP stack at all — same
+subnet, pure L2) is still pending the user's own follow-up test.
+
 ## 2026-08-22 (71) — Directory refactor step 5 (last one): `sdd.c3` split into `sdhci.c3`/`sdd.c3`
 
 Final step of the refactor plan started in entry 68. `sdd.c3` (894

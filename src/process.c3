@@ -74,17 +74,27 @@ int usbd_pid = 0;
 // descriptor, a 4-byte port status) — nothing here approaches 4KB.
 uptr usbd_dma_paddr;
 
-// The Ethernet MAC driver process (see user/ethd.c3) — Duo only
+// The Ethernet MAC driver process (see user/net/ethd.c3) — Duo only
 // (board::HAS_ETH_MAC), mutually exclusive with netd_pid below
 // (board::HAS_ETH_MAC/HAS_VIRTIO_NET, kernel.c3), same shape as
-// diskd_pid/sdd_pid. Phase 1 is MAC+embedded-PHY bring-up and MDIO
-// link-status polling only — no DMA descriptor rings needed yet
-// (MDIO transactions are plain register reads/writes through the
-// MAC's own miiaddr/miidata registers, entirely independent of its
-// DMA engine), so no physical buffer to track here.
+// diskd_pid/sdd_pid. Phase 1 was MAC+embedded-PHY bring-up and MDIO
+// link-status polling only (no DMA descriptor rings — MDIO
+// transactions are plain register reads/writes through the MAC's own
+// miiaddr/miidata registers, entirely independent of its DMA engine).
 int ethd_pid = 0;
 
-// The virtio-net driver process (see user/netd.c3) — QEMU only
+// ethd's own single-page DMA region (Ethernet Phase 2: real packet
+// TX/RX) — one TX descriptor, one RX descriptor, one TX buffer, one RX
+// buffer, back to back (user/net/dwmac.c3's own eth_dma_init() knows
+// the fixed offsets) — same pattern as usbd_dma_paddr above, allocated
+// once at ethd's creation time (setup_ethd_mappings below), uncached-
+// mapped (map_device_page, not map_page — same real-DMA-cache-
+// incoherency reasoning as usbd_dma_paddr's own comment; ethd is the
+// first driver doing genuine DMA against real Duo hardware since
+// usbd), handed back via SYS_ETHD_INFO.
+uptr ethd_dma_paddr;
+
+// The virtio-net driver process (see user/net/netd.c3) — QEMU only
 // (board::HAS_VIRTIO_NET), same shape as diskd_pid above (a real
 // virtqueue, unlike ethd — virtio-net's own spec requires at least an
 // RX and TX queue configured before DRIVER_OK, even though Phase 1
@@ -92,6 +102,13 @@ int ethd_pid = 0;
 int netd_pid = 0;
 uptr netd_rxq_paddr;
 uptr netd_txq_paddr;
+// netd's own packet-buffer page (Ethernet Phase 2) — RX buffer at
+// offset 0, TX buffer right after (user/net/netd.c3's own fixed
+// offsets), each big enough for a legacy virtio-net header (10 bytes)
+// plus a full Ethernet frame. Cacheable map_page(), same as the
+// virtqueues above and for the same reason — QEMU-only, no real
+// cache-incoherency to hit.
+uptr netd_pktbuf_paddr;
 
 // The filesystem server (see user/fsd.c3) — 0 until created, consulted
 // only by create_process below to populate every new process's default
@@ -937,16 +954,18 @@ fn void setup_usbd_mappings(Process* proc)
 
 // Called once, right after create_process() spawns ethd (see
 // kernel.c3), to give it access to the DesignWare Ethernet MAC's own
-// registers, the embedded PHY's register block, and the clock-
-// controller page it needs one bit in. Identity-mapped for the same
-// reason as every other real-device MMIO mapping in this file. No DMA
-// buffer here at all — Phase 1's own scope (MAC+PHY bring-up, MDIO
-// link-status polling) never touches the MAC's DMA engine; MDIO reads
-// are plain register transactions through the MAC's own miiaddr/
-// miidata registers.
+// registers, the embedded PHY's register block, the clock-controller
+// page it needs one bit in, and (Ethernet Phase 2) a single-page DMA
+// region for its descriptor ring/packet buffers. Identity-mapped for
+// the same reason as every other real-device MMIO mapping in this
+// file.
 fn void setup_ethd_mappings(Process* proc)
 {
 	map_device_page(proc.page_table, board::ETH_MMIO_BASE, board::ETH_MMIO_BASE, PAGE_U | PAGE_R | PAGE_W);
+	// The MAC's own DMA register block (Ethernet Phase 2) — see
+	// board::ETH_DMA_PAGE's own comment for why this is a separate
+	// mapping from ETH_MMIO_BASE above.
+	map_device_page(proc.page_table, board::ETH_DMA_PAGE, board::ETH_DMA_PAGE, PAGE_U | PAGE_R | PAGE_W);
 	// The embedded PHY's own register block — see board::ETH_PHY_PAGE's
 	// own comment for where its init sequence came from.
 	map_device_page(proc.page_table, board::ETH_PHY_PAGE, board::ETH_PHY_PAGE, PAGE_U | PAGE_R | PAGE_W);
@@ -962,6 +981,15 @@ fn void setup_ethd_mappings(Process* proc)
 	// see board::ETH_EFUSE_PAGE_0's own comment.
 	map_device_page(proc.page_table, board::ETH_EFUSE_PAGE_0, board::ETH_EFUSE_PAGE_0, PAGE_U | PAGE_R | PAGE_W);
 	map_device_page(proc.page_table, board::ETH_EFUSE_PAGE_1, board::ETH_EFUSE_PAGE_1, PAGE_U | PAGE_R | PAGE_W);
+
+	// Phase 2's own DMA region — see ethd_dma_paddr's own comment above
+	// for the layout and why this is uncached (map_device_page, not
+	// map_page): same real-DMA-cache-incoherency reasoning as
+	// usbd_dma_paddr, this being the second driver (after usbd) doing
+	// genuine DMA against real Duo hardware.
+	uptr dma_paddr = alloc_pages(1);
+	map_device_page(proc.page_table, dma_paddr, dma_paddr, PAGE_U | PAGE_R | PAGE_W);
+	ethd_dma_paddr = dma_paddr;
 
 	ethd_pid = proc.pid;
 }
@@ -995,9 +1023,15 @@ fn void setup_netd_mappings(Process* proc)
 		map_page(proc.page_table, txq_paddr + off, txq_paddr + off, PAGE_U | PAGE_R | PAGE_W);
 	}
 
-	netd_pid       = proc.pid;
-	netd_rxq_paddr = rxq_paddr;
-	netd_txq_paddr = txq_paddr;
+	// Phase 2's own packet-buffer page — see netd_pktbuf_paddr's own
+	// comment above for the layout.
+	uptr pktbuf_paddr = alloc_pages(1);
+	map_page(proc.page_table, pktbuf_paddr, pktbuf_paddr, PAGE_U | PAGE_R | PAGE_W);
+
+	netd_pid          = proc.pid;
+	netd_rxq_paddr    = rxq_paddr;
+	netd_txq_paddr    = txq_paddr;
+	netd_pktbuf_paddr = pktbuf_paddr;
 }
 
 Process* current_proc; // Currently running process

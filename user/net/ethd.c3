@@ -14,16 +14,27 @@ import std::nolibc::main_stub;
 // (docs/devlog.md), same reasoning/shape as usbd.c3's own dwc2.c3
 // split.
 //
-// Phase 1 scope, unchanged by this split: bring the MAC and its
-// on-chip PHY up, confirm link status via MDIO polling. NOT in scope
-// yet: DMA descriptor rings, packet TX/RX. QEMU has no real MAC
-// equivalent at all — its own network path is virtio-net instead, see
-// user/net/netd.c3, boards/qemu/board.c3's own comment.
+// Phase 1 scope was MAC+PHY bring-up and MDIO link-status polling
+// only. Phase 2 (see docs/devlog.md) adds real DMA packet TX/RX
+// (user/net/dwmac.c3's own eth_dma_init/send/try_recv) and a minimal
+// ARP+ICMP responder (user/net/eth_proto.c3, shared with netd.c3) so
+// an external device on the same LAN can actually ping this board.
+// QEMU has no real MAC equivalent at all — its own network path is
+// virtio-net instead, see user/net/netd.c3.
 //
-// Confirmed working on real hardware, before and after this split:
-// genuine, physically-responsive link sensing (verified via cable
-// unplug/replug) — see dwmac.c3/ephy.c3's own header comments for
-// full sourcing.
+// Confirmed working on real hardware, before and after the Phase 1
+// split: genuine, physically-responsive link sensing (verified via
+// cable unplug/replug) — see dwmac.c3/ephy.c3's own header comments
+// for full sourcing.
+//
+// Static IP, no DHCP client exists yet (same narrow phased scoping
+// USB/Ethernet Phase 1 already established) — 192.168.1.70/24,
+// gateway 192.168.1.1, per the user's own LAN.
+//
+// 02:00:00:00:00:01 — locally-administered (bit 1 of the first octet
+// set), unicast. Matches the exact bytes main() already writes into
+// the MAC's own ADDR0LO/ADDR0HI filter registers below.
+const char[6] ETHD_OUR_MAC = { (char)0x02, (char)0x00, (char)0x00, (char)0x00, (char)0x00, (char)0x01 };
 
 const char[16] HEX_DIGITS = "0123456789abcdef";
 
@@ -136,32 +147,190 @@ fn uint ethd_init()
     return 0; // unreachable — ethd_panic() calls exit()
 }
 
+// One-shot startup self-test: ARP-resolve the gateway, then ping it,
+// printing the round-trip result either way. Diagnostic only — never
+// panics on failure, since the real point of Phase 2 is the passive
+// responder in main()'s own loop, not this self-test (unlike QEMU's
+// own SLIRP gateway, a real router isn't guaranteed to be reachable or
+// even present — this is a nice-to-have confirmation, not a
+// requirement). Mirrors user/net/netd.c3's own netd_self_test()
+// exactly, just over eth_dma_send/eth_dma_try_recv instead of the
+// virtio queues.
+fn void ethd_self_test(char* our_mac, uint our_ip, uint gateway_ip)
+{
+    char[1600] scratch @noinit;
+    char[1600] rx_frame @noinit;
+    char[6] gateway_mac;
+
+    uint arp_len;
+    eth_build_arp_request(&scratch[0], &arp_len, our_mac, our_ip, gateway_ip);
+    bool sent = eth_dma_send(&scratch[0], arp_len);
+    print("ethd: self-test: diag: ARP send ");
+    print(sent ? "kicked" : "FAILED (tx desc still dma-owned)");
+    print(", tx status right after=0x");
+    print_hex32(eth_tx_desc.txrx_status);
+    print("\n");
+
+    bool got_mac = false;
+    uint any_rx_count = 0;
+    ulong arp_start = rdtime();
+    ulong arp_budget = eth_us_to_ticks(2000000);
+    while (rdtime() - arp_start < arp_budget)
+    {
+        uint rx_len;
+        if (eth_dma_try_recv(&rx_frame[0], &rx_len))
+        {
+            any_rx_count++;
+            if (eth_parse_arp_reply(&rx_frame[0], rx_len, gateway_ip, &gateway_mac[0]))
+            {
+                got_mac = true;
+                break;
+            }
+        }
+        yield();
+    }
+    print("ethd: self-test: ARP resolve of gateway ");
+    print(got_mac ? "ok\n" : "TIMED OUT\n");
+    print("ethd: self-test: diag: saw ");
+    print_uint(any_rx_count);
+    print(" other frame(s) during that window, tx status now=0x");
+    print_hex32(eth_tx_desc.txrx_status);
+    print(", dma_status=0x");
+    print_hex32(dma_reg_read(DMA_STATUS));
+    print("\n");
+    if (!got_mac) { return; }
+
+    uint icmp_len;
+    ushort ping_id = 0x1234;
+    ushort ping_seq = 1;
+    eth_build_icmp_echo_request(&scratch[0], &icmp_len, our_mac, our_ip, &gateway_mac[0], gateway_ip, ping_id, ping_seq);
+    if (!eth_dma_send(&scratch[0], icmp_len))
+    {
+        print("ethd: self-test: ping send failed\n");
+        return;
+    }
+
+    bool got_reply = false;
+    ulong ping_start = rdtime();
+    ulong ping_budget = eth_us_to_ticks(2000000);
+    while (rdtime() - ping_start < ping_budget)
+    {
+        uint rx_len;
+        if (eth_dma_try_recv(&rx_frame[0], &rx_len))
+        {
+            if (eth_parse_icmp_echo_reply(&rx_frame[0], rx_len, ping_id, ping_seq))
+            {
+                got_reply = true;
+                break;
+            }
+        }
+        yield();
+    }
+    print("ethd: self-test: ping to gateway ");
+    print(got_reply ? "ok\n" : "TIMED OUT\n");
+}
+
 fn void main()
 {
     uint phy_addr = ethd_init();
 
-    // MAC datapath enable + a real MAC address — never touched at all
-    // before now (Phase 1's own reasoning: pure MDIO link-status
-    // polling shouldn't need either, since that's PHY-register access,
-    // independent of the MAC's own RX/TX enable or address filter).
-    // Added anyway once every digital PHY-side fact checked out
-    // healthy (PLL locked, BMCR clean) with genuinely zero link ever
-    // detected by three independent peer devices — cheap, harmless,
-    // and closes a real gap, even though link detection itself
-    // shouldn't depend on it.
-    // 02:00:00:00:00:01 — locally-administered (bit1 of the first
-    // octet set), unicast. ADDR0LO = bytes 0-3 (0x02,0x00,0x00,0x00
-    // packed little-endian), ADDR0HI = bytes 4-5 (0x00,0x01).
+    // Phase 2: bring up the single-descriptor DMA ring (see
+    // dwmac.c3's own eth_dma_init() for the full sequence/sourcing) —
+    // BEFORE enabling the MAC's own RX/TX datapath below, matching the
+    // real driver's own ordering exactly (designware_eth_init(), then
+    // a separate, later designware_eth_enable()) — found to matter on
+    // real hardware: enabling RX/TX first, before eth_dma_init()'s own
+    // MII_PORTSELECT fixup and DMA reset ran, left the datapath
+    // silently non-functional (every register write still looked
+    // correct, nothing ever reached a real peer on the wire).
+    uptr dma_base = ethd_info();
+    eth_dma_init(dma_base);
+    print("ethd: DMA ring initialized\n");
+
+    // A real MAC address — set AFTER eth_dma_init() above, not before:
+    // the real driver's own designware_eth_init() rewrites it at this
+    // exact point too, with the comment "Soft reset above clears HW
+    // address registers. So we have to set it here once again." — the
+    // DMA block's own soft reset (inside eth_dma_init()) really does
+    // clear the MAC's ADDR0HI/LO filter registers, on this same IP, so
+    // writing them any earlier is silently undone. 02:00:00:00:00:01 —
+    // locally-administered (bit 1 of the first octet set), unicast.
+    // ADDR0LO = bytes 0-3 (0x02,0x00,0x00,0x00 packed little-endian),
+    // ADDR0HI = bytes 4-5 (0x00,0x01).
     mac_reg_write(ETH_MAC_ADDR0LO, 0x00000002);
     mac_reg_write(ETH_MAC_ADDR0HI, 0x00000100);
+
+    // MAC datapath enable, now that the DMA engine is actually ready.
     uint conf = mac_reg_read(ETH_MAC_CONF);
     conf |= ETH_CONF_RXENABLE | ETH_CONF_TXENABLE | ETH_CONF_FES_100 | ETH_CONF_FULLDPLXMODE;
     mac_reg_write(ETH_MAC_CONF, conf);
     print("ethd: MAC address set, RX/TX enabled\n");
 
+    // Wait for the link to actually come up before attempting the
+    // self-test below — auto-negotiation (just restarted a few steps
+    // up, in ethd_init()'s own BMCR fixup) takes real time to
+    // complete, and a real hardware round sent the self-test's own
+    // ARP request while the link was still down, before the peer
+    // switch/router had any reason to be listening at all. Bounded at
+    // 5s — real 100BASE-TX auto-negotiation typically completes well
+    // under that; if it doesn't, the self-test is skipped (not fatal
+    // — the passive responder below works fine once the link
+    // eventually comes up regardless of whether this wait succeeded).
+    bool link_ready = false;
+    ulong link_wait_start = rdtime();
+    ulong link_wait_budget = eth_us_to_ticks(5000000);
+    while (rdtime() - link_wait_start < link_wait_budget)
+    {
+        uint bmsr;
+        if (mdio_read(phy_addr, MII_BMSR, &bmsr) && (bmsr & MII_BMSR_LINK_STATUS) != 0)
+        {
+            link_ready = true;
+            break;
+        }
+        yield();
+    }
+
+    uint our_ip = make_ip(192, 168, 1, 70);
+    uint gateway_ip = make_ip(192, 168, 1, 1);
+    if (link_ready)
+    {
+        // Diagnostic: what did auto-negotiation actually resolve to?
+        // MAC_CONF is hardcoded to FES_100|FULLDPLXMODE below (forced,
+        // never read back from the PHY) — if the real link partner
+        // negotiated something else (e.g. genuine 10Mbps, or
+        // half-duplex), that MAC/PHY mismatch is a well-known real
+        // cause of exactly this failure shape (TX appears to complete
+        // at the DMA level — it only reflects the MAC's own FIFO
+        // accepting the frame, not real successful delivery — while
+        // RX stays completely dead).
+        uint bmsr_diag = 0;
+        uint anlpar_diag = 0;
+        mdio_read(phy_addr, MII_BMSR, &bmsr_diag);
+        mdio_read(phy_addr, MII_ANLPAR, &anlpar_diag);
+        print("ethd: self-test: diag: autoneg_complete=");
+        print_uint((bmsr_diag & MII_BMSR_AUTONEG_COMPLETE) != 0 ? 1 : 0);
+        print(" link_partner_ability=0x");
+        print_hex32(anlpar_diag);
+        print(" (100fd=");
+        print_uint((anlpar_diag & MII_ANLPAR_100_FULL) != 0 ? 1 : 0);
+        print(" 100hd=");
+        print_uint((anlpar_diag & MII_ANLPAR_100_HALF) != 0 ? 1 : 0);
+        print(" 10fd=");
+        print_uint((anlpar_diag & MII_ANLPAR_10_FULL) != 0 ? 1 : 0);
+        print(" 10hd=");
+        print_uint((anlpar_diag & MII_ANLPAR_10_HALF) != 0 ? 1 : 0);
+        print(")\n");
+
+        ethd_self_test(&ETHD_OUR_MAC[0], our_ip, gateway_ip);
+    }
+    else
+    {
+        print("ethd: self-test: skipped, link not up within 5s\n");
+    }
+
     print("ethd: init done, polling MDIO link status\n");
 
-    bool last_up = false;
+    bool last_up = link_ready;
     bool first = true;
     for (;;)
     {
@@ -174,6 +343,20 @@ fn void main()
                 print(up ? "ethd: link up\n" : "ethd: link down\n");
                 last_up = up;
                 first = false;
+            }
+        }
+
+        // Passive responder — answers ARP/ICMP-echo requests addressed
+        // to our_ip, same as netd's own main loop.
+        char[1600] rx_frame @noinit;
+        uint rx_len;
+        if (eth_dma_try_recv(&rx_frame[0], &rx_len))
+        {
+            char[1600] reply @noinit;
+            uint reply_len;
+            if (eth_proto_respond(&rx_frame[0], rx_len, &ETHD_OUR_MAC[0], our_ip, &reply[0], &reply_len))
+            {
+                eth_dma_send(&reply[0], reply_len);
             }
         }
 
