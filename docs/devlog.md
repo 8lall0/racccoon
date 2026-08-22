@@ -4,6 +4,28 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-22 (74) — Quiet ethd's bring-up-era diagnostics: `ETHD_VERBOSE`
+
+Small follow-up to entry 72's real-hardware debugging round (the
+missing DMA page mapping, MII_PORTSELECT, write-ordering bugs): the
+diagnostic prints added to chase those bugs (TX descriptor/DMA_STATUS
+dumps, auto-negotiation detail) never got quieted back down once the
+underlying issues were actually found and fixed. Noticed because the
+shell's own `"> "` prompt — printed once, early in boot, with no
+trailing newline (`user/shell.c3`) — got easy to miss glued onto the
+front of an early `ethd:` diagnostic line, now that there's simply a
+lot more real console output than there used to be.
+
+Added `ETHD_VERBOSE` (`user/net/ethd.c3`, default off), same
+established convention as `USBD_VERBOSE`/`SDD_VERBOSE`: gates the
+self-test's own diagnostic-only prints and the auto-negotiation detail
+dump; meaningful, non-repeating status (link up/down, self-test pass/
+fail, DHCP bound) stays visible regardless. Pure print-gating, no
+logic changes — QEMU regression clean (ethd itself is Duo-only, never
+exercised in QEMU); real-hardware confirmation deferred, SD card
+reader disconnected again mid-session (a known recurring flaky-
+connection issue, not a code problem).
+
 ## 2026-08-22 (73) — Minimal DHCP client: real ping to the Duo confirmed working end to end
 
 Direct follow-on to entry 72's real-hardware finding: a `tcpdump`

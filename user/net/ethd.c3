@@ -27,14 +27,30 @@ import std::nolibc::main_stub;
 // cable unplug/replug) — see dwmac.c3/ephy.c3's own header comments
 // for full sourcing.
 //
-// Static IP, no DHCP client exists yet (same narrow phased scoping
-// USB/Ethernet Phase 1 already established) — 192.168.1.70/24,
-// gateway 192.168.1.1, per the user's own LAN.
+// DHCP-first, static-IP fallback (192.168.1.70/24, gateway
+// 192.168.1.1) — see user/net/dhcp.c3's own header comment for why
+// DHCP was added: a static IP hit a real router-side ARP-defense
+// wall on this exact LAN.
 //
 // 02:00:00:00:00:01 — locally-administered (bit 1 of the first octet
 // set), unicast. Matches the exact bytes main() already writes into
 // the MAC's own ADDR0LO/ADDR0HI filter registers below.
 const char[6] ETHD_OUR_MAC = { (char)0x02, (char)0x00, (char)0x00, (char)0x00, (char)0x00, (char)0x01 };
+
+// Gates the self-test's own bring-up-era diagnostic prints (TX
+// descriptor/DMA_STATUS register dumps, auto-negotiation detail) —
+// necessary while actively chasing the real hardware bugs entry 72's
+// own devlog trail describes (missing DMA page mapping,
+// MII_PORTSELECT, write ordering, MAC address wiped by reset), not
+// useful day to day, and busy enough to bury the shell's own "> "
+// prompt (printed once, early, with no trailing newline — see
+// user/shell.c3's own main()) in every boot log since. Off by
+// default; flip to true for the same level of detail if a real
+// hardware bug ever needs it again — same convention as
+// USBD_VERBOSE (user/usb/dwc2.c3) and SDD_VERBOSE
+// (user/block/sdhci.c3). Meaningful, non-repeating status (link up/
+// down, self-test pass/fail, DHCP bound) stays visible regardless.
+const bool ETHD_VERBOSE = false;
 
 const char[16] HEX_DIGITS = "0123456789abcdef";
 
@@ -237,11 +253,14 @@ fn void ethd_self_test(char* our_mac, uint our_ip, uint gateway_ip)
     uint arp_len;
     eth_build_arp_request(&scratch[0], &arp_len, our_mac, our_ip, gateway_ip);
     bool sent = eth_dma_send(&scratch[0], arp_len);
-    print("ethd: self-test: diag: ARP send ");
-    print(sent ? "kicked" : "FAILED (tx desc still dma-owned)");
-    print(", tx status right after=0x");
-    print_hex32(eth_tx_desc.txrx_status);
-    print("\n");
+    if (ETHD_VERBOSE)
+    {
+        print("ethd: self-test: diag: ARP send ");
+        print(sent ? "kicked" : "FAILED (tx desc still dma-owned)");
+        print(", tx status right after=0x");
+        print_hex32(eth_tx_desc.txrx_status);
+        print("\n");
+    }
 
     bool got_mac = false;
     uint any_rx_count = 0;
@@ -263,13 +282,16 @@ fn void ethd_self_test(char* our_mac, uint our_ip, uint gateway_ip)
     }
     print("ethd: self-test: ARP resolve of gateway ");
     print(got_mac ? "ok\n" : "TIMED OUT\n");
-    print("ethd: self-test: diag: saw ");
-    print_uint(any_rx_count);
-    print(" other frame(s) during that window, tx status now=0x");
-    print_hex32(eth_tx_desc.txrx_status);
-    print(", dma_status=0x");
-    print_hex32(dma_reg_read(DMA_STATUS));
-    print("\n");
+    if (ETHD_VERBOSE)
+    {
+        print("ethd: self-test: diag: saw ");
+        print_uint(any_rx_count);
+        print(" other frame(s) during that window, tx status now=0x");
+        print_hex32(eth_tx_desc.txrx_status);
+        print(", dma_status=0x");
+        print_hex32(dma_reg_read(DMA_STATUS));
+        print("\n");
+    }
     if (!got_mac) { return; }
 
     uint icmp_len;
@@ -374,24 +396,29 @@ fn void main()
         // cause of exactly this failure shape (TX appears to complete
         // at the DMA level — it only reflects the MAC's own FIFO
         // accepting the frame, not real successful delivery — while
-        // RX stays completely dead).
-        uint bmsr_diag = 0;
-        uint anlpar_diag = 0;
-        mdio_read(phy_addr, MII_BMSR, &bmsr_diag);
-        mdio_read(phy_addr, MII_ANLPAR, &anlpar_diag);
-        print("ethd: self-test: diag: autoneg_complete=");
-        print_uint((bmsr_diag & MII_BMSR_AUTONEG_COMPLETE) != 0 ? 1 : 0);
-        print(" link_partner_ability=0x");
-        print_hex32(anlpar_diag);
-        print(" (100fd=");
-        print_uint((anlpar_diag & MII_ANLPAR_100_FULL) != 0 ? 1 : 0);
-        print(" 100hd=");
-        print_uint((anlpar_diag & MII_ANLPAR_100_HALF) != 0 ? 1 : 0);
-        print(" 10fd=");
-        print_uint((anlpar_diag & MII_ANLPAR_10_FULL) != 0 ? 1 : 0);
-        print(" 10hd=");
-        print_uint((anlpar_diag & MII_ANLPAR_10_HALF) != 0 ? 1 : 0);
-        print(")\n");
+        // RX stays completely dead). Gated by ETHD_VERBOSE (see its
+        // own comment) — this whole block exists only to feed the
+        // print below, safe to skip entirely when quiet.
+        if (ETHD_VERBOSE)
+        {
+            uint bmsr_diag = 0;
+            uint anlpar_diag = 0;
+            mdio_read(phy_addr, MII_BMSR, &bmsr_diag);
+            mdio_read(phy_addr, MII_ANLPAR, &anlpar_diag);
+            print("ethd: self-test: diag: autoneg_complete=");
+            print_uint((bmsr_diag & MII_BMSR_AUTONEG_COMPLETE) != 0 ? 1 : 0);
+            print(" link_partner_ability=0x");
+            print_hex32(anlpar_diag);
+            print(" (100fd=");
+            print_uint((anlpar_diag & MII_ANLPAR_100_FULL) != 0 ? 1 : 0);
+            print(" 100hd=");
+            print_uint((anlpar_diag & MII_ANLPAR_100_HALF) != 0 ? 1 : 0);
+            print(" 10fd=");
+            print_uint((anlpar_diag & MII_ANLPAR_10_FULL) != 0 ? 1 : 0);
+            print(" 10hd=");
+            print_uint((anlpar_diag & MII_ANLPAR_10_HALF) != 0 ? 1 : 0);
+            print(")\n");
+        }
 
         // DHCP — added specifically because a static IP hit a real
         // router-side wall (see this file's own header comment): a
