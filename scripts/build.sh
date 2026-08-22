@@ -243,6 +243,8 @@ LLC=${LLC:-llc}
     build/user/procd.bin.o \
     build/user/envd.bin.o \
     build/user/usbd.bin.o \
+    build/user/ethd.bin.o \
+    build/user/netd.bin.o \
     -T src/kernel.ld \
     -Map=build/kernel.map \
     -o build/kernel.elf

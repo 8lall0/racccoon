@@ -4,6 +4,123 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-22 (67) — Ethernet Phase 1: MAC+PHY bring-up, real analog link sensing confirmed live
+
+New feature area, mirroring USB's own Phase 1 scope: bring the MAC and
+its PHY up, confirm link status, no packet TX/RX yet. Two targets,
+mutually exclusive like diskd/sdd: `user/netd.c3` (QEMU, virtio-net on
+the same virtio-mmio bus virtio-blk already uses) and `user/ethd.c3`
+(Duo, the real on-chip Ethernet MAC — a genuinely standard, widely-
+documented Synopsys DesignWare/"stmmac" core wrapped by the vendor's
+own `cvitek,ethernet` devicetree compatible string, confirmed via the
+real devicetree's own `snps,*`/`clock-names="stmmaceth"` properties,
+not proprietary despite the vendor string).
+
+### netd (QEMU) — worked first try
+
+Legacy virtio-mmio (version 1), same register layout `diskd.c3`
+already established. Real feature negotiation this time (unlike
+diskd's own simplified skip-it-entirely approach): reads
+`HostFeatures`, negotiates `VIRTIO_NET_F_STATUS` specifically, since
+the device-config `status` field is only meaningful once that bit is
+actually accepted. Configures both RX and TX virtqueues (virtio-net's
+own spec requires both before `DRIVER_OK`, even though Phase 1 doesn't
+push anything through them yet). First real hardware round: correct
+MAC (`52:54:00:12:34:56`, QEMU's own well-known default), feature
+negotiated, link up — no debugging needed at all.
+
+### ethd (Duo) — a long chase, resolved
+
+The MAC itself (register offsets/DMA descriptor format from U-Boot's
+own `drivers/net/designware.c/.h`) needed no debugging — Phase 1 never
+touches its DMA engine at all (MDIO is plain register access through
+`miiaddr`/`miidata`, independent of the datapath). The embedded PHY
+was the real chase: U-Boot's own `board_init()` calls
+`cv180x_ephy_id_init()` unconditionally on real ASIC hardware
+(previously read during USB Phase 1 research and dismissed as
+irrelevant then), and this driver initially replicated exactly that —
+clock enables (`REG_CLK_EN_0` bits 25/26, same clock-controller page
+USB already maps), the exact register sequence, byte-for-byte.
+
+Result: PLL genuinely locked, `BMCR` read back completely healthy
+(auto-negotiation enabled, no power-down, no isolate), MDIO fully
+functional, MAC address/RX/TX configured — and **zero link ever
+detected by three independent peer devices** (two separate ports on
+the user's own machine, plus a router) across many real-hardware
+rounds. Ruled out, in order: cable (swapped), port (swapped), Linux-
+side config (`enp2s0` already administratively up — `NO-CARRIER` is a
+passive hardware report, nothing to "activate"), `BMCR` power-down/
+isolate (already clear), PLL lock (read back directly, genuinely
+locked). Every register-level fact available from `cv180x_ephy_id_init()`
+checked out healthy; the symptom pattern (working digital control
+plane, zero real analog output) pointed toward something the partial
+sequence never covered at all.
+
+**Root cause**: `cv180x_ephy_id_init()` was only ever a *subset* of
+this exact PHY's real bring-up. U-Boot ships a genuinely separate,
+dedicated PHY driver, `drivers/net/phy/cvitek.c`
+(`cv182xa_ephy_init()`, called from the real PHY framework's own
+`.config` callback) — found only by finally reading a file that had
+shown up in an initial directory listing early in this session's own
+Ethernet research but was never actually opened. Its own source
+comments mark the parts overlapping `cv180x_ephy_id_init()` as
+`/* do this in board.c */` and skip them — confirming the two were
+always meant to run together, board.c first. Everything else in that
+file had never been touched by this driver at all: efuse-based analog
+trim (TX bias current, echo cancellation, TX/RX termination), MLT-3
+line-coding phase tables (the actual 100BASE-TX signal encoding),
+**link-pulse waveform shape** (the literal analog signal a peer PHY
+recognizes as "something is connected" — the leading hypothesis for
+the whole symptom), TP_IDLE and 10BaseT tables, LPF/HPF filter
+coefficients (CV180X/"phobos" branch specifically — the source also
+has a separate CV181X branch this board doesn't need), and two
+registers never written before at all: a genuine "start auto-
+negotiation" trigger (`0x03009800=0x090e`, distinct from board.c's own
+`0x0906`) and a force-full-duplex bit. Replicated faithfully as
+`eth_phy_analog_init()` — including a real redundant re-run of the
+ANA_PD/ANA_EN release the source itself repeats, not "cleaned up" away
+even though it looks unnecessary on paper, since matching the proven
+flow exactly mattered more here than tidiness.
+
+**Result**: genuine, live, physically-responsive link sensing —
+confirmed by unplugging the cable mid-run and watching `ethd` print
+`link down`, then `link up` again on replugging. Not a stuck false
+positive; real analog activity. **Still open**: no peer device has yet
+confirmed carrier from the Duo's side (the user's own laptop still
+shows `NO-CARRIER` on both cable and port swaps) — a router test,
+which may be more tolerant of whatever's still not fully spec-
+compliant about the generated signal, is planned but not yet run.
+Genuine, meaningful progress either way: from "completely inert,
+unclear why" to "sourced from the real, complete vendor PHY driver,
+demonstrably responding to real physical state" — worth committing
+even with the peer-link question still open, rather than sitting on
+uncommitted work indefinitely.
+
+### Verification
+
+QEMU: `netd` correct end to end, shell/diskd/fsd unaffected. Duo:
+`ethd`'s own diagnostics all confirm healthy state (PLL locked, BMCR
+clean, clocks enabled with readback verification, MAC address set),
+live link-up/link-down transitions confirmed via physical unplug/
+replug. `usbd` (Phase 1+2) continues working unaffected alongside it —
+confirmed hub port detection still correct in the same boot.
+
+**Files changed:** `src/entry.c3` (`SYS_NETD_INFO`), `src/process.c3`
+(`ethd_pid`/`netd_pid`/`netd_rxq_paddr`/`netd_txq_paddr`,
+`setup_ethd_mappings`, `setup_netd_mappings`), `src/kernel.c3` (spawn
+logic), `boards/duo/board.c3` / `boards/qemu/board.c3` (`ETH_*`/
+`VIRTIO_NET_*` constants), `user/user.c3` (`netd_info()`),
+`user/ethd.c3` (new), `user/netd.c3` (new), `scripts/launch64*.sh`
+(virtio-net device), `scripts/build_user.sh`/`build.sh`/`build_duo.sh`.
+
+Also, separately: quieted `usbd`'s own logging (`USBD_VERBOSE`, off by
+default) — the periodic raw `HPRT0` dumps and per-transfer `SETUP`
+byte prints were necessary while actively debugging DWC2 bring-up and
+enumeration, not useful day to day, and were making Ethernet's own
+console output hard to read during this session's testing.
+
+---
+
 ## 2026-08-22 (66) — USB Phase 2 confirmed working: real device detected on a real hub port
 
 Entry 65's own Phase 2 code got its first real hardware test this

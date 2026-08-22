@@ -74,6 +74,25 @@ int usbd_pid = 0;
 // descriptor, a 4-byte port status) — nothing here approaches 4KB.
 uptr usbd_dma_paddr;
 
+// The Ethernet MAC driver process (see user/ethd.c3) — Duo only
+// (board::HAS_ETH_MAC), mutually exclusive with netd_pid below
+// (board::HAS_ETH_MAC/HAS_VIRTIO_NET, kernel.c3), same shape as
+// diskd_pid/sdd_pid. Phase 1 is MAC+embedded-PHY bring-up and MDIO
+// link-status polling only — no DMA descriptor rings needed yet
+// (MDIO transactions are plain register reads/writes through the
+// MAC's own miiaddr/miidata registers, entirely independent of its
+// DMA engine), so no physical buffer to track here.
+int ethd_pid = 0;
+
+// The virtio-net driver process (see user/netd.c3) — QEMU only
+// (board::HAS_VIRTIO_NET), same shape as diskd_pid above (a real
+// virtqueue, unlike ethd — virtio-net's own spec requires at least an
+// RX and TX queue configured before DRIVER_OK, even though Phase 1
+// doesn't push anything through them yet).
+int netd_pid = 0;
+uptr netd_rxq_paddr;
+uptr netd_txq_paddr;
+
 // The filesystem server (see user/fsd.c3) — 0 until created, consulted
 // only by create_process below to populate every new process's default
 // namespace. Unlike diskd, fsd is meant to be reached by ordinary
@@ -913,6 +932,71 @@ fn void setup_usbd_mappings(Process* proc)
 	usbd_dma_paddr = dma_paddr;
 
 	usbd_pid = proc.pid;
+}
+
+// Called once, right after create_process() spawns ethd (see
+// kernel.c3), to give it access to the DesignWare Ethernet MAC's own
+// registers, the embedded PHY's register block, and the clock-
+// controller page it needs one bit in. Identity-mapped for the same
+// reason as every other real-device MMIO mapping in this file. No DMA
+// buffer here at all — Phase 1's own scope (MAC+PHY bring-up, MDIO
+// link-status polling) never touches the MAC's DMA engine; MDIO reads
+// are plain register transactions through the MAC's own miiaddr/
+// miidata registers.
+fn void setup_ethd_mappings(Process* proc)
+{
+	map_device_page(proc.page_table, board::ETH_MMIO_BASE, board::ETH_MMIO_BASE, PAGE_U | PAGE_R | PAGE_W);
+	// The embedded PHY's own register block — see board::ETH_PHY_PAGE's
+	// own comment for where its init sequence came from.
+	map_device_page(proc.page_table, board::ETH_PHY_PAGE, board::ETH_PHY_PAGE, PAGE_U | PAGE_R | PAGE_W);
+	// clk_500m_eth0/clk_axi4_eth0 — see board::ETH_CLK_PAGE's own
+	// comment. Same physical page USB_CLK_PAGE/SD_CLOCK_PAGE above
+	// also map, for their own unrelated bits.
+	map_device_page(proc.page_table, board::ETH_CLK_PAGE, board::ETH_CLK_PAGE, PAGE_U | PAGE_R | PAGE_W);
+	// cv180x_ephy_led_pinmux()'s own two register pages — see
+	// board::ETH_LED_PINMUX_PAGE's own comment for why this was added.
+	map_device_page(proc.page_table, board::ETH_LED_PINMUX_PAGE, board::ETH_LED_PINMUX_PAGE, PAGE_U | PAGE_R | PAGE_W);
+	map_device_page(proc.page_table, board::ETH_SD1_SELPHY_PAGE, board::ETH_SD1_SELPHY_PAGE, PAGE_U | PAGE_R | PAGE_W);
+	// The real, complete PHY analog bring-up's own efuse trim pages —
+	// see board::ETH_EFUSE_PAGE_0's own comment.
+	map_device_page(proc.page_table, board::ETH_EFUSE_PAGE_0, board::ETH_EFUSE_PAGE_0, PAGE_U | PAGE_R | PAGE_W);
+	map_device_page(proc.page_table, board::ETH_EFUSE_PAGE_1, board::ETH_EFUSE_PAGE_1, PAGE_U | PAGE_R | PAGE_W);
+
+	ethd_pid = proc.pid;
+}
+
+// Called once, right after create_process() spawns netd (see
+// kernel.c3), to give it access to virtio-net's own virtio-mmio
+// registers and two virtqueues (RX and TX — virtio-net's own spec
+// requires both configured before DRIVER_OK, even though Phase 1
+// doesn't push anything through them yet). Cacheable map_page(), same
+// as diskd's own virtqueue above and for the same reason: netd only
+// ever runs against QEMU's software-emulated virtio-mmio
+// (board::HAS_VIRTIO_NET is QEMU-only), which has no real
+// cache-incoherency to hit — see usbd_dma_paddr's own comment
+// (map_device_page, not map_page) for why that reasoning does NOT
+// carry over to a real-hardware DMA buffer.
+fn void setup_netd_mappings(Process* proc)
+{
+	map_device_page(proc.page_table, board::VIRTIO_NET_PADDR, board::VIRTIO_NET_PADDR, PAGE_U | PAGE_R | PAGE_W);
+
+	uint vq_pages = (uint)(mem::aligned_offset((sz)Virtio_virtq::size, PAGE_SIZE) / PAGE_SIZE);
+
+	uptr rxq_paddr = alloc_pages(vq_pages);
+	for (uint off = 0; off < vq_pages * PAGE_SIZE; off += PAGE_SIZE)
+	{
+		map_page(proc.page_table, rxq_paddr + off, rxq_paddr + off, PAGE_U | PAGE_R | PAGE_W);
+	}
+
+	uptr txq_paddr = alloc_pages(vq_pages);
+	for (uint off = 0; off < vq_pages * PAGE_SIZE; off += PAGE_SIZE)
+	{
+		map_page(proc.page_table, txq_paddr + off, txq_paddr + off, PAGE_U | PAGE_R | PAGE_W);
+	}
+
+	netd_pid       = proc.pid;
+	netd_rxq_paddr = rxq_paddr;
+	netd_txq_paddr = txq_paddr;
 }
 
 Process* current_proc; // Currently running process

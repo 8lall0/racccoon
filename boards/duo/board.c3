@@ -170,6 +170,88 @@ const uptr USB_PINMUX_PAGE   = 0x03001000;
 const uint IRQ_USB           = 30; // declared, deliberately NOT wired into plic_init() yet — see IRQ_SDHCI's own claim-storm lesson above; Phase 1 polls HPRT0 instead
 const bool HAS_USB           = true;
 
+// Ethernet MAC (Synopsys DesignWare/"stmmac" core, wrapped by the
+// vendor's own "cvitek,ethernet" devicetree compatible string — the
+// register layout itself is the standard, widely-documented DW MAC
+//10/100/1000 Universal, confirmed via duo-buildroot-sdk's own U-Boot
+// driver, drivers/net/designware.c/.h) — see user/ethd.c3 for the
+// driver (Phase 1: MAC+PHY bring-up and MDIO link-status polling only,
+// no packet TX/RX yet, mirroring user/usbd.c3's own Phase 1 scope).
+// MAC registers at +0x0 (conf/framefilt/miiaddr/miidata/intreg/
+// macaddr0hi/lo), DMA registers at +0x1000 (busmode/status/opmode/
+// rxdesclistaddr/txdesclistaddr) — both comfortably within the first
+// 8KB, this board's own devicetree node reserves a full 64KB window.
+const uptr ETH_MMIO_BASE     = 0x04070000;
+// The embedded Ethernet PHY's own register block — genuinely separate
+// hardware from the MAC above, SoC-internal (this board's physical
+// RJ45 port, per the IO board's own pinout, is wired through this,
+// not an external PHY chip). Real, complete init sequence sourced
+// directly from U-Boot's own cv180x_ephy_id_init()
+// (board/cvitek/cv180x/board.c) — called unconditionally in
+// board_init() on real ASIC hardware, previously read this project's
+// own USB Phase 1 research and dismissed as irrelevant then; it's
+// actually the Ethernet PHY bring-up.
+const uptr ETH_PHY_PAGE       = 0x03009000;
+// clk_500m_eth0 (REG_CLK_EN_0 bit 25) / clk_axi4_eth0 (bit 26) — same
+// physical clock-controller page USB_CLK_PAGE/SD_CLOCK_PAGE above
+// also map, for their own unrelated bits — REG_CLK_EN_0 itself is a
+// different register (+0x000) from REG_CLK_EN_1/_2 (+0x004/+0x008)
+// those use. Marked CLK_IS_CRITICAL in the real Linux clock driver
+// (drivers/clk/cvitek/clk-cv180x.c) — plausibly already enabled by an
+// earlier boot stage, same as USB's own clk_axi4_usb/clk_apb_usb, but
+// enabled defensively here anyway, same reasoning as every other
+// "redoing it is safe either way" clock/reset write in this project.
+const uptr ETH_CLK_PAGE       = 0x03002000;
+// U-Boot's own board_init() calls cv180x_ephy_led_pinmux() together
+// with cv180x_ephy_id_init() above, unconditionally, under the same
+// #if defined(CONFIG_PHY_CVITEK) guard — this driver had only
+// replicated the first of the two until a real hardware round showed
+// every digital PHY-side fact healthy (PLL locked, BMCR clean, MDIO
+// working, clocks enabled) with genuinely zero link ever detected by
+// three independent peer devices. Despite its name ("LED PAD MUX"),
+// this second function's own comments ("SD1_CLK selphy"/"SD1_CMD
+// selphy") suggest it may be repurposing shared pins for the PHY
+// itself, not just driving status LEDs — worth testing given nothing
+// else has explained the symptom. Same physical page as
+// USB_PINMUX_PAGE above (0x03001000, offsets +0x9c/+0xa0).
+const uptr ETH_LED_PINMUX_PAGE = 0x03001000;
+// A second, genuinely new page (0x05027000, offsets +0xb0/+0xb4) —
+// never touched by anything else in this driver or user/usbd.c3.
+const uptr ETH_SD1_SELPHY_PAGE = 0x05027000;
+// The REAL, complete PHY analog bring-up — u-boot-2021.10/drivers/net/
+// phy/cvitek.c's own cv182xa_ephy_init(), called from the actual PHY
+// framework's own .config callback, not board.c's cv180x_ephy_id_init()
+// (which this same file's own comments mark "/* do this in board.c */"
+// for the specific subset it overlaps with — the two were always meant
+// to run together, board.c first). Contains everything board.c's own
+// sequence never touched: efuse-based analog trim (TX bias/echo/
+// termination), MLT3 line-coding phase tables, link-pulse waveform
+// shape, TP_IDLE, 10BaseT tables, LPF/HPF filter coefficients, and two
+// registers never written at all before now — the real "start
+// auto-negotiation" trigger (0x03009800=0x090e, distinct from board.c's
+// own 0x0906) and a force-full-duplex bit (0x03009000). Found only by
+// reading the actual PHY driver file (previously seen in an initial
+// directory listing but never opened) after every fact checkable via
+// MDIO/BMCR/PLL-lock came back healthy with genuinely zero link ever
+// detected by three independent peer devices — exactly the signature
+// analog-layer miscalibration (rather than a digital/control-plane
+// gap) would produce.
+//
+// Efuse trim values live on two more, genuinely new pages.
+const uptr ETH_EFUSE_PAGE_0 = 0x03050000; // EPHY_EFUSE_VALID_BIT_BASE @ +0x120
+const uptr ETH_EFUSE_PAGE_1 = 0x03051000; // trim values @ +0x020, +0x024
+const uint IRQ_ETH            = 31; // declared, not wired into plic_init() yet — Phase 1 polls PHY link status directly, same reasoning as IRQ_USB above
+const bool HAS_ETH            = true;
+const bool HAS_ETH_MAC        = true;
+const bool HAS_VIRTIO_NET     = false;
+
+// process.c3's setup_netd_mappings references these unconditionally,
+// same reasoning as IRQ_VIRTIO_BLK's own "0 = not applicable" pattern
+// above — this board has a real MAC, no virtio-mmio at all, never
+// dereferenced since HAS_VIRTIO_NET is false here.
+const uptr VIRTIO_NET_PADDR = 0;
+const uint IRQ_VIRTIO_NET   = 0;
+
 // fsd mounts EXT2TEST (ext2) as this board's own root — the real,
 // physical start sector, confirmed via `sfdisk`/`lsblk` against the
 // actual card. DUOBOOT (FAT32, sector 2048) deliberately isn't this

@@ -2,6 +2,19 @@ module user;
 
 import std::nolibc::mem;
 
+// Gates the noisy, repeating diagnostic prints (periodic raw HPRT0
+// dumps, the raw SETUP-byte dump on every control-transfer stage) —
+// off by default now that Phase 1+2 are both confirmed working on
+// real hardware (docs/devlog.md), same pattern user/sdd.c3's own
+// SDD_VERBOSE already established. Meaningful, non-repeating output
+// (device connected/disconnected, enumerated device info, hub port
+// status, real error messages) stays on regardless — this only trims
+// the high-frequency/high-volume stuff that was necessary while
+// actively debugging the DWC2 bring-up and enumeration, not useful
+// day to day. Flip to true if a real hardware bug ever needs that
+// level of detail again.
+const bool USBD_VERBOSE = false;
+
 // usbd: USB host-controller driver for the Milk-V Duo — Phase 1 only
 // (see docs/devlog.md and the plan file this was built from). Scope,
 // deliberately narrow: bring the Synopsys DesignWare USB2 OTG core
@@ -288,6 +301,18 @@ fn void print_hex32(uint v)
     }
 }
 
+// Gated by USBD_VERBOSE — for the one-time-but-verbose register-level
+// bring-up milestones (RST_USB toggled, PHY_CTRL set, core reset done,
+// etc.). Meaningful, low-frequency status (device connected, enumerated
+// device info, hub port status) uses plain print() and stays visible
+// regardless — see USBD_VERBOSE's own comment.
+fn void usbd_vprint(char* msg)
+{
+    if (!USBD_VERBOSE) { return; }
+    print("usbd: ");
+    print(msg);
+}
+
 fn void print_hex8(uint v)
 {
     putchar(HEX_DIGITS[(v >> 4) & 0xF]);
@@ -296,6 +321,7 @@ fn void print_hex8(uint v)
 
 fn void print_hprt0_raw(char* label)
 {
+    if (!USBD_VERBOSE) { return; }
     uint hprt0 = usb_reg_read(USB_HPRT0);
     print("usbd: ");
     print(label);
@@ -402,7 +428,7 @@ fn void usbd_init()
     uint pinmux = pinmux_read(USB_PINMUX_VBUS_DET_OFFSET);
     pinmux = (pinmux & ~USB_PINMUX_VBUS_DET_MASK) | USB_PINMUX_VBUS_DET_FUNC;
     pinmux_write(USB_PINMUX_VBUS_DET_OFFSET, pinmux);
-    print("usbd: PAD_USB_VBUS_DET pinmux set\n");
+    usbd_vprint("PAD_USB_VBUS_DET pinmux set\n");
 
     // The USB PHY's own reference clocks — clk_125m_usb/clk_33k_usb
     // (REG_CLK_EN_1 bits 30/31) and clk_12m_usb (REG_CLK_EN_2 bit 0) —
@@ -420,7 +446,7 @@ fn void usbd_init()
     uint clk_en_2 = clk_reg_read(USB_CLK_EN_2_OFFSET);
     clk_en_2 |= USB_CLK_EN_2_12M_USB;
     clk_reg_write(USB_CLK_EN_2_OFFSET, clk_en_2);
-    print("usbd: PHY reference clocks enabled\n");
+    usbd_vprint("PHY reference clocks enabled\n");
 
     // TOP block: RST_USB assert -> real delay -> deassert. Included
     // defensively even though the host-mode driver path itself doesn't
@@ -433,7 +459,7 @@ fn void usbd_init()
     while (rdtime() - rst_start < usb_us_to_ticks(50)) { yield(); }
     soft_rst = top_rst_read(USB_TOP_SOFT_RST_OFFSET);
     top_rst_write(USB_TOP_SOFT_RST_OFFSET, soft_rst | USB_TOP_SOFT_RST_USB);
-    print("usbd: RST_USB toggled\n");
+    usbd_vprint("RST_USB toggled\n");
 
     // TOP block: force OTG ID override to host/A-side.
     //
@@ -460,7 +486,7 @@ fn void usbd_init()
     phy_ctrl = (phy_ctrl & ~(USB_TOP_PHY_CTRL_ID_OVERRIDE_ENABLE | USB_TOP_PHY_CTRL_ID_VALUE))
         | USB_TOP_PHY_CTRL_ID_OVERRIDE_ENABLE;
     top_ctrl_write(USB_TOP_PHY_CTRL_OFFSET, phy_ctrl);
-    print("usbd: PHY_CTRL ID override -> host (A-side), matching vendor dwc2_set_hw_id()\n");
+    usbd_vprint("PHY_CTRL ID override -> host (A-side), matching vendor dwc2_set_hw_id()\n");
 
     // Readback verification: did the override write actually stick, and
     // (bits 8/9 — io_usb_phy_idpad_c / toreg_usb_phy_idpad_c, both RO
@@ -469,27 +495,33 @@ fn void usbd_init()
     // actually being forwarded downstream to the DWC2 core — the
     // direct way to tell whether this override is really reaching the
     // signal GOTGCTL.CONIDSTS reflects, or something else is.
-    uint phy_ctrl_rb = top_ctrl_read(USB_TOP_PHY_CTRL_OFFSET);
-    print("usbd: PHY_CTRL readback=0x");
-    print_hex32(phy_ctrl_rb);
-    print(" io_idpad_c(bit8)=");
-    print_uint((phy_ctrl_rb >> 8) & 1);
-    print(" toreg_idpad_c(bit9)=");
-    print_uint((phy_ctrl_rb >> 9) & 1);
-    print("\n");
+    if (USBD_VERBOSE)
+    {
+        uint phy_ctrl_rb = top_ctrl_read(USB_TOP_PHY_CTRL_OFFSET);
+        print("usbd: PHY_CTRL readback=0x");
+        print_hex32(phy_ctrl_rb);
+        print(" io_idpad_c(bit8)=");
+        print_uint((phy_ctrl_rb >> 8) & 1);
+        print(" toreg_idpad_c(bit9)=");
+        print_uint((phy_ctrl_rb >> 9) & 1);
+        print("\n");
+    }
 
     // ECO RX-flush errata fix — see USB_TOP_ECO_OFFSET's own comment.
     uint eco = top_ctrl_read(USB_TOP_ECO_OFFSET);
     top_ctrl_write(USB_TOP_ECO_OFFSET, eco | USB_TOP_ECO_RX_FLUSH);
-    print("usbd: ECO RX_FLUSH set\n");
+    usbd_vprint("ECO RX_FLUSH set\n");
 
     // Sanity check the core responds at all before trusting anything
     // else — same reasoning user/diskd.c3's own VIRTIO_REG_MAGIC check
     // already established as this project's pattern.
     uint snpsid = usb_reg_read(USB_GSNPSID);
-    print("usbd: GSNPSID=0x");
-    print_hex32(snpsid);
-    print("\n");
+    if (USBD_VERBOSE)
+    {
+        print("usbd: GSNPSID=0x");
+        print_hex32(snpsid);
+        print("\n");
+    }
     if (snpsid == 0x00000000 || snpsid == 0xFFFFFFFF)
     {
         usbd_panic("GSNPSID readback looks wrong — MMIO mapping or clock/reset gating is probably not right yet");
@@ -504,21 +536,24 @@ fn void usbd_init()
     // other register fix tried so far. ARCHITECTURE also determines
     // whether GAHBCFG needs DMA-related bits set below.
     uint hwcfg2 = usb_reg_read(USB_GHWCFG2);
-    print("usbd: GHWCFG2=0x");
-    print_hex32(hwcfg2);
-    print(" hs_phy_type=");
-    print_uint((hwcfg2 >> 6) & 0x3);
-    print(" (0=none,1=UTMI+,2=ULPI,3=both) architecture=");
-    print_uint((hwcfg2 >> 3) & 0x3);
-    print(" (0=slave,1=ext_dma,2=int_dma) num_host_chan=");
-    print_uint(((hwcfg2 >> 14) & 0xF) + 1);
-    print("\n");
+    if (USBD_VERBOSE)
+    {
+        print("usbd: GHWCFG2=0x");
+        print_hex32(hwcfg2);
+        print(" hs_phy_type=");
+        print_uint((hwcfg2 >> 6) & 0x3);
+        print(" (0=none,1=UTMI+,2=ULPI,3=both) architecture=");
+        print_uint((hwcfg2 >> 3) & 0x3);
+        print(" (0=slave,1=ext_dma,2=int_dma) num_host_chan=");
+        print_uint(((hwcfg2 >> 14) & 0xF) + 1);
+        print("\n");
+    }
 
     if (!usb_core_reset())
     {
         usbd_panic("initial core soft reset failed");
     }
-    print("usbd: core reset (1/2) done\n");
+    usbd_vprint("core reset (1/2) done\n");
 
     // PHY parameters: UTMI+, 16-bit width. Requires a second reset to
     // actually take effect.
@@ -531,7 +566,7 @@ fn void usbd_init()
     {
         usbd_panic("post-PHY-config core soft reset failed");
     }
-    print("usbd: core reset (2/2) done\n");
+    usbd_vprint("core reset (2/2) done\n");
 
     // Force host mode.
     usbcfg = usb_reg_read(USB_GUSBCFG);
@@ -557,13 +592,13 @@ fn void usbd_init()
         ahbcfg |= (3 << 1); // HBURSTLEN_INCR4
     }
     usb_reg_write(USB_GAHBCFG, ahbcfg);
-    print("usbd: GAHBCFG programmed (DMA enabled)\n");
+    usbd_vprint("GAHBCFG programmed (DMA enabled)\n");
 
     // Restart the PHY clock — see USB_PCGCCTL's own comment. This is
     // dwc_otg_core_host_init()'s own first step in the reference
     // driver, right after forcing host mode and before HCFG/HPRT0.
     usb_reg_write(USB_PCGCCTL, 0);
-    print("usbd: PCGCCTL cleared (PHY clock restarted)\n");
+    usbd_vprint("PCGCCTL cleared (PHY clock restarted)\n");
 
     // GOTGCTL VBUS-valid override deliberately NOT set here (removed
     // after a real round-trip) — like the TOP-block bits 0-1 already
@@ -587,9 +622,12 @@ fn void usbd_init()
     // Real, observable checkpoint: did host mode actually take effect,
     // not just "we wrote the bits and hoped."
     uint gintsts = usb_reg_read(USB_GINTSTS);
-    print("usbd: GINTSTS.CURMODE=");
-    print_uint(gintsts & USB_GINTSTS_CURMODE_HOST);
-    print(gintsts & USB_GINTSTS_CURMODE_HOST ? " (host mode active)\n" : " (still device mode — something above didn't take)\n");
+    if (USBD_VERBOSE)
+    {
+        print("usbd: GINTSTS.CURMODE=");
+        print_uint(gintsts & USB_GINTSTS_CURMODE_HOST);
+        print(gintsts & USB_GINTSTS_CURMODE_HOST ? " (host mode active)\n" : " (still device mode — something above didn't take)\n");
+    }
 
     // Port power on — read-modify-write, clearing the W1C status bits
     // from the read value first so writing them back as 0 doesn't
@@ -599,7 +637,7 @@ fn void usbd_init()
     hprt0 &= ~USB_HPRT0_W1C_MASK;
     hprt0 |= USB_HPRT0_PRTPWR;
     usb_reg_write(USB_HPRT0, hprt0);
-    print("usbd: HPRT0 port power on\n");
+    usbd_vprint("HPRT0 port power on\n");
 
     // Settle delay before trusting anything HPRT0 reports — VBUS
     // power-up is not instantaneous, and reading line state too early
@@ -631,12 +669,15 @@ fn void usbd_init()
     // their current value.
     usb_reg_write(USB_HPRT0, usb_reg_read(USB_HPRT0));
 
-    uint gotgctl_final = usb_reg_read(USB_GOTGCTL);
-    print("usbd: GOTGCTL=0x");
-    print_hex32(gotgctl_final);
-    print(" conidsts=");
-    print_uint((gotgctl_final >> 16) & 1);
-    print(" (0=A-device/host, 1=B-device/device)\n");
+    if (USBD_VERBOSE)
+    {
+        uint gotgctl_final = usb_reg_read(USB_GOTGCTL);
+        print("usbd: GOTGCTL=0x");
+        print_hex32(gotgctl_final);
+        print(" conidsts=");
+        print_uint((gotgctl_final >> 16) & 1);
+        print(" (0=A-device/host, 1=B-device/device)\n");
+    }
 }
 
 // --- Phase 2: control transfers over host channel 0, and the
@@ -745,13 +786,16 @@ fn bool usb_control_transfer(uint dev_addr, uint max_packet0, char* setup8, void
 {
     mem::copy((void*)usb_dma_paddr, setup8, 8);
 
-    print("usbd: SETUP bytes:");
-    for (int i = 0; i < 8; i++)
+    if (USBD_VERBOSE)
     {
-        putchar(' ');
-        print_hex8((uint)setup8[i] & 0xFF);
+        print("usbd: SETUP bytes:");
+        for (int i = 0; i < 8; i++)
+        {
+            putchar(' ');
+            print_hex8((uint)setup8[i] & 0xFF);
+        }
+        print("\n");
     }
-    print("\n");
 
     uint actual_len;
     int result;

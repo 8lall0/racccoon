@@ -129,6 +129,40 @@ const uptr USB_PINMUX_PAGE   = 0;
 const uint IRQ_USB           = 0;
 const bool HAS_USB           = false;
 
+// Ethernet — QEMU's virt board has no real DesignWare MAC equivalent,
+// but unlike USB it DOES have a genuine, real network path via
+// virtio-net on the same virtio-mmio bus virtio-blk already uses. This
+// board gets its own driver, user/netd.c3 (Phase 1: virtio-net device
+// bring-up and link-status query only, mirroring user/ethd.c3's own
+// Phase 1 scope on the Duo — see boards/duo/board.c3's own comment) —
+// see HAS_ETH_MAC/HAS_VIRTIO_NET below for which driver kernel.c3
+// spawns on which board, same shape as HAS_SD_BLOCK/HAS_VIRTIO_BLOCK
+// above.
+//
+// QEMU virt's own virtio-mmio transport is 8 fixed slots at
+// 0x10001000-0x10008000 (0x1000 apart, IRQ = slot number) — confirmed
+// via `-machine virt,dumpdtb=...` + dtc, same sourcing this project's
+// own TIMEBASE_HZ above already used. Slot 0 (0x10001000, IRQ 1) is
+// virtio-blk (scripts/launch64.sh); slot 1 here for virtio-net.
+const uptr VIRTIO_NET_PADDR  = 0x10002000;
+const uint IRQ_VIRTIO_NET    = 2;
+const bool HAS_ETH           = true;
+const bool HAS_ETH_MAC       = false;
+const bool HAS_VIRTIO_NET    = true;
+
+// process.c3's setup_ethd_mappings references these unconditionally,
+// same reasoning as the SD_*/USB_* constants above — QEMU has no real
+// DesignWare MAC or embedded PHY at all, never dereferenced since
+// HAS_ETH_MAC is false here.
+const uptr ETH_MMIO_BASE = 0;
+const uptr ETH_PHY_PAGE  = 0;
+const uptr ETH_CLK_PAGE  = 0;
+const uptr ETH_LED_PINMUX_PAGE = 0;
+const uptr ETH_SD1_SELPHY_PAGE = 0;
+const uptr ETH_EFUSE_PAGE_0 = 0;
+const uptr ETH_EFUSE_PAGE_1 = 0;
+const uint IRQ_ETH       = 0;
+
 // Real, confirmed timebase-frequency, not guessed — extracted directly
 // from this exact qemu-system-riscv64 binary via
 // `-machine virt,dumpdtb=...` + `dtc` (same sourcing already used for

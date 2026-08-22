@@ -50,6 +50,10 @@ extern char[] _binary_envd_bin_start @cname("_binary_envd_bin_start");
 extern char[] _binary_envd_bin_end @cname("_binary_envd_bin_end");
 extern char[] _binary_usbd_bin_start @cname("_binary_usbd_bin_start");
 extern char[] _binary_usbd_bin_end @cname("_binary_usbd_bin_end");
+extern char[] _binary_ethd_bin_start @cname("_binary_ethd_bin_start");
+extern char[] _binary_ethd_bin_end @cname("_binary_ethd_bin_end");
+extern char[] _binary_netd_bin_start @cname("_binary_netd_bin_start");
+extern char[] _binary_netd_bin_end @cname("_binary_netd_bin_end");
 
 fn void boot() @naked @export("boot") @section(".text.boot") @noinline @nostrip @used
 {
@@ -233,6 +237,25 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		Process* usbd_proc = create_process((void*)&_binary_usbd_bin_start, (uint)((uptr)&_binary_usbd_bin_end - (uptr)&_binary_usbd_bin_start));
 		setup_usbd_mappings(usbd_proc);
 		io::print("usbd created\n");
+	}
+
+	// ethd (the real Ethernet MAC driver, user/ethd.c3) — Duo only —
+	// or netd (virtio-net, user/netd.c3) — QEMU only — mutually
+	// exclusive, same board::HAS_ETH_MAC/HAS_VIRTIO_NET shape as
+	// board::HAS_SD_BLOCK/HAS_VIRTIO_BLOCK gates diskd vs sdd. Spawned
+	// last, same reasoning as usbd above: no fixed-slot convention to
+	// preserve yet, Phase 1 has no IPC clients.
+	if (board::HAS_ETH_MAC)
+	{
+		Process* ethd_proc = create_process((void*)&_binary_ethd_bin_start, (uint)((uptr)&_binary_ethd_bin_end - (uptr)&_binary_ethd_bin_start));
+		setup_ethd_mappings(ethd_proc);
+		io::print("ethd created\n");
+	}
+	if (board::HAS_VIRTIO_NET)
+	{
+		Process* netd_proc = create_process((void*)&_binary_netd_bin_start, (uint)((uptr)&_binary_netd_bin_end - (uptr)&_binary_netd_bin_start));
+		setup_netd_mappings(netd_proc);
+		io::print("netd created\n");
 	}
 
 	// Single call site for create_process(shell) below (a *respawn*

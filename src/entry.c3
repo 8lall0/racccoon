@@ -70,6 +70,7 @@ const SYS_SETUID       = 25; // sets the caller's own uid, only while still root
 const SYS_NS_MOUNT_WAIT = 26; // SYS_NS_MOUNT, but blocks (bounded by a retry count) until the target actually posts — see its case below
 const SYS_YIELD         = 27; // voluntarily gives up the rest of this process's timeslice once — see its case below
 const SYS_USBD_INFO     = 28; // usbd-only: returns its DMA buffer's physical address — same shape/reasoning as SYS_DISKD_INFO above
+const SYS_NETD_INFO     = 29; // netd-only: returns its RX/TX virtqueue physical addresses — same shape as SYS_DISKD_INFO above, two out-pointers instead of one
 
 // Generous cap on the image SYS_EXEC will install — real racccoon
 // binaries (build/user/*.bin) run 70-105KB; this leaves real headroom
@@ -1507,6 +1508,16 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// above.
 			uptr* usbd_dma_out = (uptr*)(uptr)f.a0;
 			*usbd_dma_out = usbd_dma_paddr;
+		case SYS_NETD_INFO:
+			// netd-only, called once at its own startup — see
+			// setup_netd_mappings in process.c3 for why these addresses
+			// can't be known at compile time. a0/a1 are out-pointers,
+			// same convention as SYS_DISKD_INFO above: a0 -> RX
+			// virtqueue paddr, a1 -> TX virtqueue paddr.
+			uptr* netd_rxq_out = (uptr*)(uptr)f.a0;
+			uptr* netd_txq_out = (uptr*)(uptr)f.a1;
+			*netd_rxq_out = netd_rxq_paddr;
+			*netd_txq_out = netd_txq_paddr;
 		case SYS_PARENT_INFO:
 			// Read-only, no permission check — same reasoning as
 			// SYS_PROC_INFO above. Returns the given pid's parent_pid

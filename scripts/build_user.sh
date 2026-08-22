@@ -93,3 +93,5 @@ build_user_program fsd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DI
 build_user_program procd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 user/procd.c3
 build_user_program envd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 user/envd.c3
 build_user_program usbd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 user/usbd.c3
+build_user_program ethd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 user/ethd.c3
+build_user_program netd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 user/netd.c3

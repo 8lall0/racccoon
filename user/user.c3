@@ -40,6 +40,7 @@ const int SYS_SETUID       = 25; // sets the caller's own uid, only while still 
 const int SYS_NS_MOUNT_WAIT = 26; // SYS_NS_MOUNT, but blocks (bounded by a retry count) until the target actually posts — see src/entry.c3's case
 const int SYS_YIELD         = 27; // voluntarily gives up the rest of this process's timeslice once — see src/entry.c3's case
 const int SYS_USBD_INFO     = 28; // usbd-only: returns its DMA buffer physical address — see src/entry.c3's case
+const int SYS_NETD_INFO     = 29; // netd-only: returns its RX/TX virtqueue physical addresses — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -701,6 +702,13 @@ fn uptr usbd_info() @export("usbd_info") {
     uptr dma_paddr;
     syscall(SYS_USBD_INFO, (long)&dma_paddr, 0, 0);
     return dma_paddr;
+}
+
+// netd-only, called once at its own startup — see process.c3's
+// netd_rxq_paddr/netd_txq_paddr for why these addresses can't be
+// known at compile time.
+fn void netd_info(uptr* rxq_paddr_out, uptr* txq_paddr_out) @export("netd_info") {
+    syscall(SYS_NETD_INFO, (long)rxq_paddr_out, (long)txq_paddr_out, 0);
 }
 
 // Blocks until the process with this pid no longer exists — e.g. a
