@@ -1,5 +1,6 @@
 module user;
 
+import std::nolibc::main_stub;
 import std::nolibc::fmt;
 
 int rfork_shared_value = 0;
@@ -124,7 +125,7 @@ fn void mutex_thread_body(void* arg) {
     exit();
 }
 
-fn void main() @export("main") {
+fn void main() {
     for (;;) {
         print("> ");
 

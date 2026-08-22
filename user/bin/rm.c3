@@ -1,11 +1,13 @@
 module user;
 
+import std::nolibc::main_stub;
+
 // Real, argv-taking replacement for shell.c3's own former deletetest/
 // deletetest2/rmdirtest/rmdirtest2/rmdirnonempty/rmdirnonempty2/rmrtest
 // (all hardcoded to fixed paths) — plain delete (files and empty
 // directories, matching fs_delete's own existing behavior) or, with a
 // leading -r flag, recursive delete (fs_delete_recursive).
-fn void main() @export("main") {
+fn void main() {
     char** argv;
     int argc = get_argv(&argv);
 

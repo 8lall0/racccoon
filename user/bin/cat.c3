@@ -1,10 +1,12 @@
 module user;
 
+import std::nolibc::main_stub;
+
 // Real, argv-taking replacement for shell.c3's own former readfile/
 // readfile2/readsubfile/readsubfile2 (all four hardcoded to a fixed
 // path) — one path argument, prints its content. Multi-file support
 // real cat has isn't added: nothing in this project ever needed it.
-fn void main() @export("main") {
+fn void main() {
     char** argv;
     int argc = get_argv(&argv);
     if (argc != 1) {

@@ -1,5 +1,7 @@
 module user;
 
+import std::nolibc::main_stub;
+
 // Real, argv-taking replacement for shell.c3's own former writefile/
 // newfile/newfile2/newsubfile/newsubfile2 (all hardcoded path+content
 // combinations) — fs_write() already creates-or-overwrites
@@ -8,7 +10,7 @@ module user;
 // text > file"), so this takes the content directly as its own second
 // argument rather than trying to imitate a real Unix "write" (which
 // means something else entirely — talking to another user's terminal).
-fn void main() @export("main") {
+fn void main() {
     char** argv;
     int argc = get_argv(&argv);
     if (argc != 2) {

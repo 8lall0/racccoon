@@ -1,5 +1,7 @@
 module user;
 
+import std::nolibc::main_stub;
+
 // sdd: the real-hardware SD storage driver for the Milk-V Duo, mutually
 // exclusive with diskd (user/diskd.c3, QEMU's virtio-blk driver) — see
 // board::HAS_SD_BLOCK/HAS_VIRTIO_BLOCK (kernel.c3) for how exactly one of
@@ -854,7 +856,7 @@ fn void sdd_init()
 	print("sdd: card ready\n");
 }
 
-fn void main() @export("main")
+fn void main()
 {
 	sdd_init();
 

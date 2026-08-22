@@ -1,8 +1,10 @@
 module user;
 
+import std::nolibc::main_stub;
+
 // Real, argv-taking replacement for shell.c3's own former mkdirtest
 // (hardcoded to a fixed path).
-fn void main() @export("main") {
+fn void main() {
     char** argv;
     int argc = get_argv(&argv);
     if (argc != 1) {

@@ -16,10 +16,8 @@ module user;
 // Legacy virtio-mmio (version 1) register offsets — same layout
 // diskd.c3 already uses, confirmed working there.
 
+import std::nolibc::main_stub;
 import std::nolibc::mem;
-
-const uint VIRTQ_ENTRY_NUM   = 16;
-const uint PAGE_SIZE         = 4096;
 
 // QEMU virt's own confirmed timebase frequency (netd is QEMU-only —
 // see board::TIMEBASE_HZ's own comment, boards/qemu/board.c3, for how
@@ -31,22 +29,6 @@ fn ulong netd_us_to_ticks(ulong us)
     return us * NETD_TIMEBASE_HZ / 1000000;
 }
 
-const uint VIRTIO_REG_MAGIC          = 0x00;
-const uint VIRTIO_REG_VERSION        = 0x04;
-const uint VIRTIO_REG_DEVICE_ID      = 0x08;
-const uint VIRTIO_REG_HOST_FEATURES  = 0x10;
-const uint VIRTIO_REG_GUEST_FEATURES = 0x20;
-const uint VIRTIO_REG_PAGE_SIZE      = 0x28;
-const uint VIRTIO_REG_QUEUE_SEL      = 0x30;
-const uint VIRTIO_REG_QUEUE_NUM      = 0x38;
-const uint VIRTIO_REG_QUEUE_PFN      = 0x40;
-const uint VIRTIO_REG_DEVICE_STATUS  = 0x70;
-const uint VIRTIO_REG_DEVICE_CONFIG  = 0x100;
-
-const uint VIRTIO_STATUS_ACK       = 1;
-const uint VIRTIO_STATUS_DRIVER    = 2;
-const uint VIRTIO_STATUS_DRIVER_OK = 4;
-
 const uint VIRTIO_NET_DEVICE_ID = 1; // per virtio spec — 1 = network card (2 = block device, matching diskd's own check)
 
 // VIRTIO_NET_F_STATUS (bit 16) — the device-specific config space's
@@ -57,82 +39,16 @@ const uint VIRTIO_NET_DEVICE_ID = 1; // per virtio spec — 1 = network card (2 
 const uint VIRTIO_NET_F_STATUS = 1 << 16;
 const uint VIRTIO_NET_S_LINK_UP = 1 << 0;
 
-struct Virtq_desc @packed
-{
-    ulong  addr;
-    uint   len;
-    ushort flags;
-    ushort next;
-}
-
-struct Virtq_avail @packed
-{
-    ushort flags;
-    ushort index;
-    ushort[VIRTQ_ENTRY_NUM] ring;
-}
-
-struct Virtq_used_elem @packed
-{
-    uint id;
-    uint len;
-}
-
-struct Virtq_used @packed
-{
-    ushort flags;
-    ushort index;
-    Virtq_used_elem[VIRTQ_ENTRY_NUM] ring;
-}
-
-struct Virtio_virtq @packed
-{
-    Virtq_desc[VIRTQ_ENTRY_NUM] descs;
-    Virtq_avail avail;
-    Virtq_used used @align(PAGE_SIZE);
-    int queue_index;
-    ushort* used_index;
-    ushort last_used_index;
-}
-
-// Same raw-asm MMIO access pattern as diskd.c3/usbd.c3 — see either's
-// own comment for why a plain pointer load/store isn't trustworthy for
-// device registers.
-fn uint mmio_read32(uptr addr)
-{
-    ulong v;
-    asm
-    {
-        lw v, [addr];
-    }
-    return (uint)v;
-}
-
-fn void mmio_write32(uptr addr, uint v)
-{
-    ulong vv = (ulong)v;
-    asm
-    {
-        sw vv, [addr];
-    }
-}
-
-fn ushort mmio_read16(uptr addr)
-{
-    ulong v;
-    asm
-    {
-        lhu v, [addr];
-    }
-    return (ushort)v;
-}
-
 const uint VIRTIO_NET_PADDR = 0x10002000; // board::VIRTIO_NET_PADDR duplicated locally — board is kernel-only, unreachable from user-mode code, same convention every other driver here already follows
 
-fn uint reg_read32(uint offset) { return mmio_read32((uptr)(VIRTIO_NET_PADDR + offset)); }
-fn void reg_write32(uint offset, uint v) { mmio_write32((uptr)(VIRTIO_NET_PADDR + offset), v); }
-fn void reg_fetch_or32(uint offset, uint v) { reg_write32(offset, reg_read32(offset) | v); }
-fn ushort reg_read16(uint offset) { return mmio_read16((uptr)(VIRTIO_NET_PADDR + offset)); }
+// Thin wrappers around user/virtio.c3's own base-address-parameterized
+// helpers, bound to this device's own VIRTIO_NET_PADDR — every other
+// call site in this file keeps calling plain reg_read32(offset) etc.,
+// unchanged.
+fn uint reg_read32(uint offset) { return virtio_reg_read32(VIRTIO_NET_PADDR, offset); }
+fn void reg_write32(uint offset, uint v) { virtio_reg_write32(VIRTIO_NET_PADDR, offset, v); }
+fn void reg_fetch_or32(uint offset, uint v) { virtio_reg_fetch_or32(VIRTIO_NET_PADDR, offset, v); }
+fn ushort reg_read16(uint offset) { return virtio_reg_read16(VIRTIO_NET_PADDR, offset); }
 
 const char[16] HEX_DIGITS = "0123456789abcdef";
 
@@ -161,7 +77,7 @@ fn void netd_setup_queue(Virtio_virtq* vq, uptr vq_paddr, int queue_index)
     vq.used_index  = &vq.used.index;
 }
 
-fn void main() @export("main")
+fn void main()
 {
     uptr rxq_paddr;
     uptr txq_paddr;

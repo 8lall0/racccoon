@@ -1,5 +1,7 @@
 module user;
 
+import std::nolibc::main_stub;
+
 // Minimal IPC test server. Started out as a pure echo (proving two
 // processes can exchange a message at all — see docs/devlog.md); then
 // learned the first two 9P-lite verbs (P9_TWALK/P9_TREAD, defined in
@@ -100,7 +102,7 @@ struct P9_fid_entry
 }
 P9_fid_entry[P9_FID_MAX] p9_fids;
 
-fn void main() @export("main") {
+fn void main() {
     p9_init_tree();
 
     // If exec()'d with an argument (user/shell.c3's argvtest), argv[0]

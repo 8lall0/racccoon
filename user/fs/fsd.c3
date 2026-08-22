@@ -1,5 +1,6 @@
 module user;
 
+import std::nolibc::main_stub;
 import std::nolibc::mem;
 
 // fsd: the file system, moved out of the trusted kernel into its own
@@ -410,7 +411,7 @@ fn void fs_mount()
 	print("fsd: no recognized filesystem found — this mount stays inactive\n");
 }
 
-fn void main() @export("main")
+fn void main()
 {
 	fs_mount();
 

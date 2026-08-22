@@ -1,5 +1,6 @@
 module user;
 
+import std::nolibc::main_stub;
 import std::nolibc::mem;
 import std::nolibc::fmt;
 
@@ -73,7 +74,7 @@ fn int procd_append_str(char* dst, int pos, char* src)
     return pos;
 }
 
-fn void main() @export("main") {
+fn void main() {
     for (;;) {
         char[FS_MSG_MAX] buf @noinit;
         uint verb = 0;

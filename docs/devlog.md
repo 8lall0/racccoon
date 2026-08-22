@@ -4,6 +4,106 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-22 (68) — User-space directory refactor (steps 1-3), and an idiomatic `main()`
+
+Two related pieces of housekeeping, both pure behavior-preserving
+changes verified on real Duo hardware, not new features.
+
+### Directory refactor: splitting drivers from orchestration
+
+`user/` had grown to 17 files flat in one directory, and two drivers
+in particular — `usbd.c3` (1209 lines) and (a later step) `ethd.c3`
+(671 lines) — mixed hardware-register-level code with process-level
+orchestration so thoroughly that finding "the part that talks to the
+wire" versus "the part that decides what to do next" required reading
+the whole file.
+
+Rather than reach for C3's real `interface`+`@dynamic` support (C3
+does have it — confirmed in the stdlib's own `logging.c3`/`alloc.c3`
+— a struct declares `(InterfaceName)` and marks methods `@dynamic`),
+this replicates `fsd.c3`'s own already-proven "generic core / backend
+split": plain files in subdirectories, all still `module user;` (no
+nested submodules, no import needed for same-module cross-file
+visibility — just the directory as a human-navigation aid, matching
+`user/fs/fat32.c3`/`ext2.c3`'s own precedent exactly). Introducing
+dynamic dispatch would be designing for a hypothetical second USB/
+Ethernet backend that doesn't exist yet; the seam is clean to
+formalize into a real interface later if one ever does.
+
+New layout: `user/bin/` (cat/ls/mkdir/mv/rm/write), `user/sys/`
+(echod/procd/envd), `user/fs/` (fsd joins fat32/ext2), `user/block/`
+(diskd/sdd), `user/net/` (netd/ethd), `user/usb/` (usbd). `user.c3`/
+`shell.c3`/the new `virtio.c3` stay top-level.
+
+New shared file `user/virtio.c3`: `diskd.c3` and `netd.c3` had already
+near-verbatim duplicated the legacy virtio-mmio (version 1) transport
+layer — magic/version/status/queue-setup register offsets, the
+virtqueue struct shapes, raw MMIO read/write helpers — from `netd.c3`
+being written by copying `diskd.c3`'s own pattern earlier this
+session. Real, already-existing duplication, not speculative DRY.
+Extracted the generic parts (base-address-parameterized
+`virtio_reg_read32`/`write32`/etc.); each driver keeps its own
+device-specific pieces (`VIRTIO_BLK_PADDR`/`Virtio_blk_req` for
+diskd, `VIRTIO_NET_PADDR`/`VIRTIO_NET_F_STATUS` for netd).
+
+`usbd.c3` split into `user/usb/dwc2.c3` (every `USB_*` register/bit
+constant, the host-channel transfer engine, the USB/hub-class request
+builders — the "how") and a much smaller `user/usb/usbd.c3` (just
+`main()` and `usb_enumerate_device()` — the "what"). Pure code
+motion, no logic changes.
+
+Verified: QEMU regression clean at every step (all processes created,
+`netd: link up`, FAT32 mounted). Since QEMU has no DWC2 equivalent at
+all, `usbd` itself is only ever exercised on real hardware — flashed
+the Duo and confirmed the exact same enumeration as before the split
+(hub `vid=0x05e3 pid=0x0610`, 4 ports, correct per-port status).
+
+Steps 4 (`ethd.c3` → `dwmac.c3`/`ephy.c3`/`ethd.c3`) and 5 (`sdd.c3`
+→ `sdhci.c3`/`sdd.c3`) are planned but not yet done.
+
+### An idiomatic `main()`, via a small addition to the c3c fork's stdlib
+
+Every user-mode binary's `main()` was declared `fn void main()
+@export("main")`, needed because `scripts/build_user.sh` compiles with
+`--no-entry` (required since `--use-stdlib=no` means the compiler's
+own standard main-wrapping has no forwarding macro to find). Under
+`--no-entry`, the compiler registers whatever function is literally
+named `main` without ever auto-exporting it under an unmangled linker
+name the way it does in the normal (non-`--no-entry`) path — so every
+single program needed the `@export("main")` boilerplate repeated by
+hand, purely to satisfy `user.c3`'s own hand-written `_start`
+(`call main`).
+
+Traced this down to `sema_analyse_main_function()` in the compiler's
+own `sema_decls.c` (8lall0/c3c fork) — genuinely fixable there, but a
+compiler-internals patch felt like the wrong tool for what's really a
+missing library piece: the real stdlib already solves this exact
+problem for hosted builds via `std::core::main_stub`'s `@main_no_args`
+macro (`lib/std/core/private/main_stub.c3`) — the compiler looks this
+up *by name* when it sees a plain `fn void main()`, and generates a
+real, standard, properly-exported `int main(int, char**)` wrapper
+around it automatically. Racccoon's `--use-stdlib=no` build just never
+had that macro anywhere reachable.
+
+Added `lib/std/_nolibc/main_stub.c3` to the fork (sibling to the
+existing `mem.c3`/`atomic.c3`/`fmt.c3`, same `@feat(RACCCOON)` gating)
+providing a minimal freestanding `@main_no_args` — just `#m(); return
+0;`, no args-forwarding machinery a freestanding target has no use
+for. Removed `--no-entry` from `build_user.sh`, added the new file to
+every binary's source list, and every `fn void main()` across all 16
+racccoon files now just `import std::nolibc::main_stub;` and drops
+`@export("main")` entirely — the compiler generates and exports the
+real `main` symbol itself, confirmed via `nm` (`T main`, calling into
+the mangled `user.main`), exactly like any standard hosted C3 program.
+
+Verified: QEMU regression byte-for-byte identical to the pre-change
+baseline. Real Duo hardware: full boot sequence clean across all 7
+processes (sdd/fsd/procd/envd/shell/usbd/ethd), `usbd` enumeration
+still exactly correct, and `ethd` showed `link up` this round —
+possibly the first real external-carrier confirmation since the
+`cv182xa_ephy_init()` fix (entry 67); worth an explicit `ip link`
+check on the peer side to confirm.
+
 ## 2026-08-22 (67) — Ethernet Phase 1: MAC+PHY bring-up, real analog link sensing confirmed live
 
 New feature area, mirroring USB's own Phase 1 scope: bring the MAC and

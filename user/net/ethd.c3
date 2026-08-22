@@ -1,5 +1,7 @@
 module user;
 
+import std::nolibc::main_stub;
+
 // ethd: Ethernet MAC + embedded-PHY driver for the Milk-V Duo — Phase 1
 // only (mirrors user/usbd.c3's own Phase 1 scope exactly): bring the
 // MAC and its on-chip PHY up, and poll MDIO link status. NOT in scope
@@ -621,7 +623,7 @@ fn uint ethd_init()
     return 0; // unreachable — ethd_panic() calls exit()
 }
 
-fn void main() @export("main")
+fn void main()
 {
     uint phy_addr = ethd_init();
 

@@ -1,5 +1,6 @@
 module user;
 
+import std::nolibc::main_stub;
 import std::nolibc::mem;
 
 // /env: per-process environment variables, real Plan 9 idea (there
@@ -166,7 +167,7 @@ fn void env_maybe_inherit(int pid, uint gen)
     }
 }
 
-fn void main() @export("main") {
+fn void main() {
     for (;;) {
         char[FS_MSG_MAX] buf @noinit;
         uint verb = 0;

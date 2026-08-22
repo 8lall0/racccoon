@@ -2,10 +2,53 @@ module user;
 
 import std::nolibc::mem;
 
+// dwc2: register-level DWC2 (Synopsys DesignWare USB2 OTG core) driver
+// for the Milk-V Duo's USB host controller — the "how" layer for
+// user/usb/usbd.c3's own orchestration (main()/usb_enumerate_device()).
+// Split out from what used to be one combined file once both grew
+// large enough to make "the part that talks to the wire" and "the part
+// that decides what to do next" hard to tell apart (docs/devlog.md).
+//
+// Covers: core/PHY bring-up (usbd_init(), usb_core_reset()), host
+// channel 0 control transfers (hc_transfer_once(),
+// usb_control_transfer()), and the USB-standard/hub-class request
+// builders (usb_get_descriptor(), usb_set_address(),
+// usb_set_configuration(), usb_get_hub_descriptor(),
+// usb_set_port_feature(), usb_get_port_status()) — everything
+// usbd.c3's own orchestration calls into, nothing that decides *when*
+// to call it.
+//
+// Confirmed working on real hardware: host-mode bring-up (HPRT0
+// connect/disconnect detection) and full device enumeration (including
+// through the Duo IO board's own onboard hub), both verified against
+// real silicon, not just QEMU (which has no DWC2 equivalent at all —
+// its own USB path, if ever added, would be PCIe+XHCI, a completely
+// different controller).
+//
+// Register offsets/bit layouts sourced directly from duo-buildroot-sdk's
+// own driver code, read directly this project's own USB bring-up
+// session — not reverse-engineered, not secondary documentation:
+//   - DWC2 core registers: u-boot-2021.10/drivers/usb/host/dwc2.c/.h
+//     (the generic DWC2 host driver CV1800B's own devicetree binds to
+//     unmodified — "cvitek,cv182x-usb" only changes software
+//     parameters, linux_5.10/drivers/usb/dwc2/params.c, never register
+//     addresses) and linux_5.10/drivers/usb/dwc2/core.c/platform.c
+//     (the real vendor Linux glue — the exact byte-for-byte host-mode
+//     value and the core-reset write-back this exact core revision
+//     needs both came from here, not U-Boot, which only supports
+//     gadget/device mode on this SoC).
+//   - TOP-block SoC-specific registers: u-boot-2021.10/board/cvitek/
+//     cv180x/board.c and cv180x_reg.h. Confirmed: the devicetree's own
+//     second `reg` range for this device (0x03006000, "USB 2.0 PHY" in
+//     the source comment) is never actually written by any driver in
+//     that SDK — not used here at all. The real SoC-specific registers
+//     this driver needs live in the TOP control block instead
+//     (board::USB_TOP_CTRL_PAGE/USB_TOP_RST_PAGE, boards/duo/board.c3).
+
 // Gates the noisy, repeating diagnostic prints (periodic raw HPRT0
 // dumps, the raw SETUP-byte dump on every control-transfer stage) —
 // off by default now that Phase 1+2 are both confirmed working on
-// real hardware (docs/devlog.md), same pattern user/sdd.c3's own
+// real hardware (docs/devlog.md), same pattern user/block/sdd.c3's own
 // SDD_VERBOSE already established. Meaningful, non-repeating output
 // (device connected/disconnected, enumerated device info, hub port
 // status, real error messages) stays on regardless — this only trims
@@ -14,42 +57,6 @@ import std::nolibc::mem;
 // day to day. Flip to true if a real hardware bug ever needs that
 // level of detail again.
 const bool USBD_VERBOSE = false;
-
-// usbd: USB host-controller driver for the Milk-V Duo — Phase 1 only
-// (see docs/devlog.md and the plan file this was built from). Scope,
-// deliberately narrow: bring the Synopsys DesignWare USB2 OTG core
-// ("DWC2") up into host mode, power the port, and observe the host
-// port status register (HPRT0)'s own connect-status bit change when a
-// real USB device is plugged/unplugged. NOT in scope yet: device
-// enumeration, control transfers, mass storage, interrupts (pure
-// polling — see IRQ_USB's own comment in boards/duo/board.c3 for why:
-// the SDHCI PLIC-enable claim-storm bug user/sdd.c3 already hit once
-// is exactly the kind of mistake this avoids repeating on a still
-// barely-understood peripheral).
-//
-// Register offsets/bit layouts below are sourced directly from
-// duo-buildroot-sdk's own driver code, read directly this session —
-// not reverse-engineered, not secondary documentation:
-//   - DWC2 core registers: u-boot-2021.10/drivers/usb/host/dwc2.c/.h
-//     (the generic DWC2 host driver CV1800B's own devicetree binds to
-//     unmodified — "cvitek,cv182x-usb" only changes software
-//     parameters, linux_5.10/drivers/usb/dwc2/params.c, never register
-//     addresses).
-//   - TOP-block SoC-specific registers: u-boot-2021.10/board/cvitek/
-//     cv180x/board.c and cv180x_reg.h. Confirmed: the devicetree's own
-//     second `reg` range for this device (0x03006000, "USB 2.0 PHY" in
-//     the source comment) is never actually written by any driver in
-//     that SDK — not used here at all. The real SoC-specific registers
-//     this driver needs live in the TOP control block instead
-//     (board::USB_TOP_CTRL_PAGE/USB_TOP_RST_PAGE, boards/duo/board.c3).
-//
-// Expect real-hardware iteration here — this is a careful port of
-// sourced values, not something exercised against real silicon yet (no
-// QEMU equivalent exists for this controller at all — QEMU's own USB
-// path, if ever added, would be PCIe+XHCI, a completely different
-// controller, later phase). Diagnostic prints are deliberately
-// generous at every step, not gated behind a _VERBOSE flag the way
-// sdd.c3's now are — this is first bring-up, not a settled driver.
 
 // --- DWC2 core registers (relative to board::USB_MMIO_BASE) — all fit
 // in the first 4KB page, nothing here needs the other 15 pages of the
@@ -234,14 +241,15 @@ const uint USB_CLK_EN_2_12M_USB  = 1 << 0;     // clk_12m_usb
 // Page bases — board::USB_MMIO_BASE/USB_TOP_CTRL_PAGE/USB_TOP_RST_PAGE/
 // USB_CLK_PAGE aren't reachable from user-mode code (board is a
 // kernel-only module), so duplicated here as plain constants, same
-// convention user/sdd.c3's own SD_BASE/TOP_BASE/etc. already follow.
+// convention user/block/sdd.c3's own SD_BASE/TOP_BASE/etc. already
+// follow.
 const uint USB_BASE          = 0x04340000;
 const uint USB_TOP_CTRL_BASE = 0x03000000;
 const uint USB_TOP_RST_BASE  = 0x03003000;
 const uint USB_CLK_BASE      = 0x03002000;
 const uint USB_PINMUX_BASE   = 0x03001000;
 
-// Real, confirmed timebase-frequency, same sourcing as user/sdd.c3's
+// Real, confirmed timebase-frequency, same sourcing as user/block/sdd.c3's
 // own SD_TIMEBASE_HZ duplicate — see that file's header comment.
 const uint USB_TIMEBASE_HZ = 25000000;
 
@@ -285,10 +293,10 @@ fn uint pinmux_read(uint offset) { return mmio_read32((uptr)(USB_PINMUX_BASE + o
 fn void pinmux_write(uint offset, uint v) { mmio_write32((uptr)(USB_PINMUX_BASE + offset), v); }
 
 // Phase 2's single-page DMA buffer — see process.c3's usbd_dma_paddr
-// for the full explanation. Set once in main(), before usbd_init()
-// runs. Real physical address AND the virtual address usbd itself
-// reads/writes through — identity-mapped, same as every device MMIO
-// page this driver already touches.
+// for the full explanation. Set once in main() (user/usb/usbd.c3),
+// before usbd_init() runs. Real physical address AND the virtual
+// address this driver reads/writes through — identity-mapped, same as
+// every device MMIO page this driver already touches.
 uptr usb_dma_paddr;
 
 const char[16] HEX_DIGITS = "0123456789abcdef";
@@ -513,8 +521,8 @@ fn void usbd_init()
     usbd_vprint("ECO RX_FLUSH set\n");
 
     // Sanity check the core responds at all before trusting anything
-    // else — same reasoning user/diskd.c3's own VIRTIO_REG_MAGIC check
-    // already established as this project's pattern.
+    // else — same reasoning user/block/diskd.c3's own VIRTIO_REG_MAGIC
+    // check already established as this project's pattern.
     uint snpsid = usb_reg_read(USB_GSNPSID);
     if (USBD_VERBOSE)
     {
@@ -680,21 +688,16 @@ fn void usbd_init()
     }
 }
 
-// --- Phase 2: control transfers over host channel 0, and the
-// enumeration flow built on top of them.
+// --- Control transfers over host channel 0, and the request builders
+// on top of them.
 //
-// IMPORTANT: this section is implemented from real, sourced DWC2
-// register facts (U-Boot's own chunk_msg()/_submit_control_msg()/
-// wait_for_chhltd(), duo-buildroot-sdk's u-boot-2021.10/drivers/usb/
-// host/dwc2.c) but has NOT yet been exercised against real hardware —
-// Phase 1's own HPRT0-polling bring-up needed ~20 real-hardware
-// round trips to get right, and every one of those rounds was only
-// possible because a human was there to power-cycle the board and
-// paste the console log back. This section was written and built
-// (QEMU + Duo) without that loop closed, so treat it as a well-reasoned
-// first attempt, not a verified one — the very first real test is
-// watching what happens when an actual connect event reaches
-// usb_enumerate_device() below.
+// IMPORTANT: implemented from real, sourced DWC2 register facts
+// (U-Boot's own chunk_msg()/_submit_control_msg()/wait_for_chhltd(),
+// duo-buildroot-sdk's u-boot-2021.10/drivers/usb/host/dwc2.c),
+// confirmed working on real hardware — full device enumeration through
+// the Duo IO board's own onboard hub, including hub-class
+// SET_CONFIGURATION/SetPortFeature(PORT_POWER)/GetPortStatus, all
+// verified against real silicon (see docs/devlog.md).
 
 // Single host-channel transfer: programs HCTSIZ/HCDMA/HCCHAR, enables
 // the channel, and waits for CHHLTD (channel halted — the transfer
@@ -953,257 +956,4 @@ fn bool usb_set_port_feature(uint dev_addr, uint max_packet0, uint port, uint fe
     setup[6] = (char)0;
     setup[7] = (char)0;
     return usb_control_transfer(dev_addr, max_packet0, &setup[0], null, 0, true);
-}
-
-// Orchestrates a full enumeration: bus reset -> read enough of the
-// device descriptor to learn bMaxPacketSize0 -> SET_ADDRESS -> read
-// the full device descriptor at the new address -> if it's a hub
-// (the expected case, given the IO board's own onboard hub — see
-// docs/devlog.md), fetch the hub descriptor and GET_PORT_STATUS every
-// downstream port, printing what's plugged in behind it. Called from
-// main()'s own polling loop on a real, debounced connect event — not
-// at init time (see this file's own earlier history for why an
-// unconditional reset-at-init caused a false-positive latch).
-fn void usb_enumerate_device()
-{
-    print("usbd: enumerating device...\n");
-
-    // Real bus reset — required by the USB 2.0 spec before a freshly
-    // connected device will respond to anything at all. 50ms pulse is
-    // the spec minimum; U-Boot's own dwc2_init_common() uses the same
-    // value.
-    uint hprt0 = usb_reg_read(USB_HPRT0);
-    hprt0 &= ~USB_HPRT0_W1C_MASK;
-    hprt0 |= USB_HPRT0_PRTRST;
-    usb_reg_write(USB_HPRT0, hprt0);
-    ulong rst_start = rdtime();
-    while (rdtime() - rst_start < usb_us_to_ticks(50000)) { yield(); }
-    hprt0 = usb_reg_read(USB_HPRT0);
-    hprt0 &= ~(USB_HPRT0_W1C_MASK | USB_HPRT0_PRTRST);
-    usb_reg_write(USB_HPRT0, hprt0);
-
-    // Settle delay — U-Boot's own dwc2_init_common() comment: "gives
-    // the host controller a bit time... fixes the USB detection
-    // problems with some problematic USB keys," 1 full second. Matched
-    // exactly rather than trimmed, since this whole path is untested
-    // on real hardware yet.
-    ulong settle_start = rdtime();
-    while (rdtime() - settle_start < usb_us_to_ticks(1000000)) { yield(); }
-
-    print_hprt0_raw("post-enum-reset");
-
-    char[18] desc_buf;
-
-    // Bootstrap MPS0 for the very first transfer, before we've read
-    // any descriptor at all. For full/low-speed devices this is
-    // genuinely ambiguous (bMaxPacketSize0 can be 8/16/32/64) hence
-    // the traditional "assume 8, it's always safe" trick — but for a
-    // HIGH-SPEED device, USB 2.0 spec section 5.5.3 makes EP0's MPS0 a
-    // fixed, guaranteed 64, not something to discover at all. A real
-    // hardware round hit a persistent (non-transient, all 3 retries
-    // identical) STALL on this exact request while HPRT0.PRTSPD read
-    // 0 (high-speed, confirmed via print_hprt0_raw above) — using 8
-    // instead of the spec-mandated 64 here is a real, concrete
-    // mismatch between what this driver tells the host channel to
-    // expect and what a genuinely high-speed device expects on the
-    // wire, and a plausible explanation for exactly that failure.
-    uint bootstrap_mps0 = ((hprt0 & USB_HPRT0_PRTSPD_MASK) >> USB_HPRT0_PRTSPD_SHIFT) == 0 ? 64 : 8;
-    print("usbd: bootstrap MPS0=");
-    print_uint(bootstrap_mps0);
-    print(" (");
-    print(bootstrap_mps0 == 64 ? "high-speed, spec-fixed" : "full/low-speed, safe default");
-    print(")\n");
-
-    // Retried up to 3 times on failure — kept even after the MPS0 fix
-    // above, since a transient STALL on the very first post-reset
-    // request is also a real, independently known possibility (real
-    // USB host stacks retry this for the same reason, e.g. Linux's own
-    // usbcore).
-    bool got_initial_desc = false;
-    for (int attempt = 0; attempt < 3; attempt++)
-    {
-        if (usb_get_descriptor(0, bootstrap_mps0, USB_DESC_TYPE_DEVICE, 0, &desc_buf[0], 8))
-        {
-            got_initial_desc = true;
-            break;
-        }
-        print("usbd: initial GET_DESCRIPTOR(8) attempt ");
-        print_uint((uint)(attempt + 1));
-        print(" failed, retrying\n");
-        ulong retry_start = rdtime();
-        while (rdtime() - retry_start < usb_us_to_ticks(100000)) { yield(); }
-    }
-    if (!got_initial_desc)
-    {
-        print("usbd: enumeration failed: initial GET_DESCRIPTOR(8) (all attempts)\n");
-        return;
-    }
-    uint max_packet0 = (uint)desc_buf[7] & 0xFF;
-    print("usbd: bMaxPacketSize0=");
-    print_uint(max_packet0);
-    print("\n");
-
-    if (!usb_set_address(max_packet0, USB_ENUM_ADDR))
-    {
-        print("usbd: enumeration failed: SET_ADDRESS\n");
-        return;
-    }
-
-    // SetAddress recovery interval — USB 2.0 spec requires the host
-    // wait at least 2ms before expecting the device to respond at its
-    // new address; a generous 10ms margin here.
-    ulong addr_settle = rdtime();
-    while (rdtime() - addr_settle < usb_us_to_ticks(10000)) { yield(); }
-
-    if (!usb_get_descriptor(USB_ENUM_ADDR, max_packet0, USB_DESC_TYPE_DEVICE, 0, &desc_buf[0], 18))
-    {
-        print("usbd: enumeration failed: GET_DESCRIPTOR(18) at new address\n");
-        return;
-    }
-
-    uint device_class = (uint)desc_buf[4] & 0xFF;
-    uint vendor_id  = ((uint)desc_buf[8]  & 0xFF) | (((uint)desc_buf[9]  & 0xFF) << 8);
-    uint product_id = ((uint)desc_buf[10] & 0xFF) | (((uint)desc_buf[11] & 0xFF) << 8);
-
-    print("usbd: enumerated device: class=0x");
-    print_hex8(device_class);
-    print(" vid=0x");
-    print_hex8((vendor_id >> 8) & 0xFF);
-    print_hex8(vendor_id & 0xFF);
-    print(" pid=0x");
-    print_hex8((product_id >> 8) & 0xFF);
-    print_hex8(product_id & 0xFF);
-    print("\n");
-
-    if (device_class == USB_CLASS_HUB)
-    {
-        print("usbd: device is a hub — fetching hub descriptor and per-port status\n");
-
-        // SET_CONFIGURATION — required by USB 2.0 spec before most
-        // per-port hub operations are valid; GetHubDescriptor above is
-        // allowed in the unconfigured "Address" state, but
-        // GetPortStatus is not. Hardcoded to configuration 1 (this
-        // driver never fetches the configuration descriptor at all —
-        // basic hubs almost universally have exactly one configuration,
-        // and Phase 2's own scope doesn't need anything from that
-        // descriptor beyond confirming this).
-        if (!usb_set_configuration(USB_ENUM_ADDR, max_packet0, 1))
-        {
-            print("usbd: SET_CONFIGURATION failed\n");
-            return;
-        }
-
-        char[9] hub_desc;
-        if (!usb_get_hub_descriptor(USB_ENUM_ADDR, max_packet0, &hub_desc[0], 9))
-        {
-            print("usbd: hub descriptor fetch failed\n");
-            return;
-        }
-        uint num_ports = (uint)hub_desc[2] & 0xFF;
-        print("usbd: hub has ");
-        print_uint(num_ports);
-        print(" ports\n");
-
-        // Power on every port before querying status — required by
-        // USB 2.0 spec: an unpowered port does no connect detection at
-        // all and always reports empty, regardless of what's actually
-        // plugged in. A real hardware round hit exactly that (every
-        // port reporting "empty" with a real device attached before
-        // boot) after skipping this step entirely. bPwrOn2PwrGood
-        // (hub descriptor byte 5, in 2ms units) is the hub's own
-        // specified settle time before port status is meaningful;
-        // floored at 20ms in case a hub reports something tiny.
-        uint pwr_on_2_pwr_good_ms = ((uint)hub_desc[5] & 0xFF) * 2;
-        if (pwr_on_2_pwr_good_ms < 20) { pwr_on_2_pwr_good_ms = 20; }
-        for (uint port = 1; port <= num_ports; port++)
-        {
-            if (!usb_set_port_feature(USB_ENUM_ADDR, max_packet0, port, USB_HUB_FEATURE_PORT_POWER))
-            {
-                print("usbd: hub port ");
-                print_uint(port);
-                print(": SetPortFeature(PORT_POWER) failed\n");
-            }
-        }
-        ulong pwr_settle_start = rdtime();
-        while (rdtime() - pwr_settle_start < usb_us_to_ticks((ulong)pwr_on_2_pwr_good_ms * 1000)) { yield(); }
-
-        for (uint port = 1; port <= num_ports; port++)
-        {
-            char[4] port_status;
-            if (usb_get_port_status(USB_ENUM_ADDR, max_packet0, port, &port_status[0]))
-            {
-                bool port_connected = ((uint)port_status[0] & 0x1) != 0;
-                print("usbd: hub port ");
-                print_uint(port);
-                print(": ");
-                print(port_connected ? "connected\n" : "empty\n");
-            }
-            else
-            {
-                print("usbd: hub port ");
-                print_uint(port);
-                print(": GET_PORT_STATUS failed\n");
-            }
-        }
-    }
-    else
-    {
-        print("usbd: non-hub device (class 0x");
-        print_hex8(device_class);
-        print(") — no further action this phase\n");
-    }
-}
-
-fn void main() @export("main")
-{
-    usb_dma_paddr = usbd_info();
-    usbd_init();
-    print("usbd: init done, polling HPRT0 for connect/disconnect\n");
-
-    bool last_connected = false;
-    int poll_count = 0;
-    for (;;)
-    {
-        uint hprt0 = usb_reg_read(USB_HPRT0);
-        bool connected = (hprt0 & USB_HPRT0_PRTCONNSTS) != 0;
-        if (connected != last_connected)
-        {
-            print(connected ? "usbd: device connected\n" : "usbd: device disconnected\n");
-            last_connected = connected;
-            if (connected)
-            {
-                usb_enumerate_device();
-            }
-        }
-
-        // Periodic raw diagnostic dump (~every 2s, not gated on
-        // PRTCONNSTS changing) — PRTLNSTS in particular is a direct
-        // sample of the D+/D- differential pair, true regardless of
-        // whether the core's own connect-detect logic ever reacts. See
-        // print_hprt0_raw's own comment for how to read it.
-        poll_count += 1;
-        if (poll_count % 20 == 0)
-        {
-            print_hprt0_raw("poll");
-        }
-
-        // Clear PRTCONNDET (W1C) if it's set, without disturbing any
-        // other W1C bit — keeps the register tidy for whenever a later
-        // phase starts consulting it instead of just PRTCONNSTS.
-        if (hprt0 & USB_HPRT0_PRTCONNDET)
-        {
-            uint clear = (hprt0 & ~USB_HPRT0_W1C_MASK) | USB_HPRT0_PRTCONNDET;
-            usb_reg_write(USB_HPRT0, clear);
-        }
-
-        // yield()-paced, not a bare spin — this is the loop that
-        // actually deadlocked the system on real hardware the first
-        // time (docs/devlog.md): a genuinely syscall-free poll here
-        // can never be preempted once the shell is idling on a
-        // keystroke (SYS_GETCHAR), since this kernel's own design
-        // means that alone holds interrupts globally disabled for as
-        // long as it lasts.
-        ulong poll_start = rdtime();
-        while (rdtime() - poll_start < usb_us_to_ticks(100000)) { yield(); }
-    }
 }
