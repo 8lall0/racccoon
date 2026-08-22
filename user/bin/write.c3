@@ -10,21 +10,16 @@ import std::nolibc::main_stub;
 // text > file"), so this takes the content directly as its own second
 // argument rather than trying to imitate a real Unix "write" (which
 // means something else entirely — talking to another user's terminal).
-fn void main() {
-    char** argv;
-    int argc = get_argv(&argv);
-    if (argc != 2) {
+fn void main(String[] args) {
+    if (args.len != 2) {
         print("usage: write <path> <text>\n");
         return;
     }
 
-    int len = 0;
-    while (argv[1][len] != 0) len++;
-
-    int written = fs_write(argv[0], argv[1], len);
+    int written = fs_write(args[0].ptr, args[1].ptr, (int)args[1].len);
     if (written < 0) {
         print("write: ");
-        print(argv[0]);
+        print(args[0].ptr);
         print(": failed\n");
     }
 }

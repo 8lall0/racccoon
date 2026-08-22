@@ -4,6 +4,54 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-22 (69) — Idiomatic argc/argv, following on from `main()` (entry 68)
+
+Direct follow-up to entry 68's `@main_no_args` addition: the c3 spec's
+own entry-point section also defines `fn void main(String[] args)` as
+the idiomatic args-taking form (`MAIN_TYPE_ARGS` in the compiler's own
+`sema_decls.c`), backed by a second forwarding macro, `@main_args`.
+
+Every real stdlib version of that macro heap-allocates its `String[]`
+(`mem::alloc_array`/`free`) — no allocator exists in this freestanding
+build, so `lib/std/_nolibc/main_stub.c3` (8lall0/c3c fork) gets a
+fixed-size static-array version instead (32 entries, matching the
+convention the old `argv_storage` mechanism it replaces already used).
+
+One real bug caught before it shipped, not just a mechanical
+translation: the compiler's synthetic wrapper declares `argv` as a
+genuine `char**` (the standard C-ABI type), but racccoon's own
+`SYS_EXEC` doesn't actually hand off a real pointer array — `user.c3`'s
+own `exec()` packs argv as a single NUL-separated blob ("foo\0bar\0"),
+the only encoding that survives being copied as flat bytes into a
+freshly exec'd process's address space. `@main_args` reinterprets the
+`char**` as that blob's raw base address and walks it sequentially,
+not `argv[i]`-indexes it — verified by first testing the naive
+(wrong) `argv[i]` version in isolation, confirming it does NOT match
+this project's own wire format on inspection, before it ever touched
+a real racccoon file.
+
+Converted every real consumer (`cat`/`ls`/`mv`/`mkdir`/`write`/`rm`/
+`echod` — 7 files) from the old `char** argv; int argc = get_argv(&argv);`
+pattern to plain `fn void main(String[] args)`. Two of them got
+genuinely simpler in the process: `write.c3` and `echod.c3` both used
+to hand-scan for a NUL terminator to get a string's length; `args[i].len`
+replaces that outright. With every consumer converted, the old
+`exec_argc`/`exec_argv_blob`/`argv_storage`/`get_argv()` machinery in
+`user.c3` was genuinely dead — removed, and `start()` simplified
+(`a0`/`a1` now pass straight through as `main()`'s real parameters,
+instead of being stashed into globals first).
+
+Verified end to end, not just "it compiles": a `write`→`cat` round
+trip on real content, `ls` before/after `mv`/`rm`, and `argvtest`'s
+own IPC-reply check — first scripted against QEMU (a real bug in the
+test harness itself surfaced here too: `shell.c3`'s own input loop
+only recognizes `\r` as line-end, not `\n` — a `\n`-only test harness
+just accumulates characters silently forever instead of ever
+dispatching a command), then the identical sequence on real Duo
+hardware against ext2 (case-preserving, unlike FAT32 — `f.txt`/`g.txt`
+stayed lowercase there, a nice independent confirmation the real
+argv content survived intact).
+
 ## 2026-08-22 (68) — User-space directory refactor (steps 1-3), and an idiomatic `main()`
 
 Two related pieces of housekeeping, both pure behavior-preserving

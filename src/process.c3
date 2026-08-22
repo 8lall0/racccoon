@@ -540,15 +540,16 @@ fn void user_entry() @naked @noinline @noreturn
 	// otherwise unchanged from the RV32 version.
 	//
 	// a0/a1 explicitly zeroed: user/user.c3's start() (this process's
-	// very first instruction after sret) stashes a0/a1 as argc/its own
-	// argv blob address — SYS_EXEC (entry.c3) sets both deliberately for
-	// an exec()'d process, but this path is for a brand new process
-	// create_process() is booting for the first time, where a0/a1 would
-	// otherwise still hold whatever the kernel's own boot-time code last
-	// left in the physical registers. Zeroing here is what makes
-	// get_argv() (user.c3) reliably report argc=0 for every
-	// create_process()'d server (echod, diskd, fsd, procd, envd, shell)
-	// instead of reading that leftover garbage as if it meant something.
+	// very first instruction after sret) passes a0/a1 straight through
+	// as main()'s own argc/argv parameters — SYS_EXEC (entry.c3) sets
+	// both deliberately for an exec()'d process, but this path is for a
+	// brand new process create_process() is booting for the first time,
+	// where a0/a1 would otherwise still hold whatever the kernel's own
+	// boot-time code last left in the physical registers. Zeroing here
+	// is what makes every create_process()'d server (echod, diskd, fsd,
+	// procd, envd, shell) reliably see an empty args (String[] of
+	// length 0, via std::nolibc::main_stub's @main_args) instead of
+	// reading that leftover garbage as if it meant something.
 	asm(`
         li t0, 0x1000000
         csrw sepc, t0

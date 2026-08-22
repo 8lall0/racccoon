@@ -6,19 +6,18 @@ import std::nolibc::main_stub;
 // readfile2/readsubfile/readsubfile2 (all four hardcoded to a fixed
 // path) — one path argument, prints its content. Multi-file support
 // real cat has isn't added: nothing in this project ever needed it.
-fn void main() {
-    char** argv;
-    int argc = get_argv(&argv);
-    if (argc != 1) {
+fn void main(String[] args) {
+    if (args.len != 1) {
         print("usage: cat <path>\n");
         return;
     }
+    char* path = args[0].ptr;
 
     char[1024] buf @noinit;
-    int len = fs_read(argv[0], &buf, 1023);
+    int len = fs_read(path, &buf, 1023);
     if (len < 0) {
         print("cat: ");
-        print(argv[0]);
+        print(path);
         print(": not found\n");
         return;
     }

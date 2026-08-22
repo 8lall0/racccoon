@@ -102,23 +102,20 @@ struct P9_fid_entry
 }
 P9_fid_entry[P9_FID_MAX] p9_fids;
 
-fn void main() {
+fn void main(String[] args) {
     p9_init_tree();
 
-    // If exec()'d with an argument (user/shell.c3's argvtest), argv[0]
+    // If exec()'d with an argument (user/shell.c3's argvtest), args[0]
     // replaces the hardcoded P9_TREAD reply below — concrete, observable
     // proof argv actually reached this process, not just that exec()
     // itself returned success. Boot-time (pid 2, no argv) and runtest's
-    // own no-args exec() both get argc=0 here, so the canned reply stays
-    // exactly what it's always been for them.
-    char** argv;
-    int argc = get_argv(&argv);
+    // own no-args exec() both get an empty args here, so the canned
+    // reply stays exactly what it's always been for them.
     char* canned = "hello from 9p-lite\n";
     int canned_len = 21;
-    if (argc > 0) {
-        canned = argv[0];
-        canned_len = 0;
-        while (canned[canned_len] != 0) canned_len++;
+    if (args.len > 0) {
+        canned = args[0].ptr;
+        canned_len = (int)args[0].len;
     }
 
     char[64] buf @noinit;

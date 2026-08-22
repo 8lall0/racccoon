@@ -7,17 +7,14 @@ import std::nolibc::main_stub;
 // (all hardcoded to fixed paths) — plain delete (files and empty
 // directories, matching fs_delete's own existing behavior) or, with a
 // leading -r flag, recursive delete (fs_delete_recursive).
-fn void main() {
-    char** argv;
-    int argc = get_argv(&argv);
-
+fn void main(String[] args) {
     int result;
     char* target;
-    if (argc == 1) {
-        target = argv[0];
+    if (args.len == 1) {
+        target = args[0].ptr;
         result = fs_delete(target);
-    } else if (argc == 2 && strcmp(argv[0], "-r") == 0) {
-        target = argv[1];
+    } else if (args.len == 2 && strcmp(args[0].ptr, "-r") == 0) {
+        target = args[1].ptr;
         result = fs_delete_recursive(target);
     } else {
         print("usage: rm <path> | rm -r <path>\n");
