@@ -4,6 +4,50 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-22 (70) — Directory refactor step 4: `ethd.c3` split into `dwmac.c3`/`ephy.c3`/`ethd.c3`
+
+Continuation of entry 68's refactor plan. `ethd.c3` (673 lines) had
+three genuinely distinct layers tangled into one file: generic DW
+MAC/MDIO register access, this board's own Cvitek embedded-PHY analog
+bring-up, and the orchestration deciding when to call either. Split
+into three, same shape as the earlier `usbd.c3` → `dwc2.c3`/`usbd.c3`
+split (entry 68):
+
+- `user/net/dwmac.c3`: `ETH_MAC_*`/`ETH_MII_*`/standard IEEE 802.3
+  `MII_*` constants, `mmio_read32`/`write32`, `mac_reg_read`/`write`,
+  `mdio_read`/`write`/`wait_ready`, `eth_us_to_ticks`. The layer any
+  other real DW-MAC board could reuse unchanged.
+- `user/net/ephy.c3`: everything Cvitek-embedded-PHY-specific —
+  `ETH_PHY_*`/`ETH_CLK_*`/`ETH_LED_*`/`ETH_SD1_*`/`ETH_EFUSE_*`
+  constants, `phy_reg_read`/`write`/`clk_reg_*`/`led_pinmux_write`/
+  `sd1_selphy_write`/`efuse0_read`/`efuse1_read`, `eth_phy_init()`,
+  `eth_phy_led_pinmux()`, and the ~200-line `eth_phy_analog_init()`
+  (the faithful `cv182xa_ephy_init()` translation).
+- `user/net/ethd.c3`: `main()` and `ethd_init()`'s own sequencing
+  only.
+
+One real lesson from this split specifically (didn't come up in the
+USB split, since `dwc2.c3` was the only register-level file there):
+`dwmac.c3` and `ephy.c3` are both `module user;` — same module, no
+import needed for cross-file visibility — which means a raw
+`mmio_read32`/`write32` genuinely can't be duplicated in both files
+the way `usb_us_to_ticks`-style helpers safely are duplicated across
+*different* modules elsewhere in this codebase (e.g. `virtio.c3` vs.
+`dwc2.c3` each having their own copy) — same-module duplicate function
+*definitions* are a real compile error ("would shadow a previous
+declaration"), not just untidy. Fixed by defining `mmio_read32`/
+`write32` once in `dwmac.c3` and having `ephy.c3` call them directly,
+same as `eth_us_to_ticks` already had to.
+
+Pure code motion, no logic changes — verified byte-identical real-
+hardware behavior before and after: full PHY bring-up sequence, MDIO
+scan finding the PHY at address 0, BMCR fixup, and live link-up/
+link-down sensing, plus `usbd`'s own hub enumeration (same shared
+kernel image) unaffected.
+
+Step 5 (`sdd.c3` → `sdhci.c3`/`sdd.c3`) is the last one in the
+original refactor plan, still pending.
+
 ## 2026-08-22 (69) — Idiomatic argc/argv, following on from `main()` (entry 68)
 
 Direct follow-up to entry 68's `@main_no_args` addition: the c3 spec's
