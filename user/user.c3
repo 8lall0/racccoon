@@ -39,6 +39,7 @@ const int SYS_EXEC         = 24; // replaces the calling process's own image in 
 const int SYS_SETUID       = 25; // sets the caller's own uid, only while still root — see src/entry.c3's case
 const int SYS_NS_MOUNT_WAIT = 26; // SYS_NS_MOUNT, but blocks (bounded by a retry count) until the target actually posts — see src/entry.c3's case
 const int SYS_YIELD         = 27; // voluntarily gives up the rest of this process's timeslice once — see src/entry.c3's case
+const int SYS_USBD_INFO     = 28; // usbd-only: returns its DMA buffer physical address — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -692,6 +693,14 @@ fn int ns_mount_wait(char* prefix, char* srv_name, ulong max_attempts) @export("
 // inefficiency.
 fn void yield() @export("yield") {
     syscall(SYS_YIELD, 0, 0, 0);
+}
+
+// usbd-only, called once at its own startup — see process.c3's
+// usbd_dma_paddr for why this address can't be known at compile time.
+fn uptr usbd_info() @export("usbd_info") {
+    uptr dma_paddr;
+    syscall(SYS_USBD_INFO, (long)&dma_paddr, 0, 0);
+    return dma_paddr;
 }
 
 // Blocks until the process with this pid no longer exists — e.g. a

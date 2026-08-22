@@ -1,5 +1,7 @@
 module user;
 
+import std::nolibc::mem;
+
 // usbd: USB host-controller driver for the Milk-V Duo — Phase 1 only
 // (see docs/devlog.md and the plan file this was built from). Scope,
 // deliberately narrow: bring the Synopsys DesignWare USB2 OTG core
@@ -59,6 +61,58 @@ const uint USB_HPRT0    = 0x440;
 // written to them — the signature of an entire clock domain still
 // gated off, not a wrong bit value.
 const uint USB_PCGCCTL  = 0xE00;
+
+// --- Host channel 0 registers (Phase 2: control transfers) — real
+// devices behind the root port that this driver enumerates directly
+// (the IO board's own hub, and later whatever mass-storage device
+// enumeration finds behind it) are full-speed and directly on the
+// root port from the DWC2 core's own point of view, so this driver
+// only ever uses one channel, no split transactions. Offsets/bit
+// fields sourced the same way as everything else in this file —
+// duo-buildroot-sdk's own U-Boot dwc2.c/.h (struct dwc2_hc_regs,
+// channel 0 base 0x500, 0x20 bytes per channel).
+const uint USB_HC0_HCCHAR   = 0x500;
+const uint USB_HC0_HCSPLT   = 0x504;
+const uint USB_HC0_HCINT    = 0x508;
+const uint USB_HC0_HCINTMSK = 0x50C;
+const uint USB_HC0_HCTSIZ   = 0x510;
+const uint USB_HC0_HCDMA    = 0x514;
+
+const uint USB_HCCHAR_MPS_MASK      = 0x7FF;      // bits 10:0
+const uint USB_HCCHAR_EPNUM_SHIFT   = 11;
+const uint USB_HCCHAR_EPDIR         = 1 << 15;    // 1 = IN
+const uint USB_HCCHAR_LSPDDEV       = 1 << 17;    // low-speed device — never set, this driver only ever talks to full-speed devices
+const uint USB_HCCHAR_EPTYPE_SHIFT  = 18;
+const uint USB_HCCHAR_EPTYPE_CONTROL = 0;
+const uint USB_HCCHAR_MULTICNT_SHIFT = 20;
+const uint USB_HCCHAR_DEVADDR_SHIFT = 22;
+const uint USB_HCCHAR_CHDIS         = 1 << 30;
+const uint USB_HCCHAR_CHEN          = 0x80000000; // bit 31 — see USB_GRSTCTL_AHBIDLE's own comment for why bit-31 constants use a plain hex literal
+
+const uint USB_HCINT_XFERCOMP   = 1 << 0;
+const uint USB_HCINT_CHHLTD     = 1 << 1;
+const uint USB_HCINT_STALL      = 1 << 3;
+const uint USB_HCINT_NAK        = 1 << 4;
+const uint USB_HCINT_XACTERR    = 1 << 7;
+const uint USB_HCINT_BBLERR     = 1 << 8;
+const uint USB_HCINT_FRMOVRUN   = 1 << 9;
+const uint USB_HCINT_ALL_MASK   = 0x3FFF; // enough bits to clear every real HCINT status this core defines
+
+const uint USB_HCTSIZ_XFERSIZE_MASK = 0x7FFFF;   // bits 18:0
+const uint USB_HCTSIZ_PKTCNT_SHIFT  = 19;
+const uint USB_HCTSIZ_PID_SHIFT     = 29;
+
+const uint USB_PID_DATA0 = 0;
+const uint USB_PID_DATA1 = 2;
+const uint USB_PID_SETUP = 3;
+
+// --- USB standard requests/descriptors (USB 2.0 spec, chapter 9 and
+// chapter 11 for the hub class bits) — protocol constants, not
+// hardware-specific at all.
+const uint USB_DESC_TYPE_DEVICE = 1;
+const uint USB_DESC_TYPE_HUB    = 0x29;
+const uint USB_CLASS_HUB        = 0x09;
+const uint USB_ENUM_ADDR        = 1; // the one address this driver ever assigns — Phase 2 only ever enumerates a single device at a time
 
 // GOTGCTL — "Host only" mode bits, per the real CV1800B/CV1801B
 // datasheet (register reference, section 12.6): a second,
@@ -217,6 +271,13 @@ fn void clk_reg_write(uint offset, uint v) { mmio_write32((uptr)(USB_CLK_BASE + 
 fn uint pinmux_read(uint offset) { return mmio_read32((uptr)(USB_PINMUX_BASE + offset)); }
 fn void pinmux_write(uint offset, uint v) { mmio_write32((uptr)(USB_PINMUX_BASE + offset), v); }
 
+// Phase 2's single-page DMA buffer — see process.c3's usbd_dma_paddr
+// for the full explanation. Set once in main(), before usbd_init()
+// runs. Real physical address AND the virtual address usbd itself
+// reads/writes through — identity-mapped, same as every device MMIO
+// page this driver already touches.
+uptr usb_dma_paddr;
+
 const char[16] HEX_DIGITS = "0123456789abcdef";
 
 fn void print_hex32(uint v)
@@ -225,6 +286,12 @@ fn void print_hex32(uint v)
     {
         putchar(HEX_DIGITS[(v >> shift) & 0xF]);
     }
+}
+
+fn void print_hex8(uint v)
+{
+    putchar(HEX_DIGITS[(v >> 4) & 0xF]);
+    putchar(HEX_DIGITS[v & 0xF]);
 }
 
 fn void print_hprt0_raw(char* label)
@@ -572,8 +639,480 @@ fn void usbd_init()
     print(" (0=A-device/host, 1=B-device/device)\n");
 }
 
+// --- Phase 2: control transfers over host channel 0, and the
+// enumeration flow built on top of them.
+//
+// IMPORTANT: this section is implemented from real, sourced DWC2
+// register facts (U-Boot's own chunk_msg()/_submit_control_msg()/
+// wait_for_chhltd(), duo-buildroot-sdk's u-boot-2021.10/drivers/usb/
+// host/dwc2.c) but has NOT yet been exercised against real hardware —
+// Phase 1's own HPRT0-polling bring-up needed ~20 real-hardware
+// round trips to get right, and every one of those rounds was only
+// possible because a human was there to power-cycle the board and
+// paste the console log back. This section was written and built
+// (QEMU + Duo) without that loop closed, so treat it as a well-reasoned
+// first attempt, not a verified one — the very first real test is
+// watching what happens when an actual connect event reaches
+// usb_enumerate_device() below.
+
+// Single host-channel transfer: programs HCTSIZ/HCDMA/HCCHAR, enables
+// the channel, and waits for CHHLTD (channel halted — the transfer
+// attempt is over, one way or another). Returns 0 on real success
+// (XFERCOMP), 1 on NAK/FRMOVRUN (caller should retry — completely
+// normal while a device is still processing a request), -1 on
+// anything else (STALL, transaction/babble error, or this function's
+// own CHHLTD timeout).
+fn int hc_transfer_once(uint dev_addr, bool is_in, uint pid, uint max_packet, uint xfer_len, uint num_packets, uint* actual_len_out)
+{
+    uint hctsiz = (xfer_len & USB_HCTSIZ_XFERSIZE_MASK)
+        | (num_packets << USB_HCTSIZ_PKTCNT_SHIFT)
+        | (pid << USB_HCTSIZ_PID_SHIFT);
+    usb_reg_write(USB_HC0_HCTSIZ, hctsiz);
+    usb_reg_write(USB_HC0_HCDMA, (uint)usb_dma_paddr);
+
+    uint hcchar = (max_packet & USB_HCCHAR_MPS_MASK)
+        | (is_in ? USB_HCCHAR_EPDIR : 0)
+        | (USB_HCCHAR_EPTYPE_CONTROL << USB_HCCHAR_EPTYPE_SHIFT)
+        | (1 << USB_HCCHAR_MULTICNT_SHIFT)
+        | (dev_addr << USB_HCCHAR_DEVADDR_SHIFT);
+    usb_reg_write(USB_HC0_HCCHAR, hcchar);
+
+    // Explicitly disable split transactions — U-Boot's own
+    // dwc_otg_hc_init() always writes this as part of channel setup
+    // (this driver never touches HCSPLT at all otherwise). A real gap:
+    // if this register isn't reliably 0 at reset and a stray SPLTENA
+    // bit were set, the core would attempt split-transaction protocol
+    // against a device that isn't behind a split (every device this
+    // driver talks to is directly on the root port), which would
+    // plausibly produce exactly the kind of persistent STALL a real
+    // hardware round hit on the very first control transfer attempted.
+    usb_reg_write(USB_HC0_HCSPLT, 0);
+
+    // Clear stale interrupt state before this attempt — standard DWC2
+    // idiom (matches U-Boot's own transfer_chunk()), same reasoning as
+    // every other W1C register this driver already clears before use.
+    usb_reg_write(USB_HC0_HCINT, USB_HCINT_ALL_MASK);
+
+    usb_reg_write(USB_HC0_HCCHAR, hcchar | USB_HCCHAR_CHEN);
+
+    ulong start = rdtime();
+    ulong budget = usb_us_to_ticks(2000000);
+    uint hcint;
+    for (;;)
+    {
+        hcint = usb_reg_read(USB_HC0_HCINT);
+        if (hcint & USB_HCINT_CHHLTD) break;
+        if (rdtime() - start > budget)
+        {
+            print("usbd: hc_transfer_once timed out waiting for CHHLTD, HCINT=0x");
+            print_hex32(hcint);
+            print("\n");
+            return -1;
+        }
+        yield();
+    }
+
+    uint hctsiz_after = usb_reg_read(USB_HC0_HCTSIZ);
+    uint remaining = hctsiz_after & USB_HCTSIZ_XFERSIZE_MASK;
+    *actual_len_out = xfer_len - remaining;
+
+    usb_reg_write(USB_HC0_HCINT, USB_HCINT_ALL_MASK);
+
+    if (hcint & USB_HCINT_XFERCOMP) return 0;
+    if (hcint & USB_HCINT_NAK) return 1;
+    if (hcint & USB_HCINT_FRMOVRUN) return 1;
+
+    print("usbd: hc_transfer_once real error, HCINT=0x");
+    print_hex32(hcint);
+    print(hcint & USB_HCINT_STALL ? " (STALL)" : "");
+    print(hcint & USB_HCINT_XACTERR ? " (XACTERR)" : "");
+    print(hcint & USB_HCINT_BBLERR ? " (BBLERR)" : "");
+    print("\n");
+    return -1;
+}
+
+// Full 3-stage control transfer: SETUP (always 8 bytes, PID=SETUP) ->
+// optional DATA stage (buf_len bytes, PID starts DATA1 — control
+// endpoints always restart their toggle at DATA1 after a SETUP stage,
+// regardless of any previous transfer's own final toggle state, so no
+// per-endpoint toggle tracking is needed here) -> STATUS stage (zero
+// length, opposite direction of the data stage, or IN if there was no
+// data stage at all). setup8 must point at exactly 8 bytes, formatted
+// per USB 2.0 spec chapter 9's own SETUP packet layout. On a
+// successful IN data stage, copies up to buf_len bytes (or however
+// many the device actually returned, if fewer) into out_buf.
+fn bool usb_control_transfer(uint dev_addr, uint max_packet0, char* setup8, void* out_buf, uint buf_len, bool data_is_in)
+{
+    mem::copy((void*)usb_dma_paddr, setup8, 8);
+
+    print("usbd: SETUP bytes:");
+    for (int i = 0; i < 8; i++)
+    {
+        putchar(' ');
+        print_hex8((uint)setup8[i] & 0xFF);
+    }
+    print("\n");
+
+    uint actual_len;
+    int result;
+    ulong nak_budget = usb_us_to_ticks(3000000);
+
+    ulong stage_start = rdtime();
+    for (;;)
+    {
+        result = hc_transfer_once(dev_addr, false, USB_PID_SETUP, max_packet0, 8, 1, &actual_len);
+        if (result == 0) break;
+        if (result == 1 && rdtime() - stage_start < nak_budget) { yield(); continue; }
+        print("usbd: control transfer failed at SETUP stage\n");
+        return false;
+    }
+
+    // Small settle delay before reprogramming the channel for the next
+    // stage — a real hardware round hit a persistent STALL on the very
+    // first DATA stage, immediately following a successful SETUP, with
+    // zero delay between CHHLTD firing and the channel being
+    // reprogrammed; this tests whether that back-to-back timing itself
+    // is the problem, independent of anything about the transfer's own
+    // content (which was separately confirmed correct via the raw
+    // SETUP byte dump above).
+    ulong interstage_start = rdtime();
+    while (rdtime() - interstage_start < usb_us_to_ticks(2000)) { yield(); }
+
+    if (buf_len > 0)
+    {
+        uint num_packets = (buf_len + max_packet0 - 1) / max_packet0;
+        // Every Phase 2 caller only ever does IN data stages (GET_*),
+        // so this is currently unreachable — kept for correctness
+        // anyway, symmetric with the IN-side copy below, since an OUT
+        // data stage without this would silently send whatever stale
+        // bytes were already in the DMA buffer.
+        if (!data_is_in)
+        {
+            mem::copy((void*)usb_dma_paddr, out_buf, buf_len);
+        }
+        stage_start = rdtime();
+        for (;;)
+        {
+            result = hc_transfer_once(dev_addr, data_is_in, USB_PID_DATA1, max_packet0, buf_len, num_packets, &actual_len);
+            if (result == 0) break;
+            if (result == 1 && rdtime() - stage_start < nak_budget) { yield(); continue; }
+            print("usbd: control transfer failed at DATA stage\n");
+            return false;
+        }
+        if (data_is_in && out_buf != null)
+        {
+            uint copy_len = actual_len < buf_len ? actual_len : buf_len;
+            mem::copy(out_buf, (void*)usb_dma_paddr, copy_len);
+        }
+
+        interstage_start = rdtime();
+        while (rdtime() - interstage_start < usb_us_to_ticks(2000)) { yield(); }
+    }
+
+    bool status_is_in = buf_len > 0 ? !data_is_in : true;
+    stage_start = rdtime();
+    for (;;)
+    {
+        result = hc_transfer_once(dev_addr, status_is_in, USB_PID_DATA1, max_packet0, 0, 1, &actual_len);
+        if (result == 0) break;
+        if (result == 1 && rdtime() - stage_start < nak_budget) { yield(); continue; }
+        print("usbd: control transfer failed at STATUS stage\n");
+        return false;
+    }
+
+    return true;
+}
+
+fn bool usb_get_descriptor(uint dev_addr, uint max_packet0, uint desc_type, uint desc_index, void* buf, uint len)
+{
+    char[8] setup;
+    setup[0] = (char)0x80; // IN, standard, device
+    setup[1] = (char)0x06; // GET_DESCRIPTOR
+    setup[2] = (char)desc_index;
+    setup[3] = (char)desc_type;
+    setup[4] = (char)0;
+    setup[5] = (char)0;
+    setup[6] = (char)(len & 0xFF);
+    setup[7] = (char)((len >> 8) & 0xFF);
+    return usb_control_transfer(dev_addr, max_packet0, &setup[0], buf, len, true);
+}
+
+fn bool usb_set_address(uint max_packet0, uint new_addr)
+{
+    char[8] setup;
+    setup[0] = (char)0x00; // OUT, standard, device
+    setup[1] = (char)0x05; // SET_ADDRESS
+    setup[2] = (char)(new_addr & 0xFF);
+    setup[3] = (char)0;
+    setup[4] = (char)0;
+    setup[5] = (char)0;
+    setup[6] = (char)0;
+    setup[7] = (char)0;
+    // Still addressed as 0 (the default address) — the device hasn't
+    // taken on its new address yet until this very request completes.
+    return usb_control_transfer(0, max_packet0, &setup[0], null, 0, true);
+}
+
+fn bool usb_set_configuration(uint dev_addr, uint max_packet0, uint config_value)
+{
+    char[8] setup;
+    setup[0] = (char)0x00; // OUT, standard, device
+    setup[1] = (char)0x09; // SET_CONFIGURATION
+    setup[2] = (char)(config_value & 0xFF);
+    setup[3] = (char)0;
+    setup[4] = (char)0;
+    setup[5] = (char)0;
+    setup[6] = (char)0;
+    setup[7] = (char)0;
+    return usb_control_transfer(dev_addr, max_packet0, &setup[0], null, 0, true);
+}
+
+fn bool usb_get_hub_descriptor(uint dev_addr, uint max_packet0, void* buf, uint len)
+{
+    char[8] setup;
+    setup[0] = (char)0xA0; // IN, class, device
+    setup[1] = (char)0x06; // GET_DESCRIPTOR
+    setup[2] = (char)0;
+    setup[3] = (char)USB_DESC_TYPE_HUB;
+    setup[4] = (char)0;
+    setup[5] = (char)0;
+    setup[6] = (char)(len & 0xFF);
+    setup[7] = (char)((len >> 8) & 0xFF);
+    return usb_control_transfer(dev_addr, max_packet0, &setup[0], buf, len, true);
+}
+
+fn bool usb_get_port_status(uint dev_addr, uint max_packet0, uint port, void* buf4)
+{
+    char[8] setup;
+    setup[0] = (char)0xA3; // IN, class, other (port)
+    setup[1] = (char)0x00; // GET_STATUS
+    setup[2] = (char)0;
+    setup[3] = (char)0;
+    setup[4] = (char)(port & 0xFF); // wIndex = port number, 1-based
+    setup[5] = (char)0;
+    setup[6] = (char)4;
+    setup[7] = (char)0;
+    return usb_control_transfer(dev_addr, max_packet0, &setup[0], buf4, 4, true);
+}
+
+const uint USB_HUB_FEATURE_PORT_POWER = 8; // USB 2.0 spec Table 11-17
+
+fn bool usb_set_port_feature(uint dev_addr, uint max_packet0, uint port, uint feature)
+{
+    char[8] setup;
+    setup[0] = (char)0x23; // OUT, class, other (port)
+    setup[1] = (char)0x03; // SET_FEATURE
+    setup[2] = (char)(feature & 0xFF);
+    setup[3] = (char)0;
+    setup[4] = (char)(port & 0xFF); // wIndex = port number, 1-based
+    setup[5] = (char)0;
+    setup[6] = (char)0;
+    setup[7] = (char)0;
+    return usb_control_transfer(dev_addr, max_packet0, &setup[0], null, 0, true);
+}
+
+// Orchestrates a full enumeration: bus reset -> read enough of the
+// device descriptor to learn bMaxPacketSize0 -> SET_ADDRESS -> read
+// the full device descriptor at the new address -> if it's a hub
+// (the expected case, given the IO board's own onboard hub — see
+// docs/devlog.md), fetch the hub descriptor and GET_PORT_STATUS every
+// downstream port, printing what's plugged in behind it. Called from
+// main()'s own polling loop on a real, debounced connect event — not
+// at init time (see this file's own earlier history for why an
+// unconditional reset-at-init caused a false-positive latch).
+fn void usb_enumerate_device()
+{
+    print("usbd: enumerating device...\n");
+
+    // Real bus reset — required by the USB 2.0 spec before a freshly
+    // connected device will respond to anything at all. 50ms pulse is
+    // the spec minimum; U-Boot's own dwc2_init_common() uses the same
+    // value.
+    uint hprt0 = usb_reg_read(USB_HPRT0);
+    hprt0 &= ~USB_HPRT0_W1C_MASK;
+    hprt0 |= USB_HPRT0_PRTRST;
+    usb_reg_write(USB_HPRT0, hprt0);
+    ulong rst_start = rdtime();
+    while (rdtime() - rst_start < usb_us_to_ticks(50000)) { yield(); }
+    hprt0 = usb_reg_read(USB_HPRT0);
+    hprt0 &= ~(USB_HPRT0_W1C_MASK | USB_HPRT0_PRTRST);
+    usb_reg_write(USB_HPRT0, hprt0);
+
+    // Settle delay — U-Boot's own dwc2_init_common() comment: "gives
+    // the host controller a bit time... fixes the USB detection
+    // problems with some problematic USB keys," 1 full second. Matched
+    // exactly rather than trimmed, since this whole path is untested
+    // on real hardware yet.
+    ulong settle_start = rdtime();
+    while (rdtime() - settle_start < usb_us_to_ticks(1000000)) { yield(); }
+
+    print_hprt0_raw("post-enum-reset");
+
+    char[18] desc_buf;
+
+    // Bootstrap MPS0 for the very first transfer, before we've read
+    // any descriptor at all. For full/low-speed devices this is
+    // genuinely ambiguous (bMaxPacketSize0 can be 8/16/32/64) hence
+    // the traditional "assume 8, it's always safe" trick — but for a
+    // HIGH-SPEED device, USB 2.0 spec section 5.5.3 makes EP0's MPS0 a
+    // fixed, guaranteed 64, not something to discover at all. A real
+    // hardware round hit a persistent (non-transient, all 3 retries
+    // identical) STALL on this exact request while HPRT0.PRTSPD read
+    // 0 (high-speed, confirmed via print_hprt0_raw above) — using 8
+    // instead of the spec-mandated 64 here is a real, concrete
+    // mismatch between what this driver tells the host channel to
+    // expect and what a genuinely high-speed device expects on the
+    // wire, and a plausible explanation for exactly that failure.
+    uint bootstrap_mps0 = ((hprt0 & USB_HPRT0_PRTSPD_MASK) >> USB_HPRT0_PRTSPD_SHIFT) == 0 ? 64 : 8;
+    print("usbd: bootstrap MPS0=");
+    print_uint(bootstrap_mps0);
+    print(" (");
+    print(bootstrap_mps0 == 64 ? "high-speed, spec-fixed" : "full/low-speed, safe default");
+    print(")\n");
+
+    // Retried up to 3 times on failure — kept even after the MPS0 fix
+    // above, since a transient STALL on the very first post-reset
+    // request is also a real, independently known possibility (real
+    // USB host stacks retry this for the same reason, e.g. Linux's own
+    // usbcore).
+    bool got_initial_desc = false;
+    for (int attempt = 0; attempt < 3; attempt++)
+    {
+        if (usb_get_descriptor(0, bootstrap_mps0, USB_DESC_TYPE_DEVICE, 0, &desc_buf[0], 8))
+        {
+            got_initial_desc = true;
+            break;
+        }
+        print("usbd: initial GET_DESCRIPTOR(8) attempt ");
+        print_uint((uint)(attempt + 1));
+        print(" failed, retrying\n");
+        ulong retry_start = rdtime();
+        while (rdtime() - retry_start < usb_us_to_ticks(100000)) { yield(); }
+    }
+    if (!got_initial_desc)
+    {
+        print("usbd: enumeration failed: initial GET_DESCRIPTOR(8) (all attempts)\n");
+        return;
+    }
+    uint max_packet0 = (uint)desc_buf[7] & 0xFF;
+    print("usbd: bMaxPacketSize0=");
+    print_uint(max_packet0);
+    print("\n");
+
+    if (!usb_set_address(max_packet0, USB_ENUM_ADDR))
+    {
+        print("usbd: enumeration failed: SET_ADDRESS\n");
+        return;
+    }
+
+    // SetAddress recovery interval — USB 2.0 spec requires the host
+    // wait at least 2ms before expecting the device to respond at its
+    // new address; a generous 10ms margin here.
+    ulong addr_settle = rdtime();
+    while (rdtime() - addr_settle < usb_us_to_ticks(10000)) { yield(); }
+
+    if (!usb_get_descriptor(USB_ENUM_ADDR, max_packet0, USB_DESC_TYPE_DEVICE, 0, &desc_buf[0], 18))
+    {
+        print("usbd: enumeration failed: GET_DESCRIPTOR(18) at new address\n");
+        return;
+    }
+
+    uint device_class = (uint)desc_buf[4] & 0xFF;
+    uint vendor_id  = ((uint)desc_buf[8]  & 0xFF) | (((uint)desc_buf[9]  & 0xFF) << 8);
+    uint product_id = ((uint)desc_buf[10] & 0xFF) | (((uint)desc_buf[11] & 0xFF) << 8);
+
+    print("usbd: enumerated device: class=0x");
+    print_hex8(device_class);
+    print(" vid=0x");
+    print_hex8((vendor_id >> 8) & 0xFF);
+    print_hex8(vendor_id & 0xFF);
+    print(" pid=0x");
+    print_hex8((product_id >> 8) & 0xFF);
+    print_hex8(product_id & 0xFF);
+    print("\n");
+
+    if (device_class == USB_CLASS_HUB)
+    {
+        print("usbd: device is a hub — fetching hub descriptor and per-port status\n");
+
+        // SET_CONFIGURATION — required by USB 2.0 spec before most
+        // per-port hub operations are valid; GetHubDescriptor above is
+        // allowed in the unconfigured "Address" state, but
+        // GetPortStatus is not. Hardcoded to configuration 1 (this
+        // driver never fetches the configuration descriptor at all —
+        // basic hubs almost universally have exactly one configuration,
+        // and Phase 2's own scope doesn't need anything from that
+        // descriptor beyond confirming this).
+        if (!usb_set_configuration(USB_ENUM_ADDR, max_packet0, 1))
+        {
+            print("usbd: SET_CONFIGURATION failed\n");
+            return;
+        }
+
+        char[9] hub_desc;
+        if (!usb_get_hub_descriptor(USB_ENUM_ADDR, max_packet0, &hub_desc[0], 9))
+        {
+            print("usbd: hub descriptor fetch failed\n");
+            return;
+        }
+        uint num_ports = (uint)hub_desc[2] & 0xFF;
+        print("usbd: hub has ");
+        print_uint(num_ports);
+        print(" ports\n");
+
+        // Power on every port before querying status — required by
+        // USB 2.0 spec: an unpowered port does no connect detection at
+        // all and always reports empty, regardless of what's actually
+        // plugged in. A real hardware round hit exactly that (every
+        // port reporting "empty" with a real device attached before
+        // boot) after skipping this step entirely. bPwrOn2PwrGood
+        // (hub descriptor byte 5, in 2ms units) is the hub's own
+        // specified settle time before port status is meaningful;
+        // floored at 20ms in case a hub reports something tiny.
+        uint pwr_on_2_pwr_good_ms = ((uint)hub_desc[5] & 0xFF) * 2;
+        if (pwr_on_2_pwr_good_ms < 20) { pwr_on_2_pwr_good_ms = 20; }
+        for (uint port = 1; port <= num_ports; port++)
+        {
+            if (!usb_set_port_feature(USB_ENUM_ADDR, max_packet0, port, USB_HUB_FEATURE_PORT_POWER))
+            {
+                print("usbd: hub port ");
+                print_uint(port);
+                print(": SetPortFeature(PORT_POWER) failed\n");
+            }
+        }
+        ulong pwr_settle_start = rdtime();
+        while (rdtime() - pwr_settle_start < usb_us_to_ticks((ulong)pwr_on_2_pwr_good_ms * 1000)) { yield(); }
+
+        for (uint port = 1; port <= num_ports; port++)
+        {
+            char[4] port_status;
+            if (usb_get_port_status(USB_ENUM_ADDR, max_packet0, port, &port_status[0]))
+            {
+                bool port_connected = ((uint)port_status[0] & 0x1) != 0;
+                print("usbd: hub port ");
+                print_uint(port);
+                print(": ");
+                print(port_connected ? "connected\n" : "empty\n");
+            }
+            else
+            {
+                print("usbd: hub port ");
+                print_uint(port);
+                print(": GET_PORT_STATUS failed\n");
+            }
+        }
+    }
+    else
+    {
+        print("usbd: non-hub device (class 0x");
+        print_hex8(device_class);
+        print(") — no further action this phase\n");
+    }
+}
+
 fn void main() @export("main")
 {
+    usb_dma_paddr = usbd_info();
     usbd_init();
     print("usbd: init done, polling HPRT0 for connect/disconnect\n");
 
@@ -587,6 +1126,10 @@ fn void main() @export("main")
         {
             print(connected ? "usbd: device connected\n" : "usbd: device disconnected\n");
             last_connected = connected;
+            if (connected)
+            {
+                usb_enumerate_device();
+            }
         }
 
         // Periodic raw diagnostic dump (~every 2s, not gated on

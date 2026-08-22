@@ -64,6 +64,16 @@ int sdd_pid = 0;
 // whenever a later phase needs it, same as diskd_pid/sdd_pid above.
 int usbd_pid = 0;
 
+// usbd's own single-page DMA buffer (Phase 2: control transfers over
+// the DWC2 host channels) — same pattern as diskd_vq_paddr/
+// diskd_req_paddr above: allocated once at usbd's creation time
+// (setup_usbd_mappings below), identity-mapped into its own page
+// table, handed back via SYS_USBD_INFO. One page is comfortably enough
+// for control-transfer payloads this phase needs (an 8-byte SETUP
+// packet, an 18-byte device descriptor, a handful-of-bytes hub
+// descriptor, a 4-byte port status) — nothing here approaches 4KB.
+uptr usbd_dma_paddr;
+
 // The filesystem server (see user/fsd.c3) — 0 until created, consulted
 // only by create_process below to populate every new process's default
 // namespace. Unlike diskd, fsd is meant to be reached by ordinary
@@ -871,6 +881,36 @@ fn void setup_usbd_mappings(Process* proc)
 	// PAD_USB_VBUS_DET pinmux function-select — see board::USB_PINMUX_PAGE's
 	// own comment.
 	map_device_page(proc.page_table, board::USB_PINMUX_PAGE, board::USB_PINMUX_PAGE, PAGE_U | PAGE_R | PAGE_W);
+
+	// Phase 2's own DMA buffer — see usbd_dma_paddr's own comment above
+	// for why this is identity-mapped, the same reasoning as diskd's
+	// virtqueue/request buffers (setup_diskd_mappings above): the DWC2
+	// host channel's HCDMA register needs a real physical address, and
+	// usbd (like every other user process) otherwise has no way to
+	// learn its own virtual pages' physical backing.
+	//
+	// map_device_page(), NOT map_page(), despite this being ordinary
+	// RAM, not a hardware register — deliberately uncached. This is
+	// the one real difference from diskd's own virtqueue mapping, and
+	// it matters here in a way it never has before: diskd only ever
+	// runs against QEMU's virtio-mmio (HAS_VIRTIO_BLOCK is QEMU-only),
+	// a software-emulated device that just reads the guest's memory
+	// buffer directly — no real cache-incoherency effect exists to
+	// hit there at all. usbd is the first driver in this project's
+	// history doing genuine DMA against real Duo hardware, where a
+	// cacheable mapping (map_page()'s own PTE_EXTRA_BITS = SHARE|
+	// CACHE|BUF, see its own comment) risks the DWC2 core's own DMA
+	// engine — a separate AHB bus master — reading stale memory the
+	// CPU's write never made it past its own cache line for. A real
+	// hardware round hit a persistent, deterministic STALL on the
+	// very first control transfer, unaffected by every content/timing
+	// fix tried, which is exactly the signature of the *actual*
+	// transmitted bytes silently differing from what this driver's
+	// own debug prints (reading the original stack buffer, not the
+	// DMA buffer) had been trusted as confirming correct.
+	uptr dma_paddr = alloc_pages(1);
+	map_device_page(proc.page_table, dma_paddr, dma_paddr, PAGE_U | PAGE_R | PAGE_W);
+	usbd_dma_paddr = dma_paddr;
 
 	usbd_pid = proc.pid;
 }

@@ -69,6 +69,7 @@ const SYS_EXEC         = 24; // replaces the calling process's own image in plac
 const SYS_SETUID       = 25; // sets the caller's own uid, only while still root — see its case below
 const SYS_NS_MOUNT_WAIT = 26; // SYS_NS_MOUNT, but blocks (bounded by a retry count) until the target actually posts — see its case below
 const SYS_YIELD         = 27; // voluntarily gives up the rest of this process's timeslice once — see its case below
+const SYS_USBD_INFO     = 28; // usbd-only: returns its DMA buffer's physical address — same shape/reasoning as SYS_DISKD_INFO above
 
 // Generous cap on the image SYS_EXEC will install — real racccoon
 // binaries (build/user/*.bin) run 70-105KB; this leaves real headroom
@@ -1498,6 +1499,14 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// own scheduling would have.
 			yield();
 			f.a0 = 0;
+		case SYS_USBD_INFO:
+			// usbd-only, called once at its own startup — see
+			// setup_usbd_mappings in process.c3 for why this address
+			// can't be known at compile time or derived by usbd itself.
+			// a0 is an out-pointer, same convention as SYS_DISKD_INFO
+			// above.
+			uptr* usbd_dma_out = (uptr*)(uptr)f.a0;
+			*usbd_dma_out = usbd_dma_paddr;
 		case SYS_PARENT_INFO:
 			// Read-only, no permission check — same reasoning as
 			// SYS_PROC_INFO above. Returns the given pid's parent_pid

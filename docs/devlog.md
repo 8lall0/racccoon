@@ -4,6 +4,178 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-22 (66) — USB Phase 2 confirmed working: real device detected on a real hub port
+
+Entry 65's own Phase 2 code got its first real hardware test this
+morning — it did not work on the first try, or the second, or the
+third, but four real bugs found and fixed in sequence got it all the
+way to a genuine, physical confirmation: `hub port 2: connected`, a
+real USB device correctly identified on the exact downstream port of
+the Duo IO board's own hub it was actually plugged into. Full chain
+now verified real: DWC2 host-mode bring-up (entry 64) -> control
+transfers over host channel 0 -> device enumeration -> hub
+configuration -> per-port power-on -> per-port connect status,
+end to end, no simulation, no assumption left unverified.
+
+### The four bugs, in the order they were found
+
+**1. Cache-incoherent DMA buffer** (the big one). `usbd`'s own DMA
+buffer (entry 65's `setup_usbd_mappings`) used `map_page()` — the same
+call `diskd`'s virtqueue uses — which marks the mapping cacheable
+(`board::PTE_EXTRA_BITS`, `SHARE|CACHE|BUF`). Correct for ordinary RAM
+the CPU alone touches; wrong for a buffer a *separate bus master* (the
+DWC2 core's own DMA engine) also reads directly, since a CPU write can
+sit in a cache line indefinitely without ever reaching real RAM.
+`diskd`'s own precedent turned out to be a false one: it only ever
+runs against QEMU's software-emulated virtio-mmio, which just reads
+the guest's memory buffer directly — no real incoherency exists to hit
+there at all. `usbd` is the first driver in this project's history
+doing genuine DMA against real hardware, and it hit this immediately:
+every control transfer's SETUP stage reported success, but the
+following DATA stage STALLed, byte-identical (`HCINT=0x0000000a`),
+completely unaffected by every other real, well-reasoned fix tried
+first (bootstrap MPS0 switched to the USB-2.0-spec-mandated 64 for
+high-speed devices, an explicit `HCSPLT=0` write, a 2ms inter-stage
+settle delay) — the signature of the actually-transmitted bytes
+silently differing from what this driver's own debug prints, reading
+the original stack buffer rather than the DMA buffer, had been
+trusted as confirming correct. Fixed by switching to
+`map_device_page()` (uncached) for this one allocation — everything
+else about the DMA-buffer pattern (identity-mapped, physical address
+handed back via `SYS_USBD_INFO`) stayed exactly as entry 65 built it.
+
+**2. Missing `SET_CONFIGURATION`**. Device and hub-class descriptor
+reads both succeeded even in the unconfigured "Address" state (USB 2.0
+spec allows `GetHubDescriptor` there), but `GetPortStatus` doesn't —
+STALLed identically on all 4 ports until a `SET_CONFIGURATION(1)`
+request was added between the hub descriptor fetch and the per-port
+status loop. Hardcoded to configuration 1 (this driver never fetches
+the configuration descriptor at all — basic hubs essentially always
+have exactly one).
+
+**3. Missing per-port `PORT_POWER`**. With enumeration otherwise fully
+working, every port reported "empty" despite a real device being
+plugged in before boot — an unpowered port does no connect detection
+at all, regardless of what's attached, until the host explicitly
+issues `SetPortFeature(PORT_POWER)` for it (a real, spec-mandated step
+for hubs with per-port power switching, which this Genesys Logic
+GL850/852-family hub — real vendor ID `0x05e3`, confirmed via its own
+correctly-decoded device descriptor — implements). Fixed by powering
+every port before querying status, then waiting the hub's own
+specified `bPwrOn2PwrGood` settle time (hub descriptor byte 5, 2ms
+units, floored at 20ms) before trusting any port status read.
+
+**4. (Non-bug, confirmed along the way)** `HPRT0.PRTSPD` read 0
+(high-speed) once a real reset actually ran against a real device —
+this hub genuinely negotiates HS. Tried switching the bootstrap MPS0
+from the traditional "always 8, full/low-speed only" trick to the
+USB-2.0-spec-mandated fixed 64 for high-speed devices; didn't change
+the outcome on its own (bug #1 was still blocking everything at that
+point) but is spec-correct and stayed in.
+
+### Verification
+
+Real Duo hardware, IO board attached, a real USB device plugged into
+one of the hub's 4 downstream ports before power-on: full enumeration
+trace clean end to end — `bMaxPacketSize0=64`, `SET_ADDRESS`,
+`vid=0x05e3 pid=0x0610` (correct, real Genesys Logic hub IDs),
+`SET_CONFIGURATION`, hub descriptor (`4 ports`), all 4 `PORT_POWER`
+requests, and finally `hub port 2: connected` — the exact port the
+device was actually plugged into, the other three correctly reporting
+empty. QEMU unaffected (`HAS_USB=false`, this code never runs there).
+
+**Files changed this entry:** `src/process.c3` (`map_device_page()`
+for the DMA buffer instead of `map_page()`), `user/usbd.c3`
+(`usb_set_configuration()`, `usb_set_port_feature()`, the per-port
+power-on step, the high-speed bootstrap-MPS0 fix, and the diagnostic
+prints — SETUP byte dump, per-stage failure labels, raw `HCINT` on
+error — that made finding all of the above possible).
+
+Not yet committed, alongside entry 65's own work — both land together
+once the user reviews the full diff.
+
+---
+
+## 2026-08-22 (65) — USB Phase 2: device enumeration over host channel 0 (implemented, NOT yet hardware-verified)
+
+Written and built (QEMU + Duo, both clean) autonomously overnight,
+after entry 64's own Phase 1 confirmed real hot-plug detection but
+also confirmed the user's physical test rig (the Duo's official
+USB&Ethernet IO board) has an onboard hub, meaning `HPRT0` can only
+ever see that hub's own connection — never a downstream device — until
+this driver can actually enumerate the hub itself and poll its
+individual ports. **This entry's own code has not been run against
+real hardware at all** — every other USB entry this session needed a
+human to physically power-cycle the Duo and paste back the console log
+each round, and that loop wasn't available while writing this. Treat
+everything below as a well-reasoned first attempt, not a verified
+result — the honest, first real test is whatever happens the next time
+someone boots this and a connect event reaches `usb_enumerate_device()`.
+
+### Design
+
+Control transfers over DWC2 host channel 0 only (no split
+transactions — every device this driver enumerates directly, the
+IO board's own hub included, is full-speed and directly on the root
+port from the DWC2 core's own point of view). Sourced from U-Boot's
+own `chunk_msg()`/`_submit_control_msg()`/`wait_for_chhltd()`
+(`duo-buildroot-sdk`'s `u-boot-2021.10/drivers/usb/host/dwc2.c`) —
+register offsets for `struct dwc2_hc_regs` (channel 0 base `0x500`,
+`HCCHAR`/`HCSPLT`/`HCINT`/`HCINTMSK`/`HCTSIZ`/`HCDMA`), not guessed.
+
+**DMA buffer**: the DWC2 core (already configured for `DMAENABLE` in
+Phase 1's `GAHBCFG` write) needs a real physical address for transfer
+data — `usbd`, like any user-mode process, has no way to learn its own
+virtual pages' physical backing. Solved with the exact same pattern
+`diskd`'s virtqueue already established: `setup_usbd_mappings`
+(`process.c3`) allocates one page via `alloc_pages(1)`, identity-maps
+it into `usbd`'s own page table, and hands the physical address back
+via a new syscall (`SYS_USBD_INFO`, 28 — same shape as
+`SYS_DISKD_INFO`).
+
+**Transfer engine** (`user/usbd.c3`): `hc_transfer_once()` programs
+`HCTSIZ`/`HCDMA`/`HCCHAR`, sets `CHEN`, and polls `HCINT` for
+`CHHLTD` (yield()-paced, 2s timeout) — returns 0 (`XFERCOMP`), 1
+(`NAK`/`FRMOVRUN` — completely normal, caller retries), or -1 (real
+error). `usb_control_transfer()` builds the standard 3-stage SETUP ->
+DATA -> STATUS sequence on top of it, with a 3-second wall-clock NAK-retry
+budget per stage (this driver's own established `rdtime()`-based
+budget idiom, not a raw iteration count). Control endpoints always
+restart their data toggle at DATA1 after a SETUP stage regardless of
+any previous transfer's own final state, so no per-endpoint toggle
+tracking was needed — a real simplification bulk/interrupt transfers
+won't get to keep.
+
+**Enumeration flow** (`usb_enumerate_device()`, called from `main()`'s
+own polling loop the moment a real connect event fires — not at init
+time, matching entry 64's own lesson about false-positive latches from
+an unconditional reset against noise): 50ms bus-reset pulse + a full
+1-second settle (matching U-Boot's `dwc2_init_common()` own comment
+about "problematic USB keys" exactly, rather than trimming an untested
+value) -> `GET_DESCRIPTOR(8)` at the default address to learn
+`bMaxPacketSize0` -> `SET_ADDRESS(1)` -> `GET_DESCRIPTOR(18)` at the
+new address for the full device descriptor -> if `bDeviceClass ==
+0x09` (hub, the expected case here), `GET_DESCRIPTOR` for the
+class-specific hub descriptor, then `GET_PORT_STATUS` on every
+downstream port, printing connected/empty per port.
+
+**Verification**: QEMU (`HAS_USB=false`, this code never runs there,
+confirms only that the kernel-side additions — `SYS_USBD_INFO`,
+`usbd_dma_paddr`, the new `setup_usbd_mappings` allocation — don't
+disturb anything else) and Duo both build clean. No real-hardware run
+yet at all — this is the pending work for whenever the user is back at
+the physical board.
+
+**Files changed:** `src/entry.c3` (`SYS_USBD_INFO`), `src/process.c3`
+(`usbd_dma_paddr`, DMA page allocation in `setup_usbd_mappings`),
+`user/user.c3` (`usbd_info()`), `user/usbd.c3` (the transfer engine
+and enumeration flow).
+
+Not committed — same standing rule as always, and doubly so here:
+this is real, untested protocol-level code, not just a register tweak.
+
+---
+
 ## 2026-08-22 (64) — USB Phase 1: DWC2 host-mode bring-up, real on the Duo
 
 Goal: bring the Duo's actual USB host controller (Synopsys DesignWare
