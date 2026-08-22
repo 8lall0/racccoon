@@ -147,6 +147,78 @@ fn uint ethd_init()
     return 0; // unreachable — ethd_panic() calls exit()
 }
 
+// Minimal DHCP client (RFC 2131): DISCOVER -> OFFER -> REQUEST -> ACK,
+// once at startup, no lease renewal — see user/net/dhcp.c3's own
+// header comment for full scope/rationale (added specifically because
+// a static IP hit a real router-side ARP-defense wall — see this
+// file's own header comment). Mirrors user/net/netd.c3's own
+// netd_run_dhcp_client() exactly, just over eth_dma_send/
+// eth_dma_try_recv instead of the virtio queues.
+fn bool ethd_run_dhcp_client(char* our_mac, uint* our_ip_out, uint* gateway_ip_out)
+{
+    char[600] scratch @noinit;
+    char[1600] rx_frame @noinit;
+
+    for (int attempt = 0; attempt < 3; attempt++)
+    {
+        uint xid = (uint)rdtime() ^ (uint)attempt;
+
+        uint discover_len;
+        dhcp_build_discover(&scratch[0], &discover_len, our_mac, xid);
+        if (!eth_dma_send(&scratch[0], discover_len)) { continue; }
+
+        uint offered_ip = 0;
+        uint offer_server_ip = 0;
+        bool got_offer = false;
+        ulong offer_start = rdtime();
+        ulong offer_budget = eth_us_to_ticks(2000000);
+        while (rdtime() - offer_start < offer_budget)
+        {
+            uint rx_len;
+            if (eth_dma_try_recv(&rx_frame[0], &rx_len))
+            {
+                uint msg_type, yiaddr, server_id, router;
+                if (dhcp_parse_message(&rx_frame[0], rx_len, xid, &msg_type, &yiaddr, &server_id, &router) && msg_type == DHCP_MSG_OFFER)
+                {
+                    offered_ip = yiaddr;
+                    offer_server_ip = server_id;
+                    got_offer = true;
+                    break;
+                }
+            }
+            yield();
+        }
+        if (!got_offer) { continue; }
+
+        uint request_len;
+        dhcp_build_request(&scratch[0], &request_len, our_mac, xid, offered_ip, offer_server_ip);
+        if (!eth_dma_send(&scratch[0], request_len)) { continue; }
+
+        ulong ack_start = rdtime();
+        ulong ack_budget = eth_us_to_ticks(2000000);
+        while (rdtime() - ack_start < ack_budget)
+        {
+            uint rx_len;
+            if (eth_dma_try_recv(&rx_frame[0], &rx_len))
+            {
+                uint msg_type, yiaddr, server_id, router;
+                if (dhcp_parse_message(&rx_frame[0], rx_len, xid, &msg_type, &yiaddr, &server_id, &router))
+                {
+                    if (msg_type == DHCP_MSG_ACK)
+                    {
+                        *our_ip_out = yiaddr;
+                        *gateway_ip_out = router;
+                        return true;
+                    }
+                    if (msg_type == DHCP_MSG_NAK) { break; }
+                }
+            }
+            yield();
+        }
+    }
+    return false;
+}
+
 // One-shot startup self-test: ARP-resolve the gateway, then ping it,
 // printing the round-trip result either way. Diagnostic only — never
 // panics on failure, since the real point of Phase 2 is the passive
@@ -320,6 +392,31 @@ fn void main()
         print(" 10hd=");
         print_uint((anlpar_diag & MII_ANLPAR_10_HALF) != 0 ? 1 : 0);
         print(")\n");
+
+        // DHCP — added specifically because a static IP hit a real
+        // router-side wall (see this file's own header comment): a
+        // live tcpdump capture confirmed this board's own ARP
+        // requests reach the wire perfectly formed, but the router
+        // never replies to a device using a static IP it never itself
+        // assigned. Falls back to the static our_ip/gateway_ip above
+        // on failure/timeout — no regression for a network without a
+        // DHCP server at all.
+        uint dhcp_ip;
+        uint dhcp_gateway;
+        if (ethd_run_dhcp_client(&ETHD_OUR_MAC[0], &dhcp_ip, &dhcp_gateway))
+        {
+            our_ip = dhcp_ip;
+            gateway_ip = dhcp_gateway;
+            print("ethd: DHCP: bound, ip=");
+            print_ip(our_ip);
+            print(" gateway=");
+            print_ip(gateway_ip);
+            print("\n");
+        }
+        else
+        {
+            print("ethd: DHCP: failed, falling back to static IP\n");
+        }
 
         ethd_self_test(&ETHD_OUR_MAC[0], our_ip, gateway_ip);
     }

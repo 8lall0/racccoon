@@ -175,6 +175,78 @@ fn bool netd_send(char* frame, uint frame_len)
 // user` can't easily deliver an *inbound* ping from the host to test
 // the passive-responder path directly).
 
+// Minimal DHCP client (RFC 2131): DISCOVER -> OFFER -> REQUEST -> ACK,
+// once at startup, no lease renewal — see user/net/dhcp.c3's own
+// header comment for full scope/rationale. Up to 3 DISCOVER attempts,
+// each with a bounded (2s) wait for a matching OFFER; on a real OFFER,
+// one REQUEST + a bounded (2s) wait for ACK/NAK. Returns false (caller
+// falls back to its own static IP) on any timeout/NAK across all
+// attempts.
+fn bool netd_run_dhcp_client(char* our_mac, uint* our_ip_out, uint* gateway_ip_out)
+{
+    char[600] scratch @noinit;
+    char[1600] rx_frame @noinit;
+
+    for (int attempt = 0; attempt < 3; attempt++)
+    {
+        uint xid = (uint)rdtime() ^ (uint)attempt;
+
+        uint discover_len;
+        dhcp_build_discover(&scratch[0], &discover_len, our_mac, xid);
+        if (!netd_send(&scratch[0], discover_len)) { continue; }
+
+        uint offered_ip = 0;
+        uint offer_server_ip = 0;
+        bool got_offer = false;
+        ulong offer_start = rdtime();
+        ulong offer_budget = netd_us_to_ticks(2000000);
+        while (rdtime() - offer_start < offer_budget)
+        {
+            uint rx_len;
+            if (netd_try_recv(&rx_frame[0], &rx_len))
+            {
+                uint msg_type, yiaddr, server_id, router;
+                if (dhcp_parse_message(&rx_frame[0], rx_len, xid, &msg_type, &yiaddr, &server_id, &router) && msg_type == DHCP_MSG_OFFER)
+                {
+                    offered_ip = yiaddr;
+                    offer_server_ip = server_id;
+                    got_offer = true;
+                    break;
+                }
+            }
+            yield();
+        }
+        if (!got_offer) { continue; }
+
+        uint request_len;
+        dhcp_build_request(&scratch[0], &request_len, our_mac, xid, offered_ip, offer_server_ip);
+        if (!netd_send(&scratch[0], request_len)) { continue; }
+
+        ulong ack_start = rdtime();
+        ulong ack_budget = netd_us_to_ticks(2000000);
+        while (rdtime() - ack_start < ack_budget)
+        {
+            uint rx_len;
+            if (netd_try_recv(&rx_frame[0], &rx_len))
+            {
+                uint msg_type, yiaddr, server_id, router;
+                if (dhcp_parse_message(&rx_frame[0], rx_len, xid, &msg_type, &yiaddr, &server_id, &router))
+                {
+                    if (msg_type == DHCP_MSG_ACK)
+                    {
+                        *our_ip_out = yiaddr;
+                        *gateway_ip_out = router;
+                        return true;
+                    }
+                    if (msg_type == DHCP_MSG_NAK) { break; }
+                }
+            }
+            yield();
+        }
+    }
+    return false;
+}
+
 // One-shot startup self-test: ARP-resolve the gateway, then ping it,
 // printing the round-trip result either way. Diagnostic only — never
 // panics on failure, since the real point of Phase 2 is the passive
@@ -307,8 +379,30 @@ fn void main()
 
     netd_arm_rx();
 
+    // Static fallback — used as-is if the DHCP client below fails/
+    // times out (e.g. no DHCP server on this network at all): SLIRP's
+    // own default virtual subnet for `-netdev user`, see this file's
+    // own header comment.
     uint our_ip = make_ip(10, 0, 2, 15);
     uint gateway_ip = make_ip(10, 0, 2, 2);
+
+    uint dhcp_ip;
+    uint dhcp_gateway;
+    if (netd_run_dhcp_client(&our_mac[0], &dhcp_ip, &dhcp_gateway))
+    {
+        our_ip = dhcp_ip;
+        gateway_ip = dhcp_gateway;
+        print("netd: DHCP: bound, ip=");
+        print_ip(our_ip);
+        print(" gateway=");
+        print_ip(gateway_ip);
+        print("\n");
+    }
+    else
+    {
+        print("netd: DHCP: failed, falling back to static IP\n");
+    }
+
     netd_self_test(&our_mac[0], our_ip, gateway_ip);
 
     print("netd: init done, polling link status\n");

@@ -63,11 +63,30 @@ fn uint make_ip(uint a, uint b, uint c, uint d)
     return (a << 24) | (b << 16) | (c << 8) | d;
 }
 
-// Standard IPv4/ICMP one's-complement 16-bit checksum: sum all 16-bit
-// big-endian words (the field being computed itself assumed already
-// zeroed by the caller), fold any carry back in, then take the one's
-// complement. Used for both the IPv4 header and the ICMP message.
-fn ushort ip_checksum(char* data, uint len)
+// Prints an IP address in the usual dotted-decimal form — used for
+// logging a DHCP-assigned address, where a raw hex dump is far less
+// useful to read than what a human would actually type into a router
+// admin page or a ping command.
+fn void print_ip(uint ip)
+{
+    print_uint((ip >> 24) & 0xFF);
+    putchar('.');
+    print_uint((ip >> 16) & 0xFF);
+    putchar('.');
+    print_uint((ip >> 8) & 0xFF);
+    putchar('.');
+    print_uint(ip & 0xFF);
+}
+
+// Standard IPv4/ICMP/UDP one's-complement 16-bit checksum, split into
+// a partial-sum step and a finalize step so a UDP checksum (which
+// needs to sum a synthetic pseudo-header and the real segment as if
+// they were one contiguous buffer, without physically concatenating
+// them) can call the summing half twice and finalize once. Sums all
+// 16-bit big-endian words (the field being computed itself assumed
+// already zeroed by the caller); finalize folds any carry back in,
+// then takes the one's complement.
+fn uint checksum_partial_sum(char* data, uint len)
 {
     uint sum = 0;
     uint i = 0;
@@ -83,6 +102,11 @@ fn ushort ip_checksum(char* data, uint len)
         // this checksum algorithm.
         sum += ((uint)data[i] & 0xFF) << 8;
     }
+    return sum;
+}
+
+fn ushort checksum_finalize(uint sum)
+{
     while ((sum >> 16) != 0)
     {
         sum = (sum & 0xFFFF) + (sum >> 16);
@@ -90,11 +114,50 @@ fn ushort ip_checksum(char* data, uint len)
     return (ushort)(~sum & 0xFFFF);
 }
 
+// Used for both the IPv4 header and the ICMP message — neither needs
+// a pseudo-header, unlike UDP's own udp_checksum() below.
+fn ushort ip_checksum(char* data, uint len)
+{
+    return checksum_finalize(checksum_partial_sum(data, len));
+}
+
+// UDP's own checksum additionally covers a 12-byte "pseudo-header"
+// (src/dst IP + zero + protocol + UDP length) that never actually
+// rides on the wire — a mechanism IPv4 UDP borrows to guard against
+// misrouted datagrams landing on the wrong host/protocol, standard
+// per RFC 768. Summed as a separate span rather than physically
+// prepended to udp_seg, avoiding a copy.
+fn ushort udp_checksum(uint src_ip, uint dst_ip, char* udp_seg, uint udp_len)
+{
+    char[12] pseudo;
+    write_be32(&pseudo[0], src_ip);
+    write_be32(&pseudo[4], dst_ip);
+    pseudo[8] = 0;
+    pseudo[9] = (char)IP_PROTO_UDP;
+    write_be16(&pseudo[10], (ushort)udp_len);
+    uint sum = checksum_partial_sum(&pseudo[0], 12) + checksum_partial_sum(udp_seg, udp_len);
+    return checksum_finalize(sum);
+}
+
+// Writes an 8-byte UDP header at seg_out[0..7] with a real checksum —
+// the caller must already have payload_len bytes of real payload in
+// place at seg_out[8..], since the checksum covers the whole segment.
+fn void build_udp_header(char* seg_out, uint payload_len, uint src_ip, uint dst_ip, ushort src_port, ushort dst_port)
+{
+    uint udp_len = 8 + payload_len;
+    write_be16(&seg_out[0], src_port);
+    write_be16(&seg_out[2], dst_port);
+    write_be16(&seg_out[4], (ushort)udp_len);
+    write_be16(&seg_out[6], 0);
+    write_be16(&seg_out[6], udp_checksum(src_ip, dst_ip, seg_out, udp_len));
+}
+
 const uint ETH_TYPE_ARP  = 0x0806;
 const uint ETH_TYPE_IPV4 = 0x0800;
 const uint ARP_OPER_REQUEST = 1;
 const uint ARP_OPER_REPLY   = 2;
 const uint IP_PROTO_ICMP = 1;
+const uint IP_PROTO_UDP  = 17;
 const uint ICMP_TYPE_ECHO_REQUEST = 8;
 const uint ICMP_TYPE_ECHO_REPLY   = 0;
 

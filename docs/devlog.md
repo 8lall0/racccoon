@@ -4,6 +4,56 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-22 (73) — Minimal DHCP client: real ping to the Duo confirmed working end to end
+
+Direct follow-on to entry 72's real-hardware finding: a `tcpdump`
+capture proved the Duo's own ARP requests reach the wire perfectly
+formed, but the user's router silently never replied to them — the
+classic signature of IP-MAC-binding/ARP-defense dropping traffic from
+a device using a static IP it never itself assigned. A real DHCP
+client sidesteps this class of problem entirely, on top of being
+generally more useful than a hand-picked address.
+
+Scope, deliberately narrow (same phased approach every earlier feature
+here used): DHCPDISCOVER → DHCPOFFER → DHCPREQUEST → DHCPACK, once at
+startup, no lease renewal, no DHCPRELEASE/DECLINE, no RFC-5227 ARP
+probe of the offered address before use. Falls back to the existing
+static IP on failure/timeout (3 DISCOVER attempts, 2s each) — zero
+regression for a network without a DHCP server.
+
+New `user/net/dhcp.c3`: DHCP message build/parse (RFC 2131),
+transport-agnostic — same shape as `user/net/eth_proto.c3` itself,
+which gained the generic UDP support this needed (`build_udp_header`/
+`udp_checksum`, plus a refactor of the existing `ip_checksum` into a
+`checksum_partial_sum`/`checksum_finalize` split so the UDP checksum
+can sum a synthetic 12-byte pseudo-header and the real segment as two
+separate spans without a physical concatenation copy). `ethd.c3`/
+`netd.c3` each get their own DHCP client loop (same duplication
+pattern the self-test itself already established — no callback/
+dependency-injection mechanism is idiomatic to this codebase, so each
+backend's own orchestration calls into the shared build/parse
+functions directly), inserted before the existing self-test, which
+now runs against whatever `our_ip`/`gateway_ip` DHCP resolved (or the
+static fallback).
+
+**Verified end to end, not just "it compiles":**
+- QEMU: real interop with SLIRP's own embedded DHCP server on the
+  first attempt — `netd: DHCP: bound, ip=10.0.2.15 gateway=10.0.2.2`,
+  then the self-test passing against those dynamic values.
+- Real Duo hardware: `ethd: DHCP: bound, ip=192.168.1.5
+  gateway=192.168.1.1` — a real lease from the user's own router,
+  confirming the whole point of this feature (the router that
+  silently ignored the static IP now hands out a real, recognized
+  address). The self-test's own ARP-resolve-then-ping now succeeds
+  too, for the same reason. And, closing the loop entirely: a genuine
+  `ping 192.168.1.5` from another device on the same LAN got real
+  replies — `64 bytes from 192.168.1.5: icmp_seq=1 ttl=64 time=927
+  ms`. The Duo answers real pings from a real external device now.
+  Round-trip times are high (several hundred ms) — expected, not a
+  bug: the main loop's own poll interval is 500ms, busy-polled rather
+  than interrupt-driven, same convention every device driver in this
+  codebase already uses; nothing here is latency-tuned yet.
+
 ## 2026-08-22 (72) — Ethernet Phase 2: real packet TX/RX + ARP/ICMP, confirmed transmitting on real hardware
 
 Direct follow-on to Ethernet Phase 1 (entries 67-71): link sensing
