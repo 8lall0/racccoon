@@ -4,6 +4,43 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-22 (71) — Directory refactor step 5 (last one): `sdd.c3` split into `sdhci.c3`/`sdd.c3`
+
+Final step of the refactor plan started in entry 68. `sdd.c3` (894
+lines) mixed the standard SDHCI register/PIO layer (pad/power/clock
+bring-up, SD command issuing, block PIO transfer — genuinely spec-
+level, not Duo-specific except for the base addresses and the vendor
+pad/PHY registers) with the driver's own orchestration (`main()`'s IPC
+request loop). Split, same shape as the `usbd.c3`/`ethd.c3` splits
+before it:
+
+- `user/block/sdhci.c3`: every `SD_*` SDHCI register/bit constant,
+  `mmio_read32`/`write32`, `sd_reg_read`/`write` and friends
+  (`top_reg_*`/`pinmux_reg_*`/`clock_reg_*`), `sdd_pad_power_clock_init()`,
+  `sd_send_cmd()`, `sdd_raise_clock()`, `sdd_enumerate()`,
+  `sdd_block_rw()`. Also `SDD_VERBOSE` and `print_hex32` — moved here
+  rather than staying in `sdd.c3`, matching the precedent the `usbd.c3`
+  split already set (`USBD_VERBOSE` lives in `dwc2.c3`, not `usbd.c3`).
+- `user/block/sdd.c3`: `main()`, `sdd_init()`, `sdd_panic()`, and the
+  DISKD_READ/WRITE wire-protocol constants only.
+
+Pure code motion, no logic changes. Real hardware verification: the
+full `sdd` boot sequence (`clock_stable=1`, CMD0/CMD8/ACMD41/CMD2/
+CMD3/CMD7 all succeeding, `raised clock`, `card ready`) came back
+byte-identical to pre-split, and `fsd: ext2 mounted, block_size=4096
+inode_table_block=67` already proves real block reads work end to end
+through the new `sdhci.c3` (mounting requires reading the superblock/
+inode table via `sdd_block_rw`) — `usbd`/`ethd` (same shared kernel
+image) unaffected too.
+
+This closes out the user-space directory refactor started in entry
+68: `user/` is now `bin/`/`sys/`/`fs/`/`block/`/`net/`/`usb/`, every
+driver that had grown large enough to blur "talks to the wire" vs.
+"decides what to do next" (`usbd`, `ethd`, `sdd`) has been split
+accordingly, and the shared `virtio.c3`/`main_stub.c3` pieces are
+factored out where real duplication existed. No further steps planned
+from that original plan.
+
 ## 2026-08-22 (70) — Directory refactor step 4: `ethd.c3` split into `dwmac.c3`/`ephy.c3`/`ethd.c3`
 
 Continuation of entry 68's refactor plan. `ethd.c3` (673 lines) had
