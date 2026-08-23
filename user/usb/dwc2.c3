@@ -56,7 +56,7 @@ import std::nolibc::mem;
 // actively debugging the DWC2 bring-up and enumeration, not useful
 // day to day. Flip to true if a real hardware bug ever needs that
 // level of detail again.
-const bool USBD_VERBOSE = false; // interrupt-transfer split support (g_split_active) still doesn't complete on real hardware — see docs/devlog.md for the full trace of what's been ruled out. Flip back to true for that investigation's own diagnostic prints (hc_transfer_once_split, usb_interrupt_poll).
+const bool USBD_VERBOSE = false; // interrupt-transfer split support (g_split_active) still doesn't complete on real hardware — see docs/devlog.md for the full trace of what's been ruled out, including hub multi-TT mode. Flip back to true for that investigation's own diagnostic prints (hc_transfer_once_split, usb_interrupt_poll).
 
 // --- DWC2 core registers (relative to board::USB_MMIO_BASE) — all fit
 // in the first 4KB page, nothing here needs the other 15 pages of the
@@ -160,6 +160,11 @@ const uint USB_DESC_TYPE_INTERFACE = 4;
 const uint USB_DESC_TYPE_ENDPOINT  = 5;
 const uint USB_DESC_TYPE_HUB       = 0x29;
 const uint USB_CLASS_HUB           = 0x09;
+// bDeviceProtocol values for a hub-class device (USB 2.0 spec table
+// 11-11) — 0=full-speed hub, 1=Hi-Speed hub with a single shared TT,
+// 2=Hi-Speed hub with one TT per port ("multi-TT"). Sourced from real
+// Linux's own USB_HUB_PR_* constants, include/uapi/linux/usb/ch11.h.
+const uint USB_HUB_PROTOCOL_MULTI_TT = 2;
 const uint USB_ENUM_ADDR  = 1; // Phase 2's own root-port device (the hub) — Phase 3 (USB Phase 3, hub-downstream enumeration) assigns a second address, USB_DOWNSTREAM_ADDR, to whatever's plugged into one of its ports
 const uint USB_DOWNSTREAM_ADDR = 2;
 
@@ -1568,6 +1573,32 @@ fn bool usb_set_configuration(uint dev_addr, uint max_packet0, uint config_value
     setup[2] = (char)(config_value & 0xFF);
     setup[3] = (char)0;
     setup[4] = (char)0;
+    setup[5] = (char)0;
+    setup[6] = (char)0;
+    setup[7] = (char)0;
+    return usb_control_transfer(dev_addr, max_packet0, &setup[0], null, 0, true);
+}
+
+// USB 2.0 spec chapter 9 standard request, wValue=alt_setting,
+// wIndex=iface_num, no data stage. Real, sourced motivation
+// (docs/devlog.md): mainline Linux's own hub_configure()
+// (drivers/usb/core/hub.c) sends exactly this — SET_INTERFACE(hub, 0,
+// 1) — for any Hi-Speed hub reporting bDeviceProtocol==2
+// (USB_HUB_PR_HS_MULTI_TT), switching it from its default shared-TT
+// behavior into "one Transaction Translator per port" mode. This
+// driver never did that before; a shared TT has to serialize/schedule
+// split transactions across every port together, plausible enough to
+// explain occasional one-off control transfers working while a
+// sustained periodic interrupt poll — competing for the same shared
+// TT resource on every single poll — never lines up.
+fn bool usb_set_interface(uint dev_addr, uint max_packet0, uint iface_num, uint alt_setting)
+{
+    char[8] setup;
+    setup[0] = (char)0x01; // OUT, standard, interface
+    setup[1] = (char)0x0B; // SET_INTERFACE
+    setup[2] = (char)(alt_setting & 0xFF);
+    setup[3] = (char)0;
+    setup[4] = (char)(iface_num & 0xFF);
     setup[5] = (char)0;
     setup[6] = (char)0;
     setup[7] = (char)0;

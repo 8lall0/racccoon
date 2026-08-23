@@ -4,6 +4,50 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-23 (continued) — Hub multi-TT mode: a real, correct fix, but not the interrupt-split bug either
+
+One more real lead chased down on the still-paused interrupt-split
+bug, after reverting the Slave/PIO detour (previous entry) back to
+the known-good DMA-mode baseline.
+
+**The gap**: real mainline Linux's `hub_configure()`
+(`drivers/usb/core/hub.c`) checks a Hi-Speed hub's own
+`bDeviceProtocol` (device descriptor byte 6): if it's `2`
+(`USB_HUB_PR_HS_MULTI_TT`, one Transaction Translator per port), Linux
+explicitly sends `SET_INTERFACE(hub, altsetting=1)` to switch it out
+of its default shared-TT behavior. This driver never checked that
+byte or sent that request at all — a real, previously-unexamined gap,
+not a guess (confirmed by reading `hub_configure()` directly, not
+assumed).
+
+**Implemented**: `usb_set_interface()` (`dwc2.c3`, standard
+SET_INTERFACE control request) and a check in `usbd.c3`'s root-hub
+enumeration — read `bDeviceProtocol`, and if it's multi-TT-capable,
+send the switch.
+
+**Result on real hardware**: the IO board's hub genuinely does report
+`bDeviceProtocol=2`, and the `SET_INTERFACE` genuinely succeeds
+("hub switched to multi-TT (one TT per port)") — a real, verified fix,
+kept regardless of the outcome below since it's correct per spec. But
+the interrupt-split symptom is completely unchanged: still "gave up
+after 1 fresh start-split attempt" on every single poll, byte-identical
+to every previous round.
+
+**Where the investigation stands now**: this closes out the last
+well-grounded, source-derived hypothesis available without deeper
+tooling. Ruled out across this and the previous sessions, all with
+real hardware evidence: microframe start-split/complete-split timing
+and gap, complete-split retry budget and shape, `HCCHAR.ODDFRM`,
+`xfer_len` clamping to `max_packet` for split IN, the DMA-vs-Slave/PIO
+transfer mechanism itself, and now hub TT mode. What's left almost
+certainly requires seeing the actual wire-level SSPLIT/CSPLIT exchange
+between the host, hub, and device — a protocol or logic analyzer, not
+available this session. Paused here, not abandoned; revisit if that
+tooling becomes available, or if a genuinely new hypothesis turns up
+from a source this project hasn't already read carefully.
+
+---
+
 ## 2026-08-23 (continued) — Slave/PIO mode rewrite attempted and reverted; interrupt-split investigation still paused
 
 Continuation of the same day's USB work. Real lead followed all the

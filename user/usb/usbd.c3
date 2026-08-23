@@ -154,6 +154,27 @@ fn void usb_enumerate_device()
             return;
         }
 
+        // Real, sourced gap this driver never closed before (see
+        // usb_set_interface's own comment, dwc2.c3): a Hi-Speed hub
+        // reporting bDeviceProtocol==2 (multi-TT capable) defaults to
+        // shared-TT behavior until explicitly switched — real Linux's
+        // hub_configure() always does this switch for such a hub.
+        uint hub_device_protocol = (uint)desc_buf[6] & 0xFF;
+        print("usbd: hub bDeviceProtocol=");
+        print_uint(hub_device_protocol);
+        print(hub_device_protocol == USB_HUB_PROTOCOL_MULTI_TT ? " (multi-TT capable)\n" : " (single-TT or full-speed)\n");
+        if (hub_device_protocol == USB_HUB_PROTOCOL_MULTI_TT)
+        {
+            if (usb_set_interface(USB_ENUM_ADDR, max_packet0, 0, 1))
+            {
+                print("usbd: hub switched to multi-TT (one TT per port)\n");
+            }
+            else
+            {
+                print("usbd: hub multi-TT SET_INTERFACE failed, staying in shared-TT mode\n");
+            }
+        }
+
         char[9] hub_desc;
         if (!usb_get_hub_descriptor(USB_ENUM_ADDR, max_packet0, &hub_desc[0], 9))
         {
