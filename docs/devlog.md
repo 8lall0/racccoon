@@ -4,6 +4,44 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-23 (continued) — Removed rforkmemtest/rforkmemresult: a shipped shell command that had already once page-faulted the kernel
+
+Audited every `asm { }`/`asm(...)` site across `user/` after a request
+for "absolutely safe userspace executables." Most of it is unavoidable
+and already about as contained as inline asm gets: `user.c3`'s
+`syscall()`/`syscall4()`/`syscall5()` (the `ecall` trampolines — the
+only way to trap into the kernel on RISC-V), `start()` (crt0
+equivalent), `rdtime()` (read-only CSR read), `threadcreate()` (rfork
++ private-stack switch, has to be raw asm because nothing can safely
+touch memory in the window between the fork syscall returning in the
+child and switching `sp`), and the single-instruction `asm("fence")`
+memory barriers in `diskd.c3`/`netd.c3` before ringing a virtio
+doorbell.
+
+One site was genuinely different: `shell.c3`'s `rforkmemtest`/
+`rforkmemresult` commands did a raw, hand-inlined `RFMEM` fork
+specifically to demonstrate the shared-stack hazard threadcreate()
+exists to avoid — and their own comment already documented that an
+earlier version of this exact command had paged-faulted the kernel
+once, under real timing, once the parent's own subsequent activity
+reused stack memory the child's spilled return addresses still
+depended on. That's a live hazard shipped in the production shell
+binary, not a foundational primitive — removed both commands and the
+now-unused `rfork_child_ran` global (`rfork_shared_value` stays, still
+used by `killtest`/the permission test as a generic busy-loop
+counter). Updated the two comments in `sandboxtest`/`threadtest` that
+referenced `rforkmemtest` by name to describe the hazard generically
+instead.
+
+Verified via a real QEMU boot with scripted shell input
+(`scripts/launch64.sh`'s own console, `\r`-terminated commands, per
+`stress_test.sh`'s established pattern): `rforktest`/`threadtest`/
+`threadresult` all still work exactly as before, and `rforkmemtest`
+now correctly falls through to "command not found." Both
+`scripts/build.sh` and `scripts/build_duo.sh` compile clean.
+
+---
+
 ## 2026-08-23 — USB Phase 3: xpad driver, hub-downstream enumeration, real split transactions — control works, interrupt transfers still don't
 
 Long session, mixed outcome. Real, working progress landed; the

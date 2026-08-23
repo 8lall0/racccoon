@@ -4,7 +4,6 @@ import std::nolibc::main_stub;
 import std::nolibc::fmt;
 
 int rfork_shared_value = 0;
-int rfork_child_ran = 0; // set by rforkmemtest's child, checked by rforkmemresult
 
 // threadcreate's own private stack for threadtest, and the shared
 // global the thread writes to — proving the parent can see what the
@@ -1548,76 +1547,18 @@ fn void main() {
                 putchar((char)('0' + r));
                 print("\n");
             }
-        } else if (strcmp(cmd, "rforkmemtest") == 0) {
-            // rfork(RFPROC | RFMEM): the child shares this process's
-            // address space instead of copying it — the same call as
-            // rforktest, one flag apart, is now "spawn a thread." Set a
-            // global before forking; if the child sees the same value
-            // (checked later via rforkmemresult), it's genuinely the
-            // same memory, not a copy.
-            //
-            // The ecall is inlined rather than going through the usual
-            // rfork()/syscall() wrappers, and — this matters, found the
-            // hard way — so is *everything the child does afterward*.
-            // RFMEM shares the live user stack for the child's entire
-            // remaining lifetime, not just the instant it resumes: an
-            // earlier version of this command had the child call
-            // print()/putchar()/exit() same as rforktest's child does,
-            // and it genuinely paged-faulted the kernel once, under
-            // real timing, once enough of the parent's own subsequent
-            // activity (itself just continuing normally — printing its
-            // own message, handling the next command) had reused the
-            // same stack memory those functions' own spilled return
-            // addresses depended on (see docs/devlog.md). The child
-            // path below does a plain global assignment (no function
-            // call, no stack touched at all) and exits via a second raw
-            // ecall — nothing here ever calls into rfork()/syscall()/
-            // print()/putchar()/exit(). This is exactly the discipline
-            // threadcreate (see threadtest) automates properly, with an
-            // actual private stack instead of "be careful by hand" —
-            // that's the one to reach for outside a deliberately
-            // minimal demonstration like this.
-            rfork_shared_value = 42;
-            rfork_child_ran = 0;
-            // RV64 port: these locals widen to `long` — c3c's block-form
-            // asm (the `$a0`-style bindings below) requires a register
-            // binding to be native register width, and a 32-bit `int`
-            // is rejected on a 64-bit target (same restriction as
-            // user.c3's syscall()/syscall4() — see docs/devlog.md).
-            long rf_flags = RFPROC | RFMEM;
-            long rf_sysno = SYS_RFORK;
-            long rf_gen_out = 0; // null — this child is never joined
-            long r;
-            asm {
-                mv $a0, rf_flags;
-                mv $a1, rf_gen_out;
-                mv $a3, rf_sysno;
-                ecall;
-                mv r, $a0;
-            }
-            if (r < 0) {
-                print("rfork failed\n");
-            } else if (r == 0) {
-                rfork_child_ran = rfork_shared_value;
-                long exit_sysno = SYS_EXIT;
-                asm {
-                    mv $a3, exit_sysno;
-                    ecall;
-                }
-            } else {
-                print("parent: forked a thread sharing this address space\n");
-            }
-        } else if (strcmp(cmd, "rforkmemresult") == 0) {
-            // Separate command, same reasoning as threadresult: the
-            // child runs whenever the scheduler gets to it, not
-            // synchronously with rforkmemtest.
-            print("rfork_child_ran = ");
-            putchar((char)('0' + rfork_child_ran / 10));
-            putchar((char)('0' + rfork_child_ran % 10));
-            print("\n");
         } else if (strcmp(cmd, "sandboxtest") == 0) {
             // Plain rfork(RFPROC) — a real, independent copy, so this
-            // has none of rforkmemtest's shared-stack hazard. The child
+            // has none of raw RFMEM's shared-stack hazard (see
+            // threadcreate's own comment, user.c3, for why a bare
+            // rfork(RFPROC|RFMEM) is unsafe to use directly: the child
+            // shares the live parent stack for its entire remaining
+            // lifetime, not just the instant it resumes — an earlier,
+            // now-removed version of a hand-rolled RFMEM demo command
+            // genuinely paged-faulted the kernel once, under real
+            // timing, once the parent's own subsequent activity reused
+            // stack memory the child's own spilled return addresses
+            // still depended on; see docs/devlog.md). The child
             // drops its own fsd mount right after forking; the parent's
             // own namespace (and any other process's) is untouched,
             // since the child got its own copy at fork time, not a
@@ -1653,8 +1594,8 @@ fn void main() {
             }
         } else if (strcmp(cmd, "threadtest") == 0) {
             // threadcreate (user.c3) — the stack-aware wrapper around
-            // rfork(RFPROC|RFMEM). Unlike rforkmemtest, this is safe to
-            // use normally: the thread gets its own real stack
+            // rfork(RFPROC|RFMEM). Unlike a bare RFMEM fork, this is
+            // safe to use normally: the thread gets its own real stack
             // (thread_stack) before it ever runs any C-level code, not
             // just a protected instant during the resume itself.
             thread_result = 0;
