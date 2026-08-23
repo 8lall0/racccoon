@@ -111,6 +111,7 @@ const uint USB_HCCHAR_EPDIR         = 1 << 15;    // 1 = IN
 const uint USB_HCCHAR_LSPDDEV       = 1 << 17;    // low-speed device — never set, this driver only ever talks to full-speed devices
 const uint USB_HCCHAR_EPTYPE_SHIFT  = 18;
 const uint USB_HCCHAR_EPTYPE_CONTROL = 0;
+const uint USB_HCCHAR_EPTYPE_BULK = 2; // DWC2_HCCHAR_EPTYPE_BULK in U-Boot's own dwc2.h — same encoding table as EPTYPE_INTR below
 const uint USB_HCCHAR_EPTYPE_INTERRUPT = 3; // DWC2_HCCHAR_EPTYPE_INTR in U-Boot's own dwc2.h — sourced, not guessed (see usb_interrupt_poll's own comment)
 const uint USB_HCCHAR_MULTICNT_SHIFT = 20;
 const uint USB_HCCHAR_DEVADDR_SHIFT = 22;
@@ -162,12 +163,24 @@ const uint USB_CLASS_HUB           = 0x09;
 const uint USB_ENUM_ADDR  = 1; // Phase 2's own root-port device (the hub) — Phase 3 (USB Phase 3, hub-downstream enumeration) assigns a second address, USB_DOWNSTREAM_ADDR, to whatever's plugged into one of its ports
 const uint USB_DOWNSTREAM_ADDR = 2;
 
+// Mass Storage Class (USB Phase 4 prep) — USB Mass Storage Class
+// Bulk-Only Transport spec, not guessed: interface class 0x08,
+// subclass 0x06 (SCSI transparent command set — the overwhelming
+// majority of real USB flash drives/card readers), protocol 0x50
+// (Bulk-Only Transport, "BBB" — the only transport this driver
+// implements; CBI/CB are obsolete and effectively unused on real
+// hardware today).
+const uint USB_CLASS_MASS_STORAGE     = 0x08;
+const uint USB_MSC_SUBCLASS_SCSI      = 0x06;
+const uint USB_MSC_PROTOCOL_BULK_ONLY = 0x50;
+
 // Endpoint descriptor accessors (USB 2.0 spec chapter 9) — plain
 // functions on a raw pointer into a Configuration descriptor blob,
 // same style as eth_proto.c3's own read_be16/read_be32 helpers,
 // rather than a @packed struct overlay: simpler for a handful of
 // small fixed-offset reads.
 const uint USB_EP_ATTR_XFERTYPE_MASK = 0x3; // bmAttributes bits [1:0]
+const uint USB_EP_XFERTYPE_BULK      = 2;
 const uint USB_EP_XFERTYPE_INTERRUPT = 3;
 
 fn uint usb_ep_desc_address(char* ep_desc) { return (uint)ep_desc[2] & 0xFF; }
@@ -1370,6 +1383,91 @@ fn bool usb_control_transfer(uint dev_addr, uint max_packet0, char* setup8, void
         return false;
     }
 
+    return true;
+}
+
+// --- Bulk transfers (USB Phase 4, Mass Storage prep) — same shape as
+// usb_control_transfer()'s own DATA stage (split-aware chunking with
+// manual PID-toggle tracking when g_split_active, single multi-packet
+// burst otherwise) but standalone: no SETUP/STATUS wrapping, and the
+// PID toggle persists ACROSS calls via *pid_toggle_inout, the same
+// contract as usb_interrupt_poll()'s own pid_toggle_inout — bulk
+// endpoints are hardware-toggle-maintained exactly like interrupt
+// ones (USB 2.0 spec 5.8.4), the toggle only resets on
+// SET_CONFIGURATION/SET_INTERFACE/CLEAR_FEATURE(ENDPOINT_HALT), never
+// per-transfer. Deliberately reuses hc_transfer_once() (not a new
+// bulk-specific state machine) — split bulk and split interrupt only
+// differ in HCSPLT.XACTPOS/MULTICNT handling and NYET semantics,
+// which hc_transfer_once_split() already keys off of `eptype`.
+//
+// Caller is expected to only invoke this with buf_len > 0 — MSC's own
+// CBW (31 bytes)/CSW (13 bytes)/data-stage transfers are never
+// zero-length, so no zero-length special case is implemented.
+fn bool usb_bulk_transfer(uint dev_addr, uint ep_num, uint max_packet, uint* pid_toggle_inout, bool is_in, void* buf, uint buf_len, uint* actual_len_out)
+{
+    uint actual_len;
+    int result;
+    ulong nak_budget = usb_us_to_ticks(3000000);
+
+    if (g_split_active)
+    {
+        uint done = 0;
+        ulong stage_start = rdtime();
+        while (done < buf_len)
+        {
+            uint chunk_len = buf_len - done < max_packet ? buf_len - done : max_packet;
+            if (!is_in)
+            {
+                mem::copy((void*)usb_dma_paddr, (void*)((uptr)buf + done), chunk_len);
+            }
+            for (;;)
+            {
+                result = hc_transfer_once(dev_addr, ep_num, USB_HCCHAR_EPTYPE_BULK, is_in, *pid_toggle_inout, max_packet, chunk_len, 1, &actual_len);
+                if (result == 0) break;
+                if (result == 1 && rdtime() - stage_start < nak_budget) { yield(); continue; }
+                print("usbd: bulk transfer failed (split chunk)\n");
+                return false;
+            }
+            if (is_in)
+            {
+                uint copy_len = actual_len < chunk_len ? actual_len : chunk_len;
+                mem::copy((void*)((uptr)buf + done), (void*)usb_dma_paddr, copy_len);
+            }
+            done += actual_len;
+            *pid_toggle_inout = *pid_toggle_inout == USB_PID_DATA1 ? USB_PID_DATA0 : USB_PID_DATA1;
+            if (actual_len < chunk_len) { break; } // short packet — real transfer ends early
+        }
+        *actual_len_out = done;
+        return true;
+    }
+
+    uint num_packets = (buf_len + max_packet - 1) / max_packet;
+    if (!is_in)
+    {
+        mem::copy((void*)usb_dma_paddr, buf, buf_len);
+    }
+    ulong stage_start = rdtime();
+    for (;;)
+    {
+        result = hc_transfer_once(dev_addr, ep_num, USB_HCCHAR_EPTYPE_BULK, is_in, *pid_toggle_inout, max_packet, buf_len, num_packets, &actual_len);
+        if (result == 0) break;
+        if (result == 1 && rdtime() - stage_start < nak_budget) { yield(); continue; }
+        print("usbd: bulk transfer failed\n");
+        return false;
+    }
+    if (is_in)
+    {
+        uint copy_len = actual_len < buf_len ? actual_len : buf_len;
+        mem::copy(buf, (void*)usb_dma_paddr, copy_len);
+    }
+    *actual_len_out = actual_len;
+
+    // Hardware already advanced HCTSIZ.PID past this successful
+    // transfer — read back the real value for the next call, not a
+    // blind software flip (same rationale as usb_interrupt_poll()'s
+    // own read-back).
+    uint hctsiz_after = usb_reg_read(USB_HC0_HCTSIZ);
+    *pid_toggle_inout = (hctsiz_after >> USB_HCTSIZ_PID_SHIFT) & 0x3;
     return true;
 }
 

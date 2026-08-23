@@ -172,10 +172,27 @@ fn void usb_enumerate_device()
         // port reporting "empty" with a real device attached before
         // boot) after skipping this step entirely. bPwrOn2PwrGood
         // (hub descriptor byte 5, in 2ms units) is the hub's own
-        // specified settle time before port status is meaningful;
-        // floored at 20ms in case a hub reports something tiny.
+        // specified settle time before port status is meaningful.
+        //
+        // TEMPORARY EXPERIMENT (docs/devlog.md): a real Xbox 360 wired
+        // pad does a brief self-test buzz on power-up — pure firmware
+        // behavior, independent of any host driver, confirmed
+        // happening under real Linux on this exact hardware but NEVER
+        // once under this driver despite many power cycles. That
+        // points at power delivery, not USB protocol — the device
+        // may be running under-powered, enough to answer simple
+        // control transfers but never enough to fully boot its own
+        // firmware (motor driver, report generation). Floor bumped
+        // way up from the previous 20ms as a real-data probe: does a
+        // much longer power-on settle time make the buzz (and,
+        // possibly, real interrupt data) finally appear?
         uint pwr_on_2_pwr_good_ms = ((uint)hub_desc[5] & 0xFF) * 2;
-        if (pwr_on_2_pwr_good_ms < 20) { pwr_on_2_pwr_good_ms = 20; }
+        print("usbd: hub bPwrOn2PwrGood raw=");
+        print_uint((uint)hub_desc[5] & 0xFF);
+        print(" (");
+        print_uint(pwr_on_2_pwr_good_ms);
+        print("ms specified)\n");
+        if (pwr_on_2_pwr_good_ms < 200) { pwr_on_2_pwr_good_ms = 200; }
         for (uint port = 1; port <= num_ports; port++)
         {
             if (!usb_set_port_feature(USB_ENUM_ADDR, max_packet0, port, USB_HUB_FEATURE_PORT_POWER))
@@ -330,19 +347,21 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
     print_hex8(product_id & 0xFF);
     print("\n");
 
-    if (vendor_id != XPAD_VENDOR_ID)
-    {
-        print("usbd: hub port ");
-        print_uint(port);
-        print(": not a recognized device, no further action\n");
-        usb_set_split_context(false, 0, 0);
-        return;
-    }
-
+    // Class dispatch (USB Phase 4): probe the configuration descriptor
+    // against every device class this driver knows about, rather than
+    // gating on vendor ID the way Phase 3 originally did — vendor ID
+    // only identifies XPAD (a vendor-specific class), while mass
+    // storage devices are recognized by interface class/subclass/
+    // protocol instead, the same way real USB-core stacks dispatch to
+    // class drivers. First interface match wins; a device could in
+    // principle expose more than one recognized interface, but no
+    // real device this driver targets does.
     char[256] config_buf;
     if (!usb_get_configuration_descriptor(USB_DOWNSTREAM_ADDR, max_packet0, &config_buf[0], 256))
     {
-        print("usbd: xpad: configuration descriptor fetch failed\n");
+        print("usbd: hub port ");
+        print_uint(port);
+        print(": configuration descriptor fetch failed\n");
         usb_set_split_context(false, 0, 0);
         return;
     }
@@ -350,66 +369,84 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
     uint iface_num;
     uint num_endpoints;
     uint ep_start;
-    if (!usb_find_interface(&config_buf[0], 256, XPAD_IFACE_CLASS, XPAD_IFACE_SUBCLASS, XPAD_IFACE_PROTOCOL, &iface_num, &num_endpoints, &ep_start))
+    if (usb_find_interface(&config_buf[0], 256, XPAD_IFACE_CLASS, XPAD_IFACE_SUBCLASS, XPAD_IFACE_PROTOCOL, &iface_num, &num_endpoints, &ep_start))
     {
-        print("usbd: xpad: no matching interface found in configuration descriptor\n");
-        usb_set_split_context(false, 0, 0);
-        return;
-    }
-
-    if (!usb_set_configuration(USB_DOWNSTREAM_ADDR, max_packet0, 1))
-    {
-        print("usbd: xpad: SET_CONFIGURATION failed\n");
-        usb_set_split_context(false, 0, 0);
-        return;
-    }
-
-    // Walk the interface's own endpoint descriptors looking for the
-    // interrupt IN one this phase needs. The real device also has an
-    // interrupt OUT endpoint (rumble/LED) — not used yet, no output
-    // support this phase.
-    uint ep_in_addr = 0;
-    uint ep_in_max_packet = 0;
-    uint ep_in_interval = 0;
-    bool found_in = false;
-    uint off = ep_start;
-    for (uint i = 0; i < num_endpoints; i++)
-    {
-        uint b_length = (uint)config_buf[off] & 0xFF;
-        if (b_length == 0) { break; }
-        uint b_type = (uint)config_buf[off + 1] & 0xFF;
-        if (b_type == USB_DESC_TYPE_ENDPOINT)
+        if (!usb_set_configuration(USB_DOWNSTREAM_ADDR, max_packet0, 1))
         {
-            char* ep_desc = &config_buf[off];
-            uint addr = usb_ep_desc_address(ep_desc);
-            uint xfer_type = usb_ep_desc_xfer_type(ep_desc);
-            if (xfer_type == USB_EP_XFERTYPE_INTERRUPT && (addr & 0x80) != 0)
-            {
-                ep_in_addr = addr;
-                ep_in_max_packet = usb_ep_desc_max_packet(ep_desc);
-                ep_in_interval = usb_ep_desc_interval(ep_desc);
-                found_in = true;
-            }
+            print("usbd: xpad: SET_CONFIGURATION failed\n");
+            usb_set_split_context(false, 0, 0);
+            return;
         }
-        off += b_length;
+
+        // Walk the interface's own endpoint descriptors looking for
+        // the interrupt IN one this phase needs. The real device also
+        // has an interrupt OUT endpoint (rumble/LED) — not used yet,
+        // no output support this phase.
+        uint ep_in_addr = 0;
+        uint ep_in_max_packet = 0;
+        uint ep_in_interval = 0;
+        bool found_in = false;
+        uint off = ep_start;
+        for (uint i = 0; i < num_endpoints; i++)
+        {
+            uint b_length = (uint)config_buf[off] & 0xFF;
+            if (b_length == 0) { break; }
+            uint b_type = (uint)config_buf[off + 1] & 0xFF;
+            if (b_type == USB_DESC_TYPE_ENDPOINT)
+            {
+                char* ep_desc = &config_buf[off];
+                uint addr = usb_ep_desc_address(ep_desc);
+                uint xfer_type = usb_ep_desc_xfer_type(ep_desc);
+                if (xfer_type == USB_EP_XFERTYPE_INTERRUPT && (addr & 0x80) != 0)
+                {
+                    ep_in_addr = addr;
+                    ep_in_max_packet = usb_ep_desc_max_packet(ep_desc);
+                    ep_in_interval = usb_ep_desc_interval(ep_desc);
+                    found_in = true;
+                }
+            }
+            off += b_length;
+        }
+
+        if (!found_in)
+        {
+            print("usbd: xpad: no interrupt IN endpoint found\n");
+            usb_set_split_context(false, 0, 0);
+            return;
+        }
+
+        print("usbd: xpad: controller found, interface ");
+        print_uint(iface_num);
+        print(", interrupt IN endpoint 0x");
+        print_hex8(ep_in_addr);
+        print(", max_packet=");
+        print_uint(ep_in_max_packet);
+        print(", bInterval=");
+        print_uint(ep_in_interval);
+        print("ms, reading reports\n");
+
+        usbd_xpad_read_loop(USB_DOWNSTREAM_ADDR, ep_in_addr & 0x0F, ep_in_max_packet, ep_in_interval);
+        return;
     }
 
-    if (!found_in)
+    if (usb_find_interface(&config_buf[0], 256, USB_CLASS_MASS_STORAGE, USB_MSC_SUBCLASS_SCSI, USB_MSC_PROTOCOL_BULK_ONLY, &iface_num, &num_endpoints, &ep_start))
     {
-        print("usbd: xpad: no interrupt IN endpoint found\n");
+        if (!usb_set_configuration(USB_DOWNSTREAM_ADDR, max_packet0, 1))
+        {
+            print("usbd: msc: SET_CONFIGURATION failed\n");
+            usb_set_split_context(false, 0, 0);
+            return;
+        }
+
+        usb_enumerate_msc_device(USB_DOWNSTREAM_ADDR, max_packet0, &config_buf[0], iface_num, num_endpoints, ep_start);
         usb_set_split_context(false, 0, 0);
         return;
     }
 
-    print("usbd: xpad: controller found, interface ");
-    print_uint(iface_num);
-    print(", interrupt IN endpoint 0x");
-    print_hex8(ep_in_addr);
-    print(", bInterval=");
-    print_uint(ep_in_interval);
-    print("ms, reading reports\n");
-
-    usbd_xpad_read_loop(USB_DOWNSTREAM_ADDR, ep_in_addr & 0x0F, ep_in_max_packet, ep_in_interval);
+    print("usbd: hub port ");
+    print_uint(port);
+    print(": not a recognized device, no further action\n");
+    usb_set_split_context(false, 0, 0);
 }
 
 fn void print_button_change(char* name, bool now, bool before)

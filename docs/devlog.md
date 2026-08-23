@@ -4,41 +4,189 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
-## 2026-08-23 (continued) — Removed rforkmemtest/rforkmemresult: a shipped shell command that had already once page-faulted the kernel
+## 2026-08-23 (continued) — Slave/PIO mode rewrite attempted and reverted; interrupt-split investigation still paused
 
-Audited every `asm { }`/`asm(...)` site across `user/` after a request
-for "absolutely safe userspace executables." Most of it is unavoidable
-and already about as contained as inline asm gets: `user.c3`'s
-`syscall()`/`syscall4()`/`syscall5()` (the `ecall` trampolines — the
-only way to trap into the kernel on RISC-V), `start()` (crt0
-equivalent), `rdtime()` (read-only CSR read), `threadcreate()` (rfork
-+ private-stack switch, has to be raw asm because nothing can safely
-touch memory in the window between the fork syscall returning in the
-child and switching `sp`), and the single-instruction `asm("fence")`
-memory barriers in `diskd.c3`/`netd.c3` before ringing a virtio
-doorbell.
+Continuation of the same day's USB work. Real lead followed all the
+way through to a dead end — reverted cleanly back to the known-good
+DMA-mode baseline, no net change to `dwc2.c3`'s transfer mechanics
+versus commit `275dfc0`.
 
-One site was genuinely different: `shell.c3`'s `rforkmemtest`/
-`rforkmemresult` commands did a raw, hand-inlined `RFMEM` fork
-specifically to demonstrate the shared-stack hazard threadcreate()
-exists to avoid — and their own comment already documented that an
-earlier version of this exact command had paged-faulted the kernel
-once, under real timing, once the parent's own subsequent activity
-reused stack memory the child's spilled return addresses still
-depended on. That's a live hazard shipped in the production shell
-binary, not a foundational primitive — removed both commands and the
-now-unused `rfork_child_ran` global (`rfork_shared_value` stays, still
-used by `killtest`/the permission test as a generic busy-loop
-counter). Updated the two comments in `sandboxtest`/`threadtest` that
-referenced `rforkmemtest` by name to describe the hazard generically
-instead.
+**The lead**: mainline Linux's own `drivers/usb/dwc2/params.c` has an
+explicit parameter table for this exact chip —
+`dwc2_set_cv1800_params()`, matched via the `"sophgo,cv1800b-usb"`
+devicetree compatible string — and it sets `p->host_dma = false`.
+Real, current mainline deliberately disables DMA mode for this SoC
+and runs Slave/PIO mode instead (manual FIFO push/pop) — a genuine,
+sourced fact, not a guess. Given the interrupt-split bug's own
+signature (short/infrequent DMA transfers fine, sustained/periodic
+ones never once completing across an exhaustive, source-verified
+round of fixes — see the previous entry) matched the shape of a real
+DMA-engine defect, rewriting the transfer mechanism to match mainline's
+own choice for this chip was a reasonable, well-motivated thing to try.
 
-Verified via a real QEMU boot with scripted shell input
-(`scripts/launch64.sh`'s own console, `\r`-terminated commands, per
-`stress_test.sh`'s established pattern): `rforktest`/`threadtest`/
-`threadresult` all still work exactly as before, and `rforkmemtest`
-now correctly falls through to "command not found." Both
-`scripts/build.sh` and `scripts/build_duo.sh` compile clean.
+**What the rewrite involved**: `usbd_init()` stopped setting
+`GAHBCFG.DMAEN`; `hc_transfer_once()`/`hc_transfer_once_split()` no
+longer touched `HCDMA` at all, instead pushing OUT data into the TX
+FIFO by hand (polling `GNPTXSTS`/`HPTXSTS` for space) and draining IN
+data from the shared RX FIFO by polling `GINTSTS.RXFLVL` + popping
+`GRXSTSP`, through the same `usb_dma_paddr` scratch buffer every
+caller already used. Needed a second MMIO page mapped
+(`board::USB_MMIO_FIFO_PAGE`, `+0x1000` — the host-channel FIFO port
+was a whole page past everything this driver used to touch).
+
+**Real bugs found and fixed along the way** (useful groundwork if this
+gets revisited):
+- DWC2 Slave mode does not auto-halt a channel the way DMA mode does —
+  confirmed against mainline's own `dwc2_hc_halt()`. This part of the
+  port was straightforward and correct.
+- `HCCHAR.CHENA` self-clears faster than a polling loop (as opposed to
+  a real interrupt handler) can react to `XFERCOMP` — re-asserting it
+  to request a halt at that point just re-arms an already-idle
+  channel. `CHHLTD` turned out not to be a usable completion signal at
+  polling granularity at all; every real caller only ever checks
+  specific `HCINT` bits anyway (`XFERCOMP`/`NAK`/`STALL`/...), so the
+  fix was to stop waiting for `CHHLTD` entirely.
+- Bare `ACK` (`HCINT` bit 5) can be observed on its own, one polling
+  iteration before `XFERCOMP`/the real RX data actually lands — a
+  real, narrow ordering gap between the wire-level ACK handshake and
+  the core finishing packet validation. Only a split start-split
+  legitimately completes on bare ACK alone; every other transfer needs
+  to keep polling past it.
+- `HCTSIZ`'s post-transfer remaining-count field doesn't reliably
+  track what Slave mode actually moved — the driver's own real
+  pushed/popped byte counts are a better source of truth than
+  rederiving it from that field.
+
+**Where it stopped**: after all of the above, a real 8-byte
+`GET_DESCRIPTOR` response popped 2 words from the RX FIFO — the first
+word was byte-exact correct (`bLength`/`bDescriptorType`/`bcdUSB`
+verified against the real values), but the second word exactly
+matched the value of the *next*, still-unread `GRXSTSP` status-queue
+entry, every single time, 100% reproducible. Tested and ruled out:
+
+- A memory-ordering hazard (`asm("fence")` between the two FIFO
+  reads) — zero effect.
+- A real physical timing gap between consecutive reads (a 2µs busy-spin
+  delay between them, reasoned from mainline's own `dwc2_rx_fifo_level_intr()`
+  only ever running from inside a genuine hardware interrupt, with
+  real IRQ-dispatch latency this driver's tight polling loop doesn't
+  have) — also zero effect, byte-identical output either way.
+
+Both being ruled out, byte-identical regardless of timing, means this
+is deterministic — not a race. A careful re-read of mainline's actual
+call chain (`dwc2_rx_fifo_level_intr`, `dwc2_read_packet`,
+`dwc2_hc_intr`'s dispatch order, `dwc2_get_actual_xfer_length`)
+confirmed this driver's own implementation is a faithful, line-for-line
+port of what mainline actually does — there was no difference in
+*approach* left to find by reading more of that source. Whatever's
+wrong is either a genuine CV1800B-specific FIFO erratum invisible to
+generic mainline source (plausible, given this exact chip already
+needed its own quirk table entry just to disable DMA) or something
+about this driver's own surrounding register state not yet
+cross-checked — resolving either would need the vendor's own register
+errata (not available) or a real protocol/logic analyzer (the same
+tooling gap the original interrupt-split investigation hit).
+
+**Reverted**: `boards/duo/board.c3`, `boards/qemu/board.c3`,
+`src/process.c3` back to `HEAD` in full (pure Slave/PIO artifacts).
+`user/usb/dwc2.c3` rebuilt from `HEAD` with only the (unrelated) USB
+Mass Storage prep changes reapplied on top — confirmed via `git diff
+--stat` showing pure insertions, zero deletions, versus `275dfc0`.
+Real hardware re-tested after reverting: enumeration through the hub
+and xpad detection both work exactly as before this detour started.
+Interrupt-split transfers remain paused, exactly where the previous
+entry left them — this whole detour neither fixed nor further
+diagnosed that original bug, since it never got past re-establishing
+basic control-transfer reliability under Slave mode. If revisited
+again, start from real tooling (protocol/logic analyzer) rather than
+more source-comparison guessing — this session's experience is real
+evidence that avenue is exhausted for now.
+
+---
+
+## 2026-08-23 (continued) — Interrupt-split investigation paused; USB Phase 4 prep: Mass Storage Bulk-Only Transport
+
+Continuation of the same day's USB Phase 3 session (previous entry
+below). Two parts: closing out the interrupt-transfer investigation
+for now, and starting fresh on a different USB target that doesn't
+share its root cause.
+
+**Interrupt-split investigation — paused, not resolved:**
+
+- Found and fixed a real bug on a fresh re-read of
+  `hc_transfer_once_split` (`dwc2.c3`): `HCCHAR.ODDFRM` was computed
+  once, before the start-split, then reused unchanged for the
+  complete-split. Real Linux (`dwc2_hc_set_even_odd_frame`)
+  recomputes it separately per sub-transaction, since frame parity
+  flips every 1ms and real wall-clock time passes between SSPLIT and
+  CSPLIT. Fixed by adding a separately-computed `csplit_oddfrm`. Did
+  **not** resolve the underlying bug — CSPLIT still comes back
+  NYET/NAK forever for the pad's interrupt endpoint.
+- Attached the same controller directly to the host laptop and used
+  `usbmon` to capture real, known-good USB traffic for comparison —
+  confirmed the working case is xHCI (hardware handles the hub
+  TT/relay invisibly), which is architecturally why it can't show
+  DWC2's own SSPLIT/CSPLIT detail. Tried `dynamic_debug` for
+  kernel-side DWC2 tracing on the Duo itself — no compiled-in
+  `pr_debug` calls in the relevant path, dead end.
+- **Hazard found and documented**: reading
+  `/sys/kernel/debug/usb/4340000.usb/regdump` concurrently with a live
+  USB transfer hung the entire Linux system on the Duo (recovered
+  clean via power cycle, no data loss). Never race `regdump` against
+  a live transfer again.
+- Chased a power-delivery hypothesis (real pad does a firmware
+  self-test buzz on power-up under Linux, never once under this
+  driver) — bumped `bPwrOn2PwrGood` floor from 20ms to 200ms and added
+  a 200ms post-reset settle as a real-data probe (`dwc2.c3`,
+  `usbd.c3`, both still in the tree, harmless to keep). Inconclusive:
+  the "no vibration" comparison wasn't actually a controlled test, so
+  this shouldn't be read as ruling the hypothesis in or out.
+- Formally paused, not abandoned: no protocol analyzer or logic
+  analyzer available to see the actual wire-level SSPLIT/CSPLIT
+  exchange, which is what's needed to make further progress. Revisit
+  if the tooling situation changes or the user raises it again.
+  `USBD_VERBOSE` flipped back to `false`.
+
+**USB Phase 4 prep — Mass Storage (Bulk-Only Transport), build-verified only:**
+
+Chosen specifically because bulk transfers don't carry interrupt
+transfers' periodic-scheduling complexity (ODDFRM, MULTICNT,
+per-microframe NYET handling) — the existing split-transaction
+infrastructure proven working for control transfers (chunking, PID
+toggle tracking) should be directly reusable without hitting the same
+wall.
+
+- `user/usb/dwc2.c3`: new generic `usb_bulk_transfer()` — same
+  split-aware chunking/PID-toggle shape as `usb_control_transfer()`'s
+  own DATA stage, but standalone (no SETUP/STATUS) and with a
+  persistent toggle across calls, same contract as
+  `usb_interrupt_poll()`. Added `USB_HCCHAR_EPTYPE_BULK`,
+  `USB_EP_XFERTYPE_BULK`, `USB_CLASS_MASS_STORAGE`,
+  `USB_MSC_SUBCLASS_SCSI`, `USB_MSC_PROTOCOL_BULK_ONLY` constants.
+- `user/usb/msc.c3` (new): CBW/CSW builders (BOT spec) and SCSI
+  command builders for TEST UNIT READY, INQUIRY, READ CAPACITY(10),
+  READ(10) — cross-checked the wire format against a real `usbmon`
+  capture of a live card reader's CBW/CSW exchange from the interrupt
+  investigation above. `usb_enumerate_msc_device()` is a one-shot
+  proof-of-transport probe (not a persistent read loop, not a block
+  device driver yet): TEST UNIT READY → INQUIRY (prints vendor/product
+  strings) → READ CAPACITY(10) (prints block count/size) → READ(10) of
+  LBA 0 (prints first 16 bytes). No WRITE support yet — deliberately
+  deferred until read-only access is confirmed working on real
+  hardware.
+- `user/usb/usbd.c3`: generalized `usb_enumerate_hub_port_device()`'s
+  device recognition from a hard XPAD-vendor-ID gate to real class
+  dispatch — fetches the config descriptor once, then tries
+  `usb_find_interface()` against XPAD's class/subclass/protocol first,
+  then MSC's (0x08/0x06/0x50), same pattern a real USB-core stack
+  uses.
+- `scripts/build_user.sh` updated to include `msc.c3` in the `usbd`
+  build line.
+- Both `scripts/build.sh` (QEMU) and `scripts/build_duo.sh` (real Duo)
+  compile clean. **Not yet tested on real hardware** — no USB mass
+  storage device tried against it this session; deferred to a future
+  session per explicit request ("make some preparation for usb mass
+  storage, then we can test it later").
 
 ---
 
