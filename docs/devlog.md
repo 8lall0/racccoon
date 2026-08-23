@@ -4,6 +4,121 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-23 — USB Phase 3: xpad driver, hub-downstream enumeration, real split transactions — control works, interrupt transfers still don't
+
+Long session, mixed outcome. Real, working progress landed; the
+original goal (an Xbox 360 wired pad's buttons/sticks working end to
+end) did not.
+
+**What actually works, confirmed on real hardware:**
+
+- `user/usb/xpad.c3` — Xbox 360 wired pad report parsing (vendor-
+  specific XInput protocol, sourced from duo-buildroot-sdk's real
+  Linux `xpad.c` driver, not guessed). `test/xpad_parse_test.c3`
+  (`scripts/test_xpad.sh`) is a real host-native unit test using c3c's
+  built-in `@test` framework — verified it actually catches bugs by
+  deliberately breaking the Y-axis bitwise-NOT and watching it fail on
+  the right field.
+- Hub-downstream device enumeration (`usb_enumerate_hub_port_device`,
+  `usbd.c3`) — the missing piece Phase 2 never did (port reset,
+  SET_ADDRESS, full descriptor walk) — works.
+- Real USB 2.0 split transactions (`hc_transfer_once_split`,
+  `g_split_active`, `dwc2.c3`) for **control** transfers — full
+  enumeration of the pad behind the IO board's real Hi-Speed hub
+  (device descriptor, multi-packet 139-byte config descriptor via a
+  per-packet SSPLIT/CSPLIT chunking loop with correct DATA0/DATA1
+  toggle tracking, `SET_CONFIGURATION`) succeeds every time. This
+  replaces an earlier `HCFG.FSLSSUPP` workaround (forcing the whole
+  host to Full-Speed-only to sidestep needing splits at all) once that
+  workaround turned out to only fix control transfers, not interrupt.
+- `scripts/provision_duo_sd.sh` — recreates the `DUOBOOT`/`EXT2TEST`
+  partition layout from scratch (sourced from `board.c3`'s own
+  `FS_PARTITION_START_SECTOR`). Needed after the real-Linux-comparison
+  detour below required repeatedly overwriting the SD card's partition
+  table with the vendor's own official image and back.
+
+**What doesn't work: interrupt-type (periodic) transfers to that same
+endpoint, via the same split-transaction machinery, never once
+complete on real hardware** — `HCINT` shows a clean ACK on every
+start-split, but every complete-split comes back NYET (or, in one
+configuration, NAK) forever. Confirmed NOT the explanation, each with
+real hardware evidence, not just reasoning:
+
+- `HCCHAR.ODDFRM` frame parity — implemented, matches U-Boot's
+  `!(hfnum & 1)` formula exactly.
+- `bInterval`-based poll pacing (`usb_ep_desc_interval()` was defined
+  but never called before this session).
+- `GRXFSIZ`/`GNPTXFSIZ`/`HPTXFSIZ` FIFO sizing — tried three times:
+  first trusting reset-time register defaults (like real Linux's own
+  `dwc2_config_fifos()` does — disproven, this core's reset-time
+  values summed past its real 3072-word budget); then a naive even
+  3-way split; then finally the *exact real values Linux itself uses*
+  on this exact chip, read live from
+  `/sys/kernel/debug/usb/4340000.usb/params` after booting the real
+  vendor Linux 5.10 on this same board (`host_rx_fifo_size=530`,
+  `host_nperio_tx_fifo_size=256`, `host_perio_tx_fifo_size=768`). None
+  of the three changed the failure signature at all.
+- `GDFIFOCFG.EPINFOBASE` ("dedicated/multiple Tx FIFO" mode,
+  confirmed active: `en_multiple_tx_fifo=1` in that same real params
+  dump) — implemented, including the corrected real-value EPINFOBASE.
+- `GAHBCFG.GLBL_INTR_EN` — Linux sets this unconditionally even though
+  neither driver actually uses real CPU interrupts (both poll).
+- HCTSIZ.PID toggle tracking across complete-split retries (U-Boot's
+  `wait_for_chhltd()` re-reads and reuses it every sub-attempt; an
+  earlier version of this function didn't).
+- NAK-vs-NYET retry semantics for periodic splits, matched exactly to
+  real Linux's own `dwc2_hc_nyet_intr()` (`hcd_intr.c`): periodic types
+  don't retry a stale complete-split at all, unlike control/bulk —
+  implemented, no change.
+- Retry timing/shape in general — tried single-attempt-per-poll,
+  100-frame same-split retry, and 160-fresh-start-split-per-poll (the
+  last of which got **zero** completions across ~20 genuinely
+  independent frames, and correlated with the host controller wedging
+  entirely afterward — `hc_transfer_once` timing out with `HCINT=0`
+  even on plain control transfers. Reverted immediately; this is
+  filed as a real, if not fully understood, hazard of hammering this
+  core's complete-split path too hard.)
+
+**Real Linux, on this exact board/hub/pad, does not have this
+problem** — booted the vendor's stock `milkv-duo-sd-v1.1.4.img`
+(`official-image/` in the SDK checkout) three separate times this
+session (each requiring a full SD card partition-table round-trip via
+the new `provision_duo_sd.sh` to get back to `racccoon` afterward) and
+drove it entirely over the serial console via `screen`'s
+`readreg`/`paste`/`hardcopy` (no keyboard access needed — a real,
+reusable technique for unattended real-hardware testing going
+forward). A raw `usbfs` interrupt-transfer probe (`USBDEVFS_BULK`
+ioctl, bypassing `xpad`/`usbhid` entirely — this vendor image doesn't
+even have those compiled in) against the pad's interrupt endpoint got
+50/50 successes, immediately, every time. That's the strongest
+evidence available that this is a real, fixable driver gap, not a
+hardware/board quirk — but attempts to get *why* out of the real
+kernel came up empty: no `ftrace`/`kprobes` in this kernel build, no
+per-transfer `dev_dbg`/`dwc2_sch_dbg` tracing compiled in (only
+error-path prints exist in `dynamic_debug`'s control file), and its
+`regdump` debugfs tool appears to **hang the whole system** if read
+concurrently with a live transfer (recovered clean via power-cycle,
+no lasting harm — but noted here as a real hazard, not something to
+retry carelessly). A safe, standalone `regdump` read afterward showed
+only the hub's own always-full-speed background status-endpoint
+polling (`devaddr=2`, matching the hub not the pad), not anything
+about the pad's own split transfer.
+
+**Where this leaves things:** the interrupt-transfer gap is real,
+unresolved, and — importantly — not evidence this is unfixable. Every
+symptom (clean start-split ACKs, precise real NYET/NAK responses,
+control transfers working perfectly on the identical wire path)
+points at a real, working protocol mechanism missing one detail, not
+a fundamentally broken approach. Likely next steps if this gets picked
+back up: a real USB protocol analyzer between the hub and the pad
+(the one kind of ground truth nothing software-side could substitute
+for today), or comparison against a second, different real hub.
+
+`USBD_VERBOSE` back to `false`; the `hc_transfer_once_split`/
+`usb_interrupt_poll` diagnostic prints from this investigation are
+still there, just quiet by default — flip it back on to pick this up
+again.
+
 ## 2026-08-22 (74) — Quiet ethd's bring-up-era diagnostics: `ETHD_VERBOSE`
 
 Small follow-up to entry 72's real-hardware debugging round (the
