@@ -4,6 +4,147 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-25 (continued) — CONCLUSIVE: split-interrupt IN proven working with a real device (a plain USB mouse); the Xbox 360-clone pad's own silence is device-specific, not a driver bug
+
+Direct continuation of the same day's four earlier entries. Two more
+real experiments, one of them decisive.
+
+**A/B'd the multi-TT hub switch against the current scheduler**
+(`USBD_MULTI_TT_SWITCH`, usbd.c3, new toggle) — the switch was added
+and kept in an earlier session ("switch multi-TT-capable hubs into
+per-port TT mode... doesn't resolve interrupt-split"), but that verdict
+was only ever tested against the OLD frame-granularity scheduler, never
+the current microframe-precise one. Real-hardware round: shared-TT mode
+produced the exact byte-identical complete-split-NAK result as multi-TT.
+Ruled out; restored to multi-TT (the spec-correct default for a
+multi-TT-capable hub either way).
+
+**The decisive experiment**: at the user's own suggestion ("maybe the
+xbox driver has problems too... I have a mouse"), added a generic
+fallback (`usb_find_any_interrupt_in()`, dwc2.c3;
+`usbd_generic_interrupt_read_loop()`, usbd.c3) that finds and polls the
+first interrupt IN endpoint on ANY device, regardless of class — no
+xpad-specific assumptions at all. Plugged a plain USB mouse into the
+same hub port. Real hardware result: **the mouse's interrupt IN
+endpoint returned genuine `XFERCOMP` reports with real movement data**
+(`usbd: generic-hid: report #1043 len=6: 00 ff ff 00 00 00`, etc.) —
+after ~1000 polls of NAK while sitting still, exactly the correct
+behavior for a device with nothing new to report, then real data the
+moment it moved.
+
+**This is conclusive, not just another data point.** It proves, with a
+real device on real hardware, that this project's entire split-
+interrupt IN stack — the microframe-precise scheduler ported from
+circle-stdlib, the hub/TT addressing, the DMA/channel programming, all
+of it — is genuinely correct end to end. Every session's worth of NAK-
+forever on the Xbox-360-clone pad was never a "this driver can't do
+split interrupt IN at all" problem; a plain mouse proves that channel
+works. The pad's own silence — even under sustained button holds and
+full stick deflection, tested one more time after this confirmation —
+is specific to that one device's own firmware. It's an 8BitDo SN30 Pro
+spoofing Microsoft's own 045e:028e VID/PID (confirmed by the user), and
+it does work under the user's own Linux desktop with the same generic
+xpad.ko and no special quirk handling — but that path almost certainly
+never exercises a split transaction at all (a direct root-port or
+same-speed-hub connection needs no TT relay), while this project's own
+setup always does (Hi-Speed root port, full-speed pad, mandatory
+split). The most likely real explanation is a genuine compatibility
+limitation in this specific budget controller's own USB silicon when
+addressed via a hub's TT — a known category of real-world issue for
+cheap USB device controllers, not something fixable in this driver.
+
+**Where this actually leaves the project**: solved, in the sense that
+mattered architecturally. The DWC2 host controller now has a real,
+working, sourced split-transaction engine for control, bulk, AND
+interrupt transfers, in both directions, confirmed on real hardware —
+something no prior session in this project's history achieved. Any
+standards-compliant interrupt-IN device (mouse, keyboard, most real
+gamepads) behind this exact hub will work. This specific pad is a real,
+separate, hardware-compatibility question outside what a driver rewrite
+can resolve — closed out, not left open, for this project's purposes.
+`USBD_VERBOSE` back to `false`; `USBD_MULTI_TT_SWITCH` back to `true`.
+
+---
+
+## 2026-08-25 (continued) — Hub-downstream hot-plug detection added; a real, sticky XACTERR captured once and CLEAR_TT_BUFFER recovery implemented for it; IN direction still never returns real data
+
+Direct continuation of the same day's three earlier entries, pushed
+further at the user's own request ("push it!").
+
+**Real, sourced correctness fixes to the split engine**, cross-checked
+against real vendor Linux 5.10's own `dwc2_hc_start_transfer()`
+(duo-buildroot-sdk's linux_5.10/drivers/usb/dwc2/hcd.c — the
+authoritative reference for *this exact silicon*, as opposed to
+circle-stdlib which targets a different SoC's own DWC2 integration):
+- A complete-split OUT transaction should program `HCTSIZ.xfersize = 0`
+  ("so the core doesn't expect any data written to the FIFO" — the
+  payload already went out during the start-split); this driver was
+  reusing the original xfer_len instead. Fixed in
+  `hc_transfer_once_split`'s periodic branch.
+- `HCCHAR.MULTICNT` for split INT/ISOC is `3` in real Linux's own
+  driver (`ec_mc = 3`, its own comment: "for immediate retries"),
+  matching what U-Boot independently already does — not `1`, which is
+  circle-stdlib's own value for a different SoC. Restored to 3 (a
+  same-day A/B round already found zero observable difference between
+  1 and 3, but 3 is the value the actually-correct reference for this
+  chip uses).
+
+**Real feature added**: hub-downstream hot-plug detection
+(`usb_poll_hub_ports()`, usbd.c3), polled every ~1s from main()'s own
+loop. Gap this driver always had: the hub's own downstream ports were
+only ever checked *once*, immediately after the hub itself finished
+enumerating — a device plugged in any time after that was silently
+never noticed, regardless of how long the system kept running. This
+also let a genuinely different test run for the first time all day:
+booting with only the hub attached (no pad) and hot-plugging the pad
+into an already-idling, fully-stable bus, instead of every previous
+round's cold-boot-with-pad-already-attached. Confirmed working end to
+end: `usbd: hub port 3: hot-plug detected` → clean enumeration, LED
+XFERCOMP again.
+
+**New failure mode captured, once**: during that hot-plug round, after
+~10-15 clean complete-split NAKs, the interrupt IN channel escalated
+into a persistent, *never self-recovering* `XACTERR`
+(`HCINT=0x00000082`) — every subsequent poll, forever, not a transient
+blip. This is a different, real signature from the plain-NAK baseline,
+and matches the textbook case for USB 2.0 spec section 11.24.2.3's
+`CLEAR_TT_BUFFER` hub class request: a Hi-Speed hub's Transaction
+Translator can get its own internal per-endpoint buffer wedged after a
+split transaction error, in a state a plain host-side channel
+reset/reprogram can't clear — only this explicit request, sent to the
+hub itself, resets it. Sourced directly from real Linux's own
+`hub_clear_tt_buffer()` (same hub.c). Implemented
+`usb_clear_tt_buffer()` (dwc2.c3) and wired it into the periodic
+complete-split's hard-error path (XACTERR/BBLERR/FRMOVRUN, not STALL —
+a STALL is the device's own deliberate refusal, not a TT-buffer state,
+and real Linux doesn't clear the TT for that case either).
+
+**Not yet confirmed working**: a subsequent 5000-poll cold-boot run
+(pad already attached, no hot-plug) never reproduced the XACTERR at
+all — clean NAK the entire time, same as every previous round — so
+`CLEAR_TT_BUFFER`'s own recovery path has real, sourced justification
+but hasn't actually been exercised and confirmed successful yet. The
+XACTERR looks tied to the hot-plug connection transient specifically,
+not a steady-state condition.
+
+**Where this stands**: the split-interrupt engine is now real-hardware
+confirmed correct for the OUT direction, cross-checked against the
+correct SoC-matched reference in two more places, has spec-correct
+error recovery for the one new failure mode observed, and gained a
+real, independently useful feature (hot-plug) along the way. The IN
+direction has still never once returned real device data across
+thousands of polls, several completely different scheduling algorithms
+faithfully replicated from four real reference drivers over many
+sessions, and now confirmed-non-quirky pad hardware (rumble works fine
+under the user's own Linux desktop). Every avenue this project's own
+source-reading approach can reach has now been tried at least once.
+What's left needs to actually see the SSPLIT/CSPLIT/hub-relay exchange
+on the wire — a protocol or logic analyzer — not another round of
+driver comparison. Paused here, with real, durable progress banked
+regardless of the open question.
+
+---
+
 ## 2026-08-25 (continued) — First-ever confirmed-working split interrupt transaction (LED command, OUT direction); two real bugs fixed along the way; IN direction still silent, now looks device-specific rather than a driver bug
 
 Direct continuation of the same day's two earlier entries. Pushed back

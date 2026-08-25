@@ -931,24 +931,20 @@ fn int hc_transfer_once_split(uint dev_addr, uint ep_num, uint eptype, bool is_i
 {
     bool is_interrupt = eptype == USB_HCCHAR_EPTYPE_INTERRUPT;
 
-    // MULTICNT=1 unconditionally, matching circle-stdlib's own
-    // StartChannel() (lib/usb/dwhcidevice.cpp) — for a *split* periodic
-    // transaction this field isn't "packets per microframe," it's the
-    // number of complete-splits the DWC2 core retries *autonomously in
-    // hardware* before ever signaling CHHLTD back to software (real
-    // Linux's own driver comments describe this exact field this way
-    // for the split case). U-Boot sets it to 3 ("for immediate
-    // retries"); this driver's own software-side scheduler owns
-    // complete-split retry pacing instead (hc_transfer_once_split's own
-    // header comment), so 1 is the more correct value regardless. A
-    // real-hardware round with MULTICNT=3 got an immediate,
-    // 100%-reproducible complete-split NAK on the very first
-    // software-issued attempt; MULTICNT=1 produced the exact same
-    // result (docs/devlog.md) — not the cause of that specific failure,
-    // but kept at 1 anyway since it's the value every real reference
-    // implementation of the software-paced scheduler this file follows
-    // actually uses.
-    uint multicnt = 1;
+    // MULTICNT=3 for interrupt/isoc splits, matching real vendor Linux
+    // 5.10's own dwc2_hc_start_transfer() (duo-buildroot-sdk's
+    // linux_5.10/drivers/usb/dwc2/hcd.c: `if (ep_type == INT || ISOC)
+    // ec_mc = 3; else ec_mc = 1;`, its own comment: "for immediate
+    // retries") — the authoritative reference for THIS exact silicon,
+    // and the same value U-Boot's own chunk_msg() independently uses.
+    // circle-stdlib always uses 1 instead, but circle targets a
+    // different SoC's own DWC2 integration (Raspberry Pi's "dwhci"),
+    // not this one — real-hardware A/B round on this exact board found
+    // zero observable difference between 1 and 3 either way (same
+    // complete-split NAK signature, byte-identical — docs/devlog.md),
+    // so this follows the SoC-matched reference rather than circle's
+    // own value where the two genuinely disagree.
+    uint multicnt = is_interrupt ? 3 : 1;
     uint hcchar = (max_packet & USB_HCCHAR_MPS_MASK)
         | (ep_num << USB_HCCHAR_EPNUM_SHIFT)
         | (is_in ? USB_HCCHAR_EPDIR : 0)
@@ -1019,7 +1015,17 @@ fn int hc_transfer_once_split(uint dev_addr, uint ep_num, uint eptype, bool is_i
             usb_wait_for_microframe(target_mf);
             uint csplit_oddfrm = usb_split_periodic_oddfrm();
 
-            uint csplit_hctsiz = (xfer_len & USB_HCTSIZ_XFERSIZE_MASK)
+            // Real vendor Linux 5.10's own dwc2_hc_start_transfer()
+            // (duo-buildroot-sdk's linux_5.10/drivers/usb/dwc2/hcd.c):
+            // "For CSPLIT OUT Transfer, set the size to 0 so the core
+            // doesn't expect any data written to the FIFO" — the OUT
+            // payload was already pushed during the start-split; a
+            // complete-split OUT only polls "is it done," no new FIFO
+            // write. IN keeps the real max_packet size regardless of
+            // start/complete, matching that same function's own
+            // `chan->ep_is_in || ... ` branch.
+            uint csplit_xfer_len = is_in ? xfer_len : 0;
+            uint csplit_hctsiz = (csplit_xfer_len & USB_HCTSIZ_XFERSIZE_MASK)
                 | (num_packets << USB_HCTSIZ_PKTCNT_SHIFT)
                 | (cur_pid << USB_HCTSIZ_PID_SHIFT);
             usb_reg_write(USB_HC0_HCTSIZ, csplit_hctsiz);
@@ -1046,6 +1052,23 @@ fn int hc_transfer_once_split(uint dev_addr, uint ep_num, uint eptype, bool is_i
                 print(hcint & USB_HCINT_BBLERR ? " (BBLERR)" : "");
                 print(hcint & USB_HCINT_FRMOVRUN ? " (FRMOVRUN)" : "");
                 print("\n");
+
+                // Real recovery action for exactly this signature — see
+                // usb_clear_tt_buffer's own header comment. Not STALL:
+                // a STALL is the *device* deliberately refusing the
+                // request, not a TT-buffer-level error, and real Linux
+                // doesn't clear the TT for that case either.
+                if (hcint & (USB_HCINT_XACTERR | USB_HCINT_BBLERR | USB_HCINT_FRMOVRUN))
+                {
+                    if (usb_clear_tt_buffer(g_split_hub_addr, g_split_hub_port, dev_addr, ep_num, eptype, is_in))
+                    {
+                        print("usbd: hc_transfer_once_split: CLEAR_TT_BUFFER sent\n");
+                    }
+                    else
+                    {
+                        print("usbd: hc_transfer_once_split: CLEAR_TT_BUFFER failed\n");
+                    }
+                }
                 return -1;
             }
 
@@ -1565,6 +1588,41 @@ fn bool usb_find_interface(char* config_buf, uint len, uint want_class, uint wan
     return false;
 }
 
+// Generic fallback finder: the first interrupt IN endpoint in ANY
+// interface, regardless of class/subclass/protocol — for the "does
+// split-interrupt IN even work through this hub, at all, for some
+// completely different and boring device" diagnostic
+// (usbd_generic_interrupt_read_loop, usbd.c3): a plain USB mouse/
+// keyboard's own descriptors, unlike a vendor-specific XInput pad, are
+// arbitrary and not worth matching by class/subclass/protocol the way
+// usb_find_interface above does — the goal here is just "any interrupt
+// IN endpoint at all," full stop.
+fn bool usb_find_any_interrupt_in(char* config_buf, uint len, uint* ep_addr_out, uint* max_packet_out, uint* interval_out)
+{
+    uint i = 0;
+    while (i + 1 < len)
+    {
+        uint b_length = (uint)config_buf[i] & 0xFF;
+        uint b_type = (uint)config_buf[i + 1] & 0xFF;
+        if (b_length == 0) { break; }
+        if (b_type == USB_DESC_TYPE_ENDPOINT && i + 6 < len)
+        {
+            char* ep_desc = &config_buf[i];
+            uint xfer_type = usb_ep_desc_xfer_type(ep_desc);
+            uint addr = usb_ep_desc_address(ep_desc);
+            if (xfer_type == USB_EP_XFERTYPE_INTERRUPT && (addr & 0x80) != 0)
+            {
+                *ep_addr_out = addr;
+                *max_packet_out = usb_ep_desc_max_packet(ep_desc);
+                *interval_out = usb_ep_desc_interval(ep_desc);
+                return true;
+            }
+        }
+        i += b_length;
+    }
+    return false;
+}
+
 fn bool usb_get_port_status(uint dev_addr, uint max_packet0, uint port, void* buf4)
 {
     char[8] setup;
@@ -1722,4 +1780,62 @@ fn bool usb_reset_hub_port(uint hub_addr, uint max_packet0, uint port, uint* spe
     else if (status_b1 & USB_PORT_STATUS_LOW_SPEED_B1) { *speed_out = USB_DEV_SPEED_LOW; }
     else { *speed_out = USB_DEV_SPEED_FULL; }
     return true;
+}
+
+// CLEAR_TT_BUFFER — USB 2.0 spec section 11.24.2.3, a hub class request
+// sourced directly from real vendor Linux 5.10's own
+// hub_clear_tt_buffer() (duo-buildroot-sdk's linux_5.10/drivers/usb/
+// core/hub.c). A Hi-Speed hub's Transaction Translator relays split
+// transactions to/from a full/low-speed device on its own internal
+// buffer; when a split transaction gets a genuine error (XACTERR,
+// babble, stall), that buffer can be left in a state a plain host-side
+// channel reset can't clear — only this explicit request, sent to the
+// HUB itself (not the downstream device), actually resets it. This
+// driver never implemented it before now: real hardware round (see
+// hc_transfer_once_split's own header comment, docs/devlog.md) hit
+// exactly this signature — a clean run of complete-split NAKs
+// eventually degrading into a persistent, never-recovering XACTERR —
+// the textbook case this request exists for.
+//
+// devinfo bit layout matches Linux's own exactly: bits[3:0]=endpoint
+// number, bits[10:4]=device address, bits[12:11]=endpoint type
+// (0=control,1=isoc,2=bulk,3=interrupt — same encoding as this file's
+// own USB_HCCHAR_EPTYPE_* constants), bit[15]=direction (1=IN).
+// max_packet0 for the hub's own control endpoint is hardcoded to 64,
+// not passed in or rediscovered — the same real, spec-fixed fact this
+// driver already relies on elsewhere (usbd.c3's own bootstrap_mps0):
+// EP0's max packet size for a Hi-Speed device (this driver's hub is
+// always Hi-Speed) is fixed at 64, never ambiguous the way full/low-
+// speed EP0 sizes are.
+//
+// Temporarily clears g_split_active around the request itself — this
+// goes directly to the hub's own control endpoint on the root port,
+// never split, regardless of whatever downstream split context was
+// active when the error that triggered this happened — then restores
+// it, since the caller (hc_transfer_once_split) is still mid-way
+// through handling that downstream device's own transfer.
+fn bool usb_clear_tt_buffer(uint hub_addr, uint hub_port, uint dev_addr, uint ep_num, uint ep_type, bool is_in)
+{
+    uint devinfo = (ep_num & 0xF) | ((dev_addr & 0x7F) << 4) | ((ep_type & 0x3) << 11) | (is_in ? 0x8000 : 0);
+
+    bool saved_split_active = g_split_active;
+    uint saved_split_hub_addr = g_split_hub_addr;
+    uint saved_split_hub_port = g_split_hub_port;
+    g_split_active = false;
+
+    char[8] setup;
+    setup[0] = (char)0x23; // OUT, class, other (port) — same bmRequestType as usb_set_port_feature's own
+    setup[1] = (char)0x08; // HUB_CLEAR_TT_BUFFER
+    setup[2] = (char)(devinfo & 0xFF);
+    setup[3] = (char)((devinfo >> 8) & 0xFF);
+    setup[4] = (char)(hub_port & 0xFF);
+    setup[5] = (char)0;
+    setup[6] = (char)0;
+    setup[7] = (char)0;
+    bool ok = usb_control_transfer(hub_addr, 64, &setup[0], null, 0, true);
+
+    g_split_active = saved_split_active;
+    g_split_hub_addr = saved_split_hub_addr;
+    g_split_hub_port = saved_split_hub_port;
+    return ok;
 }

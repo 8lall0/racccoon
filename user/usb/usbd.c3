@@ -16,6 +16,68 @@ import std::nolibc::main_stub;
 // device enumeration (including through the Duo IO board's own
 // onboard hub) — see dwc2.c3's own header comment for full sourcing.
 
+// Real-hardware A/B round (docs/devlog.md): with the current
+// microframe-precise split-interrupt scheduler, shared-TT mode
+// produced the exact same result as multi-TT (byte-identical
+// complete-split NAKs) — ruling this out as the interrupt-split IN
+// differentiator. Back to true, the spec-correct default for a
+// multi-TT-capable hub (see this constant's own use, below).
+const bool USBD_MULTI_TT_SWITCH = true;
+
+// Hub-downstream hot-plug state — set once after the root-port hub
+// itself is enumerated (usb_enumerate_device's own hub branch), then
+// consulted every ~1s by usb_poll_hub_ports() (main()'s own polling
+// loop) to notice a device plugged into one of the hub's OWN ports
+// *after* that one-time initial walk already ran. Real gap this
+// project never had before: the initial walk only ever looked at
+// whatever was already plugged in at the moment the hub itself finished
+// enumerating — a device plugged into the hub any time after that was
+// never noticed at all, silently, regardless of how long main()'s own
+// root-port polling loop kept running. USB_HUB_MAX_PORTS_TRACKED (8) is
+// generous headroom over the real IO board hub's own 4 ports.
+const uint USB_HUB_MAX_PORTS_TRACKED = 8;
+uint g_hub_addr = 0; // 0 = no hub known yet (root device wasn't a hub, or hasn't enumerated)
+uint g_hub_max_packet0 = 0;
+uint g_hub_num_ports = 0;
+bool g_hub_root_is_high_speed = false;
+bool[8] g_hub_port_connected; // index 0 unused (ports are 1-based); sized to USB_HUB_MAX_PORTS_TRACKED
+
+// Re-checks every known hub port for a connection state change since
+// the last check — the same GetPortStatus this file's own initial hub
+// walk already does, just repeated. A newly-connected port gets the
+// exact same usb_enumerate_hub_port_device() call the initial walk
+// uses; a newly-empty port just clears its own tracked state (so a
+// later re-plug on that same port is noticed too). No-op if the root
+// device was never a hub (g_hub_addr stays 0 in that case).
+fn void usb_poll_hub_ports()
+{
+    if (g_hub_addr == 0) { return; }
+
+    uint ports = g_hub_num_ports < USB_HUB_MAX_PORTS_TRACKED ? g_hub_num_ports : USB_HUB_MAX_PORTS_TRACKED - 1;
+    for (uint port = 1; port <= ports; port++)
+    {
+        char[4] port_status;
+        if (!usb_get_port_status(g_hub_addr, g_hub_max_packet0, port, &port_status[0])) { continue; }
+
+        bool now_connected = ((uint)port_status[0] & 0x1) != 0;
+        if (now_connected && !g_hub_port_connected[port])
+        {
+            g_hub_port_connected[port] = true;
+            print("usbd: hub port ");
+            print_uint(port);
+            print(": hot-plug detected\n");
+            usb_enumerate_hub_port_device(g_hub_addr, g_hub_max_packet0, port, g_hub_root_is_high_speed);
+        }
+        else if (!now_connected && g_hub_port_connected[port])
+        {
+            g_hub_port_connected[port] = false;
+            print("usbd: hub port ");
+            print_uint(port);
+            print(": disconnected\n");
+        }
+    }
+}
+
 // Orchestrates a full enumeration: bus reset -> read enough of the
 // device descriptor to learn bMaxPacketSize0 -> SET_ADDRESS -> read
 // the full device descriptor at the new address -> if it's a hub
@@ -163,7 +225,18 @@ fn void usb_enumerate_device()
         print("usbd: hub bDeviceProtocol=");
         print_uint(hub_device_protocol);
         print(hub_device_protocol == USB_HUB_PROTOCOL_MULTI_TT ? " (multi-TT capable)\n" : " (single-TT or full-speed)\n");
-        if (hub_device_protocol == USB_HUB_PROTOCOL_MULTI_TT)
+        // USBD_MULTI_TT_SWITCH: the multi-TT SET_INTERFACE switch
+        // (added in an earlier session, see git log "switch multi-TT-
+        // capable hubs into per-port TT mode") was tested and kept
+        // only against this driver's OLD, completely different
+        // interrupt-split scheduler (frame-granularity, always-NYET) —
+        // never re-tested against the current microframe-precise one
+        // (dwc2.c3's own hc_transfer_once_split). Real, honest
+        // possibility: the earlier "doesn't resolve interrupt-split"
+        // verdict was correct for that old algorithm and isn't
+        // necessarily still correct for this one. Flip to false for
+        // that specific A/B test (docs/devlog.md).
+        if (hub_device_protocol == USB_HUB_PROTOCOL_MULTI_TT && USBD_MULTI_TT_SWITCH)
         {
             if (usb_set_interface(USB_ENUM_ADDR, max_packet0, 0, 1))
             {
@@ -226,6 +299,7 @@ fn void usb_enumerate_device()
         ulong pwr_settle_start = rdtime();
         while (rdtime() - pwr_settle_start < usb_us_to_ticks((ulong)pwr_on_2_pwr_good_ms * 1000)) { yield(); }
 
+        bool root_is_high_speed = ((hprt0 & USB_HPRT0_PRTSPD_MASK) >> USB_HPRT0_PRTSPD_SHIFT) == 0;
         for (uint port = 1; port <= num_ports; port++)
         {
             char[4] port_status;
@@ -236,9 +310,9 @@ fn void usb_enumerate_device()
                 print_uint(port);
                 print(": ");
                 print(port_connected ? "connected\n" : "empty\n");
+                if (port < USB_HUB_MAX_PORTS_TRACKED) { g_hub_port_connected[port] = port_connected; }
                 if (port_connected)
                 {
-                    bool root_is_high_speed = ((hprt0 & USB_HPRT0_PRTSPD_MASK) >> USB_HPRT0_PRTSPD_SHIFT) == 0;
                     usb_enumerate_hub_port_device(USB_ENUM_ADDR, max_packet0, port, root_is_high_speed);
                 }
             }
@@ -249,6 +323,14 @@ fn void usb_enumerate_device()
                 print(": GET_PORT_STATUS failed\n");
             }
         }
+
+        // Enable ongoing hot-plug polling for this hub — see
+        // usb_poll_hub_ports()'s own comment for why the initial walk
+        // above isn't enough on its own.
+        g_hub_addr = USB_ENUM_ADDR;
+        g_hub_max_packet0 = max_packet0;
+        g_hub_num_ports = num_ports;
+        g_hub_root_is_high_speed = root_is_high_speed;
     }
     else
     {
@@ -523,10 +605,74 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         return;
     }
 
+    // Diagnostic fallback: not xpad, not mass storage, but if it has
+    // ANY interrupt IN endpoint at all (a plain mouse/keyboard almost
+    // certainly does), read it generically — real-hardware round
+    // testing whether split-interrupt IN works at all through this
+    // hub for some other, completely boring device, independent of
+    // whatever's specific to the XInput pad this driver otherwise
+    // targets (docs/devlog.md).
+    uint generic_ep_addr;
+    uint generic_ep_max_packet;
+    uint generic_ep_interval;
+    if (usb_find_any_interrupt_in(&config_buf[0], 256, &generic_ep_addr, &generic_ep_max_packet, &generic_ep_interval))
+    {
+        if (!usb_set_configuration(USB_DOWNSTREAM_ADDR, max_packet0, 1))
+        {
+            print("usbd: generic-hid: SET_CONFIGURATION failed\n");
+            usb_set_split_context(false, 0, 0);
+            return;
+        }
+        print("usbd: generic-hid: interrupt IN endpoint 0x");
+        print_hex8(generic_ep_addr);
+        print(", max_packet=");
+        print_uint(generic_ep_max_packet);
+        print(", bInterval=");
+        print_uint(generic_ep_interval);
+        print("ms, reading reports\n");
+        usbd_generic_interrupt_read_loop(USB_DOWNSTREAM_ADDR, generic_ep_addr & 0x0F, generic_ep_max_packet, generic_ep_interval);
+        return;
+    }
+
     print("usbd: hub port ");
     print_uint(port);
     print(": not a recognized device, no further action\n");
     usb_set_split_context(false, 0, 0);
+}
+
+// Diagnostic-only: polls an arbitrary interrupt IN endpoint forever,
+// printing the raw report bytes whenever one arrives — see this
+// function's own call site for why this exists (usb_find_any_interrupt_in).
+fn void usbd_generic_interrupt_read_loop(uint dev_addr, uint ep_num, uint max_packet, uint interval_ms)
+{
+    uint pid_toggle = USB_PID_DATA0;
+    uint paced_interval_ms = interval_ms == 0 ? 1 : interval_ms;
+    ulong interval_ticks = usb_us_to_ticks((ulong)paced_interval_ms * 1000);
+    uint poll_num = 0;
+
+    for (;;)
+    {
+        ulong poll_start = rdtime();
+        char[16] report @noinit;
+        uint report_len;
+        poll_num++;
+        if (usb_interrupt_poll(dev_addr, ep_num, max_packet, &pid_toggle, &report[0], 16, &report_len))
+        {
+            print("usbd: generic-hid: report #");
+            print_uint(poll_num);
+            print(" len=");
+            print_uint(report_len);
+            print(":");
+            uint dump_len = report_len < 16 ? report_len : 16;
+            for (uint i = 0; i < dump_len; i++)
+            {
+                putchar(' ');
+                print_hex8((uint)report[i] & 0xFF);
+            }
+            print("\n");
+        }
+        while (rdtime() - poll_start < interval_ticks) { yield(); }
+    }
 }
 
 fn void print_button_change(char* name, bool now, bool before)
@@ -657,6 +803,15 @@ fn void main()
         if (poll_count % 20 == 0)
         {
             print_hprt0_raw("poll");
+        }
+
+        // Hub-downstream hot-plug — see usb_poll_hub_ports()'s own
+        // comment. ~1s cadence: frequent enough to notice a real plug
+        // event promptly, infrequent enough not to hammer the hub with
+        // GetPortStatus every 100ms tick for no reason.
+        if (poll_count % 10 == 0)
+        {
+            usb_poll_hub_ports();
         }
 
         // Clear PRTCONNDET (W1C) if it's set, without disturbing any
