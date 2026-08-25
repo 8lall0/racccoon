@@ -387,7 +387,7 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
     }
 
     bool do_split = root_is_high_speed && device_speed != USB_DEV_SPEED_HIGH;
-    usb_set_split_context(do_split, hub_addr, port);
+    usb_set_split_context(do_split, hub_addr, port, device_speed == USB_DEV_SPEED_LOW);
     print("usbd: hub port ");
     print_uint(port);
     print(": device speed=");
@@ -413,7 +413,7 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         print("usbd: hub port ");
         print_uint(port);
         print(": initial GET_DESCRIPTOR(8) failed (all attempts)\n");
-        usb_set_split_context(false, 0, 0);
+        usb_set_split_context(false, 0, 0, false);
         return;
     }
     uint max_packet0 = (uint)desc_buf[7] & 0xFF;
@@ -423,7 +423,7 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         print("usbd: hub port ");
         print_uint(port);
         print(": SET_ADDRESS failed\n");
-        usb_set_split_context(false, 0, 0);
+        usb_set_split_context(false, 0, 0, false);
         return;
     }
     ulong addr_settle = rdtime();
@@ -434,7 +434,7 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         print("usbd: hub port ");
         print_uint(port);
         print(": GET_DESCRIPTOR(18) at new address failed\n");
-        usb_set_split_context(false, 0, 0);
+        usb_set_split_context(false, 0, 0, false);
         return;
     }
 
@@ -465,7 +465,7 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         print("usbd: hub port ");
         print_uint(port);
         print(": configuration descriptor fetch failed\n");
-        usb_set_split_context(false, 0, 0);
+        usb_set_split_context(false, 0, 0, false);
         return;
     }
 
@@ -477,7 +477,7 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         if (!usb_set_configuration(USB_DOWNSTREAM_ADDR, max_packet0, 1))
         {
             print("usbd: xpad: SET_CONFIGURATION failed\n");
-            usb_set_split_context(false, 0, 0);
+            usb_set_split_context(false, 0, 0, false);
             return;
         }
 
@@ -548,7 +548,7 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         if (!found_in)
         {
             print("usbd: xpad: no interrupt IN endpoint found\n");
-            usb_set_split_context(false, 0, 0);
+            usb_set_split_context(false, 0, 0, false);
             return;
         }
 
@@ -596,12 +596,12 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         if (!usb_set_configuration(USB_DOWNSTREAM_ADDR, max_packet0, 1))
         {
             print("usbd: msc: SET_CONFIGURATION failed\n");
-            usb_set_split_context(false, 0, 0);
+            usb_set_split_context(false, 0, 0, false);
             return;
         }
 
         usb_enumerate_msc_device(USB_DOWNSTREAM_ADDR, max_packet0, &config_buf[0], iface_num, num_endpoints, ep_start);
-        usb_set_split_context(false, 0, 0);
+        usb_set_split_context(false, 0, 0, false);
         return;
     }
 
@@ -620,7 +620,7 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         if (!usb_set_configuration(USB_DOWNSTREAM_ADDR, max_packet0, 1))
         {
             print("usbd: generic-hid: SET_CONFIGURATION failed\n");
-            usb_set_split_context(false, 0, 0);
+            usb_set_split_context(false, 0, 0, false);
             return;
         }
         print("usbd: generic-hid: interrupt IN endpoint 0x");
@@ -637,7 +637,7 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
     print("usbd: hub port ");
     print_uint(port);
     print(": not a recognized device, no further action\n");
-    usb_set_split_context(false, 0, 0);
+    usb_set_split_context(false, 0, 0, false);
 }
 
 // Diagnostic-only: polls an arbitrary interrupt IN endpoint forever,

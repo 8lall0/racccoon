@@ -4,6 +4,52 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-26 — First real-hardware USB Mass Storage test surfaces a genuine LSPDDEV gap (fixed); a USB 3.0 flash drive still won't enumerate, reporting a implausible low-speed
+
+Follow-on session, continuing the previous day's USB work with a fresh
+"what's next" survey. `msc.c3` (SCSI TEST UNIT READY/INQUIRY/READ
+CAPACITY/READ10 over Bulk-Only Transport) had existed since commit
+`b05e602` but had never once been tested against a real device — a
+natural next step now that the split engine is proven correct. Plugged
+in a real USB 3.0 flash drive (using hot-plug detection, no reboot
+needed) for the first-ever real test.
+
+**Real bug found and fixed**: the device enumerated at `device
+speed=low` — and `HCCHAR.LSPDDEV` ("low-speed device"), needed
+whenever the channel talks to a genuinely low-speed device, had a
+comment saying "never set, this driver only ever talks to full-speed
+devices" — true until this exact test, since every device tried before
+(the hub, the Xbox pad, the mouse) was full-speed. Fixed: threaded
+device speed through the same global single-device-context mechanism
+`g_split_active`/`g_split_hub_addr`/`g_split_hub_port` already use
+(`g_device_is_low_speed`, set in `usb_set_split_context()`), consulted
+in both `hc_transfer_once` and `hc_transfer_once_split` when building
+HCCHAR. Verified against real vendor Linux 5.10's own `dwc2_hc_init()`
+(duo-buildroot-sdk's linux_5.10/drivers/usb/dwc2/hcd.c): sets
+`HCCHAR_LSPDDEV` under the exact same condition
+(`chan->speed == USB_SPEED_LOW`), unconditionally regardless of
+split — byte-for-byte match, not a guess.
+
+**Still doesn't enumerate**, even with the fix. Added a raw
+`GetPortStatus` byte dump before trusting the speed reading at all
+(`03 05`) — byte1's bit2 (USB_PORT_STAT_LOW_SPEED, USB 2.0 spec table
+11-15) is genuinely set, confirming this driver's own speed decoding is
+correct and the hub itself is honestly reporting low-speed, not a
+parsing bug. But a genuine USB 3.0 drive reporting 1.5 Mbps low-speed
+is implausible on its face — even in USB2 fallback these almost always
+negotiate full or high-speed. With LSPDDEV now correctly set, the
+device still fails enumeration (`start-split not ACKed` twice, then a
+genuine `STALL` on the third attempt's complete-split). The combination
+— implausible-but-honestly-reported low speed, plus continued failure
+even once handled per spec — points at an electrical/negotiation issue
+specific to this exact drive, cable, or connector (a marginal D+/D-
+connection, e.g. through a USB-C-to-A adapter, is a known real-world
+cause of misdetected speed class), not something more driver code can
+fix. Suggested the user try a different cable/adapter or a more
+ordinary USB2 flash drive next. `USBD_VERBOSE` back to `false`.
+
+---
+
 ## 2026-08-25 (continued) — CONCLUSIVE: split-interrupt IN proven working with a real device (a plain USB mouse); the Xbox 360-clone pad's own silence is device-specific, not a driver bug
 
 Direct continuation of the same day's four earlier entries. Two more

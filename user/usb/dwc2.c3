@@ -90,7 +90,7 @@ const uint USB_HC0_HCDMA    = 0x514;
 const uint USB_HCCHAR_MPS_MASK      = 0x7FF;      // bits 10:0
 const uint USB_HCCHAR_EPNUM_SHIFT   = 11;
 const uint USB_HCCHAR_EPDIR         = 1 << 15;    // 1 = IN
-const uint USB_HCCHAR_LSPDDEV       = 1 << 17;    // low-speed device — never set, this driver only ever talks to full-speed devices
+const uint USB_HCCHAR_LSPDDEV       = 1 << 17;    // low-speed device — set whenever g_device_is_low_speed is, regardless of split/non-split (see that global's own comment)
 const uint USB_HCCHAR_EPTYPE_SHIFT  = 18;
 const uint USB_HCCHAR_EPTYPE_CONTROL = 0;
 const uint USB_HCCHAR_EPTYPE_BULK = 2;
@@ -345,11 +345,23 @@ uint g_split_hub_addr = 0;
 uint g_split_hub_port = 0;
 uint g_split_intr_diag_count = 0; // diagnostic-only, see hc_transfer_once_split's own USBD_VERBOSE-gated prints
 
-fn void usb_set_split_context(bool active, uint hub_addr, uint hub_port)
+// Real, sourced gap found on real hardware (docs/devlog.md): every
+// device this driver had ever talked to before now was full or
+// Hi-Speed, so HCCHAR.LSPDDEV ("low-speed device") was never once
+// exercised — a genuinely low-speed device behind the hub immediately
+// failed enumeration (start-split not ACKed / STALL nonsense) the
+// first time one showed up. Scoped the same way g_split_active/
+// g_split_hub_addr/g_split_hub_port already are: single global device-
+// context state, set once per device in usb_set_split_context, since
+// this driver only ever talks to one device at a time.
+bool g_device_is_low_speed = false;
+
+fn void usb_set_split_context(bool active, uint hub_addr, uint hub_port, bool is_low_speed)
 {
     g_split_active = active;
     g_split_hub_addr = hub_addr;
     g_split_hub_port = hub_port;
+    g_device_is_low_speed = is_low_speed;
 }
 
 const char[16] HEX_DIGITS = "0123456789abcdef";
@@ -767,7 +779,8 @@ fn int hc_transfer_once(uint dev_addr, uint ep_num, uint eptype, bool is_in, uin
         | (is_in ? USB_HCCHAR_EPDIR : 0)
         | (eptype << USB_HCCHAR_EPTYPE_SHIFT)
         | (1 << USB_HCCHAR_MULTICNT_SHIFT)
-        | (dev_addr << USB_HCCHAR_DEVADDR_SHIFT);
+        | (dev_addr << USB_HCCHAR_DEVADDR_SHIFT)
+        | (g_device_is_low_speed ? USB_HCCHAR_LSPDDEV : 0);
     usb_reg_write(USB_HC0_HCCHAR, hcchar);
 
     // Explicitly disable split (SPLTENA) in case a stray bit survived
@@ -950,7 +963,8 @@ fn int hc_transfer_once_split(uint dev_addr, uint ep_num, uint eptype, bool is_i
         | (is_in ? USB_HCCHAR_EPDIR : 0)
         | (eptype << USB_HCCHAR_EPTYPE_SHIFT)
         | (multicnt << USB_HCCHAR_MULTICNT_SHIFT)
-        | (dev_addr << USB_HCCHAR_DEVADDR_SHIFT);
+        | (dev_addr << USB_HCCHAR_DEVADDR_SHIFT)
+        | (g_device_is_low_speed ? USB_HCCHAR_LSPDDEV : 0);
 
     uint hcsplt_base = USB_HCSPLT_SPLTENA
         | (g_split_hub_addr << USB_HCSPLT_HUBADDR_SHIFT)
@@ -1776,6 +1790,16 @@ fn bool usb_reset_hub_port(uint hub_addr, uint max_packet0, uint port, uint* spe
     while (rdtime() - recovery_start < usb_us_to_ticks(50000)) { yield(); }
 
     uint status_b1 = (uint)port_status[1] & 0xFF;
+    if (USBD_VERBOSE)
+    {
+        print("usbd: hub port ");
+        print_uint(port);
+        print(": raw port_status bytes: ");
+        print_hex8((uint)port_status[0] & 0xFF);
+        print(" ");
+        print_hex8(status_b1);
+        print("\n");
+    }
     if (status_b1 & USB_PORT_STATUS_HIGH_SPEED_B1) { *speed_out = USB_DEV_SPEED_HIGH; }
     else if (status_b1 & USB_PORT_STATUS_LOW_SPEED_B1) { *speed_out = USB_DEV_SPEED_LOW; }
     else { *speed_out = USB_DEV_SPEED_FULL; }
