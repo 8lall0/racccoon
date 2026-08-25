@@ -4,6 +4,163 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-25 (continued) — First-ever confirmed-working split interrupt transaction (LED command, OUT direction); two real bugs fixed along the way; IN direction still silent, now looks device-specific rather than a driver bug
+
+Direct continuation of the same day's two earlier entries. Pushed back
+on my own conclusion from the previous entry (that this needed a
+multimeter to rule out power delivery) — real Linux demonstrably powers
+this exact pad through this exact hub and gets both the buzz and
+working data, so the wiring is proven capable and the gap has to be
+software, not hardware. That correction led somewhere real.
+
+**Re-read real vendor Linux 5.10's own `drivers/input/joystick/xpad.c`
+directly** (duo-buildroot-sdk's own tree, the exact kernel that produced
+the working reference behavior — not upstream mainline) rather than
+assuming. Two concrete, sourced gaps found:
+
+1. **`hub_port_reset()`** (drivers/usb/core/hub.c): after the port
+   reports enabled, real Linux does an *additional* `msleep(10 + 40)` =
+   50ms "TRSTRCY plus some extra" reset-recovery settle — a real delay
+   this driver never had at all, going straight from "port enabled"
+   into SET_ADDRESS/GET_DESCRIPTOR. Rewrote `usb_reset_hub_port()`
+   (dwc2.c3) to poll for RESET-clear+CONNECTION (like real Linux's
+   `hub_port_wait_reset()`, simplified) with up to 3 reset attempts, and
+   added the missing 50ms post-enable settle.
+2. **`xpad_led_probe()` → `xpad_identify_controller()`** (xpad.c): sends
+   an unconditional 3-byte LED-set command (`01 03 <pattern>`) over the
+   interrupt OUT endpoint right after enumeration, called directly from
+   `xpad_probe()` — NOT gated behind any application ever opening the
+   input device. This overturns an assumption held since an earlier
+   session ("pure firmware behavior, independent of any host driver")
+   — the pad's power-on behavior is host-triggered, and this driver had
+   never sent it anything at all, read-only the whole time. Added
+   `usb_interrupt_transfer_out()` (dwc2.c3) and wired it into
+   `usb_enumerate_hub_port_device()`'s own xpad branch (usbd.c3).
+
+**Real bug found and fixed while wiring in the LED command**: the
+endpoint-descriptor walk in `usb_enumerate_hub_port_device()` looped
+exactly `num_endpoints` (2) raw iterations by *position*, not by real
+endpoint count. A genuine Xbox 360-protocol pad's own vendor-specific
+interface has a proprietary 0x21 ("XInput") descriptor sitting between
+the interface descriptor and its two real endpoints — that descriptor
+consumed one loop iteration, so the walk found endpoint #1 (IN) and
+stopped one iteration short of ever reaching endpoint #2 (OUT). Real
+hardware confirmed this exactly: "no interrupt OUT endpoint found" even
+though the device unquestionably has one (real xpad.c requires exactly
+2 to even probe the device). Fixed to count only real ENDPOINT-type
+descriptors, and to stop early at the next INTERFACE descriptor.
+
+**Real hardware result — this is the milestone**: with both fixes in,
+the LED command's own split OUT transaction completed with a clean
+`XFERCOMP` — `usbd: split intr diag #1: XFERCOMP` — the first split
+*interrupt* transaction, in either direction, this project has ever
+gotten to complete. This proves the periodic scheduler ported from
+circle-stdlib (previous entries) is mechanically sound: correct hub/
+port addressing, correct microframe scheduling, the whole split
+mechanism genuinely works on this real hardware. The pad's own LED
+did not visibly change state (the user reports it was already lit
+solid before this command — plausibly this exact 8BitDo pad's own
+default "connected, unassigned" state looks the same as pattern 2), but
+the transaction itself completing at the protocol level is the real
+signal, independent of what it visibly did to the LED.
+
+**Still open**: the interrupt IN endpoint (the actual input reports)
+still NAKs every single poll, even immediately after the LED command's
+own confirmed success and with active button presses. Checked one more
+real Linux code path before concluding: `xpad_inquiry_pad_presence()`
+(an extra 12-byte init packet) exists in xpad.c but is wireless-
+receiver-only (`xpad360w_start_input`), never sent for a wired pad —
+so there's no missing Linux-side sequence step left to find; the LED
+command really is everything real Linux sends before polling IN. The
+user confirmed this exact device is an 8BitDo SN30 Pro VID/PID-cloned
+into Xbox 360 compatibility mode, not a genuine Microsoft pad — first
+suspected an 8BitDo-specific firmware quirk, but the user then shared
+their own Linux desktop's `lsmod`: `xpad`+`ff_memless` loaded, rumble
+genuinely works, on this same physical pad. That's a fully compliant,
+non-quirky pad under a normal host stack, which weakens the firmware-
+quirk theory — though that desktop is a full xHCI host with no hub-
+mediated USB2 split transaction in the picture at all, so it isn't
+directly comparable to this project's own DWC2-host-through-hub path.
+With the split mechanism now proven correct end-to-end for OUT, the
+most likely remaining explanation shifts to something specific to how
+this DWC2 core/hub combination schedules or buffers the IN direction of
+a split periodic transaction differently from OUT — not obviously
+resolvable by more source comparison; back to needing wire-level
+visibility for this specific asymmetry, same conclusion this bug has
+reached before, but from much closer in now that OUT is confirmed
+working. Real, substantive progress banked regardless: two genuine bugs
+fixed (endpoint walk, missing LED init) and the split-interrupt
+mechanism itself finally confirmed working on real hardware for the
+first time. `USBD_VERBOSE` back to `false`.
+
+---
+
+## 2026-08-25 (continued) — Two targeted, sourced fixes for the new complete-split-NAK signature, both cleanly negative — rules out scheduling jitter and MULTICNT, not timing precision itself
+
+Continuation of the same day's dwc2.c3 rewrite (previous entry). The
+rewrite's new failure signature — immediate, 100%-reproducible NAK on
+the very first complete-split attempt, no variance across ~1500+ real
+polls including active button presses — is different enough from the
+old NYET-forever signature to be worth chasing with two concrete,
+sourced hypotheses before pausing again.
+
+**Hypothesis 1: HCCHAR.MULTICNT.** For a split *periodic* transaction,
+this field isn't "packets per microframe" the way it is for a plain
+periodic transfer — real Linux's own driver comments describe it as the
+number of complete-splits the DWC2 core retries *autonomously in
+hardware* before ever signaling CHHLTD back to software. U-Boot sets it
+to 3 ("for immediate retries"), which this rewrite had carried over
+unchanged from the old driver. But circle-stdlib's own `StartChannel()`
+always uses `MULTICNT=1`, unconditionally, for everything — because its
+own scheduler owns retry pacing entirely in software and never wants the
+hardware racing its own internal, differently-timed retries underneath
+that. Real-hardware round: MULTICNT=1 for interrupt splits produced the
+exact byte-identical result as MULTICNT=3. Negative, but MULTICNT=1 is
+kept anyway (real reference value, no reason to prefer 3).
+
+**Hypothesis 2: yield() inside the microframe busy-wait.** Read this
+project's own kernel scheduler (`src/process.c3`'s `fn yield()`) directly
+rather than assuming: it's not a lightweight "let something else run if
+it wants to" — it unconditionally round-robins to the next RUNNABLE
+process and full-context-switches to it, only returning once every other
+runnable process (ethd, fsd, the shell — always present) has had its own
+turn. A single call can easily cost far more than one 125us microframe,
+which would make the new scheduler's own busy-wait-to-a-specific-
+microframe (`usb_wait_for_microframe()`) land at an effectively
+arbitrary microframe instead — a real, plausible explanation for a
+signature this deterministic. Removed yield() from that one loop
+specifically (kept bounded via a real-time rdtime() budget, no syscall,
+so it can't reintroduce the SIE/SYS_GETCHAR deadlock SYS_YIELD's own
+comment documents — see the code comment for the full reasoning).
+Real-hardware round: byte-identical result again, same NAK, same poll
+counts. Negative. Kept anyway — it's still the architecturally correct
+way to hit a 125us target regardless of this specific bug.
+
+**What this rules out**: two real, independent, plausible causes, both
+cleanly negative, and — notably — *identical* results regardless of
+timing precision (yield-paced vs. bare-spin) or hardware retry count
+(MULTICNT 1 vs. 3). That invariance is itself informative: if this were
+a scheduling-jitter or hardware-auto-retry problem, changing either of
+those should have changed the outcome, and neither did. Combined with
+the old algorithm's own equally invariant NYET-forever signature across
+many different retry-shape changes in earlier sessions, the emerging
+picture is that this bug doesn't live in the software retry/scheduling
+logic at all. The strongest remaining, still-unresolved lead is one this
+project has flagged before and never chased down: the pad's own real
+power-on self-test buzz (pure firmware behavior, confirmed happening
+under real Linux on this exact hardware every time) has never once
+happened under this driver, across every session and every algorithm
+tried — consistent with the device not actually being fully powered/
+booted, in which case an immediate, always-NAK complete-split (the hub
+correctly reporting "nothing new from downstream") would be the
+*correct* protocol-level response to a device that genuinely has nothing
+to report, not a driver bug at all. Not confirmed — would need a
+powered hub/multimeter check on the port's actual VBUS delivery under
+load, not more source or scheduling changes. `USBD_VERBOSE` back to
+`false`. Paused here.
+
+---
+
 ## 2026-08-25 — dwc2.c3 rewritten from zero against circle-stdlib's real DWC2 driver; interrupt-split still not completing, but a new and different failure signature
 
 `user/usb/dwc2.c3` (1762 lines) had accumulated so much session-by-session

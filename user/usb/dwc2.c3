@@ -820,19 +820,38 @@ fn int hc_transfer_once(uint dev_addr, uint ep_num, uint eptype, bool is_in, uin
 // field the same way.
 fn uint usb_hfnum_microframe() { return usb_reg_read(USB_HFNUM) & 0x7; }
 
-// Busy-waits (yield()-paced, bounded) until the current microframe
-// equals target_mf. Real hardware split-transaction scheduling for a
-// periodic endpoint is microframe-precise — see
-// CDWHCIFrameSchedulerPeriodic::WaitForFrame() in circle-stdlib's
+// Busy-waits, deliberately WITHOUT yield(), until the current
+// microframe equals target_mf. Real hardware split-transaction
+// scheduling for a periodic endpoint is microframe-precise (125us) —
+// see CDWHCIFrameSchedulerPeriodic::WaitForFrame() in circle-stdlib's
 // lib/usb/dwhciframeschedper.cpp, which does the same busy-wait against
-// this same field. Bounded to a short budget (a single frame is 1ms,
-// so any real target is at most a handful of microframes away) —
-// yield()'s own syscall-roundtrip cost can overshoot the exact
-// microframe boundary by more than circle's bare-metal busy loop would,
-// a real, honest limit of doing this from user-mode on top of a
-// syscall-based cooperative scheduler, not something to hide. Proceeds
-// best-effort on timeout rather than failing the whole transfer over
-// it — same reasoning as every other soft budget in this driver.
+// this same field, bare-metal with no scheduler underneath it at all.
+//
+// This driver's own yield() (src/process.c3's own fn yield()) is not a
+// lightweight "let something else run if it wants to" — it
+// unconditionally round-robins to the next RUNNABLE process and full-
+// context-switches to it, only returning once every other runnable
+// process (ethd, fsd, the shell — always present in this environment)
+// has had its own turn, easily costing far more than 125us. Kept
+// yield()-free even though a real-hardware round with it removed
+// changed nothing: same 100%-reproducible, zero-variance complete-split
+// NAK as with yield() in the loop (see hc_transfer_once_split's own
+// header comment for the full trace, docs/devlog.md) — ruling out
+// scheduling jitter as the cause of that specific failure, but this is
+// still the architecturally correct way to hit a 125us target, so it
+// stays.
+//
+// This is a deliberate, narrow exception to the yield()-everywhere
+// convention elsewhere in this driver (see SYS_YIELD's own comment,
+// src/entry.c3, for the real deadlock it exists to avoid: SIE stays
+// globally disabled while the shell idles in SYS_GETCHAR, so a
+// genuinely unbounded syscall-free spin elsewhere can wedge the whole
+// system). That risk doesn't apply here in the same way: this loop is
+// bounded to a short, fixed real-time budget via rdtime() — a plain CSR
+// read, no syscall, unaffected by SIE — so it always terminates on its
+// own regardless of interrupt state; worst case is a brief, bounded
+// stall of interrupt servicing (a few hundred us, at most a handful of
+// times per bInterval poll), not a hang.
 fn void usb_wait_for_microframe(uint target_mf)
 {
     ulong start = rdtime();
@@ -840,7 +859,6 @@ fn void usb_wait_for_microframe(uint target_mf)
     while (usb_hfnum_microframe() != target_mf)
     {
         if (rdtime() - start > budget) { return; }
-        yield();
     }
 }
 
@@ -883,7 +901,14 @@ fn uint usb_split_periodic_oddfrm()
 // microframe-scheduled, and all conflating NAK with NYET) produced a
 // deterministic NYET with no XFERCOMP ever, on real hardware (full
 // trace in docs/devlog.md). This is a materially different, real
-// algorithm, not yet confirmed on real hardware:
+// algorithm — confirmed real-hardware-working for the OUT direction
+// (usbd.c3's own xpad LED-set command completes with a clean XFERCOMP,
+// the first split interrupt transaction of any direction this project
+// has ever gotten to complete), still not observed on the IN direction
+// despite that confirmation — the scheduling mechanics below are sound;
+// whatever's stopping the pad's own interrupt IN endpoint from ever
+// returning real data is downstream of this function, not in it. Full
+// shape:
 //   - Start-split issues at a specific target microframe: current+1,
 //     bumped to 7 if that lands on 6 (microframe 6 is always skipped).
 //   - Anything but a clean ACK on the start-split is a hard give-up for
@@ -906,10 +931,24 @@ fn int hc_transfer_once_split(uint dev_addr, uint ep_num, uint eptype, bool is_i
 {
     bool is_interrupt = eptype == USB_HCCHAR_EPTYPE_INTERRUPT;
 
-    // U-Boot's own chunk_msg() sets HCCHAR.MULTICNT=3 for split INT
-    // ("for immediate retries," its own comment says); every other
-    // split type keeps 1.
-    uint multicnt = is_interrupt ? 3 : 1;
+    // MULTICNT=1 unconditionally, matching circle-stdlib's own
+    // StartChannel() (lib/usb/dwhcidevice.cpp) — for a *split* periodic
+    // transaction this field isn't "packets per microframe," it's the
+    // number of complete-splits the DWC2 core retries *autonomously in
+    // hardware* before ever signaling CHHLTD back to software (real
+    // Linux's own driver comments describe this exact field this way
+    // for the split case). U-Boot sets it to 3 ("for immediate
+    // retries"); this driver's own software-side scheduler owns
+    // complete-split retry pacing instead (hc_transfer_once_split's own
+    // header comment), so 1 is the more correct value regardless. A
+    // real-hardware round with MULTICNT=3 got an immediate,
+    // 100%-reproducible complete-split NAK on the very first
+    // software-issued attempt; MULTICNT=1 produced the exact same
+    // result (docs/devlog.md) — not the cause of that specific failure,
+    // but kept at 1 anyway since it's the value every real reference
+    // implementation of the software-paced scheduler this file follows
+    // actually uses.
+    uint multicnt = 1;
     uint hcchar = (max_packet & USB_HCCHAR_MPS_MASK)
         | (ep_num << USB_HCCHAR_EPNUM_SHIFT)
         | (is_in ? USB_HCCHAR_EPDIR : 0)
@@ -1369,6 +1408,34 @@ fn bool usb_interrupt_poll(uint dev_addr, uint ep_num, uint max_packet, uint* pi
     return true;
 }
 
+// One-shot interrupt OUT transfer — for device-specific init commands
+// sent right after enumeration, before any polling starts (e.g. the
+// xpad LED-set command usbd.c3's own xpad enumeration sends; see that
+// call site's own comment for why this exists at all). PID hardcoded
+// to DATA0: interrupt/bulk endpoints always start at DATA0 right after
+// SET_CONFIGURATION (same reasoning as usbd_xpad_read_loop's own
+// pid_toggle initialization), and this is only ever used for the very
+// first OUT transfer to a freshly configured endpoint — a real toggle-
+// tracking *pid_toggle_inout would be needed for a second call, not
+// implemented since nothing in this driver sends more than one.
+fn bool usb_interrupt_transfer_out(uint dev_addr, uint ep_num, uint max_packet, void* buf, uint buf_len)
+{
+    mem::copy((void*)usb_dma_paddr, buf, buf_len);
+
+    uint actual_len;
+    int result;
+    ulong nak_budget = usb_us_to_ticks(1000000);
+    ulong stage_start = rdtime();
+    for (;;)
+    {
+        result = hc_transfer_once(dev_addr, ep_num, USB_HCCHAR_EPTYPE_INTERRUPT, false, USB_PID_DATA0, max_packet, buf_len, 1, &actual_len);
+        if (result == 0) return true;
+        if (result == 1 && rdtime() - stage_start < nak_budget) { yield(); continue; }
+        print("usbd: interrupt OUT transfer failed\n");
+        return false;
+    }
+}
+
 fn bool usb_get_descriptor(uint dev_addr, uint max_packet0, uint desc_type, uint desc_index, void* buf, uint len)
 {
     char[8] setup;
@@ -1514,7 +1581,9 @@ fn bool usb_get_port_status(uint dev_addr, uint max_packet0, uint port, void* bu
 
 const uint USB_HUB_FEATURE_PORT_POWER = 8; // USB 2.0 spec Table 11-17
 const uint USB_HUB_FEATURE_PORT_RESET = 4; // USB 2.0 spec Table 11-17, alongside PORT_POWER above
+const uint USB_PORT_STATUS_CONNECTION = 1 << 0; // GetPortStatus wPortStatus bit 0 — USB_PORT_STAT_CONNECTION, include/uapi/linux/usb/ch11.h
 const uint USB_PORT_STATUS_ENABLE     = 1 << 1; // GetPortStatus wPortStatus bit 1
+const uint USB_PORT_STATUS_RESET      = 1 << 4; // GetPortStatus wPortStatus bit 4 — USB_PORT_STAT_RESET, still set while a reset is in progress
 // wPortStatus bits 9/10 (USB 2.0 spec Table 11-15) — within the
 // GetPortStatus response's second byte (port_status[1]), so the local
 // bit position within that byte is (9-8)=1 and (10-8)=2. Neither bit
@@ -1550,31 +1619,89 @@ fn bool usb_set_port_feature(uint dev_addr, uint max_packet0, uint port, uint fe
 // driver's root port itself negotiates whatever the hub natively
 // supports, so a downstream device that isn't itself Hi-Speed needs
 // every transfer split.
+//
+// Sequence sourced directly from real vendor Linux 5.10's own
+// hub_port_reset() (duo-buildroot-sdk's linux_5.10/drivers/usb/core/
+// hub.c), not just the USB 2.0 spec's own bare minimums — this
+// driver's earlier version (single fixed 50ms wait, one status check,
+// no post-enable settle) followed the spec minimums but skipped two
+// things real Linux does that affect how much time the device actually
+// gets before the host starts hammering it with control transfers:
+//   1. Polls GetPortStatus repeatedly for RESET to clear AND CONNECTION
+//      to stay set (hub_port_wait_reset()), instead of trusting one
+//      fixed-duration wait — a real reset can legitimately take longer
+//      than the spec minimum on real hardware.
+//   2. An explicit *additional* settle delay AFTER the port reports
+//      enabled, before ANY further communication — real Linux's own
+//      comment: "TRSTRCY = 10ms; plus some extra", reset_recovery_time
+//      = 10+40 = 50ms, done via msleep() right there in hub_port_reset()
+//      before update_devnum()/any control transfer. This driver had no
+//      equivalent at all: it went from "port reports enabled" straight
+//      into SET_ADDRESS/GET_DESCRIPTOR with zero recovery time. Real-
+//      hardware motivation: the Xbox 360 pad behind this exact hub
+//      never does its own power-on self-test buzz under this driver,
+//      despite doing so reliably under real Linux on the same physical
+//      hardware — since the wiring/power path is demonstrably capable
+//      (Linux proves it), the gap has to be in software sequencing/
+//      timing, and this is the first concrete, sourced difference from
+//      Linux's own real sequence.
 fn bool usb_reset_hub_port(uint hub_addr, uint max_packet0, uint port, uint* speed_out)
 {
-    if (!usb_set_port_feature(hub_addr, max_packet0, port, USB_HUB_FEATURE_PORT_RESET))
-    {
-        print("usbd: hub port ");
-        print_uint(port);
-        print(": SetPortFeature(PORT_RESET) failed\n");
-        return false;
-    }
-
-    // USB 2.0 spec's own minimum reset duration is 10ms; this driver's
-    // own established generous-margin convention elsewhere (e.g. root-
-    // port reset) uses 50ms instead.
-    ulong reset_start = rdtime();
-    while (rdtime() - reset_start < usb_us_to_ticks(50000)) { yield(); }
-
     char[4] port_status;
-    if (!usb_get_port_status(hub_addr, max_packet0, port, &port_status[0]))
+    bool enabled = false;
+
+    // PORT_RESET_TRIES in real Linux's own hub.c is 5 (or 2 under
+    // CONFIG_USB_FEW_INIT_RETRIES) — 3 matches this driver's own
+    // established retry-count convention elsewhere (e.g.
+    // usb_enumerate_device()'s own initial GET_DESCRIPTOR retry) rather
+    // than importing a separate magic number.
+    for (int attempt = 0; attempt < 3 && !enabled; attempt++)
     {
-        print("usbd: hub port ");
-        print_uint(port);
-        print(": GET_PORT_STATUS after reset failed\n");
-        return false;
+        if (!usb_set_port_feature(hub_addr, max_packet0, port, USB_HUB_FEATURE_PORT_RESET))
+        {
+            print("usbd: hub port ");
+            print_uint(port);
+            print(": SetPortFeature(PORT_RESET) failed\n");
+            return false;
+        }
+
+        // Poll for RESET to clear and CONNECTION to still be set,
+        // instead of trusting one fixed-duration wait — real Linux's
+        // own hub_port_wait_reset(), simplified (no HUB_RESET_TIMEOUT
+        // long-delay-after-two-short-failures ramp, just one steady
+        // 20ms poll interval up to an 800ms total budget, matching
+        // real Linux's own HUB_RESET_TIMEOUT).
+        ulong poll_start = rdtime();
+        ulong poll_budget = usb_us_to_ticks(800000);
+        for (;;)
+        {
+            ulong step_start = rdtime();
+            while (rdtime() - step_start < usb_us_to_ticks(20000)) { yield(); }
+
+            if (!usb_get_port_status(hub_addr, max_packet0, port, &port_status[0]))
+            {
+                print("usbd: hub port ");
+                print_uint(port);
+                print(": GET_PORT_STATUS after reset failed\n");
+                return false;
+            }
+            uint status_b0 = (uint)port_status[0] & 0xFF;
+            if (!(status_b0 & USB_PORT_STATUS_RESET) && (status_b0 & USB_PORT_STATUS_CONNECTION))
+            {
+                enabled = (status_b0 & USB_PORT_STATUS_ENABLE) != 0;
+                break;
+            }
+            if (!(status_b0 & USB_PORT_STATUS_CONNECTION))
+            {
+                print("usbd: hub port ");
+                print_uint(port);
+                print(": device disconnected during reset\n");
+                return false;
+            }
+            if (rdtime() - poll_start > poll_budget) { break; } // still resetting after the real Linux budget — give up this attempt, try again
+        }
     }
-    bool enabled = ((uint)port_status[0] & USB_PORT_STATUS_ENABLE) != 0;
+
     if (!enabled)
     {
         print("usbd: hub port ");
@@ -1582,6 +1709,13 @@ fn bool usb_reset_hub_port(uint hub_addr, uint max_packet0, uint port, uint* spe
         print(": did not report PORT_ENABLE after reset\n");
         return false;
     }
+
+    // Post-enable reset-recovery settle — see this function's own
+    // header comment for the real sourcing (Linux's own
+    // reset_recovery_time = 10+40 = 50ms). Nothing talks to the device
+    // until this elapses.
+    ulong recovery_start = rdtime();
+    while (rdtime() - recovery_start < usb_us_to_ticks(50000)) { yield(); }
 
     uint status_b1 = (uint)port_status[1] & 0xFF;
     if (status_b1 & USB_PORT_STATUS_HIGH_SPEED_B1) { *speed_out = USB_DEV_SPEED_HIGH; }

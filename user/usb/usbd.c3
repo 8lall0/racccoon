@@ -400,19 +400,46 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         }
 
         // Walk the interface's own endpoint descriptors looking for
-        // the interrupt IN one this phase needs. The real device also
-        // has an interrupt OUT endpoint (rumble/LED) — not used yet,
-        // no output support this phase.
+        // both the interrupt IN endpoint (reports) and the interrupt
+        // OUT one (rumble/LED) — real vendor Linux 5.10's own
+        // xpad.c (drivers/input/joystick/xpad.c, duo-buildroot-sdk)
+        // sends an LED-set command over the OUT endpoint unconditionally
+        // right after enumeration (xpad_probe() -> xpad_init_input() ->
+        // xpad_led_probe() -> xpad_identify_controller(), never gated
+        // behind any application opening the input device), which is
+        // sent below before this driver starts polling the IN endpoint.
         uint ep_in_addr = 0;
         uint ep_in_max_packet = 0;
         uint ep_in_interval = 0;
         bool found_in = false;
+        uint ep_out_addr = 0;
+        uint ep_out_max_packet = 0;
+        bool found_out = false;
+        // Walks by real endpoint COUNT, not raw descriptor position —
+        // a real Xbox 360 pad's own vendor-specific interface has a
+        // proprietary 0x21 ("XInput") descriptor sitting between the
+        // interface descriptor and its two real endpoint descriptors.
+        // A previous version of this loop ran for exactly
+        // `num_endpoints` (2) raw iterations regardless of descriptor
+        // type — that extra non-endpoint descriptor consumed one
+        // iteration, so it found endpoint #1 (IN) and then stopped one
+        // iteration short of ever reaching endpoint #2 (OUT). Confirmed
+        // on real hardware: "no interrupt OUT endpoint found" even
+        // though the device unquestionably has one (real vendor Linux's
+        // own xpad.c requires exactly 2 endpoints to even probe this
+        // device at all). Also stops at the next Interface descriptor,
+        // if one turns up before num_endpoints real endpoints have —
+        // a malformed/unexpected descriptor shouldn't run past this
+        // interface's own boundary into config_buf's fixed 256-byte
+        // bound.
         uint off = ep_start;
-        for (uint i = 0; i < num_endpoints; i++)
+        uint endpoints_found = 0;
+        while (off + 1 < 256 && endpoints_found < num_endpoints)
         {
             uint b_length = (uint)config_buf[off] & 0xFF;
             if (b_length == 0) { break; }
             uint b_type = (uint)config_buf[off + 1] & 0xFF;
+            if (b_type == USB_DESC_TYPE_INTERFACE) { break; }
             if (b_type == USB_DESC_TYPE_ENDPOINT)
             {
                 char* ep_desc = &config_buf[off];
@@ -425,6 +452,13 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
                     ep_in_interval = usb_ep_desc_interval(ep_desc);
                     found_in = true;
                 }
+                else if (xfer_type == USB_EP_XFERTYPE_INTERRUPT && (addr & 0x80) == 0)
+                {
+                    ep_out_addr = addr;
+                    ep_out_max_packet = usb_ep_desc_max_packet(ep_desc);
+                    found_out = true;
+                }
+                endpoints_found++;
             }
             off += b_length;
         }
@@ -445,6 +479,31 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         print(", bInterval=");
         print_uint(ep_in_interval);
         print("ms, reading reports\n");
+
+        // real Linux's own xpad_send_led_command(), XTYPE_XBOX360 case:
+        // {0x01, 0x03, command}, command = (pad_nr % 4) + 2 — pad_nr is
+        // always 0 for the first (and only) controller this driver ever
+        // tracks, so command=2 ("player 1," a steady, non-blinking LED
+        // pattern per the real Xbox 360 LED command table).
+        if (found_out)
+        {
+            char[3] led_cmd;
+            led_cmd[0] = (char)0x01;
+            led_cmd[1] = (char)0x03;
+            led_cmd[2] = (char)0x02;
+            if (usb_interrupt_transfer_out(USB_DOWNSTREAM_ADDR, ep_out_addr & 0x0F, ep_out_max_packet, &led_cmd[0], 3))
+            {
+                print("usbd: xpad: LED command sent\n");
+            }
+            else
+            {
+                print("usbd: xpad: LED command failed\n");
+            }
+        }
+        else
+        {
+            print("usbd: xpad: no interrupt OUT endpoint found, skipping LED command\n");
+        }
 
         usbd_xpad_read_loop(USB_DOWNSTREAM_ADDR, ep_in_addr & 0x0F, ep_in_max_packet, ep_in_interval);
         return;
