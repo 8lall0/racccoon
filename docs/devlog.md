@@ -4,6 +4,146 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-25 — dwc2.c3 rewritten from zero against circle-stdlib's real DWC2 driver; interrupt-split still not completing, but a new and different failure signature
+
+`user/usb/dwc2.c3` (1762 lines) had accumulated so much session-by-session
+narrative in its own comments — every hypothesis tried and reverted for
+the still-open interrupt-split bug — that it had become hard to reason
+about on its own terms. Rewrote it from a clean slate this session,
+using circle-stdlib's real DWC2 ("dwhci") host driver
+(github.com/rsta2/circle, fetched and read directly — lib/usb/dwhci*.cpp,
+include/circle/usb/dwhci.h, not from memory) as the primary structural
+and algorithmic reference, cross-checked against Linux where relevant.
+
+**What's unchanged in substance**: every CV1800B/Milk-V Duo TOP-block
+register fact, the core-reset sequence, the real vendor-debugfs-sourced
+FIFO sizing values, and non-split control/bulk transfer mechanics —
+these are real-hardware-proven facts orthogonal to Circle (which targets
+different SoC glue), just retyped clean with terser, fact-only comments
+instead of session archaeology.
+
+**What materially changed**: the split-transaction (SSPLIT/CSPLIT)
+engine. Reading Circle's real periodic-split state machine end to end
+(`CDWHCIFrameSchedulerPeriodic` in dwhciframeschedper.cpp, driven by the
+`StageStateStartSplit`/`StageStateCompleteSplit` handling in
+dwhcidevice.cpp) surfaced a genuinely new, sourced algorithm this driver
+had never tried — every prior attempt (mainline Linux, U-Boot, TinyUSB,
+all faithfully replicated in earlier sessions) scheduled at *frame*
+granularity and treated complete-split NAK the same as NYET (retry both).
+Circle's real, working algorithm is microframe-precise: busy-wait to a
+specific target microframe before the start-split (current+1, skip
+microframe 6), first complete-split poll at start_mf+2, each NYET/ACK
+retry advances by exactly 1 microframe (budget 3 tries, 2 if
+start_mf==5), and — the key semantic difference — a complete-split NAK
+is *not* retried at all, only NYET/ACK are, since NAK and NYET mean
+different things for a periodic split (NAK: hub has nothing new; NYET:
+still relaying, ask again). Implemented faithfully; control/bulk splits
+were deliberately left exactly as before (already proven working, and
+Circle's own non-periodic scheduler for that path is a smaller,
+lower-risk change not needed to fix the open bug).
+
+**Real hardware result**: full non-regression on every previously-working
+path — HPRT0 bring-up, full enumeration through the IO board's hub,
+multi-TT `SET_INTERFACE`, config descriptor fetch, xpad enumeration all
+clean, byte-identical in shape to before. Interrupt-split itself is
+still not completing, but the failure signature genuinely changed: every
+prior version got ACK on start-split, then NYET forever on complete-split
+across many retries. This version gets ACK on start-split, then an
+*immediate NAK* on the very first complete-split (at start_mf+2), 100%
+of ~1500+ polls, zero variance even while actively pressing buttons on
+the controller (also: no power-on self-test buzz from the pad itself,
+same as every previous session — still points at a power-delivery
+question independent of this bug). An immediate, invariant NAK this
+early is hard to explain as "hub has nothing to relay yet" — it looks
+more like the hub isn't treating our complete-split as continuing a
+pending transaction at all, which could mean the microframe-timing
+constants (skip-6, +2, ODDFRM polarity) don't transfer 1:1 from a
+Raspberry Pi's dwhci integration to this SoC's, or that something
+upstream of the scheduler itself (FIFO/channel state between the
+start-split's ACK and the complete-split's issue) isn't matching what
+real hardware expects. Not root-caused further this session — same
+conclusion as every previous round: resolving this needs to see the
+actual wire-level SSPLIT/CSPLIT exchange, not more source comparison.
+`USBD_VERBOSE` back to `false`. Paused, not abandoned.
+
+---
+
+## 2026-08-23 (continued) — Interrupt-split: four real reference drivers' retry logic tried, all fail; investigation paused
+
+After the hub multi-TT fix (previous entry) also didn't resolve the
+interrupt-split bug, went looking for real reference implementations
+of the actual SSPLIT/CSPLIT retry logic itself, not just register
+field names — the thing this project had been guessing at rather than
+sourcing directly for most of its history. Found and faithfully
+replicated the real, working logic of **four independent DWC2 host
+driver implementations**, each tested on real hardware:
+
+1. **Mainline Linux**, re-read in full (`dwc2_hc_nyet_intr()`,
+   `drivers/usb/dwc2/hcd_intr.c`): `qtd->complete_split` only resets
+   to 0 if `past_end` (the scheduling window was genuinely missed) —
+   otherwise the SAME complete-split is retried within that window.
+   This corrects an earlier misreading this project had held since
+   the previous session: periodic endpoints do *not* always get a
+   fresh start-split on NYET.
+2. **U-Boot's own `chunk_msg()`** (`drivers/usb/host/dwc2.c`): treats
+   every endpoint type identically — full register re-arm each
+   attempt, retry the same complete-split for up to 4 elapsed frames.
+   No eptype branching at all. This is what the driver now keeps.
+3. **TinyUSB's `hcd_dwc2.c`** (github.com/hathach/tinyusb) — a real,
+   shipping embedded stack, not a heavy OS abstraction: retries the
+   same complete-split up to 3 times on NYET, but touches only
+   `HCSPLT.split_compl` and `HCCHAR.odd_frame`/`CHENA` via read-modify-
+   write; `HCTSIZ`/`HCDMA` are programmed once, for the start-split,
+   and never touched again. Materially different register-touch
+   pattern from anything this driver had done before.
+4. **Circle** (github.com/rsta2/circle, `lib/usb/dwhciframeschedper.cpp`)
+   — a mature bare-metal stack for Raspberry Pi's own DWC2-family
+   "dwhci" core, with a proven-working Xbox 360-behind-a-hub driver
+   (`usbgamepadxbox360.cpp`) — busy-waits for a specific, computed
+   target microframe before issuing the *start-split itself* (current
+   microframe + 1, skipping microframe 6 entirely), not just before
+   the complete-split.
+
+**Real hardware result for all four**: (1)-(3), faithfully replicated,
+all produced the exact same deterministic outcome as this driver's
+own original logic — `ACK` on every start-split, `NYET` on every
+complete-split, never once `XFERCOMP`, regardless of retry count or
+register-touch pattern. (4) was genuinely different and informative:
+adding Circle's own microframe-alignment delay before the start-split
+shifted the hub's response from `NYET` to `NAK` — a real behavior
+change, the *only* one all session — but `NAK` (semantically "the hub
+no longer considers this split pending at all") is a worse outcome
+than `NYET`, not a step toward success. Removing the extra gap before
+the complete-split while keeping just the start-split alignment still
+produced `NAK`, meaning the alignment delay itself, not the gap after
+it, is what pushes the hub past whatever window it was tracking the
+pending split in.
+
+**Conclusion**: four independent, real, working implementations of
+this exact protocol layer all fail identically or worse on this
+specific hardware/hub/device combination when faithfully replicated.
+That is about as strong a negative result as source-only investigation
+can produce — this is very unlikely to be a driver logic bug at the
+SSPLIT/CSPLIT retry-shape level, and is now more likely either a
+genuine CV1800B-specific silicon quirk (plausible — this exact chip
+already needed its own DMA-disable quirk entry in mainline, see the
+Slave/PIO entry above) or something in this driver's own surrounding
+register/bring-up state that no amount of retry-logic comparison can
+surface. Resolving it further needs to see the actual wire-level
+SSPLIT/CSPLIT exchange — a protocol or logic analyzer, still not
+available.
+
+**Kept**: U-Boot's unified retry logic (no eptype branching) as the
+current implementation — the cleanest, most defensible state, matching
+two of the four real references exactly. `USBD_VERBOSE` back to
+`false`. Real hardware re-confirmed after cleanup: enumeration and
+xpad detection through the hub both still work exactly as before.
+Interrupt-split transfers remain paused — genuinely paused this time,
+not just deferred; further progress needs different tooling, not more
+source comparison.
+
+---
+
 ## 2026-08-23 (continued) — Hub multi-TT mode: a real, correct fix, but not the interrupt-split bug either
 
 One more real lead chased down on the still-paused interrupt-split
