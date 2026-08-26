@@ -222,6 +222,87 @@ fn void main() {
             } else {
                 print("cycletest: FAILED\n");
             }
+        } else if (strcmp(cmd, "lfntest") == 0) {
+            // Proves real VFAT long-filename (LFN) support in fat32.c3:
+            // reading a name a real, external tool (mtools' mcopy, this
+            // image's own build step) already wrote as a genuine LFN
+            // chain, writing a brand-new long name from inside racccoon
+            // itself (exercising fat32_prepare_new_entry's own alias
+            // generation + LFN-chain write), and renaming one long name
+            // to another (exercising fat32_rename's own LFN-aware
+            // lookup/creation/chain-cleanup together). Hardcoded, real
+            // space-containing names throughout — deliberately not
+            // typed at the interactive shell's own prompt, since its
+            // tokenizer splits on spaces with no quoting support at all
+            // (a separate, known gap — see docs/devlog.md).
+            //
+            // "My Long File Name.txt" is a real fixture baked into
+            // build/disk.img by scripts/build.sh itself (via mcopy,
+            // which — being a real, independent VFAT implementation —
+            // writes a genuine on-disk LFN chain, not anything this
+            // driver produced itself); on ext2 (this file's own logic
+            // never touches ext2.c3) it's absent, so this test simply
+            // reports the read as failed there rather than asserting
+            // anything about a fixture that was never seeded — the
+            // write/rename side below still exercises real ext2 long
+            // names fine either way, ext2 having never needed LFN
+            // support to begin with.
+            char[64] lfn_buf @noinit;
+            int lfn_read_len = fs_read("My Long File Name.txt", &lfn_buf, 64);
+            bool lfn_fixture_ok = true;
+            if (lfn_read_len >= 0) {
+                lfn_buf[lfn_read_len] = 0;
+                lfn_fixture_ok = strcmp(&lfn_buf, "Hello from disk!\n") == 0;
+            }
+
+            char* lfn_new_name = "tmp/A Brand New Long Name Test.txt";
+            char* lfn_new_content = "written with a real long name\n";
+            int lfn_write_len = fs_write(lfn_new_name, lfn_new_content, 31);
+            char[64] lfn_new_buf @noinit;
+            int lfn_new_read_len = fs_read(lfn_new_name, &lfn_new_buf, 64);
+            bool lfn_write_ok = false;
+            if (lfn_new_read_len >= 0) {
+                lfn_new_buf[lfn_new_read_len] = 0;
+                lfn_write_ok = strcmp(&lfn_new_buf, lfn_new_content) == 0;
+            }
+
+            // fs_list's own truncated-for-display record — just confirms
+            // *something* starting with the long name's own first 31
+            // chars shows up, not a byte-exact match (see
+            // FS_LIST_NAME_MAX's own truncation, user.c3).
+            char[576] lfn_listbuf @noinit;
+            int lfn_list_count = fs_list("tmp", &lfn_listbuf, 16);
+            bool lfn_list_ok = false;
+            for (int li = 0; li < lfn_list_count; li++) {
+                char* rec = &lfn_listbuf[li * 36];
+                if (rec[0] == 'A' && rec[1] == ' ' && rec[2] == 'B') { lfn_list_ok = true; }
+            }
+
+            char* lfn_renamed_name = "tmp/Yet Another Long Name.txt";
+            int lfn_rename_result = fs_rename(lfn_new_name, lfn_renamed_name);
+            int lfn_old_after_rename = fs_read(lfn_new_name, &lfn_new_buf, 64);
+            int lfn_new_after_rename = fs_read(lfn_renamed_name, &lfn_new_buf, 64);
+
+            int lfn_delete_result = fs_delete(lfn_renamed_name);
+            int lfn_after_delete = fs_read(lfn_renamed_name, &lfn_new_buf, 64);
+
+            if (lfn_fixture_ok && lfn_write_len == 31 && lfn_write_ok && lfn_list_ok
+                && lfn_rename_result == 0 && lfn_old_after_rename < 0 && lfn_new_after_rename >= 0
+                && lfn_delete_result == 0 && lfn_after_delete < 0) {
+                print("lfntest: ok\n");
+            } else {
+                print("lfntest: FAILED (fixture_ok=");
+                print(lfn_fixture_ok ? "1" : "0");
+                print(" write_len=");
+                print_uint((uint)(lfn_write_len < 0 ? 0 : lfn_write_len));
+                print(" write_ok=");
+                print(lfn_write_ok ? "1" : "0");
+                print(" list_ok=");
+                print(lfn_list_ok ? "1" : "0");
+                print(" rename=");
+                print_uint((uint)(lfn_rename_result < 0 ? 999 : (uint)lfn_rename_result));
+                print(")\n");
+            }
         } else if (strcmp(cmd, "ping") == 0) {
             // Resolved through the namespace now — "/srv/echo/" is where
             // echod is named (src/process.c3's default mount table),

@@ -6,9 +6,16 @@ module user;
 // every other FAT32 reader implements), not vendor-specific or
 // reverse-engineered the way this project's SDHCI register maps were.
 //
-// v1 scope, deliberately limited: 8.3 short filenames only (long
-// filename / LFN directory entries are skipped, not parsed). No
-// general, whole-filesystem cache — every call still walks the
+// Real VFAT long-filename (LFN) support: reads and writes standard
+// Microsoft-defined LFN directory-entry chains alongside the 8.3 short
+// name every entry still has (fat32_resolve_name11/fat32_lfn_feed/
+// fat32_lfn_finish for reading, fat32_prepare_new_entry for writing —
+// see their own comments). A name already exactly valid 8.3 form still
+// gets a plain, LFN-free short entry exactly as before; only a name
+// needing case-folding/truncation/invalid-character stripping gets a
+// generated short-name alias plus a real LFN chain, matching what a
+// real Windows/Linux/macOS FAT32 implementation would do. No general,
+// whole-filesystem cache — every call still walks the
 // relevant directory fresh (root, or a subdirectory reached via
 // fat32_resolve_dir — see its own comment) and follows the matched
 // file's cluster chain on demand, since there's no reasonable
@@ -65,6 +72,39 @@ const char FAT32_DIRENT_ATTR_DIRECTORY = (char)0x10; // subdirectory, not a regu
 
 const uint FAT32_ENTRY_MASK = 0x0FFFFFFF; // low 28 bits significant
 const uint FAT32_EOC_MIN    = 0x0FFFFFF8; // cluster values at or above this mean end-of-chain
+
+// VFAT long-filename (LFN) directory entry (32 bytes, same size as a
+// real dirent — ATTR_LFN at the same offset as FAT32_DIRENT_ATTR marks
+// it as one, and every reader that doesn't understand LFN — including
+// this driver until now — sees exactly the same bytes and correctly
+// skips them). Standard Microsoft VFAT extension, not vendor-specific:
+// same layout every real FAT32 reader (Linux, Windows, macOS) uses.
+// One entry holds 13 UTF-16LE code units of the name, split 5+6+2
+// across three non-contiguous byte ranges (an original FAT32 dirent's
+// own field layout — attr byte, "reserved" byte, cluster-lo — repurposed
+// in place, which is why the ranges aren't contiguous).
+const uint FAT32_LFN_SEQ        = 0x00; // u8: bits 0-4 = order (1-N), bit 0x40 = this is the LAST logical chunk of the name (the highest-numbered one), 0xE5 = a deleted LFN entry
+const uint FAT32_LFN_NAME1      = 0x01; // 5 UTF-16LE chars (10 bytes)
+const uint FAT32_LFN_ATTR       = 0x0B; // == FAT32_DIRENT_ATTR_LFN
+const uint FAT32_LFN_TYPE       = 0x0C; // u8, must be 0 for a real LFN entry
+const uint FAT32_LFN_CHECKSUM   = 0x0D; // u8, checksum of the short name this chain belongs to — see fat32_short_name_checksum
+const uint FAT32_LFN_NAME2      = 0x0E; // 6 UTF-16LE chars (12 bytes)
+const uint FAT32_LFN_CLUSTER_LO = 0x1A; // u16, always 0 for an LFN entry
+const uint FAT32_LFN_NAME3      = 0x1C; // 2 UTF-16LE chars (4 bytes)
+
+const uint FAT32_LFN_SEQ_LAST_BIT  = 0x40;
+const uint FAT32_LFN_SEQ_NUM_MASK  = 0x1F;
+const uint FAT32_LFN_CHARS_PER_ENTRY = 13;
+// Real VFAT allows up to 20 entries (255 UTF-16 units); this driver
+// caps well below that — comfortably past any realistic real-world
+// filename, while keeping every LFN buffer this file holds small and
+// fixed-size, same "generous but bounded" convention as e.g.
+// NS_PREFIX_MAX/EXEC_MAX_ARGV_SIZE elsewhere in this project. A name
+// needing more entries than this cap allows is treated as if it had no
+// usable long name at all (falls back to its short-name form) rather
+// than truncated silently.
+const int FAT32_LFN_NAME_MAX = 128;
+const int FAT32_LFN_MAX_ENTRIES = FAT32_LFN_NAME_MAX / FAT32_LFN_CHARS_PER_ENTRY;
 
 // Derived layout, computed once by fat32_mount() and cached — cheap,
 // board-static-ish facts about the volume, unlike per-file data (which
@@ -135,8 +175,11 @@ fn uint fat32_next_cluster(uint cluster)
 // uppercase, no dot — "HELLO   TXT" — ready to compare byte-for-byte
 // against a directory entry's own FAT32_DIRENT_NAME field (already stored in
 // exactly this form on disk). Truncates silently past 8 name / 3
-// extension characters — no long-filename support in v1 (see this
-// file's header comment).
+// extension characters — the plain 8.3 conversion, still used directly
+// for a name that's already valid short form, or as the base a long
+// name's own generated alias is built from (fat32_prepare_new_entry);
+// a name that needs a real LFN chain never reaches a reader as this
+// truncated form, see this file's own header comment.
 fn void fat32_name_to_8_3(char* input, char* out11)
 {
 	for (int i = 0; i < 11; i++) out11[i] = ' ';
@@ -163,6 +206,280 @@ fn void fat32_name_to_8_3(char* input, char* out11)
 		ext_i++;
 		i++;
 	}
+}
+
+// Converts an 11-byte raw short name (space-padded, as stored on disk)
+// into ordinary "name.ext" display form — e.g. "HELLO   TXT" becomes
+// "HELLO.TXT". The fallback display/matching form for any entry with
+// no valid LFN chain in front of it.
+fn void fat32_short_name_to_display(char* name11, char* out_name)
+{
+	int ni = 0;
+	for (int k = 0; k < 8 && name11[k] != ' '; k++)
+	{
+		out_name[ni] = name11[k];
+		ni++;
+	}
+	if (name11[8] != ' ')
+	{
+		out_name[ni] = '.';
+		ni++;
+		for (int k = 8; k < 11 && name11[k] != ' '; k++)
+		{
+			out_name[ni] = name11[k];
+			ni++;
+		}
+	}
+	out_name[ni] = 0;
+}
+
+// Case-insensitive comparison — FAT's own name matching always is,
+// long name or short.
+fn bool fat32_name_eq_ci(char* a, char* b)
+{
+	int i = 0;
+	while (a[i] != 0 && b[i] != 0)
+	{
+		char ca = a[i];
+		char cb = b[i];
+		if (ca >= 'a' && ca <= 'z') ca = (char)(ca - 'a' + 'A');
+		if (cb >= 'a' && cb <= 'z') cb = (char)(cb - 'a' + 'A');
+		if (ca != cb) return false;
+		i++;
+	}
+	return a[i] == b[i];
+}
+
+// Standard Microsoft VFAT short-name checksum — every LFN entry in a
+// chain carries this same value (computed over the short name the
+// chain belongs to), and a real reader must verify it before trusting
+// a reconstructed long name: an LFN chain surviving in front of an
+// unrelated short entry that later reused its old slot would otherwise
+// be misattributed to it.
+fn char fat32_short_name_checksum(char* name11)
+{
+	uint sum = 0;
+	for (int i = 0; i < 11; i++)
+	{
+		uint c = (uint)name11[i] & 0xFF;
+		sum = (((sum & 1) != 0) ? 0x80 : 0) + (sum >> 1) + c;
+		sum = sum & 0xFF;
+	}
+	return (char)sum;
+}
+
+// Extracts one LFN entry's own 13 UTF-16LE character slots into buf13
+// (ASCII only — see this file's own header comment on character-set
+// scope). A slot holding 0x0000 (the name's real terminator) or 0xFFFF
+// (post-terminator padding) becomes a plain 0 byte in buf13 — both
+// mean "no more real characters here," and the caller only ever cares
+// about the position of the first 0 once the whole chain is
+// assembled, not which sentinel produced it. Returns false (buf13
+// undefined) if any slot holds a genuine non-ASCII UTF-16 character —
+// the whole entry, and by extension the chain it belongs to, is
+// unusable, not just that one character.
+fn bool fat32_lfn_entry_chars(char* entry, char* buf13)
+{
+	bool ok = true;
+	for (uint i = 0; i < 5; i++)
+	{
+		ushort* u = (ushort*)&entry[FAT32_LFN_NAME1 + i * 2];
+		uint v = (uint)*u;
+		if (v == 0 || v == 0xFFFF) { buf13[i] = 0; }
+		else if (v > 0x7E) { buf13[i] = 0; ok = false; }
+		else { buf13[i] = (char)v; }
+	}
+	for (uint i = 0; i < 6; i++)
+	{
+		ushort* u = (ushort*)&entry[FAT32_LFN_NAME2 + i * 2];
+		uint v = (uint)*u;
+		if (v == 0 || v == 0xFFFF) { buf13[5 + i] = 0; }
+		else if (v > 0x7E) { buf13[5 + i] = 0; ok = false; }
+		else { buf13[5 + i] = (char)v; }
+	}
+	for (uint i = 0; i < 2; i++)
+	{
+		ushort* u = (ushort*)&entry[FAT32_LFN_NAME3 + i * 2];
+		uint v = (uint)*u;
+		if (v == 0 || v == 0xFFFF) { buf13[11 + i] = 0; }
+		else if (v > 0x7E) { buf13[11 + i] = 0; ok = false; }
+		else { buf13[11 + i] = (char)v; }
+	}
+	return ok;
+}
+
+// Called for each LFN entry (attr==FAT32_DIRENT_ATTR_LFN) encountered
+// while scanning a directory, in on-disk order (highest sequence
+// number — the logically LAST chunk of the name — first, descending to
+// 1 immediately before the short entry, per spec). Updates the
+// caller's own accumulation state (lfn_buf/io_expected_seq/
+// io_checksum/io_valid) in place; the caller reads it back via
+// fat32_lfn_finish() once the following short entry is reached. A
+// fresh "last" entry always resets any in-progress accumulation, even
+// a broken one — a real reader must never blend two chains.
+fn void fat32_lfn_feed(char* entry, char* lfn_buf, int* io_expected_seq, char* io_checksum, bool* io_valid)
+{
+	char raw_seq = entry[FAT32_LFN_SEQ];
+	if (raw_seq == FAT32_DIRENT_DELETED)
+	{
+		*io_valid = false;
+		return;
+	}
+
+	bool is_last = ((uint)raw_seq & FAT32_LFN_SEQ_LAST_BIT) != 0;
+	int seq = (int)((uint)raw_seq & FAT32_LFN_SEQ_NUM_MASK);
+
+	if (is_last)
+	{
+		if (seq < 1 || seq > FAT32_LFN_MAX_ENTRIES)
+		{
+			*io_valid = false;
+			return;
+		}
+		char[13] chars @noinit;
+		if (!fat32_lfn_entry_chars(entry, &chars))
+		{
+			*io_valid = false;
+			return;
+		}
+		for (int i = 0; i < 13; i++) lfn_buf[(seq - 1) * 13 + i] = chars[i];
+		*io_checksum = entry[FAT32_LFN_CHECKSUM];
+		*io_expected_seq = seq - 1;
+		*io_valid = true;
+		return;
+	}
+
+	if (!*io_valid || seq != *io_expected_seq || entry[FAT32_LFN_CHECKSUM] != *io_checksum)
+	{
+		*io_valid = false;
+		return;
+	}
+	char[13] chars @noinit;
+	if (!fat32_lfn_entry_chars(entry, &chars))
+	{
+		*io_valid = false;
+		return;
+	}
+	for (int i = 0; i < 13; i++) lfn_buf[(seq - 1) * 13 + i] = chars[i];
+	*io_expected_seq = seq - 1;
+}
+
+// Called for the real (non-LFN) entry immediately following whatever
+// LFN accumulation (if any) preceded it — validates the accumulated
+// chain (only if it reached all the way down to seq 1, io_expected_seq
+// == 0) against this entry's own short-name checksum, and writes the
+// resolved display/matching name into out_name: the reconstructed long
+// name if the chain checks out, otherwise the short name converted to
+// ordinary "name.ext" form.
+fn void fat32_lfn_finish(char* short_entry, char* lfn_buf, int expected_seq, char checksum, bool valid, char* out_name)
+{
+	if (valid && expected_seq == 0 && checksum == fat32_short_name_checksum(&short_entry[FAT32_DIRENT_NAME]))
+	{
+		int len = 0;
+		while (len < FAT32_LFN_NAME_MAX - 1 && lfn_buf[len] != 0) len++;
+		for (int i = 0; i < len; i++) out_name[i] = lfn_buf[i];
+		out_name[len] = 0;
+		return;
+	}
+	fat32_short_name_to_display(&short_entry[FAT32_DIRENT_NAME], out_name);
+}
+
+// Scans dir_cluster's own directory for an entry whose real name —
+// either its reconstructed long name (if a valid LFN chain precedes
+// it) or its short-name-derived display form — matches raw_name
+// case-insensitively. On a match, fills out_name11 with that entry's
+// own raw 11-byte short name — ready for the existing, unchanged
+// fat32_find_in_dir/fat32_find_in_root, which every caller of this
+// function still calls right afterward exactly as before, just with
+// this as the name-resolution step instead of a bare
+// fat32_name_to_8_3(). Also fills out_lfn_entry_sector/
+// out_lfn_entry_offset with the FIRST LFN entry's own location if one
+// preceded the match (0/0 if the match had no LFN chain at all), so
+// fat32_delete/fat32_rename can remove the whole chain instead of
+// leaving orphaned LFN entries behind — real corruption from any other
+// real FAT32 reader's point of view. Returns false if nothing matches
+// at all; every caller already falls back to fat32_name_to_8_3's own
+// naive conversion in that case, the only sane name to use for e.g.
+// "does this file exist yet" before creating one.
+fn bool fat32_resolve_name11(uint dir_cluster, char* raw_name, char* out_name11, uint* out_lfn_entry_sector, uint* out_lfn_entry_offset)
+{
+	uint cluster = dir_cluster;
+	char[SECTOR_SIZE] sector_buf @noinit;
+
+	char[FAT32_LFN_NAME_MAX] lfn_buf @noinit;
+	int lfn_expected_seq = 0;
+	char lfn_checksum = 0;
+	bool lfn_valid = false;
+	uint lfn_start_sector = 0;
+	uint lfn_start_offset = 0;
+	bool lfn_have_start = false;
+
+	while (cluster != 0 && cluster < FAT32_EOC_MIN)
+	{
+		uint sector = fat32_cluster_to_sector(cluster);
+		for (uint s = 0; s < fat32_sectors_per_cluster; s++)
+		{
+			if (!fs_read_sector(sector + s, &sector_buf)) return false;
+
+			for (uint e = 0; e < SECTOR_SIZE / FAT32_DIRENT_SIZE; e++)
+			{
+				char* entry = &sector_buf[e * FAT32_DIRENT_SIZE];
+				if (entry[0] == FAT32_DIRENT_FREE_REST) return false;
+				if (entry[0] == FAT32_DIRENT_DELETED)
+				{
+					lfn_valid = false;
+					lfn_have_start = false;
+					continue;
+				}
+
+				char attr = entry[FAT32_DIRENT_ATTR];
+				if (attr == FAT32_DIRENT_ATTR_LFN)
+				{
+					bool is_last = ((uint)entry[FAT32_LFN_SEQ] & FAT32_LFN_SEQ_LAST_BIT) != 0;
+					if (is_last) { lfn_have_start = false; }
+					if (!lfn_have_start)
+					{
+						lfn_start_sector = sector + s;
+						lfn_start_offset = e * FAT32_DIRENT_SIZE;
+						lfn_have_start = true;
+					}
+					fat32_lfn_feed(entry, &lfn_buf, &lfn_expected_seq, &lfn_checksum, &lfn_valid);
+					continue;
+				}
+				if ((attr & FAT32_DIRENT_ATTR_VOLUME) != 0)
+				{
+					lfn_valid = false;
+					lfn_have_start = false;
+					continue;
+				}
+
+				char[FAT32_LFN_NAME_MAX] display @noinit;
+				fat32_lfn_finish(entry, &lfn_buf, lfn_expected_seq, lfn_checksum, lfn_valid, &display);
+				bool had_lfn = lfn_valid && lfn_expected_seq == 0;
+				bool this_have_start = lfn_have_start;
+				lfn_valid = false;
+				lfn_have_start = false;
+
+				if (fat32_name_eq_ci(raw_name, &display))
+				{
+					for (uint k = 0; k < 11; k++) out_name11[k] = entry[FAT32_DIRENT_NAME + k];
+					if (had_lfn && this_have_start)
+					{
+						*out_lfn_entry_sector = lfn_start_sector;
+						*out_lfn_entry_offset = lfn_start_offset;
+					}
+					else
+					{
+						*out_lfn_entry_sector = 0;
+						*out_lfn_entry_offset = 0;
+					}
+					return true;
+				}
+			}
+		}
+		cluster = fat32_next_cluster(cluster);
+	}
+	return false;
 }
 
 // Walks the root directory's own cluster chain looking for a name11
@@ -325,7 +642,11 @@ fn bool fat32_resolve_dir(char* path, uint* out_dir_cluster)
 			seg_buf[copy_len] = 0;
 
 			char[11] seg11 @noinit;
-			fat32_name_to_8_3(&seg_buf, &seg11);
+			uint seg_lfn_sector; uint seg_lfn_offset;
+			if (!fat32_resolve_name11(dir_cluster, &seg_buf, &seg11, &seg_lfn_sector, &seg_lfn_offset))
+			{
+				fat32_name_to_8_3(&seg_buf, &seg11);
+			}
 
 			uint next_cluster;
 			uint dummy_size;
@@ -402,7 +723,11 @@ fn int fat32_read(char* name, char* dst, uint len)
 	char* leaf = fat32_leaf_name(name);
 
 	char[11] name11 @noinit;
-	fat32_name_to_8_3(leaf, &name11);
+	uint dummy_lfn_sector; uint dummy_lfn_offset;
+	if (!fat32_resolve_name11(dir_cluster, leaf, &name11, &dummy_lfn_sector, &dummy_lfn_offset))
+	{
+		fat32_name_to_8_3(leaf, &name11);
+	}
 
 	uint first_cluster;
 	uint file_size;
@@ -540,7 +865,11 @@ fn int fat32_read_at(char* name, char* dst, uint len, uint offset)
 		char* leaf = fat32_leaf_name(name);
 
 		char[11] name11 @noinit;
-		fat32_name_to_8_3(leaf, &name11);
+		uint dummy_lfn_sector; uint dummy_lfn_offset;
+		if (!fat32_resolve_name11(dir_cluster, leaf, &name11, &dummy_lfn_sector, &dummy_lfn_offset))
+		{
+			fat32_name_to_8_3(leaf, &name11);
+		}
 
 		uint dummy_sector;
 		uint dummy_offset;
@@ -731,43 +1060,237 @@ fn bool fat32_find_free_dirent(uint dir_cluster, uint* out_entry_sector, uint* o
 	return false;
 }
 
-// Creates a new, empty (zero-size) directory entry for name11 inside
+// Generalizes fat32_find_free_dirent (above) to find `count` CONSECUTIVE
+// free (or deleted) slots — needed for a long name's own LFN entries
+// plus its short entry, which must all sit contiguously for any real
+// FAT32 reader to recognize the chain (nothing tells it a chain
+// continues across a gap). A run is never allowed to span a cluster
+// boundary, even though clusters aren't necessarily physically
+// adjacent on disk (a real, if rare, correctness hazard a run that did
+// span one would hit) — resetting the run at the start of every
+// cluster costs a little potential reuse of an oddly-fragmented
+// directory's free space, in exchange for never needing to reason
+// about non-contiguous physical sectors here at all. Extends the
+// directory with one freshly zero-filled cluster if no existing run is
+// long enough — the same "extend on demand" shape
+// fat32_create_file/fat32_mkdir/fat32_rename each already do inline
+// for a single slot, generalized once here instead of a fourth
+// near-duplicate. One fresh cluster is always enough: every real
+// volume has at least 16 slots per sector, comfortably past
+// FAT32_LFN_MAX_ENTRIES+1.
+fn bool fat32_find_free_dirent_range(uint dir_cluster, int count, uint* out_entry_sector, uint* out_entry_offset)
+{
+	uint cluster = dir_cluster;
+	uint last_cluster = dir_cluster;
+
+	while (cluster != 0 && cluster < FAT32_EOC_MIN)
+	{
+		last_cluster = cluster;
+		uint sector = fat32_cluster_to_sector(cluster);
+		int run_len = 0;
+		uint run_sector = 0;
+		uint run_offset = 0;
+		for (uint s = 0; s < fat32_sectors_per_cluster; s++)
+		{
+			char[SECTOR_SIZE] sector_buf @noinit;
+			if (!fs_read_sector(sector + s, &sector_buf)) return false;
+
+			for (uint e = 0; e < SECTOR_SIZE / FAT32_DIRENT_SIZE; e++)
+			{
+				char* entry = &sector_buf[e * FAT32_DIRENT_SIZE];
+				bool free = entry[0] == FAT32_DIRENT_FREE_REST || entry[0] == FAT32_DIRENT_DELETED;
+				if (free)
+				{
+					if (run_len == 0)
+					{
+						run_sector = sector + s;
+						run_offset = e * FAT32_DIRENT_SIZE;
+					}
+					run_len++;
+					if (run_len >= count)
+					{
+						*out_entry_sector = run_sector;
+						*out_entry_offset = run_offset;
+						return true;
+					}
+				}
+				else
+				{
+					run_len = 0;
+				}
+			}
+		}
+		cluster = fat32_next_cluster(cluster);
+	}
+
+	uint new_cluster = fat32_alloc_cluster();
+	if (new_cluster == 0) return false;
+	char[SECTOR_SIZE] zero_buf @noinit;
+	for (uint i = 0; i < SECTOR_SIZE; i++) zero_buf[i] = 0;
+	for (uint s = 0; s < fat32_sectors_per_cluster; s++)
+	{
+		if (!fs_write_sector(fat32_cluster_to_sector(new_cluster) + s, &zero_buf)) return false;
+	}
+	if (!fat32_write_fat_entry(last_cluster, new_cluster)) return false;
+	if (!fat32_write_fat_entry(new_cluster, FAT32_EOC_MIN)) return false;
+	*out_entry_sector = fat32_cluster_to_sector(new_cluster);
+	*out_entry_offset = 0;
+	return true;
+}
+
+// Prepares a directory entry slot for a brand-new file/directory named
+// raw_name inside dir_cluster: if raw_name is already exactly valid
+// 8.3 short-name form (checked by round-tripping it through
+// fat32_name_to_8_3 and back through fat32_short_name_to_display — an
+// exact match means no case-folding/truncation/invalid characters were
+// needed), no LFN entries are written at all and this is exactly
+// today's existing single-slot behavior, just reached from here.
+// Otherwise generates a unique short-name alias using the standard MS
+// "numeric tail" scheme (up to 6 base characters + "~1"/"~2"/... on a
+// real collision, found by probing fat32_find_in_dir directly + up to
+// 3 extension characters), finds enough consecutive free slots for the
+// LFN chain plus the short entry (fat32_find_free_dirent_range above),
+// writes the LFN entries (highest sequence number — the logically LAST
+// chunk of the name — first, descending to 1 immediately before the
+// short entry, per spec), and returns the short entry's own (sector,
+// offset) for the caller to populate exactly like
+// fat32_create_file/fat32_mkdir already do today, unchanged.
+fn bool fat32_prepare_new_entry(uint dir_cluster, char* raw_name, char* out_name11, uint* out_entry_sector, uint* out_entry_offset)
+{
+	char[11] plain_name11 @noinit;
+	fat32_name_to_8_3(raw_name, &plain_name11);
+	char[16] roundtrip @noinit;
+	fat32_short_name_to_display(&plain_name11, &roundtrip);
+	if (strcmp(raw_name, &roundtrip) == 0)
+	{
+		for (int i = 0; i < 11; i++) out_name11[i] = plain_name11[i];
+		return fat32_find_free_dirent_range(dir_cluster, 1, out_entry_sector, out_entry_offset);
+	}
+
+	// Alias generation: up to 6 base characters + "~N" + up to 3
+	// extension characters. Invalid-in-8.3 characters were already
+	// dropped by fat32_name_to_8_3 above (plain_name11 reused as the
+	// base/extension source) — good enough for this driver's own real
+	// use (ASCII names with spaces/long extensions/multiple dots), not
+	// a byte-for-byte reproduction of every real Windows edge case.
+	bool found_alias = false;
+	for (int tail = 1; tail <= 999 && !found_alias; tail++)
+	{
+		char[4] rev @noinit;
+		int rev_len = 0;
+		int t = tail;
+		while (t > 0) { rev[rev_len] = (char)('0' + (t % 10)); rev_len++; t /= 10; }
+
+		char[11] candidate @noinit;
+		for (int i = 0; i < 11; i++) candidate[i] = ' ';
+		int base_chars = 6 - rev_len;
+		if (base_chars < 1) base_chars = 1;
+		int ci = 0;
+		for (int i = 0; i < base_chars && plain_name11[i] != ' '; i++) { candidate[ci] = plain_name11[i]; ci++; }
+		candidate[ci] = '~'; ci++;
+		for (int i = rev_len - 1; i >= 0; i--) { candidate[ci] = rev[i]; ci++; }
+		for (int i = 8; i < 11; i++) candidate[i] = plain_name11[i];
+
+		uint dummy_cluster; uint dummy_size; uint dummy_sector; uint dummy_offset; char dummy_attr;
+		if (!fat32_find_in_dir(dir_cluster, &candidate, &dummy_cluster, &dummy_size, &dummy_sector, &dummy_offset, &dummy_attr))
+		{
+			for (int i = 0; i < 11; i++) out_name11[i] = candidate[i];
+			found_alias = true;
+		}
+	}
+	if (!found_alias) return false; // exhausted — an implausible number of colliding names
+
+	int name_len = 0;
+	while (raw_name[name_len] != 0) name_len++;
+	int entries_needed = (name_len + (int)FAT32_LFN_CHARS_PER_ENTRY) / (int)FAT32_LFN_CHARS_PER_ENTRY; // ceil((name_len+1)/13) — +1 for the terminator
+	if (entries_needed < 1) entries_needed = 1;
+	if (entries_needed > FAT32_LFN_MAX_ENTRIES) return false; // longer than this driver's own bounded cap — see FAT32_LFN_NAME_MAX
+
+	uint entry_sector; uint entry_offset;
+	if (!fat32_find_free_dirent_range(dir_cluster, entries_needed + 1, &entry_sector, &entry_offset)) return false;
+
+	char checksum = fat32_short_name_checksum(out_name11);
+
+	for (int seq = entries_needed; seq >= 1; seq--)
+	{
+		char[SECTOR_SIZE] sector_buf @noinit;
+		if (!fs_read_sector(entry_sector, &sector_buf)) return false;
+		char* entry = &sector_buf[entry_offset];
+
+		char seq_byte = (char)seq;
+		if (seq == entries_needed) seq_byte = (char)((uint)seq_byte | FAT32_LFN_SEQ_LAST_BIT);
+		entry[FAT32_LFN_SEQ] = seq_byte;
+		entry[FAT32_LFN_ATTR] = FAT32_DIRENT_ATTR_LFN;
+		entry[FAT32_LFN_TYPE] = 0;
+		entry[FAT32_LFN_CHECKSUM] = checksum;
+		ushort* cluster_lo = (ushort*)&entry[FAT32_LFN_CLUSTER_LO];
+		*cluster_lo = 0;
+
+		int base = (seq - 1) * (int)FAT32_LFN_CHARS_PER_ENTRY;
+		for (uint i = 0; i < 5; i++)
+		{
+			ushort* u = (ushort*)&entry[FAT32_LFN_NAME1 + i * 2];
+			int idx = base + (int)i;
+			*u = idx < name_len ? (ushort)(uint)raw_name[idx] : (idx == name_len ? (ushort)0 : (ushort)0xFFFF);
+		}
+		for (uint i = 0; i < 6; i++)
+		{
+			ushort* u = (ushort*)&entry[FAT32_LFN_NAME2 + i * 2];
+			int idx = base + 5 + (int)i;
+			*u = idx < name_len ? (ushort)(uint)raw_name[idx] : (idx == name_len ? (ushort)0 : (ushort)0xFFFF);
+		}
+		for (uint i = 0; i < 2; i++)
+		{
+			ushort* u = (ushort*)&entry[FAT32_LFN_NAME3 + i * 2];
+			int idx = base + 11 + (int)i;
+			*u = idx < name_len ? (ushort)(uint)raw_name[idx] : (idx == name_len ? (ushort)0 : (ushort)0xFFFF);
+		}
+
+		if (!fs_write_sector(entry_sector, &sector_buf)) return false;
+
+		// Advance to the next slot (the next LFN entry going toward
+		// seq-1, or the short entry once seq reaches 1) — a plain
+		// fixed 32-byte stride with sector-boundary wraparound, never a
+		// *cluster* boundary: fat32_find_free_dirent_range's own range
+		// never crosses one (see its own comment), so raw sector-number
+		// arithmetic is safe here.
+		entry_offset += FAT32_DIRENT_SIZE;
+		if (entry_offset >= SECTOR_SIZE)
+		{
+			entry_offset = 0;
+			entry_sector += 1;
+		}
+	}
+
+	*out_entry_sector = entry_sector;
+	*out_entry_offset = entry_offset;
+	return true;
+}
+
+// Creates a new, empty (zero-size) directory entry for raw_name inside
 // dir_cluster (root or a subdirectory) and allocates its first data
-// cluster. Extends dir_cluster's own chain with a freshly zero-filled
-// cluster if it has no free slot — a directory cluster's bytes are
-// always interpreted as entries (unlike file data past the declared
-// size, which is never exposed to a reader), so unlike
-// fat32_write_file below, this really does need zero-filling for
-// correctness, not just tidiness.
-fn bool fat32_create_file(uint dir_cluster, char* name11, uint* out_first_cluster)
+// cluster. fat32_prepare_new_entry (above) does the actual slot-finding
+// (generating a short-name alias and writing a real LFN chain first if
+// raw_name needs one, extending dir_cluster's own chain with a fresh
+// zero-filled cluster if it has no room — a directory cluster's bytes
+// are always interpreted as entries, unlike file data past the
+// declared size, which is never exposed to a reader, so this really
+// does need zero-filling for correctness, not just tidiness) — this
+// function just populates the short entry itself, unchanged from
+// before. out_name11 is the actual short name written (== raw_name's
+// own 8.3 form when no LFN was needed) — the caller (fat32_write) needs
+// it for its own follow-up lookup after this returns.
+fn bool fat32_create_file(uint dir_cluster, char* raw_name, char* out_name11, uint* out_first_cluster)
 {
 	uint first_cluster = fat32_alloc_cluster();
 	if (first_cluster == 0) return false;
 
 	uint entry_sector;
 	uint entry_offset;
-	uint last_dir_cluster;
-	if (!fat32_find_free_dirent(dir_cluster, &entry_sector, &entry_offset, &last_dir_cluster))
-	{
-		uint new_dir_cluster = fat32_alloc_cluster();
-		if (new_dir_cluster == 0) return false;
-
-		char[SECTOR_SIZE] zero_buf @noinit;
-		for (uint i = 0; i < SECTOR_SIZE; i++) zero_buf[i] = 0;
-		for (uint s = 0; s < fat32_sectors_per_cluster; s++)
-		{
-			if (!fs_write_sector(fat32_cluster_to_sector(new_dir_cluster) + s, &zero_buf)) return false;
-		}
-
-		if (!fat32_write_fat_entry(last_dir_cluster, new_dir_cluster)) return false;
-		if (!fat32_write_fat_entry(new_dir_cluster, FAT32_EOC_MIN)) return false;
-
-		entry_sector = fat32_cluster_to_sector(new_dir_cluster);
-		entry_offset = 0;
-	}
+	if (!fat32_prepare_new_entry(dir_cluster, raw_name, out_name11, &entry_sector, &entry_offset)) return false;
 
 	// Defense in depth — see fs_is_protected_entry's own comment in
-	// fsd.c3. Structurally unreachable in practice: fat32_find_free_dirent
+	// fsd.c3. Structurally unreachable in practice: fat32_prepare_new_entry
 	// only ever returns a free/deleted slot, and a protected file's real
 	// entry is neither, so this would require a bug in that scan to ever
 	// fire.
@@ -777,7 +1300,7 @@ fn bool fat32_create_file(uint dir_cluster, char* name11, uint* out_first_cluste
 	if (!fs_read_sector(entry_sector, &sector_buf)) return false;
 
 	char* entry = &sector_buf[entry_offset];
-	for (uint i = 0; i < 11; i++) entry[FAT32_DIRENT_NAME + i] = name11[i];
+	for (uint i = 0; i < 11; i++) entry[FAT32_DIRENT_NAME + i] = out_name11[i];
 	entry[FAT32_DIRENT_ATTR] = (char)0x20; // ARCHIVE — an ordinary file
 	// Reserved/create-time/create-date/last-access-date fields (bytes
 	// 0x0C-0x13, between ATTR and cluster-hi) — zeroed explicitly rather
@@ -897,21 +1420,23 @@ fn int fat32_write(char* name, char* src, uint len)
 	char* leaf = fat32_leaf_name(name);
 
 	char[11] name11 @noinit;
-	fat32_name_to_8_3(leaf, &name11);
+	uint dummy_lfn_sector; uint dummy_lfn_offset;
+	bool resolved = fat32_resolve_name11(dir_cluster, leaf, &name11, &dummy_lfn_sector, &dummy_lfn_offset);
+	if (!resolved) fat32_name_to_8_3(leaf, &name11);
 
 	uint cluster;
 	uint size;
 	uint entry_sector;
 	uint entry_offset;
 	char attr;
-	bool exists = fat32_find_in_dir(dir_cluster, &name11, &cluster, &size, &entry_sector, &entry_offset, &attr);
+	bool exists = resolved && fat32_find_in_dir(dir_cluster, &name11, &cluster, &size, &entry_sector, &entry_offset, &attr);
 	// A directory isn't file content — refuse rather than overwrite
 	// whatever it points at, same refusal fat32_read gives.
 	if (exists && (attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0) return -1;
 
 	if (!exists)
 	{
-		if (!fat32_create_file(dir_cluster, &name11, &cluster)) return -1;
+		if (!fat32_create_file(dir_cluster, leaf, &name11, &cluster)) return -1;
 	}
 
 	uint written = fat32_write_file(cluster, src, len);
@@ -1018,7 +1543,11 @@ fn int fat32_delete(char* name)
 	char* leaf = fat32_leaf_name(name);
 
 	char[11] name11 @noinit;
-	fat32_name_to_8_3(leaf, &name11);
+	uint lfn_sector = 0; uint lfn_offset = 0;
+	if (!fat32_resolve_name11(dir_cluster, leaf, &name11, &lfn_sector, &lfn_offset))
+	{
+		fat32_name_to_8_3(leaf, &name11);
+	}
 
 	uint cluster;
 	uint size;
@@ -1037,6 +1566,30 @@ fn int fat32_delete(char* name)
 	sector_buf[entry_offset] = FAT32_DIRENT_DELETED;
 	if (!fs_write_sector(entry_sector, &sector_buf)) return -1;
 
+	// Also delete the whole LFN chain (if any) that preceded the short
+	// entry — leaving it behind would look like real corruption to any
+	// other real FAT32 reader (orphaned LFN entries pointing at a
+	// checksum nothing pruned). Walks by fixed 32-byte stride from the
+	// chain's own recorded start up to (not including) entry_sector/
+	// entry_offset — safe: fat32_prepare_new_entry only ever writes an
+	// LFN chain immediately, contiguously, before its own short entry,
+	// within a single cluster (see its own comment), so this can never
+	// run past a cluster boundary either.
+	if (lfn_sector != 0 || lfn_offset != 0)
+	{
+		uint del_sector = lfn_sector;
+		uint del_offset = lfn_offset;
+		while (del_sector != entry_sector || del_offset != entry_offset)
+		{
+			char[SECTOR_SIZE] del_buf @noinit;
+			if (!fs_read_sector(del_sector, &del_buf)) break;
+			del_buf[del_offset] = FAT32_DIRENT_DELETED;
+			if (!fs_write_sector(del_sector, &del_buf)) break;
+			del_offset += FAT32_DIRENT_SIZE;
+			if (del_offset >= SECTOR_SIZE) { del_offset = 0; del_sector += 1; }
+		}
+	}
+
 	return fat32_free_cluster_chain(cluster) ? 0 : -1;
 }
 
@@ -1053,14 +1606,19 @@ const int FAT32_MAX_DELETE_DEPTH = 32;
 // Empties a directory's cluster chain by deleting everything inside it
 // — files freed directly, subdirectories recursed into first — walking
 // raw directory entries by cluster/sector/offset the same way
-// fat32_dir_is_empty already does, rather than reconstructing 8.3 names
+// fat32_dir_is_empty already does, rather than reconstructing names
 // into path strings and going back through fat32_find_in_dir/
-// fat32_delete for each child (this driver has no long-filename
-// support to round-trip through anyway, and every name it would need
-// is already right here in the raw entry). Leaves dir_cluster's own
-// chain allocated — freeing *that* is the caller's job, same as
-// fat32_delete_recursive frees the top-level target's own chain once
-// this returns.
+// fat32_delete for each child (every name it would need is already
+// right here in the raw entry — no need to resolve one at all). Needs
+// no LFN awareness of its own despite that: a child's LFN entries
+// (attr==LFN, cluster field always 0) are skipped exactly like today
+// and never individually marked deleted the way each child's own short
+// entry is (below) — harmless, since dir_cluster's own chain gets
+// freed by the caller in its *entirety* regardless of what any
+// individual entry inside it says, the moment this whole recursive
+// wipe completes. Leaves dir_cluster's own chain allocated — freeing *that* is the
+// caller's job, same as fat32_delete_recursive frees the top-level
+// target's own chain once this returns.
 fn bool fat32_delete_dir_contents(uint dir_cluster, int depth)
 {
 	if (depth >= FAT32_MAX_DELETE_DEPTH) return false;
@@ -1133,7 +1691,11 @@ fn int fat32_delete_recursive(char* name)
 	char* leaf = fat32_leaf_name(name);
 
 	char[11] name11 @noinit;
-	fat32_name_to_8_3(leaf, &name11);
+	uint lfn_sector = 0; uint lfn_offset = 0;
+	if (!fat32_resolve_name11(dir_cluster, leaf, &name11, &lfn_sector, &lfn_offset))
+	{
+		fat32_name_to_8_3(leaf, &name11);
+	}
 
 	uint cluster;
 	uint size;
@@ -1151,6 +1713,26 @@ fn int fat32_delete_recursive(char* name)
 	if (!fs_read_sector(entry_sector, &sector_buf2)) return -1;
 	sector_buf2[entry_offset] = FAT32_DIRENT_DELETED;
 	if (!fs_write_sector(entry_sector, &sector_buf2)) return -1;
+
+	// Also delete the target's own whole LFN chain, if any — see
+	// fat32_delete's own comment for why: unlike the target's own
+	// *content* (cluster, wholesale-freed below), this entry lives in
+	// dir_cluster (the target's *parent*), which isn't being freed
+	// here, so an orphaned chain here would really persist.
+	if (lfn_sector != 0 || lfn_offset != 0)
+	{
+		uint del_sector = lfn_sector;
+		uint del_offset = lfn_offset;
+		while (del_sector != entry_sector || del_offset != entry_offset)
+		{
+			char[SECTOR_SIZE] del_buf @noinit;
+			if (!fs_read_sector(del_sector, &del_buf)) break;
+			del_buf[del_offset] = FAT32_DIRENT_DELETED;
+			if (!fs_write_sector(del_sector, &del_buf)) break;
+			del_offset += FAT32_DIRENT_SIZE;
+			if (del_offset >= SECTOR_SIZE) { del_offset = 0; del_sector += 1; }
+		}
+	}
 
 	return fat32_free_cluster_chain(cluster) ? 0 : -1;
 }
@@ -1180,7 +1762,11 @@ fn bool fat32_list(char* path, char* out_buf, int max_entries, int* out_count)
 		if (!fat32_resolve_dir(path, &parent_cluster)) return false;
 		char* leaf = fat32_leaf_name(path);
 		char[11] name11 @noinit;
-		fat32_name_to_8_3(leaf, &name11);
+		uint dummy_lfn_sector; uint dummy_lfn_offset;
+		if (!fat32_resolve_name11(parent_cluster, leaf, &name11, &dummy_lfn_sector, &dummy_lfn_offset))
+		{
+			fat32_name_to_8_3(leaf, &name11);
+		}
 		uint cluster;
 		uint size;
 		uint entry_sector;
@@ -1194,6 +1780,12 @@ fn bool fat32_list(char* path, char* out_buf, int max_entries, int* out_count)
 	int count = 0;
 	uint cluster = dir_cluster;
 	char[SECTOR_SIZE] sector_buf @noinit;
+	// LFN accumulation, same shape as fat32_resolve_name11's own scan —
+	// see fat32_lfn_feed/fat32_lfn_finish's own comments.
+	char[FAT32_LFN_NAME_MAX] lfn_buf @noinit;
+	int lfn_expected_seq = 0;
+	char lfn_checksum = 0;
+	bool lfn_valid = false;
 	while (cluster != 0 && cluster < FAT32_EOC_MIN && count < max_entries)
 	{
 		uint sector = fat32_cluster_to_sector(cluster);
@@ -1205,34 +1797,34 @@ fn bool fat32_list(char* path, char* out_buf, int max_entries, int* out_count)
 			{
 				char* entry = &sector_buf[e * FAT32_DIRENT_SIZE];
 				if (entry[0] == FAT32_DIRENT_FREE_REST) { *out_count = count; return true; }
-				if (entry[0] == FAT32_DIRENT_DELETED) continue;
+				if (entry[0] == FAT32_DIRENT_DELETED) { lfn_valid = false; continue; }
 
 				char attr = entry[FAT32_DIRENT_ATTR];
-				if (attr == FAT32_DIRENT_ATTR_LFN) continue;
-				if ((attr & FAT32_DIRENT_ATTR_VOLUME) != 0) continue;
+				if (attr == FAT32_DIRENT_ATTR_LFN)
+				{
+					fat32_lfn_feed(entry, &lfn_buf, &lfn_expected_seq, &lfn_checksum, &lfn_valid);
+					continue;
+				}
+				if ((attr & FAT32_DIRENT_ATTR_VOLUME) != 0) { lfn_valid = false; continue; }
+
+				char[FAT32_LFN_NAME_MAX] display @noinit;
+				fat32_lfn_finish(entry, &lfn_buf, lfn_expected_seq, lfn_checksum, lfn_valid, &display);
+				lfn_valid = false;
 
 				bool is_dot    = entry[FAT32_DIRENT_NAME] == '.' && entry[FAT32_DIRENT_NAME + 1] == ' ';
 				bool is_dotdot = entry[FAT32_DIRENT_NAME] == '.' && entry[FAT32_DIRENT_NAME + 1] == '.' && entry[FAT32_DIRENT_NAME + 2] == ' ';
 				if (is_dot || is_dotdot) continue;
 
+				// Truncated to FS_LIST_NAME_MAX-1 for display — this
+				// wire-format record is shared with ext2.c3/envd.c3,
+				// which already truncate real names longer than this
+				// the same way (see FS_LIST_NAME_MAX's own comment,
+				// user.c3) — the real, full name is still reachable via
+				// fs_read/fs_write/etc directly, only listing is capped.
 				char* rec = &out_buf[(uint)count * FS_LIST_ENTRY_SIZE];
 				int ni = 0;
-				for (uint k = 0; k < 8 && entry[FAT32_DIRENT_NAME + k] != ' '; k++)
-				{
-					rec[ni] = entry[FAT32_DIRENT_NAME + k];
-					ni++;
-				}
-				if (entry[FAT32_DIRENT_NAME + 8] != ' ')
-				{
-					rec[ni] = '.';
-					ni++;
-					for (uint k = 8; k < 11 && entry[FAT32_DIRENT_NAME + k] != ' '; k++)
-					{
-						rec[ni] = entry[FAT32_DIRENT_NAME + k];
-						ni++;
-					}
-				}
-				rec[ni] = 0; // ni is always well under FS_LIST_NAME_MAX (11-byte 8.3 names + 1 dot)
+				while (ni < (int)FS_LIST_NAME_MAX - 1 && display[ni] != 0) { rec[ni] = display[ni]; ni++; }
+				rec[ni] = 0;
 				rec[FS_LIST_NAME_MAX] = ((attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0) ? (char)1 : (char)0;
 				count++;
 			}
@@ -1266,14 +1858,8 @@ fn int fat32_mkdir(char* path)
 	char* leaf = fat32_leaf_name(path);
 
 	char[11] name11 @noinit;
-	fat32_name_to_8_3(leaf, &name11);
-
-	uint existing_cluster;
-	uint existing_size;
-	uint existing_sector;
-	uint existing_offset;
-	char existing_attr;
-	if (fat32_find_in_dir(parent_cluster, &name11, &existing_cluster, &existing_size, &existing_sector, &existing_offset, &existing_attr))
+	uint dummy_lfn_sector; uint dummy_lfn_offset;
+	if (fat32_resolve_name11(parent_cluster, leaf, &name11, &dummy_lfn_sector, &dummy_lfn_offset))
 	{
 		return -1; // already exists (file or directory)
 	}
@@ -1316,20 +1902,7 @@ fn int fat32_mkdir(char* path)
 
 	uint entry_sector;
 	uint entry_offset;
-	uint last_parent_cluster;
-	if (!fat32_find_free_dirent(parent_cluster, &entry_sector, &entry_offset, &last_parent_cluster))
-	{
-		uint new_parent_cluster = fat32_alloc_cluster();
-		if (new_parent_cluster == 0) return -1;
-		for (uint s = 0; s < fat32_sectors_per_cluster; s++)
-		{
-			if (!fs_write_sector(fat32_cluster_to_sector(new_parent_cluster) + s, &zero_buf)) return -1;
-		}
-		if (!fat32_write_fat_entry(last_parent_cluster, new_parent_cluster)) return -1;
-		if (!fat32_write_fat_entry(new_parent_cluster, FAT32_EOC_MIN)) return -1;
-		entry_sector = fat32_cluster_to_sector(new_parent_cluster);
-		entry_offset = 0;
-	}
+	if (!fat32_prepare_new_entry(parent_cluster, leaf, &name11, &entry_sector, &entry_offset)) return -1;
 
 	if (fs_is_protected_entry(entry_sector, entry_offset)) return -1;
 
@@ -1425,7 +1998,11 @@ fn int fat32_rename(char* old_path, char* new_path)
 	if (!fat32_resolve_dir(old_path, &old_parent_cluster)) return -1;
 	char* old_leaf = fat32_leaf_name(old_path);
 	char[11] old_name11 @noinit;
-	fat32_name_to_8_3(old_leaf, &old_name11);
+	uint old_lfn_sector = 0; uint old_lfn_offset = 0;
+	if (!fat32_resolve_name11(old_parent_cluster, old_leaf, &old_name11, &old_lfn_sector, &old_lfn_offset))
+	{
+		fat32_name_to_8_3(old_leaf, &old_name11);
+	}
 
 	uint cluster;
 	uint size;
@@ -1439,7 +2016,8 @@ fn int fat32_rename(char* old_path, char* new_path)
 	if (!fat32_resolve_dir(new_path, &new_parent_cluster)) return -1;
 	char* new_leaf = fat32_leaf_name(new_path);
 	char[11] new_name11 @noinit;
-	fat32_name_to_8_3(new_leaf, &new_name11);
+	uint dummy_new_lfn_sector; uint dummy_new_lfn_offset;
+	bool new_resolved = fat32_resolve_name11(new_parent_cluster, new_leaf, &new_name11, &dummy_new_lfn_sector, &dummy_new_lfn_offset);
 
 	// Moving a directory: refuse if the destination's own parent chain
 	// runs through the directory being moved — see
@@ -1451,34 +2029,22 @@ fn int fat32_rename(char* old_path, char* new_path)
 		return -1;
 	}
 
-	uint existing_cluster;
-	uint existing_size;
-	uint existing_sector;
-	uint existing_offset;
-	char existing_attr;
-	if (fat32_find_in_dir(new_parent_cluster, &new_name11, &existing_cluster, &existing_size, &existing_sector, &existing_offset, &existing_attr))
+	if (new_resolved)
 	{
-		return -1; // destination already exists
+		uint existing_cluster;
+		uint existing_size;
+		uint existing_sector;
+		uint existing_offset;
+		char existing_attr;
+		if (fat32_find_in_dir(new_parent_cluster, &new_name11, &existing_cluster, &existing_size, &existing_sector, &existing_offset, &existing_attr))
+		{
+			return -1; // destination already exists
+		}
 	}
 
 	uint new_entry_sector;
 	uint new_entry_offset;
-	uint last_new_parent_cluster;
-	if (!fat32_find_free_dirent(new_parent_cluster, &new_entry_sector, &new_entry_offset, &last_new_parent_cluster))
-	{
-		uint new_dir_cluster = fat32_alloc_cluster();
-		if (new_dir_cluster == 0) return -1;
-		char[SECTOR_SIZE] zero_buf @noinit;
-		for (uint i = 0; i < SECTOR_SIZE; i++) zero_buf[i] = 0;
-		for (uint s = 0; s < fat32_sectors_per_cluster; s++)
-		{
-			if (!fs_write_sector(fat32_cluster_to_sector(new_dir_cluster) + s, &zero_buf)) return -1;
-		}
-		if (!fat32_write_fat_entry(last_new_parent_cluster, new_dir_cluster)) return -1;
-		if (!fat32_write_fat_entry(new_dir_cluster, FAT32_EOC_MIN)) return -1;
-		new_entry_sector = fat32_cluster_to_sector(new_dir_cluster);
-		new_entry_offset = 0;
-	}
+	if (!fat32_prepare_new_entry(new_parent_cluster, new_leaf, &new_name11, &new_entry_sector, &new_entry_offset)) return -1;
 	if (fs_is_protected_entry(new_entry_sector, new_entry_offset)) return -1;
 
 	char[SECTOR_SIZE] new_sector_buf @noinit;
@@ -1515,6 +2081,27 @@ fn int fat32_rename(char* old_path, char* new_path)
 	if (!fs_read_sector(old_entry_sector, &old_sector_buf)) return -1;
 	old_sector_buf[old_entry_offset] = FAT32_DIRENT_DELETED;
 	if (!fs_write_sector(old_entry_sector, &old_sector_buf)) return -1;
+
+	// Also delete the source's own whole LFN chain, if any — see
+	// fat32_delete's own comment for why (same logic, duplicated here
+	// rather than factored out: the two callers' surrounding state —
+	// what's already been read/written, what's already been decided —
+	// differs enough that a shared helper would need as many parameters
+	// as it saves lines).
+	if (old_lfn_sector != 0 || old_lfn_offset != 0)
+	{
+		uint del_sector = old_lfn_sector;
+		uint del_offset = old_lfn_offset;
+		while (del_sector != old_entry_sector || del_offset != old_entry_offset)
+		{
+			char[SECTOR_SIZE] del_buf @noinit;
+			if (!fs_read_sector(del_sector, &del_buf)) break;
+			del_buf[del_offset] = FAT32_DIRENT_DELETED;
+			if (!fs_write_sector(del_sector, &del_buf)) break;
+			del_offset += FAT32_DIRENT_SIZE;
+			if (del_offset >= SECTOR_SIZE) { del_offset = 0; del_sector += 1; }
+		}
+	}
 
 	return 0;
 }

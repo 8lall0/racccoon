@@ -4,6 +4,80 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-26 (continued) — Real VFAT long-filename (LFN) support for fat32.c3, read and write
+
+`fat32.c3`'s own header comment already admitted the gap: "filename /
+LFN directory entries are skipped, not parsed" — every real file with
+a name that wasn't already valid 8.3 short form was only ever reachable
+through an auto-generated alias this driver never even round-tripped
+correctly against what a real Windows/Linux/macOS write would have put
+on disk.
+
+Added real, standard Microsoft VFAT LFN support — read and write —
+additively, deliberately not touching any of the ~6 existing directory-
+scan loops (`fat32_find_in_dir`/`_find_in_root`/`_find_free_dirent`/
+`_delete_dir_contents`) at all, to keep the whole, already-proven
+short-name fast path provably unchanged in outcome:
+- `fat32_resolve_name11()` (new): scans a directory reconstructing each
+  entry's real long name (if a valid, checksum-matching LFN chain
+  precedes it) or its short-name-derived display form, matching a
+  caller's raw name case-insensitively against either. Every existing
+  lookup (`fat32_read`/`_write`/`_delete`/`_delete_recursive`/`_rename`/
+  `_mkdir`/`_list`/`_resolve_dir`) now tries this first, falling back to
+  the original `fat32_name_to_8_3()` conversion only when nothing
+  matches (the "does this exist yet" case before creating something).
+- `fat32_prepare_new_entry()` (new): a name already exactly valid 8.3
+  form still gets a plain, LFN-free short entry exactly as before. A
+  name needing case-folding/truncation/invalid-character stripping
+  gets a generated short-name alias (the standard MS "numeric tail"
+  scheme, real collisions checked for) plus a real, spec-correct LFN
+  chain written immediately before it — found via a new
+  `fat32_find_free_dirent_range()`, generalizing the existing
+  single-slot finder to a *consecutive* run (deliberately never allowed
+  to span a cluster boundary, even though clusters aren't necessarily
+  physically adjacent on disk — a real correctness hazard sidestepped
+  outright rather than reasoned about).
+- Deletion (`fat32_delete`/`_delete_recursive`/`_rename`'s own source
+  cleanup) now removes the *whole* LFN chain, not just the trailing
+  short entry — leaving one behind would look like real corruption to
+  any other real FAT32 reader.
+- `fat32_list()` shows the real long name, truncated to 31 characters
+  for display (`FS_LIST_NAME_MAX`, shared with `ext2.c3`/`envd.c3`'s
+  own wire format — already truncates the same way for a real ext2
+  name longer than that; zero blast radius into either from this
+  change) — the real, full name stays reachable via `fs_read`/`_write`/
+  etc directly regardless.
+
+**Explicitly flagged, not fixed**: the interactive shell's own
+tokenizer (`user/shell.c3`) splits on spaces with no quoting support at
+all — a real long name containing a space still can't be typed as one
+argument at the shell prompt. The filesystem layer is now fully
+capable of storing/matching such names regardless (proven via a
+regression test using hardcoded strings, not the shell's own parsing —
+see below); making the shell itself handle quoting is a separate,
+smaller feature.
+
+**Verified in QEMU**: a real, externally-authored LFN fixture
+("My Long File Name.txt", written into `build/disk.img` by `mtools`'
+own `mcopy` — a genuine, independent VFAT implementation, not this
+driver — see `scripts/build.sh`) now shows its real name in `ls`
+instead of `MYLONG~1.TXT`. A new `lfntest` builtin
+(`user/shell_test.c3`) proves the full round trip using hardcoded,
+real space-containing names throughout (bypassing the shell's own
+tokenizer limitation): reads that fixture, writes a brand-new long
+name from inside racccoon itself, confirms it shows up correctly in a
+real directory listing, renames it to a different long name, and
+deletes it — all passing, on both the FAT32 and ext2 disk images (ext2
+needed no code changes at all, having never needed LFN support to
+begin with). Full existing regression suite re-run clean across all
+three QEMU disk-image variants afterward — no change in outcome for
+any short-name path.
+
+**Files changed:** `user/fs/fat32.c3`, `user/shell_test.c3` (new
+`lfntest`), `scripts/build.sh` (the new LFN fixture).
+
+---
+
 ## 2026-08-26 (continued) — USB Mass Storage write-through confirmed working on real hardware, zero new code
 
 Last open item from this session's own USB storage work: prove writes

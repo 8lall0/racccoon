@@ -25,6 +25,15 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   dd if=/dev/zero of=build/disk.img bs=1M count=64 status=none
   mkfs.vfat -F 32 build/disk.img > /dev/null
   mcopy -i build/disk.img disk/*.txt ::
+  # "My Long File Name.txt" — a real VFAT long-filename (LFN) fixture,
+  # exercising fat32.c3's own LFN read support (see docs/devlog.md and
+  # shell_test.c3's own lfntest). mcopy itself (a real, independent
+  # VFAT implementation, not this driver) writes the genuine on-disk
+  # LFN chain here — renamed on copy from the existing hello.txt source
+  # rather than a new space-containing file under disk/, since an
+  # unquoted glob (disk/*.txt above) would otherwise word-split a real
+  # space in a source filename.
+  mcopy -i build/disk.img disk/hello.txt "::My Long File Name.txt"
   # disk/subdir/ exercises fat32.c3's read-only subdirectory support
   # (see docs/devlog.md) — mmd creates the directory entry, mcopy then
   # writes into it same as the root.
