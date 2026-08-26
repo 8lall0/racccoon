@@ -122,6 +122,19 @@ const uptr USB_PINMUX_PAGE   = 0;
 const uint IRQ_USB           = 0;
 const bool HAS_USB           = false;
 
+// GPIO — no meaningful QEMU virt equivalent for "toggle a real pin";
+// same Duo-only reasoning as HAS_USB above. process.c3's
+// setup_gpiod_mappings references GPIO_BANK_C_BASE/GPIO_PINMUX_PAGE
+// unconditionally (same "0 = not applicable, never dereferenced since
+// HAS_GPIO is false" pattern as USB_MMIO_BASE etc. above), and
+// kernel.c3 still links gpiod.bin.o in on this board even though
+// HAS_GPIO gates it from ever actually spawning — see
+// scripts/build_duo.sh's own comment on diskd/sdd for why.
+const uptr GPIO_BANK_A_BASE = 0;
+const uptr GPIO_BANK_C_BASE = 0;
+const uptr GPIO_PINMUX_PAGE = 0;
+const bool HAS_GPIO = false;
+
 // Ethernet — QEMU's virt board has no real DesignWare MAC equivalent,
 // but unlike USB it DOES have a genuine, real network path via
 // virtio-net on the same virtio-mmio bus virtio-blk already uses. This

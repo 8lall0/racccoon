@@ -4,6 +4,130 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-26 (continued) — Real GPIO: a driver for the CV1800B's DW-APB controller, the onboard LED blinking, and a real scheduling-starvation bug found and fixed on real hardware
+
+Next feature after the cleanup/hardening pass: real GPIO on the Duo.
+Researched the same way this project always does real hardware — the
+local `duo-buildroot-sdk` checkout's actual Linux driver and
+devicetree, not the datasheet alone — plus the Milk-V community's own
+published header pinout (no Milk-V-specific devicetree exists in the
+vendor SDK itself).
+
+**Hardware, confirmed from source**: Synopsys DesignWare APB GPIO
+(`snps,dw-apb-gpio`), 5 independent single-port banks, each its own
+4KB region (`porta`@`0x03020000` .. `porte`@`0x05021000`). Identical
+per-bank layout: `+0x00` data-output, `+0x04` direction (1=out, 0=in),
+`+0x50` external-pin-state (the real input value — not `+0x00`).
+Pinmux: same `PINMUX_BASE` (`0x03001000`) this project's boards/duo/
+board.c3 already maps for USB/SD/ETH-LED — each pad has its own
+funcsel register, no formula from bank/bit to offset, a genuine
+per-pad lookup table.
+
+**Pin selection took several real research rounds, each one finding a
+real blocker the previous round couldn't see**: header pin 19
+(GPIOA14) looked clean until cross-referencing `user/block/sdhci.c3`'s
+own `PAD_SDIO0_PWR_EN_REG = 0x01C` — the exact same funcsel offset,
+already claimed for the SD card's real power-enable pin. Header pins
+16/17 (GPIOA16/17) looked *even* cleaner (nothing in this project's own
+code touches them) until realizing they're the live UART0 console
+pins, configured by U-Boot before racccoon's kernel ever runs —
+repurposing either would have silenced every boot message and every
+test result this project has ever produced. A full sweep of every
+bank-A/B `XGPIO*` pad against both this project's own claims *and*
+U-Boot's actual `board_init()` (gated correctly against this board's
+real `.config`, since some of its pinmux calls are conditionally
+compiled) settled on three genuinely clear pins: the onboard status
+LED (GPIOC24, pad `AUD_AOUTR`, funcsel `+0x12c` — its own GPIO number,
+440, confirmed directly by the user/board-owner, not found
+independently in the vendor SDK since this board variant's own board
+files never name a status LED) and two general-purpose header pins,
+GPIOA28 (pad `IIC0_SCL`, header pin 1) and GPIOA22 (pad `SPINOR_SCK`,
+header pin 24) — each with its own caveat (a standard I2C pin; a pin
+named for SPI-NOR flash this board variant doesn't populate) but
+neither claimed by anything in this project or by U-Boot's default
+boot on this exact board.
+
+**Design**: `user/gpio/gpiod.c3`, following this project's established
+"one owning process per real device" pattern (diskd/sdd/usbd/ethd)
+rather than mapping raw MMIO into arbitrary processes — concretely
+important here, since `PINMUX_BASE` is the exact same physical page
+multiple other drivers already map for their own pads; unrestricted
+access to it could let an unrelated process reconfigure e.g. the SD
+card's own pin by accident. A small compiled-in allowlist (the 3 pins
+above, each with its own `(bank, bit, funcsel_offset, funcsel_value)`)
+is both the safety boundary and the whole feature surface — there's no
+safe formula to fall back to for an unlisted pin. Exposes 3 IPC verbs
+(`GPIO_SET_DIR`/`GPIO_WRITE`/`GPIO_READ`) checked against the
+allowlist; `user/bin/gpio.c3` is the interactive CLI (`gpio A28 dir
+out`/`write 1`/`read`), resolving `gpiod` via the same dynamic
+`srv_post()`/`ns_mount_wait()` mechanism `usbrw.c3` established for
+`usbd`. `boards/duo/board.c3` gets `HAS_GPIO`/`GPIO_BANK_A_BASE`/
+`GPIO_BANK_C_BASE`/`GPIO_PINMUX_PAGE`; `boards/qemu/board.c3` sets
+`HAS_GPIO = false` (no meaningful QEMU equivalent) but still needs the
+placeholder constants and `gpiod.bin.o` linked into the QEMU kernel
+too — same "linker needs both binaries present regardless of which
+board's `if` ever actually runs them" reasoning `scripts/build_duo.sh`
+already documents for diskd/sdd.
+
+**A real bug, found only on real hardware**: the first cut's own main
+loop called `gpiod_ipc_poll()` (built on `ipc_poll_type()`/
+`SYS_IPC_POLL`) in a tight `for(;;)` with no `yield()` at all.
+`SYS_IPC_POLL`'s own case comment in `src/entry.c3` says outright it
+"never yields" — this loop was exactly the "syscall-free spin that
+nothing can ever switch away from" `SYS_YIELD` exists to prevent
+(that syscall's own header comment, written earlier this same day
+during the hardening pass). Both `usbd.c3` and `ethd.c3` already call
+`yield()` throughout their own busy-poll loops for this exact reason —
+missed writing gpiod's first cut. Real, concrete symptom on real
+hardware: with `usbd`/`ethd` already busy-polling from their own real
+enumeration/link-negotiation work, adding one more non-yielding
+process was enough contention that the shell's own `exec()` of
+`/bin/ls` failed outright (`ls: command not found`) — initially,
+reasonably, suspected as a regression in the same day's earlier
+`SYS_EXEC` pointer-validation hardening, until re-confirming that
+exact mechanism had already been proven working on real hardware
+*after* that hardening pass landed (the `mountusb`/`ls`/`cat` round),
+narrowing it to something introduced since — this driver, the only
+genuinely new code path on that boot. Fixed with a single `yield()`
+call once per loop iteration; re-flashed, and `ls` — plus the full
+GPIO command set — worked immediately.
+
+Confirmed fully end to end on real Milk-V Duo hardware: the onboard
+LED blinks once per second from boot with zero commands needed, and
+`gpio A28 dir out` / `write 1` / `write 0` / `gpio A22 dir in` /
+`read` all work correctly from the shell.
+
+**Follow-up cleanup, same day**: `src/process.c3` had grown seven
+`setup_xxx_mappings()` functions (diskd/sdd/usbd/ethd/gpiod/netd/fsd),
+several of them (`sdd`/`usbd`/`gpiod`/`ethd`) just repeating one
+`map_device_page(proc.page_table, X, X, PAGE_U|PAGE_R|PAGE_W)` line per
+device-register page — the exact same three-argument shape and flags
+every time, only the address changing. Added `map_device_pages(Process*
+proc, uptr* addrs, int count)` (kernel-internal only — an explicit
+decision: a real syscall letting a *running* service request its own
+mappings at will was considered and rejected, since it would let any
+process ask to map any physical address, undoing this same day's own
+"one owning process, no raw shared MMIO access" hardening work) and
+switched those four functions to build a small fixed-size array
+(`uptr[N] foo_pages = { ... };`, confirmed real C3 array-literal syntax
+works on this toolchain) and call it once. `diskd`/`netd`'s own single
+`VIRTIO_*_PADDR` mapping (before their own separate multi-page DMA
+buffer loops, which still allocate and `map_page()` by hand — a
+different shape this helper isn't for) wasn't worth converting — no
+repetition to remove there. Re-verified end to end on real hardware
+after the refactor (`ls`, `gpio A28 dir out`, `gpio A22 read` all still
+correct) — purely mechanical, same addresses and flags, just less
+repetition to keep in sync by hand next time a driver's own mapping
+list changes.
+
+**Files changed:** `boards/duo/board.c3`, `boards/qemu/board.c3`,
+`src/process.c3` (`setup_gpiod_mappings`, `map_device_pages`), `src/kernel.c3` (spawn +
+extern symbols), `user/gpio/gpiod.c3` (new), `user/bin/gpio.c3` (new),
+`scripts/build_user.sh`/`scripts/build.sh`/`scripts/build_duo.sh`/
+`scripts/populate_duo_bin.sh`.
+
+---
+
 ## 2026-08-26 (continued) — Cleanup + hardening pass: shell split (test builtins out of the shipped binary), syscall-boundary pointer validation, and dead-code removal
 
 Direct continuation of the same day's USB Mass Storage work (Tier 1 +

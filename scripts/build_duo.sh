@@ -49,6 +49,7 @@ LLC=${LLC:-llc}
     build/user/usbd.bin.o \
     build/user/ethd.bin.o \
     build/user/netd.bin.o \
+    build/user/gpiod.bin.o \
     -T boards/duo/kernel.ld \
     -Map=build/kernel_duo.map \
     -o build/kernel_duo.elf

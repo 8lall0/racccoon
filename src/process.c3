@@ -817,6 +817,25 @@ fn Process* create_process(void* image, uint image_size)
 	return proc;
 }
 
+// Maps a small, fixed list of device-register pages (identity-mapped,
+// the standard PAGE_U|R|W a driver process needs for its own MMIO)
+// into a process's page table — the repeated shape every setup_xxx_
+// mappings function below used to spell out one map_device_page() call
+// at a time, each restating proc.page_table and the same flags. NOT
+// for a DMA buffer's own multi-page allocation (diskd/usbd/ethd/netd's
+// own dma_paddr/vq_paddr loops still do that by hand, page by page,
+// since alloc_pages() has to run first and map_page() — not
+// map_device_page() — is the right call for some of them) — just the
+// fixed, compile-time-known register pages a driver already knows by
+// address before it's even created.
+fn void map_device_pages(Process* proc, uptr* addrs, int count)
+{
+	for (int i = 0; i < count; i++)
+	{
+		map_device_page(proc.page_table, addrs[i], addrs[i], PAGE_U | PAGE_R | PAGE_W);
+	}
+}
+
 // Called once, right after create_process() spawns an fsd instance (see
 // kernel.c3 — called for both the first and, if board::
 // HAS_SECOND_FS_PARTITION, the second), to tell it which partition it
@@ -889,34 +908,25 @@ fn void setup_diskd_mappings(Process* proc)
 // ordinary memory already inside sdd's own process image.
 fn void setup_sdd_mappings(Process* proc)
 {
-	map_device_page(proc.page_table, board::SD_MMIO_BASE, board::SD_MMIO_BASE, PAGE_U | PAGE_R | PAGE_W);
-
-	// Pad/power/clock one-time bring-up registers (see board.c3's own
-	// comment on these three) — separate pages from SD_MMIO_BASE and from
-	// each other.
-	map_device_page(proc.page_table, board::SD_TOP_PAGE, board::SD_TOP_PAGE, PAGE_U | PAGE_R | PAGE_W);
-	map_device_page(proc.page_table, board::SD_PINMUX_PAGE, board::SD_PINMUX_PAGE, PAGE_U | PAGE_R | PAGE_W);
-	map_device_page(proc.page_table, board::SD_CLOCK_PAGE, board::SD_CLOCK_PAGE, PAGE_U | PAGE_R | PAGE_W);
+	// SD_MMIO_BASE, then the pad/power/clock one-time bring-up registers
+	// (see board.c3's own comment on those three) — separate pages from
+	// SD_MMIO_BASE and from each other.
+	uptr[4] sdd_pages = { board::SD_MMIO_BASE, board::SD_TOP_PAGE, board::SD_PINMUX_PAGE, board::SD_CLOCK_PAGE };
+	map_device_pages(proc, &sdd_pages[0], 4);
 
 	sdd_pid = proc.pid;
 }
 
 fn void setup_usbd_mappings(Process* proc)
 {
-	map_device_page(proc.page_table, board::USB_MMIO_BASE, board::USB_MMIO_BASE, PAGE_U | PAGE_R | PAGE_W);
-
-	// TOP-block one-time bring-up registers (see board.c3's own comment
-	// on these two) — separate pages from USB_MMIO_BASE and from each
-	// other, same "map every page the driver touches individually"
-	// shape as setup_sdd_mappings above.
-	map_device_page(proc.page_table, board::USB_TOP_CTRL_PAGE, board::USB_TOP_CTRL_PAGE, PAGE_U | PAGE_R | PAGE_W);
-	map_device_page(proc.page_table, board::USB_TOP_RST_PAGE, board::USB_TOP_RST_PAGE, PAGE_U | PAGE_R | PAGE_W);
-	// The USB PHY's own reference clocks — see board::USB_CLK_PAGE's
-	// own comment for why these are needed and where they came from.
-	map_device_page(proc.page_table, board::USB_CLK_PAGE, board::USB_CLK_PAGE, PAGE_U | PAGE_R | PAGE_W);
-	// PAD_USB_VBUS_DET pinmux function-select — see board::USB_PINMUX_PAGE's
-	// own comment.
-	map_device_page(proc.page_table, board::USB_PINMUX_PAGE, board::USB_PINMUX_PAGE, PAGE_U | PAGE_R | PAGE_W);
+	// USB_MMIO_BASE, the TOP-block one-time bring-up registers (see
+	// board.c3's own comment on those two — separate pages from
+	// USB_MMIO_BASE and from each other), the USB PHY's own reference
+	// clocks (USB_CLK_PAGE), and PAD_USB_VBUS_DET's pinmux function-
+	// select (USB_PINMUX_PAGE) — see each constant's own comment in
+	// board.c3 for why it's needed.
+	uptr[5] usbd_pages = { board::USB_MMIO_BASE, board::USB_TOP_CTRL_PAGE, board::USB_TOP_RST_PAGE, board::USB_CLK_PAGE, board::USB_PINMUX_PAGE };
+	map_device_pages(proc, &usbd_pages[0], 5);
 
 	// Phase 2's own DMA buffer — see usbd_dma_paddr's own comment above
 	// for why this is identity-mapped, the same reasoning as diskd's
@@ -951,6 +961,20 @@ fn void setup_usbd_mappings(Process* proc)
 	usbd_pid = proc.pid;
 }
 
+// Called once, right after create_process() spawns gpiod (see
+// kernel.c3), to give it access to GPIO bank C's own registers and the
+// shared pinmux page every pad's own function-select register lives
+// on — see board::GPIO_BANK_C_BASE/GPIO_PINMUX_PAGE's own comments.
+// No DMA buffer, no SYS_GPIOD_INFO syscall needed: same reasoning as
+// setup_sdd_mappings above — every register gpiod touches is a fixed,
+// compile-time-known physical address, not something kernel-allocated
+// at spawn time.
+fn void setup_gpiod_mappings(Process* proc)
+{
+	uptr[3] gpiod_pages = { board::GPIO_BANK_A_BASE, board::GPIO_BANK_C_BASE, board::GPIO_PINMUX_PAGE };
+	map_device_pages(proc, &gpiod_pages[0], 3);
+}
+
 // Called once, right after create_process() spawns ethd (see
 // kernel.c3), to give it access to the DesignWare Ethernet MAC's own
 // registers, the embedded PHY's register block, the clock-controller
@@ -960,26 +984,21 @@ fn void setup_usbd_mappings(Process* proc)
 // file.
 fn void setup_ethd_mappings(Process* proc)
 {
-	map_device_page(proc.page_table, board::ETH_MMIO_BASE, board::ETH_MMIO_BASE, PAGE_U | PAGE_R | PAGE_W);
-	// The MAC's own DMA register block (Ethernet Phase 2) — see
-	// board::ETH_DMA_PAGE's own comment for why this is a separate
-	// mapping from ETH_MMIO_BASE above.
-	map_device_page(proc.page_table, board::ETH_DMA_PAGE, board::ETH_DMA_PAGE, PAGE_U | PAGE_R | PAGE_W);
-	// The embedded PHY's own register block — see board::ETH_PHY_PAGE's
-	// own comment for where its init sequence came from.
-	map_device_page(proc.page_table, board::ETH_PHY_PAGE, board::ETH_PHY_PAGE, PAGE_U | PAGE_R | PAGE_W);
-	// clk_500m_eth0/clk_axi4_eth0 — see board::ETH_CLK_PAGE's own
-	// comment. Same physical page USB_CLK_PAGE/SD_CLOCK_PAGE above
-	// also map, for their own unrelated bits.
-	map_device_page(proc.page_table, board::ETH_CLK_PAGE, board::ETH_CLK_PAGE, PAGE_U | PAGE_R | PAGE_W);
-	// cv180x_ephy_led_pinmux()'s own two register pages — see
-	// board::ETH_LED_PINMUX_PAGE's own comment for why this was added.
-	map_device_page(proc.page_table, board::ETH_LED_PINMUX_PAGE, board::ETH_LED_PINMUX_PAGE, PAGE_U | PAGE_R | PAGE_W);
-	map_device_page(proc.page_table, board::ETH_SD1_SELPHY_PAGE, board::ETH_SD1_SELPHY_PAGE, PAGE_U | PAGE_R | PAGE_W);
-	// The real, complete PHY analog bring-up's own efuse trim pages —
-	// see board::ETH_EFUSE_PAGE_0's own comment.
-	map_device_page(proc.page_table, board::ETH_EFUSE_PAGE_0, board::ETH_EFUSE_PAGE_0, PAGE_U | PAGE_R | PAGE_W);
-	map_device_page(proc.page_table, board::ETH_EFUSE_PAGE_1, board::ETH_EFUSE_PAGE_1, PAGE_U | PAGE_R | PAGE_W);
+	// ETH_MMIO_BASE; ETH_DMA_PAGE (the MAC's own DMA register block,
+	// Ethernet Phase 2 — a separate mapping from ETH_MMIO_BASE);
+	// ETH_PHY_PAGE (the embedded PHY's own register block);
+	// ETH_CLK_PAGE (clk_500m_eth0/clk_axi4_eth0 — same physical page
+	// USB_CLK_PAGE/SD_CLOCK_PAGE also map, for their own unrelated
+	// bits); ETH_LED_PINMUX_PAGE/ETH_SD1_SELPHY_PAGE
+	// (cv180x_ephy_led_pinmux()'s own two register pages); and the real,
+	// complete PHY analog bring-up's own efuse trim pages
+	// (ETH_EFUSE_PAGE_0/_1). See each constant's own comment in
+	// board.c3 for why it's needed.
+	uptr[8] ethd_pages = {
+		board::ETH_MMIO_BASE, board::ETH_DMA_PAGE, board::ETH_PHY_PAGE, board::ETH_CLK_PAGE,
+		board::ETH_LED_PINMUX_PAGE, board::ETH_SD1_SELPHY_PAGE, board::ETH_EFUSE_PAGE_0, board::ETH_EFUSE_PAGE_1
+	};
+	map_device_pages(proc, &ethd_pages[0], 8);
 
 	// Phase 2's own DMA region — see ethd_dma_paddr's own comment above
 	// for the layout and why this is uncached (map_device_page, not

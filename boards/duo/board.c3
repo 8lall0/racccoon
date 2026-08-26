@@ -251,6 +251,29 @@ const bool HAS_VIRTIO_NET     = false;
 const uptr VIRTIO_NET_PADDR = 0;
 const uint IRQ_VIRTIO_NET   = 0;
 
+// GPIO: Synopsys DesignWare APB GPIO (5 independent single-port banks,
+// confirmed via u-boot-2021.10/arch/riscv/dts/cv180x_base.dtsi's own
+// "snps,dw-apb-gpio" devicetree nodes) — a standard, simple block, one
+// 4KB page per bank, identical register layout in every bank: +0x00
+// data-output, +0x04 direction (1=out, 0=in), +0x50 external-pin-state
+// (read the real input value here, not +0x00). Only banks A and C are
+// mapped — the three pins gpiod.c3's own allowlist actually uses (see
+// that file) are split across them (two on A, one on C); the other 3
+// banks' own base addresses (portb 0x03021000, portd 0x03023000, porte
+// 0x05021000 — porte is a different, likely always-on/RTC-domain
+// region from the other four) are known but unmapped until something
+// actually needs them.
+const uptr GPIO_BANK_A_BASE = 0x03020000;
+const uptr GPIO_BANK_C_BASE = 0x03022000;
+// Same physical page as SD_PINMUX_PAGE/USB_PINMUX_PAGE/ETH_LED_PINMUX_PAGE
+// above — every GPIO pad's own function-select register lives here too
+// (gpiod.c3's own allowlist table has the exact per-pad offsets; there's
+// no bank/bit-to-register formula, each pad's offset was found by hand
+// in cv180x_reg_fmux_gpio.h, same as every other pinmux register this
+// project has ever used).
+const uptr GPIO_PINMUX_PAGE = 0x03001000;
+const bool HAS_GPIO = true;
+
 // fsd mounts EXT2TEST (ext2) as this board's own root — the real,
 // physical start sector, confirmed via `sfdisk`/`lsblk` against the
 // actual card. DUOBOOT (FAT32, sector 2048) deliberately isn't this
