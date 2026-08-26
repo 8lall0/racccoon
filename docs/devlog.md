@@ -4,6 +4,34 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-26 (continued) — USB Mass Storage write-through confirmed working on real hardware, zero new code
+
+Last open item from this session's own USB storage work: prove writes
+actually go through `mountusb`'s mounted filesystem, not just reads
+(`ls`/`cat`, already proven earlier today). Checked first whether this
+was even architecturally possible before testing anything — FAT32
+write support genuinely exists in `user/fs/fat32.c3`
+(`fat32_write`/`fat32_create_file`/`fat32_write_file`, extended
+deliberately from an original read-only implementation), and the USB
+write path (`user/usb/msc.c3`'s `msc_write10()`, `USB_MSC_IPC_WRITE`)
+was already implemented — just never actually exercised on real
+hardware until now.
+
+Tried the obvious thing directly, no new code: `mountusb` →
+`write /mnt/usb/testfile.txt hello` → `cat /mnt/usb/testfile.txt`.
+Worked end to end on the first attempt — the full stack (`write` →
+`fs_write()` → `fsd`'s dynamic `usbd` backend → `diskd_rw()` →
+`usbd`'s `USB_MSC_IPC_WRITE` responder → `msc_write10()` → a real USB
+Bulk-Only Transport OUT data stage → `fat32_create_file`/
+`fat32_write_file` on the real drive) round-tripped correctly with
+nothing to fix. This closes out the two-tier USB storage work
+(`usbrw` for raw sector I/O, `mountusb` for a real mounted
+filesystem) with both read and write proven on both tiers.
+
+**Files changed:** none — pure verification.
+
+---
+
 ## 2026-08-26 (continued) — GPIO interrupts investigated and explicitly deferred: real PLIC IRQ number found, but no reassurance it's safe on this silicon
 
 Considered next after `mountusb`/`unmountusb`: real interrupt support
