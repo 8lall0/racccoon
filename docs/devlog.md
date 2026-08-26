@@ -4,6 +4,58 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-26 (continued) — USB hotplug robustness: mountusb made idempotent, unmountusb added
+
+`mountusb` (`user/shell_common.c3`) worked end to end but had no
+lifecycle management: every call unconditionally `rfork()`'d a *new*
+dynamically-configured `fsd` with no memory of any it had spawned
+before. Two real gaps followed directly: no way to explicitly detach
+`/mnt/usb/` short of power-cycling, and — more seriously — every
+re-run (success or failure) leaked the previous `fsd` process forever.
+With `PROCS_MAX` this small, a handful of re-runs (e.g. after
+physically swapping the USB drive) would exhaust the process table
+entirely.
+
+Fixed by tracking the currently-live dynamic `fsd` in two new globals
+(`g_usbfs_fsd_pid`/`g_usbfs_fsd_gen`, 0 = none). `mountusb` now retires
+whatever the previous run left behind (`ns_unmount()` + `kill()`, same
+generation-checked `kill()` this project already uses everywhere else
+for stale-pid safety) before probing again — including on its own
+failure path, where the just-spawned `fsd` that never found anything
+used to just idle forever. New `unmountusb` builtin does the same
+teardown on request, reporting "nothing mounted" if nothing's tracked.
+
+Confirmed one thing was *already* correct and needed no fix along the
+way: a physical unplug mid-use was already handled safely by `usbd.c3`
+own hub-port polling (`usb_msc_clear_session()`, `user/usb/msc.c3`) —
+this was purely a shell-side lifecycle gap, not a disconnect-detection
+one.
+
+Verified fully on real Milk-V Duo hardware: `mountusb` twice in a row
+with the same drive attached reused the *exact same pid* (8) for the
+replacement `fsd` — direct proof the old one was actually killed, not
+leaked, and `/mnt/usb/` kept working across both mounts. Then a real
+physical unplug made `cat /mnt/usb/PIPPO.txt` fail cleanly
+("not found", no hang), and a real replug + `mountusb` again fully
+recovered (`asd` read back correctly), reusing pid 8 a second time.
+`unmountusb` itself (calling the identical `ns_unmount()`/`kill()`
+pair) was separately confirmed correct in QEMU for the "nothing
+mounted" case.
+
+Explicitly descoped: automatic background re-mounting the instant a
+new drive is plugged in. The shell is normally blocked in
+`SYS_GETCHAR` waiting for a keystroke with no way to be woken by a hub
+event; doing this for real would need a separate always-running
+process somehow pushing a mount into the *interactive shell's own*
+namespace — a real design problem (namespaces are per-process by
+design), not a small addition here. `mountusb`/`unmountusb` stay
+explicit, user-invoked commands.
+
+**Files changed:** `user/shell_common.c3` only — no kernel changes, no
+new syscalls.
+
+---
+
 ## 2026-08-26 (continued) — Real GPIO: a driver for the CV1800B's DW-APB controller, the onboard LED blinking, and a real scheduling-starvation bug found and fixed on real hardware
 
 Next feature after the cleanup/hardening pass: real GPIO on the Duo.

@@ -13,6 +13,13 @@ char[RUN_EXEC_BUF_MAX] run_exec_buf;
 // wall-clock timeout.
 const int MOUNTUSB_WAIT_ATTEMPTS = 2000000;
 
+// Tracks the dynamically-spawned fsd instance mountusb's own last run
+// left behind, if any (0 = none) — see mountusb's own comment for why
+// this exists: without it, re-running mountusb (or unmountusb) has no
+// way to know what, if anything, needs cleaning up first.
+int g_usbfs_fsd_pid = 0;
+uint g_usbfs_fsd_gen = 0;
+
 // Dispatches the small set of real, end-user shell builtins shared by
 // both the production shell (shell.c3) and the test shell
 // (shell_test.c3) — hello/exit/mountusb. Returns true if cmd was one of
@@ -26,6 +33,28 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
         } else if (strcmp(cmd, "exit") == 0) {
             exit();
         } else if (strcmp(cmd, "mountusb") == 0) {
+            // Idempotent: retires whatever a previous mountusb run left
+            // behind (a successful mount, or a fsd that never found
+            // anything and is just idling forever per its own comment
+            // below) before probing again. Without this, every re-run
+            // (e.g. after physically swapping the USB drive) leaked a
+            // whole fsd process — with PROCS_MAX this small, only a
+            // handful of re-runs would exhaust the process table
+            // entirely. ns_unmount() before kill(): the shell's own
+            // namespace entry must stop resolving to this pid before
+            // it's gone, not after — a caller racing this exact moment
+            // could otherwise reach a pid that's already been recycled
+            // into an unrelated process (closed the same way
+            // everywhere else in this codebase, via kill()'s own
+            // generation check, but there's no reason to rely on that
+            // here when unmounting first is just as easy).
+            if (g_usbfs_fsd_pid != 0) {
+                ns_unmount("/mnt/usb/");
+                kill(g_usbfs_fsd_pid, g_usbfs_fsd_gen);
+                g_usbfs_fsd_pid = 0;
+                g_usbfs_fsd_gen = 0;
+            }
+
             // Mounts whatever USB Mass Storage device is currently
             // attached at /mnt/usb/ — must be a real shell builtin,
             // not a separate /bin/mountusb exec()'d the ordinary way
@@ -68,8 +97,26 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
                 exit();
             } else if (ns_mount_wait("/mnt/usb/", "usbfs", (ulong)MOUNTUSB_WAIT_ATTEMPTS) < 0) {
                 print("mountusb: no USB filesystem appeared — no drive attached, or nothing recognized on it\n");
+                // Nothing to track — this fsd will never find anything
+                // (usbd's own state hasn't changed since ns_mount_wait
+                // gave up), so leaving it running would just be the
+                // same leak this whole idempotency fix exists to close.
+                kill(mountusb_child, mountusb_gen);
             } else {
                 print("mountusb: mounted at /mnt/usb/\n");
+                g_usbfs_fsd_pid = mountusb_child;
+                g_usbfs_fsd_gen = mountusb_gen;
+            }
+            return true;
+        } else if (strcmp(cmd, "unmountusb") == 0) {
+            if (g_usbfs_fsd_pid == 0) {
+                print("unmountusb: nothing mounted\n");
+            } else {
+                ns_unmount("/mnt/usb/");
+                kill(g_usbfs_fsd_pid, g_usbfs_fsd_gen);
+                g_usbfs_fsd_pid = 0;
+                g_usbfs_fsd_gen = 0;
+                print("unmountusb: unmounted\n");
             }
             return true;
         }
