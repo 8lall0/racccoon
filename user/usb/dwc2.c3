@@ -1660,8 +1660,26 @@ const uint USB_PORT_STATUS_RESET      = 1 << 4; // GetPortStatus wPortStatus bit
 // GetPortStatus response's second byte (port_status[1]), so the local
 // bit position within that byte is (9-8)=1 and (10-8)=2. Neither bit
 // set means full-speed; the two are mutually exclusive per spec.
-const uint USB_PORT_STATUS_HIGH_SPEED_B1 = 1 << 1; // bit 9
-const uint USB_PORT_STATUS_LOW_SPEED_B1  = 1 << 2;  // bit 10
+// Real bug found and fixed this session: these two were swapped. Real
+// vendor Linux 5.10's own include/uapi/linux/usb/ch11.h:
+// USB_PORT_STAT_LOW_SPEED=0x0200 (global wPortStatus bit 9),
+// USB_PORT_STAT_HIGH_SPEED=0x0400 (bit 10) — confirmed directly, not
+// re-guessed. port_status[1] is byte 1 of the 4-byte GetPortStatus
+// reply (bits 8-15 of wPortStatus), so the local bit position is
+// (global_bit - 8): LOW_SPEED -> bit 1, HIGH_SPEED -> bit 2. The
+// previous version of this file had them backwards — harmless for a
+// genuinely full-speed device (neither bit set, falls through to the
+// FULL branch correctly either way), but a real Hi-Speed device (e.g.
+// a USB 3.0 drive's own USB2 fallback, which negotiates Hi-Speed) was
+// silently misreported as low-speed, and vice versa. That
+// misclassification alone explains a real-hardware round that looked
+// like a hub/cable/device incompatibility: this driver then wrongly
+// forced split transactions (SSPLIT/CSPLIT via the hub's own TT) onto
+// a device that should have been addressed directly at Hi-Speed, no
+// splitting at all — producing exactly the observed start-split-not-
+// ACKed/STALL failures.
+const uint USB_PORT_STATUS_LOW_SPEED_B1  = 1 << 1; // bit 9
+const uint USB_PORT_STATUS_HIGH_SPEED_B1 = 1 << 2; // bit 10
 
 const uint USB_DEV_SPEED_FULL = 0;
 const uint USB_DEV_SPEED_LOW  = 1;

@@ -4,6 +4,66 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-26 (continued) — RESOLVED: the "USB 3.0 flash drive won't enumerate" mystery was a swapped LOW_SPEED/HIGH_SPEED bit in GetPortStatus decoding, not a cable/hub/device problem at all
+
+Direct continuation of the same day's earlier entries. The user pushed
+back hard on the previous session's "device/cable-specific, not a
+driver bug" conclusion about the USB 3.0 drive that kept failing
+enumeration with an implausible low-speed report — correctly.
+
+Re-verified a foundational assumption instead of defending the earlier
+conclusion: `USB_PORT_STATUS_HIGH_SPEED_B1`/`_LOW_SPEED_B1`
+(dwc2.c3) were inherited from before this session's own rewrite,
+never independently re-checked. Checked real vendor Linux 5.10's own
+`include/uapi/linux/usb/ch11.h` directly:
+`USB_PORT_STAT_LOW_SPEED = 0x0200` (wPortStatus bit 9),
+`USB_PORT_STAT_HIGH_SPEED = 0x0400` (bit 10). `port_status[1]` is byte
+1 of the 4-byte GetPortStatus reply (bits 8-15), so the local bit
+position is (global_bit - 8): LOW_SPEED -> local bit 1, HIGH_SPEED ->
+local bit 2. **This project's own constants had them backwards** —
+`HIGH_SPEED_B1 = 1<<1` and `LOW_SPEED_B1 = 1<<2`, exactly swapped.
+
+**Why this was so hard to catch**: it's silently harmless for a
+genuinely full-speed device (neither bit set, correctly falls through
+to the FULL branch regardless of the swap) — which is exactly why the
+mouse tested two sessions ago worked perfectly and gave zero signal
+that anything was wrong. It only misfires for a genuinely low-speed OR
+high-speed device, and every such device this project had tried before
+today was the one specific 8BitDo pad (whose own real problem is
+unrelated/device-specific, so it never produced a clean enough signal
+to notice). The USB 3.0 flash drive was the first genuinely Hi-Speed-
+capable device ever tested here — and got immediately misclassified as
+low-speed, which then made this driver wrongly force split-transaction
+handling (SSPLIT/CSPLIT via the hub's own TT) onto a device that should
+have been addressed directly at Hi-Speed with no splitting at all —
+producing exactly the observed start-split-not-ACKed/STALL failures,
+identically, regardless of every cable/port/timing variable tried.
+
+Fixed by swapping the two constants' values (names were already
+correct). **Confirmed on real hardware, immediately, completely**: same
+raw `GetPortStatus` bytes as every previous attempt (`03 05`), now
+correctly decoded as `device speed=high, no split needed` — and the
+drive enumerated fully: `INQUIRY vendor="JetFlash" product="Transcend
+32GB"`, `capacity: 59725824 blocks x 512 bytes`, and a real `READ(10)`
+of LBA 0 returning genuine data (`33 c0 fa 8e d8 8e d0 bc 00 7c 89 e6 06
+57 8e c0` — an authentic x86 boot sector signature). This is the first
+successful real USB Mass Storage read in this project's history, and
+it needed zero split-transaction machinery at all — the drive was
+always meant to talk directly.
+
+**The lesson, stated plainly**: the user's skepticism ("I think our usb
+driver implementation is fundamentally wrong on something") was
+correct, and the fix was in re-verifying a foundational, never-
+independently-checked assumption directly against source, not in more
+hardware experimentation. Every other USB investigation this project
+ran on this exact symptom (MULTICNT, yield() removal, multi-TT vs
+shared-TT, reset-recovery timing, CLEAR_TT_BUFFER) was real, correct,
+and worth keeping — but none of them could have found this, because the
+actual bug was upstream of all of them: the driver never even knew
+this was a Hi-Speed device in the first place.
+
+---
+
 ## 2026-08-26 (continued) — Added a standalone usbrw tool + usbd IPC responder for raw USB-drive sector I/O; surfaced and fixed a real EXT2_MAX_GROUPS bug along the way (the real root fs is 57.3GB, not ~1GB)
 
 Direct continuation of the same day's earlier entry, chasing "verify USB
