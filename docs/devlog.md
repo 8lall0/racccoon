@@ -16,14 +16,31 @@ With `PROCS_MAX` this small, a handful of re-runs (e.g. after
 physically swapping the USB drive) would exhaust the process table
 entirely.
 
-Fixed by tracking the currently-live dynamic `fsd` in two new globals
-(`g_usbfs_fsd_pid`/`g_usbfs_fsd_gen`, 0 = none). `mountusb` now retires
-whatever the previous run left behind (`ns_unmount()` + `kill()`, same
-generation-checked `kill()` this project already uses everywhere else
-for stale-pid safety) before probing again — including on its own
-failure path, where the just-spawned `fsd` that never found anything
-used to just idle forever. New `unmountusb` builtin does the same
-teardown on request, reporting "nothing mounted" if nothing's tracked.
+First cut tracked the currently-live dynamic `fsd` in two new globals
+(`g_usbfs_fsd_pid`/`g_usbfs_fsd_gen`). Working, but flagged (correctly)
+as the wrong architecture: a side-channel copy of state the namespace
+table already records, one more thing to keep in sync by hand.
+Redesigned to be fully stateless instead — `usbfs_teardown()` now
+reads the live binding straight out of `ns_resolve("/mnt/usb/", &len)`
++ `proc_info()` at the moment it's needed, rather than trusting a
+separately-maintained pid/generation pair that could drift (e.g. if
+the fsd ever died on its own for an unrelated reason). Designing this
+surfaced a real, would-have-been-serious bug before it ever shipped:
+`ns_resolve()`'s own longest-prefix match (`src/entry.c3`'s
+`SYS_NS_RESOLVE`) falls through to the `""` catch-all — the *root*
+filesystem server — for any path with nothing more specific bound,
+including `/mnt/usb/` itself whenever it isn't actually mounted. A
+naive "if `ns_resolve` returns a live pid, kill it" would have killed
+the root fsd every time `unmountusb` ran with nothing mounted. Fixed
+by also checking the matched-prefix length
+(`ns_resolve`'s own optional out-param) equals `strlen("/mnt/usb/")`
+— confirming an exact match, not the fallback — before ever touching
+the resolved pid. `mountusb` now calls this same `usbfs_teardown()`
+before probing again (closing the leak, including on its own failure
+path, where the just-spawned `fsd` that never found anything used to
+idle forever); `unmountusb` calls it on request, checking the same
+exact-match condition itself first to report "nothing mounted"
+correctly.
 
 Confirmed one thing was *already* correct and needed no fix along the
 way: a physical unplug mid-use was already handled safely by `usbd.c3`
@@ -38,9 +55,13 @@ leaked, and `/mnt/usb/` kept working across both mounts. Then a real
 physical unplug made `cat /mnt/usb/PIPPO.txt` fail cleanly
 ("not found", no hang), and a real replug + `mountusb` again fully
 recovered (`asd` read back correctly), reusing pid 8 a second time.
-`unmountusb` itself (calling the identical `ns_unmount()`/`kill()`
-pair) was separately confirmed correct in QEMU for the "nothing
-mounted" case.
+`unmountusb` was separately confirmed correct in both QEMU (crucially,
+confirmed `ls`/`cat` on the *root* filesystem still worked immediately
+after calling `unmountusb` with nothing mounted — the exact scenario
+the exact-match fix above protects) and again on real hardware after
+the stateless redesign: `mountusb` → `ls /mnt/usb/` → `unmountusb` →
+`ls /mnt/usb/` now correctly reports "not found" → `mountusb` again →
+`cat /mnt/usb/PIPPO.txt` reads real content back, full round trip.
 
 Explicitly descoped: automatic background re-mounting the instant a
 new drive is plugged in. The shell is normally blocked in

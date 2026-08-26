@@ -13,12 +13,35 @@ char[RUN_EXEC_BUF_MAX] run_exec_buf;
 // wall-clock timeout.
 const int MOUNTUSB_WAIT_ATTEMPTS = 2000000;
 
-// Tracks the dynamically-spawned fsd instance mountusb's own last run
-// left behind, if any (0 = none) — see mountusb's own comment for why
-// this exists: without it, re-running mountusb (or unmountusb) has no
-// way to know what, if anything, needs cleaning up first.
-int g_usbfs_fsd_pid = 0;
-uint g_usbfs_fsd_gen = 0;
+// Kills whatever's currently mounted at /mnt/usb/ (if anything) and
+// removes the namespace binding — shared by mountusb (idempotent
+// re-run) and unmountusb (explicit teardown) below. Deliberately
+// stateless: reads the live binding straight out of the namespace/
+// process tables via ns_resolve()/proc_info() rather than keeping a
+// separate side-channel pid/generation pair that could drift out of
+// sync with reality (e.g. if the fsd ever died on its own for an
+// unrelated reason) — this way there's exactly one place "what's
+// mounted at /mnt/usb/" is ever recorded, the namespace table itself.
+//
+// matched_len == 9 (strlen("/mnt/usb/")) is the real safety check
+// here, not just a sanity assertion: ns_resolve()'s own longest-prefix
+// match (src/entry.c3's SYS_NS_RESOLVE) falls through to the ""
+// catch-all (root fsd, matched_len 0) for ANY path when nothing more
+// specific is bound — including "/mnt/usb/" itself, whenever it isn't
+// currently mounted. Without this check, calling usbfs_teardown() with
+// nothing actually mounted there would resolve to the ROOT filesystem
+// server's own pid instead and kill it.
+fn void usbfs_teardown()
+{
+    uint matched_len = 0;
+    int old_pid = ns_resolve("/mnt/usb/", &matched_len);
+    if (old_pid > 0 && matched_len == 9) {
+        uint old_gen = 0;
+        proc_info(old_pid, null, &old_gen, null);
+        ns_unmount("/mnt/usb/");
+        kill(old_pid, old_gen);
+    }
+}
 
 // Dispatches the small set of real, end-user shell builtins shared by
 // both the production shell (shell.c3) and the test shell
@@ -36,24 +59,12 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
             // Idempotent: retires whatever a previous mountusb run left
             // behind (a successful mount, or a fsd that never found
             // anything and is just idling forever per its own comment
-            // below) before probing again. Without this, every re-run
-            // (e.g. after physically swapping the USB drive) leaked a
-            // whole fsd process — with PROCS_MAX this small, only a
-            // handful of re-runs would exhaust the process table
-            // entirely. ns_unmount() before kill(): the shell's own
-            // namespace entry must stop resolving to this pid before
-            // it's gone, not after — a caller racing this exact moment
-            // could otherwise reach a pid that's already been recycled
-            // into an unrelated process (closed the same way
-            // everywhere else in this codebase, via kill()'s own
-            // generation check, but there's no reason to rely on that
-            // here when unmounting first is just as easy).
-            if (g_usbfs_fsd_pid != 0) {
-                ns_unmount("/mnt/usb/");
-                kill(g_usbfs_fsd_pid, g_usbfs_fsd_gen);
-                g_usbfs_fsd_pid = 0;
-                g_usbfs_fsd_gen = 0;
-            }
+            // below) before probing again — see usbfs_teardown()'s own
+            // comment above. Without this, every re-run (e.g. after
+            // physically swapping the USB drive) leaked a whole fsd
+            // process — with PROCS_MAX this small, only a handful of
+            // re-runs would exhaust the process table entirely.
+            usbfs_teardown();
 
             // Mounts whatever USB Mass Storage device is currently
             // attached at /mnt/usb/ — must be a real shell builtin,
@@ -104,18 +115,15 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
                 kill(mountusb_child, mountusb_gen);
             } else {
                 print("mountusb: mounted at /mnt/usb/\n");
-                g_usbfs_fsd_pid = mountusb_child;
-                g_usbfs_fsd_gen = mountusb_gen;
             }
             return true;
         } else if (strcmp(cmd, "unmountusb") == 0) {
-            if (g_usbfs_fsd_pid == 0) {
+            uint um_matched_len = 0;
+            int um_pid = ns_resolve("/mnt/usb/", &um_matched_len);
+            if (um_pid <= 0 || um_matched_len != 9) {
                 print("unmountusb: nothing mounted\n");
             } else {
-                ns_unmount("/mnt/usb/");
-                kill(g_usbfs_fsd_pid, g_usbfs_fsd_gen);
-                g_usbfs_fsd_pid = 0;
-                g_usbfs_fsd_gen = 0;
+                usbfs_teardown();
                 print("unmountusb: unmounted\n");
             }
             return true;
