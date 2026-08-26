@@ -73,6 +73,20 @@ begin with). Full existing regression suite re-run clean across all
 three QEMU disk-image variants afterward — no change in outcome for
 any short-name path.
 
+**Confirmed on real Milk-V Duo hardware**, via `mountusb`: writing a
+new 30-character name (`ARealLongFileNameForTesting.txt` — no space,
+the shell's own tokenizer limitation, but well past 8.3 either way)
+created it correctly, `ls /mnt/usb/` showed the real name, and `cat`
+read the real content back. A genuine bonus surfaced immediately: the
+real drive's own `pippo.txt` — referenced constantly earlier this same
+session, always shown as `PIPPO.TXT` before this feature — turned out
+to already carry a real, pre-existing LFN chain for its actual
+lowercase name (lowercase isn't valid 8.3 form, so any real OS that
+wrote it would have needed one), which this driver had been silently
+discarding until now. It displays as `pippo.txt` immediately, with no
+code written specifically for that case — the general mechanism just
+correctly reads whatever a real LFN chain says.
+
 **Files changed:** `user/fs/fat32.c3`, `user/shell_test.c3` (new
 `lfntest`), `scripts/build.sh` (the new LFN fixture).
 
