@@ -4,6 +4,69 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-26 (continued) — GPIO interrupts investigated and explicitly deferred: real PLIC IRQ number found, but no reassurance it's safe on this silicon
+
+Considered next after `mountusb`/`unmountusb`: real interrupt support
+for `gpiod` (currently poll-only). Found a real, specific candidate —
+GPIO bank A's own PLIC IRQ is 60 (`peripheral_number + 16`, from an
+upstream, in-progress Linux mainline devicetree patch for this exact
+SoC — not present anywhere in this project's own local vendor SDK
+checkout, which has zero `interrupts =` property on any of the 5 GPIO
+devicetree nodes at all) — a real interrupt-control register block
+also exists on this same IP block (`INTEN`/`INTMASK`/`INTTYPE_LEVEL`/
+`INT_POLARITY`/`INTSTATUS`/`PORTA_DEBOUNCE`/`PORTA_EOI` at `+0x30`
+through `+0x4c`, confirmed via `linux_5.10/drivers/gpio/gpio-dwapb.c`).
+
+Before touching any code, re-read this project's own real history with
+non-timer PLIC interrupts first — and the picture was much more
+serious than a passing mention suggested. The one real attempt
+(`IRQ_SDHCI`, `boards/duo/board.c3`/`docs/devlog.md`'s own entry) found
+that setting that one PLIC enable-bit alone — independent of whether
+the SD controller itself ever asserted anything — put the CPU into a
+**permanent** `SCAUSE_SUPERVISOR_EXTERNAL` trap storm, `plic_claim()`
+returning 0 on every single sample, forever, requiring a reflash to
+escape rather than anything recoverable at runtime. Four other
+explanations (PLIC context number, the IRQ number itself, stale device
+status bits, completion sequencing) were carefully ruled out first;
+the conclusion was "a real, undocumented silicon/PLIC erratum for this
+source (or possibly this whole context)" — genuinely never resolved
+which. USB and Ethernet's own interrupts were never even attempted for
+exactly this reason.
+
+Checked for reassurance before deciding: does the vendor's own
+shipping Linux get GPIO (or any real peripheral) interrupt working
+reliably on this exact RISC-V chip? Found none, either direction. No
+real Linux devicetree exists for the actual RISC-V CV1800B in the
+vendor SDK at all — only for its ARM sibling (CV1835), which uses GIC,
+not this PLIC. The Linux PLIC driver in use here is explicitly named
+`"T-Head PLIC"` (`linux_5.10/drivers/irqchip/irq-sifive-plic.c`) — a
+vendor-specific variant, consistent with the T-Head-silicon `PAGE_A`/
+`PAGE_D` erratum this project already hit once before (Sv39 bring-up),
+making a T-Head interrupt-delivery erratum entirely plausible, not far
+-fetched. Its claim/complete sequence is functionally identical to
+`board.c3`'s own `plic_claim()`/`plic_complete()` — no hidden extra
+init step found that would explain the storm. And the SD controller's
+own devicetree node — the one whose real-hardware interrupt attempt
+caused it — has no `interrupts =` property in the vendor's own shared
+devicetree either, mild evidence the vendor doesn't rely on it
+either.
+
+**Decision**: stay poll-only, matching USB/Ethernet's own already-
+deliberate choice for the identical reason. A demonstrated, permanent,
+reflash-requiring failure mode plus zero positive evidence the
+underlying mechanism is safe on this exact silicon is not a good trade
+for "a client can be woken by an edge instead of polling on demand."
+Documented directly in `user/gpio/gpiod.c3`'s own header comment (the
+real PLIC IRQ number included) so a future revisit — ideally with real
+hardware debug tooling (logic analyzer, vendor engineering support)
+able to actually resolve the open erratum question — doesn't have to
+re-derive any of this from scratch.
+
+**Files changed:** `user/gpio/gpiod.c3` (comment only, no functional
+change).
+
+---
+
 ## 2026-08-26 (continued) — USB hotplug robustness: mountusb made idempotent, unmountusb added
 
 `mountusb` (`user/shell_common.c3`) worked end to end but had no

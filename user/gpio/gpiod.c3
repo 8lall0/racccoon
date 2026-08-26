@@ -21,6 +21,35 @@ import std::nolibc::main_stub;
 //                        own boot-time pin toggle is the first real
 //                        test of that assumption).
 //
+// Poll-only, deliberately — no PLIC interrupt wiring, even though this
+// same IP block also has a real interrupt-control register set at
+// +0x30 (INTEN) through +0x4c (PORTA_EOI), and a specific PLIC IRQ
+// number (60 for bank A) was found in an upstream, in-progress Linux
+// mainline devicetree patch (not present in this project's own local
+// vendor SDK checkout — that has zero "interrupts =" on any GPIO
+// devicetree node at all). Investigated and explicitly deferred: this
+// project's one real attempt at any non-timer, non-virtio PLIC
+// interrupt (IRQ_SDHCI, see boards/duo/board.c3's own comment and
+// docs/devlog.md) put the CPU into a PERMANENT SCAUSE_SUPERVISOR_
+// EXTERNAL trap storm the moment that one PLIC enable-bit was set —
+// independent of whether the device ever asserted anything — requiring
+// a reflash to escape, not just a bad log. Whether that's specific to
+// IRQ 36 or affects this whole PLIC context was never resolved. A
+// follow-up check for reassurance (does the vendor's own shipping
+// Linux get GPIO, or any peripheral, interrupt working reliably on
+// this exact RISC-V chip?) found none: no real Linux devicetree exists
+// for this chip in the vendor SDK at all (only for its ARM sibling,
+// which uses GIC, not this PLIC), and even the SD controller's own
+// devicetree node — the one whose real-hardware interrupt attempt
+// caused the storm — has no "interrupts =" property in the vendor's
+// own shared devicetree either. Given a demonstrated, permanent,
+// reflash-requiring failure mode and no positive evidence the
+// underlying mechanism works reliably on this exact silicon at all,
+// staying poll-only here matches USB/Ethernet's own already-deliberate
+// choice for the identical reason. Revisit only with real hardware
+// debug tooling (logic analyzer, vendor engineering support) able to
+// actually resolve the open question, not by guessing again.
+//
 // Owns GPIO bank A/C and the shared pinmux page exclusively — matches
 // this project's own diskd/sdd/usbd/ethd pattern (one owning process
 // per real device, everyone else talks over IPC) rather than mapping
