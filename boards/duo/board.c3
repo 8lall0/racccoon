@@ -63,17 +63,9 @@ const uptr PLIC_ENABLE_BASE   = PLIC_BASE + 0x2000 + PLIC_S_CONTEXT * 0x80;
 const uptr PLIC_THRESHOLD     = PLIC_BASE + 0x200000 + PLIC_S_CONTEXT * 0x1000;
 const uptr PLIC_CLAIM         = PLIC_BASE + 0x200004 + PLIC_S_CONTEXT * 0x1000;
 
-// Context-independent, system-wide pending bitmap — unlike CLAIM (which
-// is per-context and consumes/clears as it's read), this just reflects
-// raw hardware pending state for every IRQ source, one bit each. Used
-// only as a diagnostic (entry.c3's handle_trap) while chasing the
-// IRQ_SDHCI claim-storm bug — see docs/devlog.md.
-const uptr PLIC_PENDING_BASE = PLIC_BASE + 0x1000;
-
 const uptr PLIC_PRIORITY_PAGE = PLIC_PRIORITY_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
 const uptr PLIC_ENABLE_PAGE   = PLIC_ENABLE_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
 const uptr PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uptr)~(kernel::PAGE_SIZE - 1);
-const uptr PLIC_PENDING_PAGE  = PLIC_PENDING_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
 
 // SDHCI-compliant SD controller (cvitek,cv180x-sd), sourced from
 // duo-buildroot-sdk's own U-Boot driver (drivers/mmc/cvitek/sdhci-cv180x.c)

@@ -4,6 +4,148 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-26 (continued) — Cleanup + hardening pass: shell split (test builtins out of the shipped binary), syscall-boundary pointer validation, and dead-code removal
+
+Direct continuation of the same day's USB Mass Storage work (Tier 1 +
+Tier 2, both committed). Before picking up a new feature, a step back:
+"remove stuff that is not needed, some major cleanups, harden the
+system." Three parallel research passes surveyed the repo first
+(shell.c3's own structure, `src/entry.c3`'s syscall boundary, dead code/
+resource limits repo-wide) before any code changed.
+
+**Shell split.** `user/shell.c3` was 1771 lines; only `hello`/`exit`/
+`mountusb`/the `/bin/<cmd>` fallback (4 of 37 command branches) are
+real end-user features — the other 33 are one-off `*test` commands
+accumulated across this project's whole tutorial/bring-up history
+(`p9test`, `killtest`, `permtest`, `mounttest`, `threadtest`, ...), all
+shipping identically embedded in every kernel image including the real
+Duo hardware build. Split into three files:
+- `user/shell_common.c3` — the shared/real pieces: `run_exec_buf`/
+  `RUN_EXEC_BUF_MAX` (needed by both shells' `mountusb`/`/bin/`
+  fallback AND 8 of the test builtins), `shell_dispatch_common()`
+  (hello/exit/mountusb), `shell_exec_external()` (the `/bin/` fallback).
+- `user/shell.c3` — trimmed to just the read/tokenize loop + a call
+  into `shell_common.c3`. This is now what `scripts/build_duo.sh`
+  embeds for real hardware: 336KB (was 685KB), most of the drop being
+  `bigread_buf`'s 300KB test-only fixture buffer and the race/mutex
+  test stacks, none of which real hardware ever needs.
+- `user/shell_test.c3` — every dev/regression-test builtin, falling
+  back to `shell_common.c3` for anything it doesn't itself handle. This
+  is what `scripts/build.sh` (QEMU) embeds — full regression coverage
+  unchanged.
+
+One real build-system wrinkle: `objcopy -Ibinary` derives the embedded
+`_binary_*_start/_end` symbol names from the input file's own
+basename, and `src/kernel.c3` references `_binary_shell_bin_start`
+unconditionally (board-agnostic). Simply linking `shell_test.bin.o`
+for QEMU would have produced `_binary_shell_test_bin_*` instead,
+silently failing to link against what `kernel.c3` expects. Fixed by
+having `scripts/build.sh` re-embed `shell_test.bin` under the literal
+name `shell.bin` in its own separate directory (`build/user_qemu_shell/`,
+not `build/user/`, which still holds the real production
+`shell.bin.o` for `build_duo.sh`) right before the kernel link step —
+no change needed to `build_user.sh`'s one-name-per-binary convention or
+to `kernel.c3` itself.
+
+Verified full regression parity across all three QEMU disk-image
+variants (`disk.img`, `disk_ext2.img`, `disk_dual.img`) before and after
+the split — every test builtin behaves identically, including the ones
+needing the correct non-default disk image (`mounttest`/`runtest2`/etc.
+need `disk_dual.img`, `fspermtest`/`p9fstest`/etc. need `disk_ext2.img`
+— confirmed against the wrong image first, which is expected FAT32-vs-
+ext2/single-vs-dual-mount behavior, not a regression).
+
+**Security-boundary hardening.** `src/entry.c3`'s syscall dispatch had
+no user-pointer validation anywhere — every raw pointer/out-pointer
+argument (`(T*)(uptr)f.aN`) was dereferenced directly, relying on
+`sstatus.SUM` (permanently set, `process.c3`'s `user_entry`) to let
+S-mode touch `PAGE_U` pages unconditionally. Worst two: `SYS_FUTEX_WAIT`
+dereferenced its argument with zero checks (`*futex_addr`, no null
+check even), and an unrecognized syscall number hit
+`default: panic::panic("unexpected syscall")` — both a one-line,
+unprivileged, whole-kernel crash reachable from any process.
+
+Added `user_range_valid(table2, vaddr, len, want_write)` to
+`src/page.c3`, alongside `walk_to_leaf_table`/`map_page`/
+`map_device_page` (reusing `pte_to_paddr`, the `PAGE_*` flags):
+non-allocating page-table walk validating every page in `[vaddr,
+vaddr+len)` is present, `PAGE_U`, and has the requested permission —
+returns false (rather than allocating, unlike `walk_to_leaf_table`) on
+the first gap, with an overflow check on `vaddr+len`. Applied at every
+unvalidated raw-pointer syscall site the audit found — `SYS_FUTEX_WAIT`,
+`SYS_IPC_SEND`/`REPLY`/`RECV`/`RECV_GEN`/`POLL`, `SYS_NS_RESOLVE`,
+`SYS_NS_UNMOUNT`, `SYS_NS_MOUNT`/`_WAIT`, `SYS_SRV_POST`, `SYS_RFORK`'s
+generation out-pointer, `SYS_PROC_INFO`, `SYS_PARENT_INFO`,
+`SYS_DISKD_INFO`/`SYS_FS_PARTITION_INFO`/`SYS_USBD_INFO`/
+`SYS_NETD_INFO`/`SYS_ETHD_INFO`'s out-pointers, and `SYS_EXEC`'s own
+`exec_image` root pointer (previously the *only* completely
+unvalidated part of an otherwise carefully bounds-checked syscall — a
+bad `exec_image` pointing at kernel memory could have leaked up to
+`EXEC_MAX_IMAGE_SIZE + EXEC_MAX_ARGV_SIZE` bytes of it into a process's
+own executable pages). Each failure denies with the same
+`f.a0 = (ulong)(-1); break;` convention this file already used for
+`SYS_SETUID`'s non-root case, instead of proceeding. The `default:`
+case got the same fix — deny, don't panic. `SYS_NS_MOUNT_WAIT`'s own
+caller-supplied attempt count (a plain `ulong`, no cap) is now clamped
+to a new `NS_MOUNT_WAIT_MAX_ATTEMPTS` (50,000,000 — comfortably above
+`mountusb`'s own 2,000,000, the largest real caller today).
+
+Explicitly not done, flagged rather than fixed: restricting the
+`*_INFO` syscalls to their intended driver process only (several
+comments say "diskd-only"/"usbd-only" but it's unenforced) — `fsd` can
+now be dynamically `exec()`'d against arbitrary backends with a
+non-fixed pid (this same day's `mountusb` work), so a naive
+caller-pid-must-match check would break that; and IPC send/reply's
+unbounded wait on the destination process draining its inbox, inherent
+to this project's cooperative, timeout-free Plan-9-style IPC design.
+
+Added a kept regression test, `hardentest` (`user/shell_test.c3`):
+issues a real `SYS_FUTEX_WAIT` on a null pointer and a real,
+genuinely-unrecognized syscall number (31 — one past `SYS_ETHD_INFO`),
+confirms both come back denied rather than hanging the whole suite (a
+panic halts every process) or never returning. Passes in QEMU; the
+full existing regression suite re-run clean afterward too, including
+every syscall path the new checks touch (IPC round trips, `ns_mount`/
+`_wait`, `exec`/`exec_path`, `/proc` reads, `rfork`) — no false
+positives found.
+
+**Dead code removed**: `disable_interrupts()`/`enable_interrupts()`
+(`src/entry.c3` — never called, superseded by
+`enable_external_interrupts()`); `top_reg_read()`
+(`user/block/sdhci.c3` — never called); the `PLIC_PENDING_PAGE`
+mapping (`board::PLIC_PENDING_BASE`/`PLIC_PENDING_PAGE` in both
+`boards/qemu/board.c3` and `boards/duo/board.c3`, plus its two
+`map_device_page()` call sites in `src/process.c3` and `src/entry.c3`'s
+own `SYS_RFORK` child-table setup — confirmed never read anywhere,
+leftover from the reverted Slave/PIO investigation; caught the second
+call site only via a compile error after removing the board constant,
+first grep missed it). `scripts/launch.sh`/`scripts/stress_test.sh`
+deleted — both target `build/disk.tar` on `qemu-system-riscv32`, long
+superseded by the RV64/FAT32-image build and `scripts/launch64*.sh`.
+Not touched: `src/libc/libc.c3`'s unused-but-`@nostrip` functions
+(deliberate ABI-completeness marker) and `test/xpad_parse_test.c3` (a
+real test with its own dedicated script, just outside the four build
+scripts searched).
+
+Confirmed end to end on real Milk-V Duo hardware after all three parts
+landed: normal boot, `mountusb` → `ls /mnt/usb/` → `cat` still work
+exactly as before against the real USB drive — the trimmed production
+shell and the new syscall-boundary checks don't interfere with any real
+driver's own legitimate use of the hardened syscalls (`usbd`'s
+`SYS_USBD_INFO`, the dynamically-spawned `fsd`'s namespace/exec calls,
+etc.). Real hardware's own `fip.bin` shrank from ~1.72MB to ~1.37MB,
+reflecting the production shell's size drop.
+
+**Files changed:** `user/shell.c3` (trimmed), `user/shell_common.c3`
+(new), `user/shell_test.c3` (new, `hardentest` added), `src/page.c3`
+(`user_range_valid`), `src/entry.c3` (validation call sites, `default:`
+fix, `NS_MOUNT_WAIT_MAX_ATTEMPTS`, dead-code removal),
+`user/block/sdhci.c3`, `src/process.c3`, `boards/qemu/board.c3`,
+`boards/duo/board.c3`, `scripts/build_user.sh`, `scripts/build.sh`;
+`scripts/launch.sh`/`scripts/stress_test.sh` deleted.
+
+---
+
 ## 2026-08-26 (continued) — Tier 2: mounting a real USB Mass Storage drive as a browsable filesystem (`mountusb`), plus real GPT support and a real namespace-scoping bug found on real hardware
 
 Direct continuation of the same day's Tier 1 work (raw sector read/write

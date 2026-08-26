@@ -58,6 +58,13 @@ const SYS_FS_PARTITION_INFO = 14; // fsd-only: returns current_proc.fs_partition
                                     // needing a different answer to this same syscall.
 const SYS_FUTEX_WAIT = 15; // block while *addr == expected — see its case below
 const SYS_FUTEX_WAKE = 16; // wake every waiter blocked on addr in this address space
+
+// SYS_NS_MOUNT_WAIT's own attempt-count argument is a plain, caller-
+// supplied ulong with no cap of its own — see that case's comment for
+// why a hard ceiling here is worth having even though every legitimate
+// caller already asks for far less (the largest today,
+// user/shell.c3's own MOUNTUSB_WAIT_ATTEMPTS, is 2,000,000).
+const ulong NS_MOUNT_WAIT_MAX_ATTEMPTS = 50000000;
 const SYS_PROC_INFO  = 17; // procd-only in practice, but open to any caller — see its case below
 const SYS_KILL       = 18; // procd-only in practice (the /proc/<pid>/ctl write path), open to any caller — see its case below
 const SYS_IPC_RECV_GEN = 19; // same as SYS_IPC_RECV, plus the sender's generation — see its case below
@@ -288,29 +295,6 @@ fn void enable_timer_interrupts()
 fn void enable_user_timer_access()
 {
 	write_csr("scounteren", read_reg("scounteren") | SCOUNTEREN_TM);
-}
-
-// For the standard check-condition-then-wfi race: if the completion
-// interrupt arrives in the gap between checking a condition and executing
-// wfi, the trap fires right there (claimed/completed as a normal
-// interrupt), and a subsequent wfi then waits forever for an interrupt
-// that already happened — a real lost wakeup, not a hypothetical one (see
-// docs/devlog.md). The fix is the textbook one: disable interrupts before
-// the check, keep them disabled across the whole check-and-wfi loop, only
-// re-enable once the condition is actually met. wfi still wakes on a
-// pending-but-globally-disabled interrupt per the RISC-V spec — that's
-// the whole point of this pattern — it just doesn't let the trap actually
-// fire and consume it until we're done checking.
-fn void disable_interrupts()
-{
-	write_csr("sstatus", read_reg("sstatus") & ~(ulong)SSTATUS_SIE);
-}
-
-fn void enable_interrupts()
-{
-	// Just the global gate — sie.SEIE was already set once at boot by
-	// enable_external_interrupts() and never needs touching again.
-	write_csr("sstatus", read_reg("sstatus") | SSTATUS_SIE);
 }
 
 // @align(4) alone is not reliably honored (found via disassembly diffing:
@@ -554,6 +538,11 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			int ipc_len      = (int)f.a4;
 			int ipc_copy_len = ipc_len > MSG_MAX ? MSG_MAX : ipc_len;
 			if (ipc_copy_len < 0) ipc_copy_len = 0;
+			if (!user_range_valid(current_proc.page_table, (uptr)ipc_data, (ulong)ipc_copy_len, false))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
 			// proc_by_pid here only ever guards against a plain dead/
 			// never-existed pid (e.g. a stale hardcoded pid like echod's
 			// or diskd's, if one of those ever exited). The stale-
@@ -633,6 +622,11 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			uint reply_expected_generation = (uint)f.a5;
 			int reply_copy_len = reply_len > MSG_MAX ? MSG_MAX : reply_len;
 			if (reply_copy_len < 0) reply_copy_len = 0;
+			if (!user_range_valid(current_proc.page_table, (uptr)reply_data, (ulong)reply_copy_len, false))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
 			Process* reply_target = proc_by_pid(reply_dest_pid);
 			if (!reply_target || (reply_expected_generation != 0 && reply_target.generation != reply_expected_generation))
 			{
@@ -670,6 +664,14 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			char* recv_buf       = (char*)(uptr)f.a0;
 			int recv_len         = (int)f.a1;
 			uint* recv_type_out  = (uint*)(uptr)f.a2;
+			int recv_valid_len = recv_len > MSG_MAX ? MSG_MAX : recv_len;
+			if (recv_valid_len < 0) recv_valid_len = 0;
+			if (!user_range_valid(current_proc.page_table, (uptr)recv_buf, (ulong)recv_valid_len, true)
+				|| (recv_type_out != null && !user_range_valid(current_proc.page_table, (uptr)recv_type_out, 4, true)))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
 			current_proc.in_blocking_wait = true;
 			blocking_depth++;
 			for (;;)
@@ -725,6 +727,15 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			int recv_gen_len         = (int)f.a1;
 			uint* recv_gen_type_out  = (uint*)(uptr)f.a2;
 			uint* recv_gen_from_generation_out = (uint*)(uptr)f.a4;
+			int recv_gen_valid_len = recv_gen_len > MSG_MAX ? MSG_MAX : recv_gen_len;
+			if (recv_gen_valid_len < 0) recv_gen_valid_len = 0;
+			if (!user_range_valid(current_proc.page_table, (uptr)recv_gen_buf, (ulong)recv_gen_valid_len, true)
+				|| (recv_gen_type_out != null && !user_range_valid(current_proc.page_table, (uptr)recv_gen_type_out, 4, true))
+				|| (recv_gen_from_generation_out != null && !user_range_valid(current_proc.page_table, (uptr)recv_gen_from_generation_out, 4, true)))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
 			current_proc.in_blocking_wait = true;
 			blocking_depth++;
 			for (;;)
@@ -794,6 +805,12 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			int poll_copy_len = poll_len > MSG_MAX ? MSG_MAX : poll_len;
 			if (poll_copy_len < 0) poll_copy_len = 0;
+			if (!user_range_valid(current_proc.page_table, (uptr)poll_buf, (ulong)poll_copy_len, true)
+				|| (poll_type_out != null && !user_range_valid(current_proc.page_table, (uptr)poll_type_out, 4, true)))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
 			mem::copy(poll_buf, &current_proc.msg_data, (sz)poll_copy_len);
 			if (poll_type_out != null)
 			{
@@ -826,6 +843,13 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// also matches. Returns -1 (in f.a0, read as signed by the
 			// caller) if nothing matches.
 			char* ns_path = (char*)(uptr)f.a0;
+			uint* ns_prefix_len_out_check = (uint*)(uptr)f.a1;
+			if (!user_range_valid(current_proc.page_table, (uptr)ns_path, NS_PREFIX_MAX, false)
+				|| (ns_prefix_len_out_check != null && !user_range_valid(current_proc.page_table, (uptr)ns_prefix_len_out_check, 4, true)))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
 			int ns_result = -1;
 			int ns_best_len = -1;
 			for (int m = 0; m < NS_MOUNTS_MAX; m++)
@@ -878,6 +902,12 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// optional type-out pointer): a0 -> vq paddr, a1 -> req paddr.
 			uptr* diskd_vq_out  = (uptr*)(uptr)f.a0;
 			uptr* diskd_req_out = (uptr*)(uptr)f.a1;
+			if (!user_range_valid(current_proc.page_table, (uptr)diskd_vq_out, 8, true)
+				|| !user_range_valid(current_proc.page_table, (uptr)diskd_req_out, 8, true))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
 			*diskd_vq_out  = diskd_vq_paddr;
 			*diskd_req_out = diskd_req_paddr;
 		case SYS_FS_PARTITION_INFO:
@@ -890,12 +920,18 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// mounted simultaneously now, so a single shared board
 			// constant can't answer this the same way for both.
 			uint* fs_partition_out = (uint*)(uptr)f.a0;
+			bool* fs_is_secondary_out = (bool*)(uptr)f.a1;
+			if (!user_range_valid(current_proc.page_table, (uptr)fs_partition_out, 4, true)
+				|| (fs_is_secondary_out != null && !user_range_valid(current_proc.page_table, (uptr)fs_is_secondary_out, 1, true)))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
 			*fs_partition_out = current_proc.fs_partition_start;
 			// a1 is a second, optional out-pointer (same "null means
 			// the caller doesn't care" convention SYS_NS_RESOLVE/
 			// SYS_RFORK already use) — see is_secondary_fs's own
 			// comment (process.c3) for why fsd.c3 needs this at all.
-			bool* fs_is_secondary_out = (bool*)(uptr)f.a1;
 			if (fs_is_secondary_out != null)
 			{
 				*fs_is_secondary_out = current_proc.is_secondary_fs;
@@ -906,7 +942,9 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// fork_entry() for how the child actually resumes, and
 			// docs/devlog.md for the full design rationale.
 			int rfork_flags = (int)f.a0;
-			if ((rfork_flags & RFPROC) == 0)
+			uint* rfork_gen_out_check = (uint*)(uptr)f.a1;
+			if ((rfork_flags & RFPROC) == 0
+				|| (rfork_gen_out_check != null && !user_range_valid(current_proc.page_table, (uptr)rfork_gen_out_check, 4, true)))
 			{
 				f.a0 = (ulong)(-1);
 				break;
@@ -959,7 +997,6 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				map_device_page(child_table, board::PLIC_PRIORITY_PAGE, board::PLIC_PRIORITY_PAGE, PAGE_R | PAGE_W);
 				map_device_page(child_table, board::PLIC_ENABLE_PAGE, board::PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
 				map_device_page(child_table, board::PLIC_CLAIM_PAGE, board::PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
-				map_device_page(child_table, board::PLIC_PENDING_PAGE, board::PLIC_PENDING_PAGE, PAGE_R | PAGE_W);
 
 				ulong* parent_table2 = current_proc.page_table;
 				for (uint vpn2 = 0; vpn2 < 512; vpn2++)
@@ -1070,6 +1107,11 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// affecting the parent or any other process. Returns 0 if
 			// found and removed, -1 if no mount had that exact prefix.
 			char* unmount_prefix = (char*)(uptr)f.a0;
+			if (!user_range_valid(current_proc.page_table, (uptr)unmount_prefix, NS_PREFIX_MAX, false))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
 			int unmount_result = -1;
 			for (int um = 0; um < NS_MOUNTS_MAX; um++)
 			{
@@ -1144,6 +1186,11 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// not.
 			int* futex_addr     = (int*)(uptr)f.a0;
 			int futex_expected  = (int)f.a1;
+			if (!user_range_valid(current_proc.page_table, (uptr)futex_addr, 4, false))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
 			if (*futex_addr != futex_expected)
 			{
 				f.a0 = 0;
@@ -1221,6 +1268,13 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			uint* state_out = (uint*)(uptr)f.a1;
 			uint* generation_out = (uint*)(uptr)f.a2;
 			int* uid_out = (int*)(uptr)f.a4;
+			if ((state_out != null && !user_range_valid(current_proc.page_table, (uptr)state_out, 4, true))
+				|| (generation_out != null && !user_range_valid(current_proc.page_table, (uptr)generation_out, 4, true))
+				|| (uid_out != null && !user_range_valid(current_proc.page_table, (uptr)uid_out, 4, true)))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
 			if (state_out != null) *state_out = (uint)queried.state;
 			if (generation_out != null) *generation_out = queried.generation;
 			if (uid_out != null) *uid_out = queried.uid;
@@ -1370,6 +1424,11 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// entry with this exact name is rebound in place (e.g. after
 			// a server restart) rather than refused.
 			char* post_name = (char*)(uptr)f.a0;
+			if (!user_range_valid(current_proc.page_table, (uptr)post_name, SRV_NAME_MAX, false))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
 			int post_free_slot = -1;
 			int post_result = -1;
 			bool post_denied = false;
@@ -1417,6 +1476,12 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// loop around this exact same single attempt).
 			char* mount_prefix = (char*)(uptr)f.a0;
 			char* mount_srv_name = (char*)(uptr)f.a1;
+			if (!user_range_valid(current_proc.page_table, (uptr)mount_prefix, NS_PREFIX_MAX, false)
+				|| !user_range_valid(current_proc.page_table, (uptr)mount_srv_name, SRV_NAME_MAX, false))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
 			f.a0 = (ulong)(iptr)(ns_mount_try(mount_prefix, mount_srv_name) ? 0 : -1);
 		case SYS_NS_MOUNT_WAIT:
 			// Same as SYS_NS_MOUNT, but blocks — retrying ns_mount_try()
@@ -1467,6 +1532,20 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			char* mw_prefix = (char*)(uptr)f.a0;
 			char* mw_srv_name = (char*)(uptr)f.a1;
 			ulong mw_max_attempts = f.a2;
+			if (!user_range_valid(current_proc.page_table, (uptr)mw_prefix, NS_PREFIX_MAX, false)
+				|| !user_range_valid(current_proc.page_table, (uptr)mw_srv_name, SRV_NAME_MAX, false))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			// A caller-controlled ulong with no cap would let one process
+			// tie up its own blocking_depth-tracked slot for up to
+			// 2^64-1 cooperative retries — each one harmless on its own
+			// (a bounded ns_mount_try() + yield()), but there's no reason
+			// to trust an unbounded request at all when every legitimate
+			// caller in this tree already asks for a few million at most
+			// (see e.g. user/shell.c3's own MOUNTUSB_WAIT_ATTEMPTS).
+			if (mw_max_attempts > NS_MOUNT_WAIT_MAX_ATTEMPTS) mw_max_attempts = NS_MOUNT_WAIT_MAX_ATTEMPTS;
 			bool mw_ok = false;
 			current_proc.in_blocking_wait = true;
 			blocking_depth++;
@@ -1508,6 +1587,11 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// a0 is an out-pointer, same convention as SYS_DISKD_INFO
 			// above.
 			uptr* usbd_dma_out = (uptr*)(uptr)f.a0;
+			if (!user_range_valid(current_proc.page_table, (uptr)usbd_dma_out, 8, true))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
 			*usbd_dma_out = usbd_dma_paddr;
 		case SYS_NETD_INFO:
 			// netd-only, called once at its own startup — see
@@ -1520,6 +1604,13 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			uptr* netd_rxq_out = (uptr*)(uptr)f.a0;
 			uptr* netd_txq_out = (uptr*)(uptr)f.a1;
 			uptr* netd_pktbuf_out = (uptr*)(uptr)f.a2;
+			if (!user_range_valid(current_proc.page_table, (uptr)netd_rxq_out, 8, true)
+				|| !user_range_valid(current_proc.page_table, (uptr)netd_txq_out, 8, true)
+				|| !user_range_valid(current_proc.page_table, (uptr)netd_pktbuf_out, 8, true))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
 			*netd_rxq_out = netd_rxq_paddr;
 			*netd_txq_out = netd_txq_paddr;
 			*netd_pktbuf_out = netd_pktbuf_paddr;
@@ -1530,6 +1621,11 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// a0 is an out-pointer, same convention as SYS_USBD_INFO
 			// above.
 			uptr* ethd_dma_out = (uptr*)(uptr)f.a0;
+			if (!user_range_valid(current_proc.page_table, (uptr)ethd_dma_out, 8, true))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
 			*ethd_dma_out = ethd_dma_paddr;
 		case SYS_PARENT_INFO:
 			// Read-only, no permission check — same reasoning as
@@ -1552,6 +1648,11 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				break;
 			}
 			uint* parent_generation_out = (uint*)(uptr)f.a1;
+			if (parent_generation_out != null && !user_range_valid(current_proc.page_table, (uptr)parent_generation_out, 4, true))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
 			if (parent_generation_out != null) *parent_generation_out = parent_queried.parent_generation;
 			f.a0 = (ulong)(iptr)parent_queried.parent_pid;
 		case SYS_EXEC:
@@ -1577,6 +1678,22 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			uint exec_argv_len = (uint)f.a2;
 			int exec_argc = (int)f.a4;
 			if (exec_image_size == 0 || exec_image_size > EXEC_MAX_IMAGE_SIZE || exec_argv_len > EXEC_MAX_ARGV_SIZE)
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			// exec_image is the caller's own buffer (user/user.c3's own
+			// exec() wrapper reads the whole new image into it before
+			// this ever runs) — the argv blob is packed right after the
+			// image content in that same buffer, so one check covering
+			// the combined length validates both. Without this, a caller
+			// could point exec_image at arbitrary (e.g. kernel) memory
+			// and exfiltrate up to EXEC_MAX_IMAGE_SIZE+EXEC_MAX_ARGV_SIZE
+			// bytes of it into its own, now-executable/readable pages —
+			// every offset/size check below this point is real and
+			// careful, but none of them ever validated this root pointer
+			// itself.
+			if (!user_range_valid(current_proc.page_table, (uptr)exec_image, (ulong)exec_image_size + (ulong)exec_argv_len, false))
 			{
 				f.a0 = (ulong)(-1);
 				break;
@@ -1977,7 +2094,13 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			current_proc.uid = (int)f.a0;
 			f.a0 = 0;
 		default:
-			panic::panic("unexpected syscall");
+			// An unrecognized syscall number from any process — a
+			// genuine bug in that process, or a deliberately hostile
+			// one — must never be able to take down the whole kernel
+			// for every other process. Deny cleanly, same convention as
+			// every other rejection in this switch, instead of the
+			// panic::panic() this used to be.
+			f.a0 = (ulong)(-1);
 	}
 }
 

@@ -116,6 +116,54 @@ fn ulong* walk_to_leaf_table(ulong* table2, uptr vaddr)
 	return (ulong*)pte_to_paddr(table1[vpn1]);
 }
 
+// Validates that every page in [vaddr, vaddr+len) is present in
+// `table2`, user-accessible, and has the requested permission — the
+// check every syscall taking a raw user pointer/length needs before
+// dereferencing it, since sstatus.SUM (process.c3's user_entry) lets
+// S-mode read/write PAGE_U pages unconditionally otherwise: with no
+// check at all, a process could pass any address — including kernel
+// RAM mapped PAGE_R|PAGE_W|PAGE_X but not PAGE_U into every process's
+// own table (process.c3's create_process) — and the kernel would read
+// or write it on the process's behalf.
+//
+// Deliberately non-allocating, unlike walk_to_leaf_table(): a missing
+// intermediate table means the address was never validly mapped at
+// all, which must fail closed (false), not silently allocate a fresh
+// empty table and then fail the leaf check anyway. Walks one page at a
+// time rather than reusing walk_to_leaf_table's cached table1 pointer
+// across pages — this is a boundary check on the way to a handful of
+// syscall arguments, not a hot path, so the extra per-page walk cost
+// isn't worth the complexity of short-circuiting it.
+fn bool user_range_valid(ulong* table2, uptr vaddr, ulong len, bool want_write)
+{
+	if (len == 0) return true;
+	if (vaddr + len < vaddr) return false; // overflow
+
+	uptr start_page = vaddr & ~(uptr)(PAGE_SIZE - 1);
+	uptr end_page = (vaddr + len - 1) & ~(uptr)(PAGE_SIZE - 1);
+
+	for (uptr page_addr = start_page; ; page_addr += PAGE_SIZE)
+	{
+		uint vpn2 = (uint)((page_addr >> 30) & 0x1ff);
+		if ((table2[vpn2] & PAGE_V) == 0) return false;
+		ulong* table1 = (ulong*)pte_to_paddr(table2[vpn2]);
+
+		uint vpn1 = (uint)((page_addr >> 21) & 0x1ff);
+		if ((table1[vpn1] & PAGE_V) == 0) return false;
+		ulong* table0 = (ulong*)pte_to_paddr(table1[vpn1]);
+
+		uint vpn0 = (uint)((page_addr >> 12) & 0x1ff);
+		ulong pte = table0[vpn0];
+		if ((pte & PAGE_V) == 0) return false;
+		if ((pte & PAGE_U) == 0) return false;
+		if (want_write && (pte & PAGE_W) == 0) return false;
+		if (!want_write && (pte & PAGE_R) == 0) return false;
+
+		if (page_addr == end_page) break;
+	}
+	return true;
+}
+
 fn void map_page(ulong* table2, uptr vaddr, uptr paddr, uint flags)
 {
 	if (!mem::ptr_is_aligned((void*)vaddr, PAGE_SIZE))

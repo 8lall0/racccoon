@@ -46,12 +46,6 @@ const uptr PLIC_ENABLE_BASE   = PLIC_BASE + 0x2000 + PLIC_S_CONTEXT * 0x80;    /
 const uptr PLIC_THRESHOLD     = PLIC_BASE + 0x200000 + PLIC_S_CONTEXT * 0x1000;
 const uptr PLIC_CLAIM         = PLIC_BASE + 0x200004 + PLIC_S_CONTEXT * 0x1000;
 
-// Context-independent, system-wide pending bitmap — see boards/duo/
-// board.c3's matching comment (this exists on both boards purely so
-// entry.c3's diagnostic code can reference board::PLIC_PENDING_PAGE
-// unconditionally; not otherwise used on QEMU).
-const uptr PLIC_PENDING_BASE = PLIC_BASE + 0x1000;
-
 // Page-aligned bases of the distinct pages the registers above fall in
 // (PLIC_ENABLE_BASE and PLIC_THRESHOLD/PLIC_CLAIM aren't page-aligned
 // themselves), for process.c3's create_process to map into every
@@ -59,7 +53,6 @@ const uptr PLIC_PENDING_BASE = PLIC_BASE + 0x1000;
 const uptr PLIC_PRIORITY_PAGE = PLIC_PRIORITY_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
 const uptr PLIC_ENABLE_PAGE   = PLIC_ENABLE_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
 const uptr PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uptr)~(kernel::PAGE_SIZE - 1);
-const uptr PLIC_PENDING_PAGE  = PLIC_PENDING_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
 
 // QEMU's virt board always has virtio-blk attached (see scripts/launch64.sh) —
 // diskd/fsd get spawned and the shell has real file access.

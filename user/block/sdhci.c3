@@ -175,7 +175,6 @@ fn void mmio_write32(uptr addr, uint v)
 fn uint sd_reg_read(uint offset) { return mmio_read32((uptr)(SD_BASE + offset)); }
 fn void sd_reg_write(uint offset, uint v) { mmio_write32((uptr)(SD_BASE + offset), v); }
 
-fn uint top_reg_read(uint offset) { return mmio_read32((uptr)(TOP_BASE + offset)); }
 fn void top_reg_write(uint offset, uint v) { mmio_write32((uptr)(TOP_BASE + offset), v); }
 
 fn uint pinmux_reg_read(uint offset) { return mmio_read32((uptr)(PINMUX_BASE + offset)); }

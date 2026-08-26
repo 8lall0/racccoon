@@ -4,6 +4,7 @@ set -e
 
 LLVM_LLD=${LLVM_LLD:-/opt/riscv/bin/ld.lld}
 LLC=${LLC:-llc}
+LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
 
 (
   cd "$(dirname "$0")/.."
@@ -230,12 +231,33 @@ LLC=${LLC:-llc}
       -filetype=obj -o "build/obj_medany/$name.o" "$f"
   done
 
+  # QEMU embeds the *test* shell (user/shell_test.c3 — every dev/
+  # regression-test builtin this project has accumulated), not the
+  # trimmed production shell.bin the real Duo build embeds
+  # (scripts/build_duo.sh) — see docs/devlog.md. src/kernel.c3's
+  # _binary_shell_bin_start/_end symbols are board-agnostic and fixed by
+  # name, and objcopy -Ibinary derives the embedded symbol name from the
+  # input file's own basename — so shell_test.bin.o's symbols would come
+  # out named _binary_shell_test_bin_*, not matching. Re-embedding
+  # shell_test.bin under the literal name "shell.bin" in its own
+  # directory (not build/user/, which already holds the real
+  # build/user/shell.bin.o for Duo) sidesteps that without changing
+  # build_user.sh's own one-name-per-binary convention or touching
+  # kernel.c3 at all.
+  echo "==> Re-embedding the test shell as this kernel's own shell..."
+  mkdir -p build/user_qemu_shell
+  cp build/user/shell_test.bin build/user_qemu_shell/shell.bin
+  (
+    cd build/user_qemu_shell
+    $LLVM_OBJCOPY -Ibinary -Oelf64-littleriscv shell.bin shell.bin.o
+  )
+
   echo "==> Linking kernel.elf (with embedded shell)..."
   # No libclang_rt.builtins-riscv64 to link against (see
   # src/kernel/softfloat_stubs.c3's own comment for why that's fine).
   $LLVM_LLD \
     build/obj_medany/*.o \
-    build/user/shell.bin.o \
+    build/user_qemu_shell/shell.bin.o \
     build/user/echod.bin.o \
     build/user/diskd.bin.o \
     build/user/sdd.bin.o \
