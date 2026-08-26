@@ -4,6 +4,81 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-26 (continued) — exFAT read-only support: a third fsd backend
+
+Started exFAT as fsd's third filesystem backend, alongside FAT32 and
+ext2, with the same probe-and-dispatch shape (`fs_mount()`,
+`user/fs/fsd.c3`) both of those already use. **Read-only in this pass**
+(`FS_READ`/`FS_READ_AT`/`FS_LIST`) — deliberately, same incremental
+precedent FAT32 and ext2 both followed (read support first, write
+support — the riskier code — as a separate later session).
+
+New file `user/fs/exfat.c3`: boot sector parsing, FAT chain walking
+(with exFAT's own no-mask 32-bit entries), and a real, spec-correct
+directory entry-set reader — exFAT names live in `0x85`+`0xC0`+`0xC1`
+entry triples (File Directory Entry + Stream Extension + File Name),
+not a single self-contained dirent the way FAT32's short/LFN entries
+are, and a file's data can be either a real FAT chain OR fully
+contiguous (`NoFatChain`, the Stream Extension entry's own flag) — every
+cluster-chain walk in this file threads that flag through, including
+subdirectory resolution (unlike FAT32, an exFAT subdirectory can itself
+be contiguous). Case-insensitive matching parses the volume's *real*
+Up-case Table (a hidden root-directory system file) rather than a fixed
+ASCII fold — decompressed per its own run-length-escape format, but
+only codepoints < 256 are actually cached (`exfat_upcase_low`,
+512 bytes) — full 65536-entry materialization would be 128KB, wildly
+out of scale with every other fixed buffer in this codebase. `fsd.c3`
+gained `FS_TYPE_EXFAT`, an `exfat_probe()` branch in `fs_mount()`
+(tried before FAT32's own weak `0xAA55` fallback, same reasoning
+ext2's magic-first probe already documents), and one new dispatch
+branch each for `FS_LIST`/`FS_READ_AT`/`FS_READ`. `FS_WRITE`/
+`FS_DELETE`/`FS_MKDIR`/`FS_RENAME` needed **no changes at all** — their
+existing `if fs_type == ...`/`else if` chains already default to
+"unsupported" for any `fs_type` with no branch, and `fs_write_disabled`
+already defaults `true` and is simply never flipped for this backend —
+the honest, do-nothing-extra way to express "this backend can't write."
+
+**This was a background/sandboxed session with no working build or test
+loop** — worth recording plainly rather than glossing over. The real
+`c3c` fork this project builds with (`RACCCOON_STD_DIR`, normally at
+`~/Workspace/c3c`) isn't present in this sandbox, so **none of this new
+code has actually been compiled**, and `mtools`/a loop-mountable kernel
+exFAT driver/`fuse-exfat` weren't available either, so no QEMU boot test
+happened. In their place: `mkfs.exfat` (exfatprogs) *was* available, so
+every boot-sector field offset this file reads was cross-checked byte-
+for-byte against a real exfatprogs-formatted image (all matched
+exactly, including a surprising, undocumented `0x20`-type padding entry
+this driver's own "skip anything that isn't a recognized primary/File
+Directory Entry type" logic already handled correctly without any
+special-casing). The full read path — mount, Up-case Table
+decompression, entry-set parsing, contiguous *and* FAT-chained cluster
+walking, subdirectory resolution, case-insensitive matching, and
+offset reads — was then validated by hand-crafting real on-disk file/
+subdirectory/fragmented-file structures into that same image and
+running a faithful line-by-line Python port of `exfat.c3`'s own algorithm
+against it; every case passed (contiguous file, a genuinely fragmented
+2-cluster file crossing a cluster boundary mid-read, a subdirectory with
+its own contiguous file inside it, case-insensitive lookup via the real
+decompressed Up-case Table, and a correctly-failing lookup for a
+nonexistent name). That's real confidence in the *logic*, but zero
+confidence yet in raw C3 syntax/type-system correctness (in particular,
+this is the first file in the codebase to use C3's `Char16`/`WString`
+type family at all) — **`bash scripts/build.sh` needs to actually run,
+and the exFAT branch needs a real QEMU boot, before this is trusted the
+way FAT32/ext2 are.**
+
+**Next up:** run the real build, fix whatever `c3c` objects to, build a
+real `mkfs.exfat`-formatted test image populated with actual files (this
+session's sandbox couldn't populate one — no loop-mount, no
+`fuse-exfat`), wire it into `scripts/build.sh` alongside `disk.img`/
+`disk-ext2.img`, and only then write support, following the same
+later-session precedent FAT32 and ext2 both set.
+
+**Files changed:** `user/fs/exfat.c3` (new), `user/fs/fsd.c3`,
+`scripts/build_user.sh`.
+
+---
+
 ## 2026-08-26 (continued) — Real VFAT long-filename (LFN) support for fat32.c3, read and write
 
 `fat32.c3`'s own header comment already admitted the gap: "filename /

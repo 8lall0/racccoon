@@ -104,6 +104,7 @@ uint fs_partition_start;
 const int FS_TYPE_NONE  = 0;
 const int FS_TYPE_FAT32 = 1;
 const int FS_TYPE_EXT2  = 2;
+const int FS_TYPE_EXFAT = 3;
 int fs_type = FS_TYPE_NONE;
 
 // Real 9P (read-only), against ext2 only — see docs/devlog.md. No new
@@ -394,6 +395,20 @@ fn void fs_mount(bool dynamic_mode, char* dynamic_self_name)
 		// use of — shell.c3's own mounttest proves the same name is
 		// genuinely re-mountable later via real ns_unmount()/ns_mount()
 		// syscalls, not just boot-time plumbing.
+		if (dynamic_mode) { srv_post(dynamic_self_name); } else if (is_secondary) { srv_post("fs2"); }
+		return;
+	}
+	// exFAT next: its "EXFAT   " signature (exfat_probe) is just as
+	// unambiguous as ext2's magic, so it's tried before FAT32's own weak
+	// 0xAA55 fallback below — same reasoning as the ext2-before-FAT32
+	// ordering above. Read-only backend (see exfat.c3's own header
+	// comment): fs_write_disabled stays at its default `true` (this
+	// function's own top-of-file declaration) and no *_reserve_protected
+	// call is needed, since nothing here can ever reach fs_write_sector.
+	if (exfat_probe())
+	{
+		fs_type = FS_TYPE_EXFAT;
+		exfat_mount();
 		if (dynamic_mode) { srv_post(dynamic_self_name); } else if (is_secondary) { srv_post("fs2"); }
 		return;
 	}
@@ -964,6 +979,10 @@ fn void main(String[] args)
 			{
 				if (!ext2_list(&filename, &buf[4], max_entries, &count)) count = -1;
 			}
+			else if (fs_type == FS_TYPE_EXFAT)
+			{
+				if (!exfat_list(&filename, &buf[4], max_entries, &count)) count = -1;
+			}
 			*result_len_field = count;
 			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
 			continue;
@@ -1089,6 +1108,10 @@ fn void main(String[] args)
 			{
 				result = ext2_read_at(&filename, &buf[4], (uint)req_len, req_offset);
 			}
+			else if (fs_type == FS_TYPE_EXFAT)
+			{
+				result = exfat_read_at(&filename, &buf[4], (uint)req_len, req_offset);
+			}
 			*result_len_field = result;
 			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
 			continue;
@@ -1103,6 +1126,10 @@ fn void main(String[] args)
 		else if (fs_type == FS_TYPE_EXT2)
 		{
 			result = ext2_read(&filename, &buf[4], (uint)req_len);
+		}
+		else if (fs_type == FS_TYPE_EXFAT)
+		{
+			result = exfat_read(&filename, &buf[4], (uint)req_len);
 		}
 		*result_len_field = result;
 
