@@ -60,7 +60,7 @@ LLC=${LLC:-llc}
   # bin/{cat,ls,write,rm,mkdir,mv} — the real, argv-taking utilities
   # shell.c3's own /bin/ fallback branch execs (see docs/devlog.md),
   # replacing what used to be hardcoded shell builtins.
-  for u in cat ls write rm mkdir mv usbrw; do
+  for u in cat ls write rm mkdir mv usbrw fsd; do
     mcopy -i build/disk.img "build/user/$u.bin" "::bin/$u"
   done
 
@@ -118,7 +118,7 @@ LLC=${LLC:-llc}
   debugfs -w -R "mkdir bin" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_ext2.img > /dev/null
-  for u in cat ls write rm mkdir mv usbrw; do
+  for u in cat ls write rm mkdir mv usbrw fsd; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_ext2.img > /dev/null
   done
   debugfs -w -R "write build/bigfile_fixture.bin bigfile.bin" build/disk_ext2.img > /dev/null
@@ -170,7 +170,7 @@ LLC=${LLC:-llc}
   debugfs -w -R "mkdir bin" build/disk_dual_root_part.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_root_part.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_root_part.img > /dev/null
-  for u in cat ls write rm mkdir mv usbrw; do
+  for u in cat ls write rm mkdir mv usbrw fsd; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_root_part.img > /dev/null
   done
   dd if=build/disk_dual_root_part.img of=build/disk_dual.img bs=512 seek=0 conv=notrunc status=none
@@ -191,7 +191,7 @@ LLC=${LLC:-llc}
   debugfs -w -R "mkdir bin" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_ext2_part.img > /dev/null
-  for u in cat ls write rm mkdir mv usbrw; do
+  for u in cat ls write rm mkdir mv usbrw fsd; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_ext2_part.img > /dev/null
   done
   # bigfile.bin — same double-indirect-block fixture as the single-mount

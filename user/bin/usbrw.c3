@@ -4,13 +4,15 @@ import std::nolibc::main_stub;
 
 // Raw single-sector read/write against whatever USB Mass Storage device
 // is currently attached (through the DWC2 host controller's own hub,
-// user/usb/msc.c3) — the standalone "prove real I/O works" tool for USB
-// storage, deliberately not wired into the mountable-filesystem layer
-// (fsd/diskd_rw) at all: fsd's own backend discovery is hardcoded to a
-// fixed boot-time pid (DISKD_PID = 3), and a genuinely hot-pluggable USB
-// drive can't fit that model without real changes to fsd itself and a
-// way to spawn/mount a new instance at runtime — a materially bigger
-// piece of work than proving raw read/write first (see docs/devlog.md).
+// user/usb/msc.c3) — Tier 1 of this project's own two-tier USB storage
+// work (see docs/devlog.md): prove raw read/write first, independent of
+// the bigger step of wiring a drive into the mountable-filesystem layer
+// (Tier 2 — see user/bin/mountusb.c3, which does exactly that now, a
+// dynamically exec()'d fsd instance pointed at usbd instead of the real
+// disk). Kept as its own standalone tool even after Tier 2 landed — a
+// low-level dd/fdisk-style complement to normal mounted file access,
+// useful independent of whatever filesystem (if any) is actually on a
+// given drive.
 //
 // Talks to usbd (user/usb/usbd.c3) over the dynamic srv_post()/
 // ns_mount_wait() mechanism, same Plan-9-style post+mount two-step
@@ -20,13 +22,15 @@ import std::nolibc::main_stub;
 //
 // Wire protocol: byte 0..3 = LBA (uint), byte 4..515 = one 512-byte
 // sector's data (the sector written, for a write request; the sector
-// read, for a read reply) — same shape as diskd's own DISKD_READ/
-// DISKD_WRITE (user/block/diskd.c3). These constants must match
-// user/usb/msc.c3's own copy by hand, same "kept in sync by hand"
-// convention this project already established for DISKD_READ/WRITE
-// across diskd.c3/fsd.c3's own separate copies.
-const uint USB_MSC_IPC_READ  = 100;
-const uint USB_MSC_IPC_WRITE = 101;
+// read, for a read reply) — the exact same shape AND numeric verb
+// values as diskd's own DISKD_READ/DISKD_WRITE (user/block/diskd.c3) —
+// deliberately, not arbitrary, so usbd is a genuine drop-in diskd-
+// compatible block server (see docs/devlog.md). These constants must
+// match user/usb/msc.c3's own copy by hand, same "kept in sync by
+// hand" convention this project already established for DISKD_READ/
+// WRITE across diskd.c3/fsd.c3's own separate copies.
+const uint USB_MSC_IPC_READ  = 10;
+const uint USB_MSC_IPC_WRITE = 11;
 const uint USB_MSC_IPC_MSG_MAX = 516;
 const uint USB_SECTOR_SIZE = 512;
 

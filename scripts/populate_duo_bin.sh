@@ -42,7 +42,7 @@ fi
 # image's own bin/ — kept in sync by hand, same convention this
 # project already uses for the small protocol constants duplicated
 # across diskd.c3/fsd.c3.
-BINARIES="echod cat ls write rm mkdir mv usbrw"
+BINARIES="echod cat ls write rm mkdir mv usbrw fsd"
 
 for b in $BINARIES; do
   if [ ! -f "build/user/$b.bin" ]; then

@@ -80,7 +80,15 @@ const uint SECTOR_SIZE   = 512;
 // service; fsd's *own* clients (the shell) go through namespace
 // resolution instead, so they never need to know fsd's pid at all — see
 // user.c3's fs_read/fs_write.
-const int DISKD_PID = 3;
+//
+// Mutable, not `const`, since a dynamically exec()'d fsd instance
+// (main()'s own args.len==1 branch, for mounting a USB Mass Storage
+// device — see docs/devlog.md) resolves a completely different backend
+// pid at its own startup, via the same srv_post()/ns_mount_wait()
+// mechanism usbrw.c3 already uses (usbd's own pid isn't fixed either).
+// diskd_rw() below is otherwise unchanged — it always just targets
+// whatever this holds, boot-time-fixed 3 or a dynamically resolved pid.
+int g_diskd_pid = 3;
 
 // board::FS_PARTITION_START_SECTOR, learned via syscall — board is a
 // kernel-only module (see user/sdd.c3's own header comment for why),
@@ -283,7 +291,7 @@ fn bool diskd_rw(char* buf, uint sector, bool is_write)
 
 	uint verb = is_write ? DISKD_WRITE : DISKD_READ;
 	uint reply_verb = 0;
-	int from = p9_call(DISKD_PID, verb, &req, DISKD_MSG_MAX, &req, DISKD_MSG_MAX, &reply_verb);
+	int from = p9_call(g_diskd_pid, verb, &req, DISKD_MSG_MAX, &req, DISKD_MSG_MAX, &reply_verb);
 	if (from <= 0 || reply_verb != verb) return false;
 
 	char status = req[0];
@@ -330,10 +338,22 @@ fn void fs_reserve_protection_summary()
 	print("\n");
 }
 
-fn void fs_mount()
+// dynamic_mode/dynamic_self_name: for a dynamically exec()'d instance
+// (main()'s own args.len==1 branch) mounting a USB Mass Storage device
+// instead of a board-fixed partition — see docs/devlog.md. When true,
+// fs_partition_start is already set (main()'s own MBR-parse, since a
+// removable drive's real filesystem doesn't start at a board-fixed
+// compile-time sector the way the SD card's does) and
+// fs_partition_info() is skipped entirely (meaningless here — that
+// syscall only ever returns real data for the two create_process()-
+// spawned instances, fsd/fsd2), and dynamic_self_name is always
+// srv_post()-ed once mounted, unconditionally (there's no
+// is_secondary concept for a dynamic instance — it's simply the only
+// instance of itself).
+fn void fs_mount(bool dynamic_mode, char* dynamic_self_name)
 {
 	bool is_secondary = false;
-	if (fs_partition_info(&fs_partition_start, &is_secondary) < 0)
+	if (!dynamic_mode && fs_partition_info(&fs_partition_start, &is_secondary) < 0)
 	{
 		fs_panic("failed to get partition info");
 	}
@@ -374,7 +394,7 @@ fn void fs_mount()
 		// use of — shell.c3's own mounttest proves the same name is
 		// genuinely re-mountable later via real ns_unmount()/ns_mount()
 		// syscalls, not just boot-time plumbing.
-		if (is_secondary) srv_post("fs2");
+		if (dynamic_mode) { srv_post(dynamic_self_name); } else if (is_secondary) { srv_post("fs2"); }
 		return;
 	}
 	if (fat32_probe())
@@ -387,7 +407,7 @@ fn void fs_mount()
 		fat32_reserve_protected(&FS_PROTECTED_NAME);
 		fs_reserve_protection_summary();
 		// See the ext2 branch's own comment above — same reasoning.
-		if (is_secondary) srv_post("fs2");
+		if (dynamic_mode) { srv_post(dynamic_self_name); } else if (is_secondary) { srv_post("fs2"); }
 		return;
 	}
 
@@ -411,9 +431,157 @@ fn void fs_mount()
 	print("fsd: no recognized filesystem found — this mount stays inactive\n");
 }
 
-fn void main()
+// Real MBR partition table parsing — new this session (see
+// docs/devlog.md), needed only by main()'s own dynamic-mount branch: a
+// removable USB drive's real filesystem doesn't start at a board-fixed
+// compile-time sector the way the SD card's does (board::
+// FS_PARTITION_START_SECTOR), so this has to actually read and parse
+// LBA 0. Standard, stable, decades-old format: 0x55AA signature at
+// byte offset 510-511, four 16-byte partition entries starting at
+// offset 446 (type byte at +4, LBA-start u32 LE at +8). Takes the
+// FIRST non-empty (type != 0) entry — good enough for the overwhelming
+// majority of real single-partition USB drives; multiple primary
+// partitions, extended/logical partitions, and GPT are all real,
+// deliberately out of scope for this driver, same "narrow scope
+// first" approach every other feature here has used. Falls back to
+// `*out_start = 0` (whole-disk, no partition table — a "superfloppy"-
+// formatted drive) if the signature is missing or every entry is
+// empty, rather than failing outright.
+// GPT support — real, sourced necessity, not scope creep for its own
+// sake: the actual USB drive this feature was built and tested against
+// (a real Transcend 32GB stick) turned out to be GPT-partitioned, found
+// via a raw byte dump during real-hardware testing (docs/devlog.md) —
+// entry 0 was type 0xEE ("GPT Protective", the standard placeholder a
+// GPT disk's own legacy MBR carries for backward compatibility) with
+// LBA-start 1, which is exactly where a GPT header lives, not a real
+// filesystem — treating that as a real filesystem's own start sector is
+// exactly the bug that raw dump caught. Real GPT format: the header at
+// LBA 1 ("EFI PART" 8-byte signature at offset 0, PartitionEntryLBA u64
+// LE at offset 72), then the partition entry array (128 bytes/entry by
+// convention) starting at that LBA — this only ever reads the very
+// first entry, same "first partition wins" scope as the classic-MBR
+// path. Only the low 32 bits of the two real 64-bit LBA fields are
+// read — every sector number this driver ever handles is a plain uint
+// (fs_partition_start, diskd_rw's own sector parameter), and no
+// realistic USB flash drive's own partition table needs more than 32
+// bits' worth of sectors (2TB+) for this to matter.
+fn void fs_parse_gpt_partition_start(uint* out_start)
 {
-	fs_mount();
+	char[SECTOR_SIZE] gpt_header @noinit;
+	if (!diskd_rw(&gpt_header[0], 1, false)) { return; }
+
+	char* sig = "EFI PART";
+	for (uint i = 0; i < 8; i++)
+	{
+		if (gpt_header[i] != sig[i]) { return; } // not a real GPT header — leave *out_start at its caller-set default
+	}
+
+	uint* entry_lba_field = (uint*)&gpt_header[72];
+	uint entry_lba = *entry_lba_field;
+
+	char[SECTOR_SIZE] entry_sector @noinit;
+	if (!diskd_rw(&entry_sector[0], entry_lba, false)) { return; }
+
+	// PartitionTypeGUID (16 bytes, offset 0 of the first entry) —
+	// all-zero means this entry slot is unused.
+	bool used = false;
+	for (uint i = 0; i < 16; i++)
+	{
+		if (entry_sector[i] != (char)0) { used = true; break; }
+	}
+	if (!used) { return; }
+
+	uint* starting_lba_field = (uint*)&entry_sector[32]; // StartingLBA
+	*out_start = *starting_lba_field;
+}
+
+fn void fs_parse_mbr_partition_start(uint* out_start)
+{
+	char[SECTOR_SIZE] mbr @noinit;
+	*out_start = 0;
+	if (!diskd_rw(&mbr[0], 0, false)) { return; }
+
+	if ((mbr[510] != (char)0x55) || (mbr[511] != (char)0xAA)) { return; }
+
+	// GPT protective MBR — see fs_parse_gpt_partition_start's own
+	// comment. Real GPT disks always encode this as entry 0 specifically
+	// (the spec requires it), so checking only that one entry is
+	// correct, not a simplification.
+	if (mbr[446 + 4] == (char)0xEE)
+	{
+		fs_parse_gpt_partition_start(out_start);
+		return;
+	}
+
+	for (uint entry = 0; entry < 4; entry++)
+	{
+		uint off = 446 + entry * 16;
+		char part_type = mbr[off + 4];
+		if (part_type == (char)0)
+		{
+			continue;
+		}
+		uint* lba_start_field = (uint*)&mbr[off + 8];
+		*out_start = *lba_start_field;
+		return;
+	}
+}
+
+fn void main(String[] args)
+{
+	if (args.len == 1)
+	{
+		// Dynamic mount (e.g. "usbd" — usbd.c3's own srv_post()-ed name;
+		// its usb_msc_ipc_poll() is diskd-compatible) — see this
+		// function's own header comment and fs_mount()'s for the full
+		// reasoning. Builds "/srv/<name>/" from args[0] since it's a real
+		// runtime string, not something usbrw.c3's own hardcoded
+		// "/srv/usbd/" precedent could just reuse literally.
+		char[48] backend_prefix @noinit;
+		char* lit = "/srv/";
+		uint bp_i = 0;
+		while (lit[bp_i] != 0) { backend_prefix[bp_i] = lit[bp_i]; bp_i++; }
+		uint name_i = 0;
+		while (args[0].ptr[name_i] != 0 && bp_i < 46) { backend_prefix[bp_i] = args[0].ptr[name_i]; bp_i++; name_i++; }
+		backend_prefix[bp_i] = (char)'/';
+		bp_i++;
+		backend_prefix[bp_i] = 0;
+
+		if (ns_mount_wait(&backend_prefix[0], args[0].ptr, 200) < 0)
+		{
+			print("fsd: dynamic backend \"");
+			print(args[0].ptr);
+			print("\" never posted, giving up\n");
+			exit();
+		}
+		int resolved_pid = ns_resolve(&backend_prefix[0], null);
+		if (resolved_pid < 0)
+		{
+			print("fsd: dynamic backend \"");
+			print(args[0].ptr);
+			print("\" resolved but ns_resolve failed\n");
+			exit();
+		}
+		g_diskd_pid = resolved_pid;
+		print("fsd: dynamic backend \"");
+		print(args[0].ptr);
+		print("\" resolved, pid=");
+		print_uint((uint)resolved_pid);
+		print(", reading MBR...\n");
+
+		fs_parse_mbr_partition_start(&fs_partition_start);
+		print("fsd: dynamic mount: fs_partition_start=");
+		print_uint(fs_partition_start);
+		print(", probing...\n");
+		fs_mount(true, "usbfs");
+		print("fsd: dynamic mount: fs_mount() returned, fs_type=");
+		print_uint((uint)fs_type);
+		print("\n");
+	}
+	else
+	{
+		fs_mount(false, null);
+	}
 
 	for (;;)
 	{

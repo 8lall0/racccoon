@@ -237,8 +237,16 @@ fn bool msc_write10(uint dev_addr, uint ep_out, uint ep_in, uint max_packet, uin
 // runtime when a drive shows up, a materially bigger piece of work than
 // proving raw read/write actually works on real hardware first (see
 // docs/devlog.md).
-const uint USB_MSC_IPC_READ  = 100; // arbitrary, just needs to not collide with anything else usbd's own single inbox ever receives — it currently receives nothing else at all
-const uint USB_MSC_IPC_WRITE = 101;
+// Same numeric values as diskd's own DISKD_READ/DISKD_WRITE
+// (user/block/diskd.c3) — deliberately, not arbitrary: this makes
+// usbd a genuine drop-in diskd-compatible block server, so fsd.c3's
+// own existing diskd_rw() can talk to it completely unchanged, just
+// pointed at a different pid (see docs/devlog.md, the USB-drive-
+// mounting session). Kept in sync by hand, same convention this
+// project already uses for DISKD_READ/WRITE across diskd.c3/fsd.c3's
+// own separate copies.
+const uint USB_MSC_IPC_READ  = 10;
+const uint USB_MSC_IPC_WRITE = 11;
 const uint USB_MSC_IPC_MSG_MAX = 516; // 4 (sector) + 512 (one block) — same shape as diskd's own DISKD_MSG_MAX
 
 bool g_msc_present = false;

@@ -28,6 +28,11 @@ char[RUN_EXEC_BUF_MAX] run_exec_buf;
 const int BIGFILE_SIZE = 300000;
 char[BIGFILE_SIZE] bigread_buf;
 
+// mountusb builtin's own wait bound — see that command's own comment
+// below for why this is a plain retry count this generous, not a
+// wall-clock timeout.
+const int MOUNTUSB_WAIT_ATTEMPTS = 2000000;
+
 fn void thread_body(void* arg) {
     thread_result = 99;
     print("thread: running on my own stack, wrote thread_result\n");
@@ -1686,6 +1691,52 @@ fn void main() {
                 print(" (expected ");
                 print_uint((uint)(MUTEX_TEST_ITERS * 2));
                 print(")\n");
+            }
+        } else if (strcmp(cmd, "mountusb") == 0) {
+            // Mounts whatever USB Mass Storage device is currently
+            // attached at /mnt/usb/ — must be a real shell builtin,
+            // not a separate /bin/mountusb exec()'d the ordinary way
+            // (the first cut of this feature, tried and reverted): the
+            // final ns_mount_wait() call below binds "/mnt/usb/" into
+            // whatever process calls it, and rfork() only ever copies
+            // a namespace from parent to child at the moment of the
+            // call — never the other way, and never retroactively. A
+            // separate mountusb.bin is itself just another rfork()'d+
+            // exec()'d child of this shell (same as ls/cat below): it
+            // would print "mounted" truthfully, then exit, taking that
+            // mount right along with it — leaving the shell's own
+            // namespace (and everything the shell rfork()s afterward,
+            // e.g. `ls /mnt/usb/`) exactly as unmounted as before.
+            // Confirmed the hard way on real hardware: fsd itself
+            // mounted a real FAT32 filesystem correctly every time,
+            // but `ls /mnt/usb/` kept reporting "not found" regardless
+            // (see docs/devlog.md). Running this directly in the
+            // shell's own long-lived process is what makes the mount
+            // actually visible to commands typed afterward.
+            //
+            // Spawns a second, dynamically-configured fsd instance
+            // (the exact same binary the boot-time fsd/fsd2 use,
+            // user/fs/fsd.c3 — exec()'d here with an argv instead of
+            // create_process()'d at boot) pointed at usbd itself
+            // ("usbd" — the exact name usbd.c3's own main() already
+            // srv_post()s under; its usb_msc_ipc_poll() responder is
+            // diskd-compatible). That fsd instance runs forever, like
+            // every other server in this system — not join()ed.
+            char*[1] mountusb_fsd_argv;
+            mountusb_fsd_argv[0] = "usbd";
+
+            uint mountusb_gen = 0;
+            int mountusb_child = rfork(RFPROC, &mountusb_gen);
+            if (mountusb_child < 0) {
+                print("mountusb: rfork failed (no free process slot)\n");
+            } else if (mountusb_child == 0) {
+                exec_path("fsd", &run_exec_buf, RUN_EXEC_BUF_MAX, 0, &mountusb_fsd_argv[0], 1);
+                print("mountusb: failed to exec fsd\n");
+                exit();
+            } else if (ns_mount_wait("/mnt/usb/", "usbfs", (ulong)MOUNTUSB_WAIT_ATTEMPTS) < 0) {
+                print("mountusb: no USB filesystem appeared — no drive attached, or nothing recognized on it\n");
+            } else {
+                print("mountusb: mounted at /mnt/usb/\n");
             }
         } else {
             // Not a builtin — try /bin/<cmd> (cat/ls/write/rm/mkdir/mv,

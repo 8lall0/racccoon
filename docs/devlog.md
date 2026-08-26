@@ -4,6 +4,95 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-26 (continued) — Tier 2: mounting a real USB Mass Storage drive as a browsable filesystem (`mountusb`), plus real GPT support and a real namespace-scoping bug found on real hardware
+
+Direct continuation of the same day's Tier 1 work (raw sector read/write
+via `usbrw`, previous entry). Tier 2's goal: make the drive's own
+filesystem mountable and browsable (`/mnt/usb/`), not just raw-sector
+accessible.
+
+**Unified the wire protocol first**: `usb_msc_ipc_poll()`'s verb
+constants (`user/usb/msc.c3`) changed from 100/101 to 10/11, exactly
+matching `DISKD_READ`/`DISKD_WRITE` (`user/block/diskd.c3`). This makes
+`usbd` a genuine drop-in diskd-compatible block server — `fsd.c3`'s own
+`diskd_rw()` needed zero wire-protocol changes, only a different target
+pid. `usbrw.c3`'s duplicated copy of the constants updated to match.
+
+**`fsd.c3` gained a dynamic-backend mode**: `fn void main()` became
+`fn void main(String[] args)`. `args.len == 0` (the boot-time
+`create_process`'d fsd/fsd2) is byte-for-byte the original path,
+untouched. `args.len == 1` (a `srv_post()`-ed backend name, e.g.
+`"usbd"`) resolves it via `ns_mount_wait("/srv/<name>/", name, 200)` +
+`ns_resolve()`, stores the result in a new mutable `g_diskd_pid`
+(replacing the old `const DISKD_PID`), then reads and parses LBA 0's
+MBR itself before running the same `ext2_probe()`/`fat32_probe()` logic
+already used for the static path.
+
+**Real drive forced real, unplanned scope**: the original plan
+explicitly called GPT parsing out of scope ("a partition-table-less
+superfloppy still works" was the fallback). The real 32GB Transcend
+drive's actual boot sector turned out to be a GPT protective MBR
+(`33 c0 fa 8e d8 8e ...`, the standard MS-DOS bootstrap stub, with
+partition entry 0's type byte = `0xEE`) — real GPT, not raw FAT32 nor
+a normal MBR. Added `fs_parse_gpt_partition_start()` to `fsd.c3`: reads
+LBA 1's `"EFI PART"` header, follows `PartitionEntryLBA` (header offset
+72) to the first real entry, reads its `StartingLBA` (entry offset 32).
+Small, well-justified, done without stopping to ask first since it was
+the user's actual real test drive — correctly found `fs_partition_start
+= 2048`, and the drive's real FAT32 filesystem mounted correctly on
+the very next real-hardware round.
+
+**First cut of `mountusb` was wrong, and only real hardware caught it.**
+Built as a standalone `/bin/mountusb` command (`rfork(RFPROC)`+
+`exec_path("fsd", ...)` for the dynamic fsd child, then its own
+`ns_mount_wait("/mnt/usb/", "usbfs", ...)` call to bind the mount and
+report success). On real hardware this printed `mountusb: mounted at
+/mnt/usb/` correctly every time — genuine success, real GPT parse, real
+FAT32 mount — but the very next `ls /mnt/usb/` at the same shell prompt
+reported "not found" regardless. Root cause, found by re-reading
+`SYS_NS_MOUNT`/`SYS_RFORK` (`src/entry.c3`): `ns_mount()` binds a prefix
+into whichever process calls it, and `rfork()` only ever copies a
+namespace from parent to child at the moment of the call — never the
+reverse, and never retroactively. `mountusb` as a separate command is
+itself just another `rfork()`'d+`exec()`'d child of the interactive
+shell (same as `ls`/`cat`): it mounted `/mnt/usb/` into its *own*,
+already-doomed namespace, then exited, taking the mount with it. The
+shell's own namespace — and everything the shell `rfork()`s afterward,
+including every subsequent `ls`/`cat` — never saw it.
+
+Fixed by turning `mountusb` into a real shell builtin (`user/shell.c3`),
+following the exact pattern its own pre-existing `mounttest`/
+`hotplugtest` builtins already established (call `ns_mount`/
+`ns_mount_wait` directly in the shell's own long-lived process, not a
+throwaway child). The dynamic-fsd-spawning half is unchanged; only the
+final `ns_mount_wait("/mnt/usb/", "usbfs", ...)` call moved from the
+now-deleted `user/bin/mountusb.c3` into `shell.c3` itself, reusing its
+existing `run_exec_buf`/`RUN_EXEC_BUF_MAX` (already sized for any
+binary this project ships, including `fsd.bin`) instead of a second,
+separately-sized buffer. Confirmed the fix on real hardware immediately
+after: `mountusb` → `ls /mnt/usb/` → real `TMP/`/`PIPPO.TXT` listing →
+`cat /mnt/usb/PIPPO.TXT` → real file content (`asd`), end to end.
+
+Also hit, along the way, a smaller real gotcha worth recording: this
+system's namespace-prefix matching (`SYS_NS_RESOLVE`, `src/entry.c3`)
+is an exact `str_starts_with` against the *literal* registered prefix
+string, including its trailing slash — `ls /mnt/usb` (no trailing `/`)
+genuinely fails to resolve at all (the path is shorter than the
+prefix), same as it would for any other mount (`/srv/`, `/proc/`,
+`/mnt/fs2/`). Not a bug, just this project's existing convention
+applied to a fresh mount point for the first time.
+
+**Files changed:** `user/usb/msc.c3` (verb constants), `user/bin/usbrw.c3`
+(matching constants), `user/fs/fsd.c3` (`main(String[] args)`,
+`g_diskd_pid`, MBR + GPT parsing, `fs_mount()` dynamic-mode params),
+`user/shell.c3` (new `mountusb` builtin, replacing the deleted
+`user/bin/mountusb.c3`), `scripts/build_user.sh`/`scripts/build.sh`/
+`scripts/populate_duo_bin.sh` (build/deploy wiring, `mountusb` binary
+entry removed, `fsd` binary entry kept — the shell `exec_path()`s it by
+name at runtime).
+
+---
+
 ## 2026-08-26 (continued) — RESOLVED: the "USB 3.0 flash drive won't enumerate" mystery was a swapped LOW_SPEED/HIGH_SPEED bit in GetPortStatus decoding, not a cable/hub/device problem at all
 
 Direct continuation of the same day's earlier entries. The user pushed
