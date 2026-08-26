@@ -155,20 +155,34 @@ const uint EXT2_DIRENT_NAME     = 8; // name_len bytes, NOT null-terminated
 // truncation.
 const uint EXT2_MAX_BLOCK_SIZE = 4096;
 
-// Real hardware bug found and fixed this session: this driver used to
-// only ever know group 0's inode table, so any inode belonging to a
-// different group (real Linux tools spread new files/directories
+// Real hardware bug found and fixed in an earlier session: this driver
+// used to only ever know group 0's inode table, so any inode belonging
+// to a different group (real Linux tools spread new files/directories
 // across groups) was silently treated as not-found — see
 // ext2_read_inode/ext2_write_inode's own comments and docs/devlog.md.
 // ext2_alloc_block()/ext2_alloc_inode() now scan every group too, so
 // this driver's own writes aren't confined to group 0 as it fills up
-// either. 64 groups is generous for this project's real hardware (a
-// 1GB partition needs about 8); a volume needing more just can't fully
-// interoperate/allocate past group 63 — every group-indexed lookup in
-// this file already fails closed (treated as not-found, or "no space
-// left") for anything beyond what ext2_group_count/these arrays
-// actually cover.
-const uint EXT2_MAX_GROUPS = 64;
+// either.
+//
+// That fix originally set this to 64, reasoned as "generous... a 1GB
+// partition needs about 8" — a real, wrong assumption about the actual
+// hardware: the real Duo's own root ext2 partition is 57.3GB (the
+// physical SD card's second partition, everything after the 1GB
+// DUOBOOT FAT32 one), needing roughly 459 groups at this card's own
+// 128MiB-per-group density, seven times over the old cap. Every
+// group-indexed lookup in this file already fails closed (treated as
+// not-found, or "no space left") for anything beyond what
+// ext2_group_count/these arrays actually cover — so this cap being too
+// low doesn't crash anything, it just makes any file whose inode or
+// data landed in group 64+ silently invisible, which is exactly what
+// happened the first time anything was ever written to this real
+// partition from outside this driver (a host-side `mkdir bin` +
+// `cp` for exec()'d shell commands — see docs/devlog.md): every new
+// file came back "not found"/"command not found," even though `ls`
+// from the host side showed them present. 2048 covers up to ~256GiB at
+// this same density — real headroom for a bigger card later, at a
+// trivial cost (three uint[2048] arrays, 24KB total static memory).
+const uint EXT2_MAX_GROUPS = 2048;
 const uint EXT2_BGD_SIZE   = 32; // bytes per block group descriptor, standard fixed size
 
 uint ext2_block_size;

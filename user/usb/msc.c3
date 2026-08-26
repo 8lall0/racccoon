@@ -17,12 +17,15 @@ import std::nolibc::mem;
 // captured usbmon trace of a live card reader's CBW/CSW exchange
 // during this project's own investigation session.
 //
-// This file only implements enough of BOT + SCSI to prove real
-// end-to-end I/O: TEST UNIT READY, INQUIRY, READ CAPACITY(10), and
-// READ(10) — no WRITE support yet (deliberately out of scope until
-// read-only access is confirmed working on real hardware first, per
-// this project's own established habit of verifying each layer before
-// building the next one on top of it).
+// Implements enough of BOT + SCSI for real end-to-end I/O: TEST UNIT
+// READY, INQUIRY, READ CAPACITY(10), READ(10), and WRITE(10). Also
+// exposes the currently-attached device's raw sectors over IPC
+// (usb_msc_ipc_poll(), called from usbd.c3's own main loop) — a single-
+// sector-at-a-time protocol, same wire shape as diskd's own
+// DISKD_READ/DISKD_WRITE (user/block/diskd.c3), for a standalone dd-
+// style command to read/write a USB drive directly without the bigger
+// step of wiring this into the fsd/mountable-filesystem layer (see
+// docs/devlog.md for why that's a separate, larger piece of work).
 
 const uint USB_MSC_CBW_SIGNATURE = 0x43425355; // "USBC", little-endian on the wire
 const uint USB_MSC_CSW_SIGNATURE = 0x53425355; // "USBS", little-endian on the wire
@@ -36,6 +39,7 @@ const char USB_SCSI_TEST_UNIT_READY = (char)0x00;
 const char USB_SCSI_INQUIRY         = (char)0x12;
 const char USB_SCSI_READ_CAPACITY10 = (char)0x25;
 const char USB_SCSI_READ10          = (char)0x28;
+const char USB_SCSI_WRITE10         = (char)0x2A;
 
 fn void write_le32(char* buf, uint offset, uint val)
 {
@@ -196,6 +200,110 @@ fn bool msc_read10(uint dev_addr, uint ep_out, uint ep_in, uint max_packet, uint
     return status == 0;
 }
 
+// WRITE(10) — same CDB layout as READ10 above, opcode 0x2A, data stage
+// direction OUT instead of IN. msc_command() already supports an OUT
+// data stage generically (data_in=false copies buf to the device before
+// the CSW), so this is the only new piece needed.
+fn bool msc_write10(uint dev_addr, uint ep_out, uint ep_in, uint max_packet, uint* pid_out, uint* pid_in, uint lba, uint num_blocks, uint block_size, void* buf)
+{
+    char[16] cb;
+    mem::set(&cb[0], 0, 16);
+    cb[0] = USB_SCSI_WRITE10;
+    cb[2] = (char)((lba >> 24) & 0xFF);
+    cb[3] = (char)((lba >> 16) & 0xFF);
+    cb[4] = (char)((lba >> 8) & 0xFF);
+    cb[5] = (char)(lba & 0xFF);
+    cb[7] = (char)((num_blocks >> 8) & 0xFF);
+    cb[8] = (char)(num_blocks & 0xFF);
+    uint status;
+    if (!msc_command(dev_addr, ep_out, ep_in, max_packet, pid_out, pid_in, &cb[0], 10, buf, num_blocks * block_size, false, &status)) { return false; }
+    return status == 0;
+}
+
+// --- Raw-sector IPC responder: exposes the currently-attached MSC
+// device's own sectors to any other process (a standalone dd-style
+// command, user/bin/usbrw.c3) via the same 516-byte wire shape as
+// diskd's own protocol — byte 0..3 = sector number, byte 4..515 = one
+// 512-byte sector's data. Session state (endpoints, toggles, geometry)
+// persists here across calls, set once when a device is found
+// (usb_enumerate_msc_device below) and cleared on disconnect
+// (usb_msc_clear_session(), called from usbd.c3's own hub-port
+// hot-plug/disconnect handling).
+//
+// Deliberately its own small protocol, not wired into fsd/the
+// diskd_rw()-consuming filesystem layer at all — that would need fsd
+// itself to support a dynamically-discovered backend instead of its own
+// hardcoded DISKD_PID, plus a way to spawn/mount a new instance at
+// runtime when a drive shows up, a materially bigger piece of work than
+// proving raw read/write actually works on real hardware first (see
+// docs/devlog.md).
+const uint USB_MSC_IPC_READ  = 100; // arbitrary, just needs to not collide with anything else usbd's own single inbox ever receives — it currently receives nothing else at all
+const uint USB_MSC_IPC_WRITE = 101;
+const uint USB_MSC_IPC_MSG_MAX = 516; // 4 (sector) + 512 (one block) — same shape as diskd's own DISKD_MSG_MAX
+
+bool g_msc_present = false;
+uint g_msc_hub_port = 0;
+uint g_msc_dev_addr = 0;
+uint g_msc_ep_out = 0;
+uint g_msc_ep_in = 0;
+uint g_msc_max_packet = 0;
+uint g_msc_pid_out = 0;
+uint g_msc_pid_in = 0;
+uint g_msc_block_size = 0;
+uint g_msc_last_lba = 0;
+
+// Called from usbd.c3's own usb_poll_hub_ports() when the hub port
+// holding the current MSC device (if any) goes empty — see
+// g_msc_hub_port's own comment. Safe to call unconditionally even if no
+// device is attached (or a different port disconnected).
+fn void usb_msc_clear_session(uint disconnected_port)
+{
+    if (g_msc_present && disconnected_port == g_msc_hub_port)
+    {
+        g_msc_present = false;
+    }
+}
+
+// Non-blocking — see hc_transfer_once_split's own convention for the
+// wider "poll, don't block" reasoning that applies here too: usbd's
+// main loop still needs to keep servicing HPRT0/hub-port polling
+// regardless of whether a block-IO client ever sends anything.
+// Requires g_msc_block_size == 512 (true for essentially every real USB
+// flash drive/card reader — the wire protocol here is fixed at one
+// 512-byte sector per request, matching diskd's own SECTOR_SIZE, not a
+// general variable-block-size design); a device with a different real
+// block size is left attached but unreachable through this specific
+// protocol, cleanly rejected below rather than silently corrupting data
+// with a mismatched size.
+fn void usb_msc_ipc_poll()
+{
+    char[USB_MSC_IPC_MSG_MAX] buf @noinit;
+    uint verb = 0;
+    int from = ipc_poll_type(&buf[0], USB_MSC_IPC_MSG_MAX, &verb);
+    if (from < 0) { return; }
+    if (verb != USB_MSC_IPC_READ && verb != USB_MSC_IPC_WRITE) { return; }
+
+    bool is_write = verb == USB_MSC_IPC_WRITE;
+    uint* sector_field = (uint*)&buf[0];
+    uint lba = *sector_field;
+
+    bool ok = false;
+    if (g_msc_present && g_msc_block_size == 512 && lba <= g_msc_last_lba)
+    {
+        if (is_write)
+        {
+            ok = msc_write10(g_msc_dev_addr, g_msc_ep_out, g_msc_ep_in, g_msc_max_packet, &g_msc_pid_out, &g_msc_pid_in, lba, 1, 512, &buf[4]);
+        }
+        else
+        {
+            ok = msc_read10(g_msc_dev_addr, g_msc_ep_out, g_msc_ep_in, g_msc_max_packet, &g_msc_pid_out, &g_msc_pid_in, lba, 1, 512, &buf[4]);
+        }
+    }
+
+    buf[0] = ok ? (char)0 : (char)1;
+    ipc_reply(from, verb, &buf[0], USB_MSC_IPC_MSG_MAX, 0);
+}
+
 // Entry point called from usbd.c3's own class-dispatch once a mass
 // storage interface has been found and SET_CONFIGURATION has already
 // run. Walks the interface's own endpoint descriptors for the bulk IN
@@ -208,19 +316,28 @@ fn bool msc_read10(uint dev_addr, uint ep_out, uint ep_in, uint max_packet, uint
 // transport probe per the current phase's own scope ("preparation for
 // usb mass storage, then we can test it later"), not a full block
 // device driver.
-fn void usb_enumerate_msc_device(uint dev_addr, uint max_packet0, char* config_buf, uint iface_num, uint num_endpoints, uint ep_start)
+fn void usb_enumerate_msc_device(uint dev_addr, uint max_packet0, char* config_buf, uint iface_num, uint num_endpoints, uint ep_start, uint hub_port)
 {
     uint ep_out_addr = 0;
     uint ep_in_addr = 0;
     uint ep_max_packet = 0;
     bool found_out = false;
     bool found_in = false;
+    // Walks by real endpoint COUNT, not raw descriptor position — see
+    // usbd.c3's own endpoint-walk comment (usb_enumerate_hub_port_device)
+    // for the real bug this exact shape fixes on a different device
+    // class (an interleaved non-endpoint descriptor silently consuming
+    // one of the num_endpoints iterations). Applied here defensively —
+    // no real device has shown this specific problem for MSC yet — for
+    // the same reason, not because it's been observed to matter.
     uint off = ep_start;
-    for (uint i = 0; i < num_endpoints; i++)
+    uint endpoints_found = 0;
+    while (off + 1 < 256 && endpoints_found < num_endpoints)
     {
         uint b_length = (uint)config_buf[off] & 0xFF;
         if (b_length == 0) { break; }
         uint b_type = (uint)config_buf[off + 1] & 0xFF;
+        if (b_type == USB_DESC_TYPE_INTERFACE) { break; }
         if (b_type == USB_DESC_TYPE_ENDPOINT)
         {
             char* ep_desc = &config_buf[off];
@@ -240,6 +357,7 @@ fn void usb_enumerate_msc_device(uint dev_addr, uint max_packet0, char* config_b
                 }
                 ep_max_packet = usb_ep_desc_max_packet(ep_desc);
             }
+            endpoints_found++;
         }
         off += b_length;
     }
@@ -312,5 +430,29 @@ fn void usb_enumerate_msc_device(uint dev_addr, uint max_packet0, char* config_b
     else
     {
         print("usbd: msc: READ(10) of LBA 0 failed or block size unsupported\n");
+    }
+
+    // Persist this session for usb_msc_ipc_poll() — after every local
+    // diagnostic transfer above, so pid_out/pid_in reflect the real,
+    // hardware-advanced toggle state at this point, not a stale
+    // snapshot from before the READ(10) demo just above also advanced
+    // it. See that function's own comment for the wire protocol and why
+    // it's fixed at 512-byte sectors regardless of what this device's
+    // own real block_size turns out to be.
+    g_msc_dev_addr = dev_addr;
+    g_msc_ep_out = ep_out;
+    g_msc_ep_in = ep_in;
+    g_msc_max_packet = ep_max_packet;
+    g_msc_pid_out = pid_out;
+    g_msc_pid_in = pid_in;
+    g_msc_block_size = block_size;
+    g_msc_last_lba = last_lba;
+    g_msc_hub_port = hub_port;
+    g_msc_present = true;
+    if (block_size != 512)
+    {
+        print("usbd: msc: block size is ");
+        print_uint(block_size);
+        print(", not 512 — raw sector IPC (usbrw) won't work correctly against this device\n");
     }
 }

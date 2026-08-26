@@ -4,6 +4,93 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-26 (continued) — Added a standalone usbrw tool + usbd IPC responder for raw USB-drive sector I/O; surfaced and fixed a real EXT2_MAX_GROUPS bug along the way (the real root fs is 57.3GB, not ~1GB)
+
+Direct continuation of the same day's earlier entry, chasing "verify USB
+Mass Storage on real hardware" (Tier 1 of the two-tier plan from the
+previous session: raw read/write first, real fsd/mount integration
+later — see that entry).
+
+**Implemented**: `msc_write10()` (SCSI WRITE(10), mirrors the existing
+`msc_read10()`); a small IPC responder in `usb/msc.c3`
+(`usb_msc_ipc_poll()`, non-blocking, called from usbd's own main loop)
+exposing whatever MSC device is currently attached over the same
+516-byte wire shape as diskd's own `DISKD_READ`/`DISKD_WRITE`; and a new
+standalone command, `user/bin/usbrw.c3` (`usbrw read/write <lba>
+<path>`), talking to it via the project's own existing Plan-9-style
+`srv_post()`/`ns_mount_wait()` mechanism (the same pattern `fsd2`
+already uses) — usbd's own pid isn't fixed (spawned last at boot, after
+the shell itself) and `rfork()` copies the parent's namespace verbatim
+(confirmed by reading `src/entry.c3`'s own `SYS_RFORK` case), so a
+static namespace default would've been permanently stale for every
+shell-spawned command; briefly considered and reverted that approach
+before landing on the dynamic one. Fixed the same endpoint-descriptor-
+walk bug in `msc.c3`'s own endpoint scan that the earlier xpad session
+found, defensively (no real device has shown it there yet). Zero kernel
+changes — this is fully user-space. New `scripts/populate_duo_bin.sh`
+(mirrors `flash_duo.sh`'s own style) to copy `build/user/*.bin` onto the
+real Duo's root ext2 filesystem's `bin/`, needed because — a genuinely
+new discovery — no exec()'d command had ever actually been tested
+against the real Duo's SD card before, only QEMU's disk images.
+
+**That discovery led somewhere real.** Once `usbrw`/`ls`/`cat` were all
+copied onto the real root filesystem and the board rebooted, *every*
+command failed with "command not found" — not specific to `usbrw` at
+all. `fsd` still reported a clean mount (`fsd: ext2 mounted...`), and
+root-level lookups already worked (the protected-file check ran
+normally) — so this wasn't a mount failure, just something about the
+newly-created `bin/` directory and its contents specifically.
+
+Root cause, found by re-reading `ext2.c3`'s own comments: an earlier
+session already found and fixed a real bug here — real Linux tools
+spread new files/directories across ext2 block groups, and this driver
+used to only ever know group 0's own inode table, silently treating
+anything in another group as not-found. That fix added `EXT2_MAX_GROUPS
+= 64`, reasoned as "generous... a 1GB partition needs about 8." That
+reasoning was built on a wrong assumption about the actual hardware:
+the real Duo's root ext2 partition is **57.3GB** (the SD card's second
+partition, everything after the 1GB DUOBOOT FAT32 one — confirmed by
+the exact arithmetic: `board::FS_PARTITION_START_SECTOR` = 2099200
+sectors = exactly 1GiB), needing roughly **459** groups at this card's
+own density — seven times over the old cap. Every group-indexed lookup
+in this file already "fails closed" (treated as not-found) for
+anything beyond what the arrays actually cover, by design — so this
+never crashed anything, it just made the *entire* newly-created `bin/`
+directory (and anything else ever written to this real filesystem from
+outside this driver) silently invisible the moment its inode or data
+landed in group 64 or beyond, which is overwhelmingly likely for any
+new allocation on a huge, mostly-empty real filesystem.
+
+**Fix**: bumped `EXT2_MAX_GROUPS` from 64 to 2048 (covers up to ~256GiB
+at this same density — real headroom for a bigger card later, at a
+trivial cost: three `uint[2048]` arrays, 24KB total static memory).
+Corrected the old comment's wrong "~1GB partition" assumption with the
+real, verified number. Confirmed no regression on QEMU's own (tiny,
+single-group) ext2 test image.
+
+**Confirmed on real hardware**: `ls` now runs and correctly lists the
+real filesystem's actual root contents (`lost+found/ bin/ tmp/`) — no
+more "command not found." `usbrw read 0 test.bin` also now runs
+end-to-end, correctly reaching usbd via `ns_mount_wait`/`p9_call_path`
+and getting a real, honest reply: "no MSC device attached" — because
+the specific USB drive plugged in at the time failed enumeration for
+the same still-unresolved low-speed/STALL reason from the previous
+entry (now on a different hub port, same symptom — still looks like a
+device/cable issue, not something new or something either of today's
+fixes could touch). Both the ext2 fix and the usbrw/usbd IPC path are
+genuinely proven working on real hardware, independent of whether a
+cooperating USB drive is available to test full read/write against.
+
+This is a good example of the same pattern the whole USB investigation
+kept running into: a limit or assumption that was completely reasonable
+and correctly reasoned about *the hardware as understood at the time*,
+silently wrong once a real, larger/different piece of hardware
+(here: how big the actual SD card partition really is) got involved —
+found only by actually trying something real on it, not by more code
+review alone.
+
+---
+
 ## 2026-08-26 — First real-hardware USB Mass Storage test surfaces a genuine LSPDDEV gap (fixed); a USB 3.0 flash drive still won't enumerate, reporting a implausible low-speed
 
 Follow-on session, continuing the previous day's USB work with a fresh

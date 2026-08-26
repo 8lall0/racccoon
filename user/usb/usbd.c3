@@ -74,6 +74,7 @@ fn void usb_poll_hub_ports()
             print("usbd: hub port ");
             print_uint(port);
             print(": disconnected\n");
+            usb_msc_clear_session(port);
         }
     }
 }
@@ -600,7 +601,7 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
             return;
         }
 
-        usb_enumerate_msc_device(USB_DOWNSTREAM_ADDR, max_packet0, &config_buf[0], iface_num, num_endpoints, ep_start);
+        usb_enumerate_msc_device(USB_DOWNSTREAM_ADDR, max_packet0, &config_buf[0], iface_num, num_endpoints, ep_start, port);
         usb_set_split_context(false, 0, 0, false);
         return;
     }
@@ -776,12 +777,27 @@ fn void main()
 {
     usb_dma_paddr = usbd_info();
     usbd_init();
+    // Posts this process under "usbd" in the global srv_table (same
+    // Plan-9-style post+mount two-step fsd2 already uses, srv_post("fs2")
+    // — see docs/devlog.md) so a client (usbrw, user/bin/usbrw.c3) can
+    // reach it dynamically at any later time via ns_mount_wait()/
+    // ns_resolve(), without usbd's own pid ever needing to be hardcoded
+    // or baked into a namespace default — usbd's own pid isn't fixed
+    // (it's spawned last, after the shell itself, see kernel.c3's own
+    // comment) and rfork() copies the PARENT's namespace verbatim
+    // (src/entry.c3's SYS_RFORK case), so a static default-namespace
+    // entry set before usbd existed would stay permanently stale for
+    // every shell-spawned command — the dynamic srv_post/ns_mount_wait
+    // path sidesteps that entirely.
+    srv_post("usbd");
     print("usbd: init done, polling HPRT0 for connect/disconnect\n");
 
     bool last_connected = false;
     int poll_count = 0;
     for (;;)
     {
+        usb_msc_ipc_poll();
+
         uint hprt0 = usb_reg_read(USB_HPRT0);
         bool connected = (hprt0 & USB_HPRT0_PRTCONNSTS) != 0;
         if (connected != last_connected)
