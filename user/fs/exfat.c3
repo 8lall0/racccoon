@@ -19,8 +19,8 @@ module user;
 // exFAT's on-disk model is genuinely different from FAT32's, not just a
 // renamed version of it:
 //  - No 8.3/LFN split — every entry set stores its real name directly, as
-//    UTF-16 (this file uses C3's own Char16/WString type family for that —
-//    see exfat_ascii_to_utf16's own comment).
+//    UTF-16 (this file works in raw 16-bit code units — see the Char16
+//    alias below and exfat_ascii_to_utf16's own comment).
 //  - A file/directory is a whole SET of 32-byte directory entries (one
 //    primary "File Directory Entry" + one "Stream Extension" entry + as
 //    many "File Name" entries as the name needs), not one self-contained
@@ -33,6 +33,13 @@ module user;
 //    Up-case Table (a hidden system file), not a fixed ASCII-only fold —
 //    see exfat_load_upcase_table's own comment for how much of it this
 //    driver actually keeps resident.
+
+// C3's std::core::string calls the UTF-16 code-unit type Char16 (a plain
+// alias for ushort) and a Char16* a WString, but this project builds
+// --use-stdlib=no so neither name is reachable — fat32.c3 just uses a
+// bare ushort for its own LFN code units. Alias it locally so the exFAT
+// name-handling code below still reads as the UTF-16 it actually is.
+alias Char16 = ushort;
 
 // --- Main Boot Sector (sector 0) field offsets --------------------------
 const uint EXFAT_BS_FS_NAME                   = 0x03; // 8 bytes, must be "EXFAT   "
@@ -84,7 +91,7 @@ const uint EXFAT_STREAM_FLAG_NO_FAT_CHAIN = 0x02; // bit 1 — data is fully con
 
 // File Name entry (secondary, type 0xC1) field offsets.
 const uint EXFAT_NAME_CHARS           = 0x02; // 15 UTF-16 code units (30 bytes)
-const uint EXFAT_NAME_CHARS_PER_ENTRY = 15;
+const int EXFAT_NAME_CHARS_PER_ENTRY = 15; // a loop/index count, like EXFAT_NAME_MAX — kept int for use in int-typed name arithmetic
 
 // Up-case Table entry (primary, type 0x82, root dir only) field offsets.
 const uint EXFAT_UPCASE_FIRST_CLUSTER = 0x14; // u32
@@ -299,7 +306,7 @@ fn bool exfat_read_entry_set(Exfat_dir_cursor* cur, char* fde_entry, ushort* out
 			{
 				int pos = base + k;
 				if (pos >= name_len || pos >= EXFAT_NAME_MAX) break;
-				Char16* ch = (Char16*)&entry[EXFAT_NAME_CHARS + k * 2];
+				Char16* ch = (Char16*)&entry[(int)EXFAT_NAME_CHARS + k * 2];
 				out_name[pos] = *ch;
 			}
 		}

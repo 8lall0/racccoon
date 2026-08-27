@@ -211,6 +211,18 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   dd if=build/disk_dual_ext2_part.img of=build/disk_dual.img bs=512 seek=18432 conv=notrunc status=none
   rm -f build/disk_dual_ext2_part.img
 
+  echo "==> Building disk image (exFAT, for scripts/launch64_exfat.sh)..."
+  # Additional, opt-in test target — same status as the ext2 and dual
+  # images above (launch64.sh / build/disk.img / FAT32 stays the
+  # default). exFAT has no pure-userspace image editor (exfatprogs ships
+  # only mkfs/fsck/dump/label), so this one needs a real exFAT mount to
+  # populate — udisksctl (no root) or passwordless sudo. Best-effort: a
+  # build host with neither simply doesn't get build/disk_exfat.img, and
+  # scripts/launch64_exfat.sh is the only thing that reads it. See
+  # scripts/mk_exfat_image.sh's own header and docs/devlog.md's exFAT
+  # entry.
+  bash scripts/mk_exfat_image.sh || echo "    (skipped — see scripts/mk_exfat_image.sh; exFAT boot test unavailable on this host)"
+
   echo "==> Compiling kernel to LLVM IR..."
   rm -rf build/obj build/llvm build/obj_medany build/kernel.*
   c3c build racccoon --no-entry --safe=no --riscv-cpu=rvimac --emit-llvm

@@ -4,6 +4,94 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-27 — exFAT read-only: real c3c build + QEMU boot verification
+
+Follow-up to the previous entry, which landed `user/fs/exfat.c3` from a
+sandboxed session with **no c3c toolchain and no way to populate an
+exFAT image** — the code had never been compiled or booted. This
+session had both, so it closed items 1–3 of that entry's "Next up":
+real build, real test image, real QEMU boot.
+
+**1. c3c build.** `exfat.c3` needed three fixes to compile — all
+type-system, no logic changes:
+- It leaned on C3's stdlib `Char16`/`WString` names, unreachable under
+  this project's `--use-stdlib=no` build (the previous entry flagged
+  this as the single biggest unknown). Replaced with a local
+  `alias Char16 = ushort` — `fat32.c3` already uses a bare `ushort` for
+  its own LFN code units, so this just keeps the exFAT name-handling
+  code reading as the UTF-16 it is.
+- `EXFAT_NAME_CHARS_PER_ENTRY` was `const uint` but is only ever used in
+  `int`-typed name-offset arithmetic (`base = (i - 1) * ...`). Made it
+  `const int`, matching `EXFAT_NAME_MAX`.
+- One `(Char16*)&entry[EXFAT_NAME_CHARS + k * 2]` mixed `uint` +
+  `int` in the index; added an explicit `(int)` cast.
+After these, `bash scripts/build.sh` compiles and links `fsd` (with
+`exfat.c3`) clean. (This host also needed `LLVM_LLD=/usr/bin/ld.lld` —
+the scripts default to `/opt/riscv/bin/ld.lld`; unrelated to exFAT.)
+
+**2. Test image.** New `scripts/mk_exfat_image.sh` +
+`scripts/launch64_exfat.sh` + `disk-exfat/` fixtures, mirroring the
+ext2 (`launch64_ext2.sh` / `disk-ext2/`) and dual setups. exFAT is the
+awkward one: exfatprogs ships only `mkfs`/`fsck`/`dump`/`label` — none
+write file data, and no `mtools`/`debugfs` equivalent for exFAT exists
+anywhere. So the image has to be populated through a real exFAT mount.
+The script uses `udisksctl` (no root — same reasoning as the "Flash Duo
+without sudo" note) with a passwordless-`sudo mount` fallback, and
+`scripts/build.sh` calls it best-effort: a host with neither just
+doesn't get `build/disk_exfat.img`, exactly like the other opt-in boot
+targets.
+
+The image carries a deliberately **maximally fragmented** file:
+`bin/ls_frag`, a copy of `ls.bin` written 4KB-at-a-time interleaved
+with a filler file that's then deleted, so no two data clusters end up
+adjacent — exFAT marks it `NoFatChain=0` and every cluster boundary
+forces a real `exfat_next_cluster` FAT-table lookup. A parser
+(`python3`, walking the on-disk dir tree + FAT) confirmed it: 18
+clusters, 18 fragments. Every other file on a fresh volume lands
+contiguous, so without this the FAT-chain read path never runs on QEMU.
+
+**3. QEMU boot.** `qemu-system-riscv64 ... -drive
+file=build/disk_exfat.img` (`-serial stdio -monitor none`, `\r`-
+terminated piped input — the test shell breaks lines on CR only).
+Everything passed:
+- `fsd: exFAT mounted, partition_start=0 root_cluster=5
+  sectors_per_cluster=8`
+- `ls` — full root listing, including `My Long File Name.txt` (a
+  non-8.3 name, stored directly in `0xC1` entries — no short/long split
+  like FAT32) and directories flagged with `/`
+- `ls subdir` / `ls /subdir` — subdirectory listing
+- `ls emptydir` — zero-entry success, not an error
+- `cat hello.txt`, `cat subdir/nested.txt` — file reads, root and nested
+- `cat MIXEDCASE.TXT` / `mixedcase.txt` / `MixedCase.txt` all resolve to
+  the same file — case-insensitive matching via the volume's real
+  decompressed Up-case Table
+- `cat nope.txt` — correctly "not found"
+- **`ls_frag subdir` execs and prints `nested.txt`** — the 18-fragment
+  binary loaded correctly through `exec()`'s chunked `FS_READ_AT`, i.e.
+  `exfat_read_chain_at`'s FAT-chain traversal, end to end. The
+  contiguous multi-cluster path is covered too (every other `/bin/*`
+  exec).
+
+Known non-issue: `ls /` (leading slash, empty leaf) returns "not found"
+— but it does the same on the ext2 backend (verified this session) and
+on FAT32; all three special-case only the empty path string. Project-
+wide, bare paths are the convention (see earlier entries). Not touched.
+
+**Still deferred** (previous entry's item 4): exFAT write support —
+same separate-session precedent FAT32 and ext2 both followed.
+
+**Not tested this session:** real Milk-V Duo hardware. The Duo boots
+ext2-root + FAT32-boot-partition (see the filesystem-topology notes);
+exFAT has no role in that boot path, and there's no exFAT partition on
+the Duo's card. exFAT on real hardware would only matter for a
+hot-plugged exFAT USB stick via `mountusb`, which is a later concern.
+
+**Files changed:** `user/fs/exfat.c3`, `scripts/build.sh` (new exFAT
+image step), `scripts/mk_exfat_image.sh` (new), `scripts/launch64_exfat.sh`
+(new), `disk-exfat/` (new fixtures).
+
+---
+
 ## 2026-08-26 (continued) — exFAT read-only support: a third fsd backend
 
 Started exFAT as fsd's third filesystem backend, alongside FAT32 and
