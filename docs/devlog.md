@@ -29,12 +29,32 @@ rm-and-rebuilt each run (re-running `build.sh` is itself a reset). Also
 added `cd "$(dirname "$0")"` to the launch scripts so they work from the
 repo root too, not only from `scripts/`.
 
-Verified: `launch64_exfat.sh` run twice — run 1 writes a marker file,
-run 2's `ls`/`cat` don't see it; pristine `disk_exfat.img` mtime
-unchanged. All four launch scripts boot and mount. Full `build.sh`
-(FAT32 via mtools, ext2/dual via debugfs, exFAT via mk_exfat_image.sh)
-completes clean, and re-running the ext2 `mv` test on a pristine image
-behaves exactly right (refuses existing dest, succeeds on a free one).
+Isolation check: `launch64_exfat.sh` run twice — run 1 writes a marker
+file, run 2's `ls`/`cat` don't see it; pristine `disk_exfat.img` mtime
+unchanged. Full `build.sh` (FAT32 via mtools, ext2/dual via debugfs,
+exFAT via mk_exfat_image.sh) completes clean.
+
+**Full boot-test pass, re-run through the updated launch scripts** (fresh
+`build.sh`, then each `launch64*.sh` once, `\r`-terminated piped input):
+
+- **`launch64.sh` (FAT32)** — mounts; `cat hello.txt`; `write` + `cat`
+  round-trip; `mkdir /dtest` + write-into-it; `mv /wtest.txt
+  /wtest2.txt` → new name reads back, old name gone, **no `mv: failed`**;
+  `rm -r /dtest` → gone.
+- **`launch64_ext2.sh`** — same sequence, all clean. The `mv` that
+  triggered this whole investigation now succeeds outright, because the
+  run starts from a pristine image.
+- **`launch64_dual.sh`** — both ext2 filesystems mount (fsd + fsd2);
+  reads/writes on root *and* `/mnt/fs2/`; `bigreadtest: ok` (the
+  double-indirect-block fixture at `/mnt/fs2/bigfile.bin`); same-dir
+  `mv` clean.
+- **`launch64_exfat.sh`** — mounts `writes=on`; reads incl. the
+  Up-case-fold and the fragmented-`ls_frag` exec; `write`/`cat`;
+  `mkdir` + nested write; file `mv`; directory `mv /dtest /dmoved`
+  (children still reachable); `rm -r /dmoved` → gone. `fsck.exfat` on
+  the booted `disk_exfat.run.img` afterwards: **clean** (16 files); the
+  master `disk_exfat.img` still `fsck`-clean at 15 files, mtime = build
+  time (never booted).
 
 **Files changed:** `scripts/launch64.sh`, `scripts/launch64_ext2.sh`,
 `scripts/launch64_dual.sh`, `scripts/launch64_exfat.sh`,
