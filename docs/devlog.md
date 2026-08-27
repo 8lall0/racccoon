@@ -4,6 +4,83 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-27 (continued) — exFAT write support: create/overwrite, delete, mkdir
+
+Second exFAT session, following the same read-then-write split FAT32 and
+ext2 both took. `user/fs/exfat.c3` gains `exfat_write` (create or
+overwrite), `exfat_delete` (file or *empty* directory) and `exfat_mkdir`;
+`fsd.c3` flips `fs_write_disabled` off for an exFAT mount and gets the
+three matching dispatch branches. Rename/move and recursive delete stay
+unimplemented (no exFAT branch in `fsd.c3`, still return -1).
+
+**How exFAT allocation actually works, and why that made this small.**
+An exFAT file's clusters are tracked in the **Allocation Bitmap** (a
+system file, root-dir entry type `0x81`), *not* the FAT — the FAT only
+describes fragmented chains, and a contiguous file's `NoFatChain` flag
+says "ignore the FAT entirely, my clusters are consecutive." `mkfs.exfat`
+leaves a `NoFatChain` file's FAT entries at 0. Combined with the fact
+that `fsd.c3` caps a single `FS_WRITE` at ~1 KB and there's no
+append/offset write verb, **every file this driver writes fits in one
+cluster** (≥ 4 KB everywhere) — so every allocation is exactly one
+contiguous `NoFatChain` cluster and the FAT is never touched for file
+data. The allocator is just "find a 0 bit in the bitmap, set it"; free is
+"clear the bit." The FAT-walk path exists only for *freeing* a
+pre-existing fragmented file on `rm`.
+
+**The parts that needed real care:**
+- **Entry-set construction.** An exFAT file is a *set* of 32-byte slots
+  (File + Stream Extension + ⌈name/15⌉ File Name entries) carrying two
+  checksums: a **SetChecksum** over the whole set (rotate-right-then-add,
+  skipping its own 2 bytes) in the primary entry, and a **NameHash** over
+  the up-cased name in the Stream entry. Both had to be computed
+  correctly for anything else to read the file back — got them right
+  first try, confirmed by the Linux kernel exFAT driver mounting and
+  reading every file this wrote.
+- **In-place overwrite.** Repointing an existing file's Stream Extension
+  entry at new data means recomputing the SetChecksum across every slot
+  of the set, then writing back the (possibly multi-sector-spanning)
+  primary + stream slots. Slot locations come straight from the
+  directory cursor (`Exfat_set_locs`), not arithmetic, so a set split
+  across sectors is handled.
+- **Ordering.** Allocate + write the new data first, *then* repoint the
+  entry, *then* free the old clusters — "fail toward a leak, never toward
+  losing the file," same rule `fat32_write`/`fat32_rename` follow.
+
+**Deliberate scope limits (all documented in the file):** one cluster per
+file; **no directory extension** — a directory that fills its initial
+cluster (128 slots, ~40 entries) can't grow, the create just fails; no
+rename; no recursive delete; delete of a directory only if empty. exFAT
+directories have no `.`/`..` entries, so `mkdir` is just "allocate a
+cluster, zero it (that's a valid empty directory), add the entry set."
+
+**Verification** — `scripts/launch64_exfat.sh` on QEMU, then
+`fsck.exfat` on the host, then re-mounting the image with the host's own
+exFAT driver to read back what racccoon wrote:
+- create, `cat`-verify; overwrite (shorter *and* longer content);
+  create-in-subdirectory; a 58-character filename (4 File Name entries)
+  including overwriting it; case-insensitive overwrite (`ALPHA.TXT` then
+  `alpha.txt` → one file); empty-file write.
+- `mkdir`, nested `mkdir`, write into the nested dir, `ls` it.
+- `rm` a file; `rm` a contiguous 18-cluster binary (`bin/ls` — multi-bit
+  bitmap free); `rm` the deliberately-fragmented `bin/ls_frag` (real
+  FAT-chain walk + per-cluster FAT clear); `rm` a non-empty directory →
+  correctly refused; bottom-up delete of a nested tree.
+- allocator bitmap reuse (write → rm → write again).
+- **`fsck.exfat` reported the volume clean after every one of these**, and
+  ext2's own write regression (`cat`/`write`/`mkdir` + `fsck.ext2`) still
+  passes — the shared `fsd.c3` dispatch changes are purely additive.
+
+`mk_exfat_image.sh` / `launch64_exfat.sh` headers updated to note the
+image is now written in place (rerun `mk_exfat_image.sh` to reset it).
+Not tested on real Milk-V Duo hardware — exFAT has no role in the Duo's
+ext2-root + FAT32-boot layout; it'd only matter for a hot-plugged exFAT
+USB stick via `mountusb`, a later concern.
+
+**Files changed:** `user/fs/exfat.c3`, `user/fs/fsd.c3`,
+`scripts/mk_exfat_image.sh`, `scripts/launch64_exfat.sh`.
+
+---
+
 ## 2026-08-27 — exFAT read-only: real c3c build + QEMU boot verification
 
 Follow-up to the previous entry, which landed `user/fs/exfat.c3` from a

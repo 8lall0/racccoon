@@ -5,16 +5,16 @@ module user;
 // exFAT File System Specification) — same "well-known layout" situation
 // fat32.c3's own header comment describes, not reverse-engineered.
 //
-// Read-only in this pass: exfat_probe/exfat_mount/exfat_read/
-// exfat_read_at/exfat_list only — no create/write/delete/mkdir/rename.
-// fsd.c3's write-side dispatch (FS_WRITE/FS_DELETE/FS_MKDIR/FS_RENAME)
-// already defaults to "unsupported" (result stays -1) for any fs_type it
-// has no branch for, and fs_write_disabled defaults to true and is never
-// flipped by exfat_mount() — see fsd.c3's own comment for that machinery.
-// Matches the same incremental precedent FAT32 and ext2 both followed
-// (see docs/devlog.md): read support first, write support (the riskier
-// code — an allocator/directory-entry-set bug here could corrupt the very
-// partition this boots from) as a deliberate, separate follow-up.
+// Read: exfat_probe/exfat_mount/exfat_read/exfat_read_at/exfat_list.
+// Write: exfat_write (create/overwrite, one cluster max), exfat_delete
+// (file or empty directory, non-recursive), exfat_mkdir — added a
+// session after the read path, the same incremental precedent FAT32 and
+// ext2 both followed (see docs/devlog.md), because the write side is the
+// riskier code: an allocator or directory-entry-set bug here could
+// corrupt a live volume. See the "Write path" section near the bottom of
+// this file for the deliberate scope limits of that first pass (no
+// rename/move, no recursive delete, no directory extension). Rename and
+// recursive delete still have no exFAT branch in fsd.c3 and return -1.
 //
 // exFAT's on-disk model is genuinely different from FAT32's, not just a
 // renamed version of it:
@@ -45,9 +45,11 @@ alias Char16 = ushort;
 const uint EXFAT_BS_FS_NAME                   = 0x03; // 8 bytes, must be "EXFAT   "
 const uint EXFAT_BS_FAT_OFFSET                = 0x50; // u32, sectors from volume start to the FAT
 const uint EXFAT_BS_CLUSTER_HEAP_OFFSET       = 0x58; // u32, sectors from volume start to the cluster heap (data region)
+const uint EXFAT_BS_CLUSTER_COUNT             = 0x5C; // u32, total clusters in the heap (bit count of the Allocation Bitmap)
 const uint EXFAT_BS_ROOT_CLUSTER              = 0x60; // u32
 const uint EXFAT_BS_BYTES_PER_SECTOR_SHIFT    = 0x6C; // u8 — sector size is 1 << shift here, not a raw value like FAT32's BPB
 const uint EXFAT_BS_SECTORS_PER_CLUSTER_SHIFT = 0x6D; // u8 — same, cluster size in sectors is 1 << shift
+const uint EXFAT_BS_NUMBER_OF_FATS            = 0x6E; // u8 — 1 for plain exFAT, 2 only for the TexFAT variant this driver rejects
 const uint EXFAT_BS_SIGNATURE_OFFSET          = 0x1FE; // u16, must be 0xAA55, same offset/convention fat32.c3 uses
 
 const uint EXFAT_FS_NAME_LEN = 8;
@@ -63,8 +65,15 @@ const char[8] EXFAT_FS_NAME = "EXFAT   ";
 // means "this slot and everything after it in the directory is unused" —
 // same end-of-directory convention FAT32_DIRENT_FREE_REST uses.
 const char EXFAT_ENTRY_TYPE_END    = (char)0x00;
+const char EXFAT_ENTRY_TYPE_BITMAP = (char)0x81; // Allocation Bitmap (root dir only) — standalone, one per volume
 const char EXFAT_ENTRY_TYPE_UPCASE = (char)0x82; // Up-case Table (root dir only) — standalone, not part of an entry set
 const char EXFAT_ENTRY_TYPE_FILE   = (char)0x85; // File Directory Entry — primary entry of a file/directory's entry set
+
+// Secondary entry types the write path emits — the in-use forms only
+// (the delete path clears the 0x80 bit in place, it never writes these
+// deleted forms itself).
+const char EXFAT_ENTRY_TYPE_STREAM = (char)0xC0; // Stream Extension
+const char EXFAT_ENTRY_TYPE_NAME   = (char)0xC1; // File Name
 
 const uint EXFAT_ENTRY_INUSE_BIT     = 0x80;
 const uint EXFAT_ENTRY_TYPECODE_MASK = 0x1F;
@@ -72,8 +81,18 @@ const uint EXFAT_TYPECODE_FILE       = 0x05; // (0x85 & 0x1F) == (0x05 & 0x1F) =
 
 // File Directory Entry (primary, type 0x85/0x05) field offsets.
 const uint EXFAT_FDE_SECONDARY_COUNT = 0x01; // u8 — number of Stream Extension + File Name entries following this one
+const uint EXFAT_FDE_SET_CHECKSUM    = 0x02; // u16 — checksum over the whole entry set, excluding these 2 bytes
 const uint EXFAT_FDE_ATTRIBUTES      = 0x04; // u16
+const uint EXFAT_FDE_CREATE_TIME     = 0x08; // u32 — DOS-packed; also LastModified at 0x0C, LastAccessed at 0x10
 const uint EXFAT_ATTR_DIRECTORY      = 0x0010; // same bit FAT32_DIRENT_ATTR_DIRECTORY uses
+const uint EXFAT_ATTR_ARCHIVE        = 0x0020; // set on every regular file this driver creates, same as FAT32/Windows
+
+// This driver has no RTC (nothing in racccoon does — see docs/devlog.md).
+// A zero timestamp decodes to an invalid 1980-00-00, which fsck flags,
+// so every entry this driver writes gets one fixed, valid, obviously-
+// synthetic value: 2026-01-01 00:00:00. DOS packing: bits 25..31
+// year-1980 (46), 21..24 month (1), 16..20 day (1), rest zero.
+const uint EXFAT_FIXED_TIMESTAMP = (46u << 25) | (1u << 21) | (1u << 16);
 
 // Stream Extension entry (secondary, type 0xC0, always the first entry
 // right after a File Directory Entry) field offsets. ValidDataLength and
@@ -82,12 +101,15 @@ const uint EXFAT_ATTR_DIRECTORY      = 0x0010; // same bit FAT32_DIRENT_ATTR_DIR
 // offsets everywhere already — fs_read/fs_write's own `len` is `uint` —
 // so a file bigger than 4GB is already out of scope regardless of this
 // backend's own field width).
-const uint EXFAT_STREAM_FLAGS         = 0x01; // u8 — GeneralSecondaryFlags
-const uint EXFAT_STREAM_NAME_LENGTH   = 0x03; // u8 — name length in UTF-16 code units
-const uint EXFAT_STREAM_FIRST_CLUSTER = 0x14; // u32
-const uint EXFAT_STREAM_DATA_LENGTH   = 0x18; // u64 on disk, low 4 bytes read
+const uint EXFAT_STREAM_FLAGS             = 0x01; // u8 — GeneralSecondaryFlags
+const uint EXFAT_STREAM_NAME_LENGTH       = 0x03; // u8 — name length in UTF-16 code units
+const uint EXFAT_STREAM_NAME_HASH         = 0x04; // u16 — hash of the up-cased name (a lookup fast-path readers may use)
+const uint EXFAT_STREAM_VALID_DATA_LENGTH = 0x08; // u64 on disk — bytes actually written (<= DataLength); this driver keeps them equal
+const uint EXFAT_STREAM_FIRST_CLUSTER     = 0x14; // u32
+const uint EXFAT_STREAM_DATA_LENGTH       = 0x18; // u64 on disk, low 4 bytes read
 
-const uint EXFAT_STREAM_FLAG_NO_FAT_CHAIN = 0x02; // bit 1 — data is fully contiguous, don't walk the FAT at all
+const uint EXFAT_STREAM_FLAG_ALLOC_POSSIBLE = 0x01; // bit 0 — a first cluster is/could be allocated
+const uint EXFAT_STREAM_FLAG_NO_FAT_CHAIN   = 0x02; // bit 1 — data is fully contiguous, don't walk the FAT at all
 
 // File Name entry (secondary, type 0xC1) field offsets.
 const uint EXFAT_NAME_CHARS           = 0x02; // 15 UTF-16 code units (30 bytes)
@@ -97,7 +119,22 @@ const int EXFAT_NAME_CHARS_PER_ENTRY = 15; // a loop/index count, like EXFAT_NAM
 const uint EXFAT_UPCASE_FIRST_CLUSTER = 0x14; // u32
 const uint EXFAT_UPCASE_DATA_LENGTH   = 0x18; // u64 on disk, low 4 bytes read
 
+// Allocation Bitmap entry (primary, type 0x81, root dir only) field
+// offsets — same shape as the Up-case Table entry.
+const uint EXFAT_BITMAP_FIRST_CLUSTER = 0x14; // u32
+const uint EXFAT_BITMAP_DATA_LENGTH   = 0x18; // u64 on disk, low 4 bytes read
+
 const uint EXFAT_DIRENT_SIZE = 32;
+const uint EXFAT_SLOTS_PER_SECTOR = 16; // SECTOR_SIZE / EXFAT_DIRENT_SIZE — 512 / 32
+
+// Longest entry set the write path builds: 1 File + 1 Stream + one File
+// Name entry per 15 name units. EXFAT_NAME_MAX (128) / 15 rounds up to 9.
+const int EXFAT_MAX_SET_SLOTS = 2 + 9;
+const uint EXFAT_SET_BYTES_MAX = 32 * 11; // EXFAT_DIRENT_SIZE * EXFAT_MAX_SET_SLOTS, as a plain array-size constant
+
+// End-of-chain marker this driver writes into a FAT entry (any value
+// >= EXFAT_EOC_MIN reads as end-of-chain; 0xFFFFFFFF is what mkfs uses).
+const uint EXFAT_EOC_WRITE = 0xFFFFFFFF;
 
 // exFAT FAT entries are full, un-masked 32-bit values (cluster indices
 // never approach this range) — unlike FAT32_ENTRY_MASK's 28-bit scheme,
@@ -115,6 +152,18 @@ uint exfat_fat_start_sector;    // FatOffset field, partition-relative sectors
 uint exfat_cluster_heap_offset; // ClusterHeapOffset field, partition-relative sectors
 uint exfat_sectors_per_cluster; // 1 << SectorsPerClusterShift
 uint exfat_root_cluster;
+uint exfat_cluster_count;       // ClusterCount field — number of bits in the Allocation Bitmap
+
+// --- Write path state, set by exfat_load_bitmap_info() at mount -------
+// exfat_writes_ok gates fsd.c3 flipping fs_write_disabled off: it stays
+// false unless the Allocation Bitmap was found AND the volume has
+// exactly one FAT (a TexFAT volume, NumberOfFats==2, is left read-only —
+// keeping its second FAT in sync is out of scope, same "reject the
+// nonstandard layout rather than half-handle it" stance exfat_mount's
+// 512-byte-sector check already takes).
+uint exfat_bitmap_cluster = 0;  // Allocation Bitmap first cluster (0 = not found)
+uint exfat_bitmap_length  = 0;  // its DataLength in bytes
+bool exfat_writes_ok      = false;
 
 // Up-case Table cache — see exfat_load_upcase_table's own comment for why
 // only codepoints < EXFAT_UPCASE_CACHE_SIZE are actually retained.
@@ -213,6 +262,13 @@ struct Exfat_dir_cursor
 	uint entry_in_sector;
 	char[SECTOR_SIZE] sector_buf;
 	bool sector_loaded;
+	// Absolute (partition-relative) location of the entry the most recent
+	// exfat_cursor_next() call returned — the write path needs to be able
+	// to go back and modify a slot it walked past (rewrite a Stream
+	// Extension entry, clear an in-use bit). Meaningless before the first
+	// successful exfat_cursor_next().
+	uint last_abs_sector;
+	uint last_slot_in_sector;
 }
 
 fn void exfat_cursor_init(Exfat_dir_cursor* cur, uint dir_cluster, bool no_fat_chain)
@@ -222,6 +278,8 @@ fn void exfat_cursor_init(Exfat_dir_cursor* cur, uint dir_cluster, bool no_fat_c
 	cur.sector_in_cluster = 0;
 	cur.entry_in_sector = 0;
 	cur.sector_loaded = false;
+	cur.last_abs_sector = 0;
+	cur.last_slot_in_sector = 0;
 }
 
 // Returns a pointer to the next 32-byte entry (valid only until the next
@@ -240,6 +298,8 @@ fn char* exfat_cursor_next(Exfat_dir_cursor* cur)
 	}
 
 	char* entry = &cur.sector_buf[cur.entry_in_sector * EXFAT_DIRENT_SIZE];
+	cur.last_abs_sector = exfat_cluster_to_sector(cur.cluster) + cur.sector_in_cluster;
+	cur.last_slot_in_sector = cur.entry_in_sector;
 
 	cur.entry_in_sector++;
 	if (cur.entry_in_sector >= SECTOR_SIZE / EXFAT_DIRENT_SIZE)
@@ -271,12 +331,22 @@ fn char* exfat_cursor_next(Exfat_dir_cursor* cur)
 // filled in. Doesn't compute/check NameHash — a real optimization exFAT
 // readers use, but exact post-fold name comparison is already correct
 // without it (see exfat_find_in_dir), and this is a narrower first pass.
-fn bool exfat_read_entry_set(Exfat_dir_cursor* cur, char* fde_entry, ushort* out_attr, uint* out_first_cluster, uint* out_data_length, bool* out_no_fat_chain, Char16* out_name, int* out_name_len)
+// out_locs (nullable): if given, records the absolute (sector, slot) of
+// every entry in the set — index 0 is the primary File entry (the caller
+// fills that from its own cur.last_abs_sector before calling), 1.. are
+// the secondaries as this walk reaches them. The write path uses it to
+// go back and rewrite the Stream Extension entry / clear in-use bits
+// without a second name search. A set with more secondaries than
+// EXFAT_MAX_SET_SLOTS-1 (never one this driver wrote) records what fits
+// and marks itself over-length via out_locs.count so callers refuse it.
+fn bool exfat_read_entry_set(Exfat_dir_cursor* cur, char* fde_entry, ushort* out_attr, uint* out_first_cluster, uint* out_data_length, bool* out_no_fat_chain, Char16* out_name, int* out_name_len, Exfat_set_locs* out_locs)
 {
 	bool in_use = ((uint)fde_entry[0] & EXFAT_ENTRY_INUSE_BIT) != 0;
 	int secondary_remaining = (int)((uint)fde_entry[EXFAT_FDE_SECONDARY_COUNT] & 0xFF);
 	ushort* attr_field = (ushort*)&fde_entry[EXFAT_FDE_ATTRIBUTES];
 	ushort attr = *attr_field;
+
+	if (out_locs != null) out_locs.count = 1 + secondary_remaining;
 
 	bool stream_seen = false;
 	bool no_fat_chain = false;
@@ -288,6 +358,12 @@ fn bool exfat_read_entry_set(Exfat_dir_cursor* cur, char* fde_entry, ushort* out
 	{
 		char* entry = exfat_cursor_next(cur);
 		if (entry == null) return false; // truncated directory
+
+		if (out_locs != null && (i + 1) < EXFAT_MAX_SET_SLOTS)
+		{
+			out_locs.sector[i + 1] = cur.last_abs_sector;
+			out_locs.slot[i + 1]   = cur.last_slot_in_sector;
+		}
 
 		if (!stream_seen)
 		{
@@ -320,17 +396,35 @@ fn bool exfat_read_entry_set(Exfat_dir_cursor* cur, char* fde_entry, ushort* out
 	return in_use && stream_seen;
 }
 
+// The absolute (sector, slot) of every 32-byte entry in one file's/
+// directory's entry set — index 0 is the primary File entry, 1.. the
+// secondaries (Stream Extension, then File Name entries). Filled in by
+// exfat_find_in_dir_located() straight from the directory cursor, so it
+// stays correct for any on-disk layout (a set split across sectors, or
+// even across a directory's cluster chain), not just the contiguous case
+// arithmetic-from-the-primary would assume. `count` is the true slot
+// count (1 + SecondaryCount); if it exceeds EXFAT_MAX_SET_SLOTS the set
+// isn't one this driver ever wrote and callers refuse to edit it.
+struct Exfat_set_locs
+{
+	int count;
+	uint[EXFAT_MAX_SET_SLOTS] sector;
+	uint[EXFAT_MAX_SET_SLOTS] slot;
+}
+
 // Walks dir_cluster's entry sets looking for a name match (post-upcase-
 // fold, see exfat_name_eq_ci). dir_no_fat_chain describes dir_cluster's
 // OWN chain (root is always false — see this file's header comment — a
 // subdirectory's is whatever its own Stream Extension entry said, thread-
-// ed in by the caller).
-fn bool exfat_find_in_dir(uint dir_cluster, bool dir_no_fat_chain, Char16* name_utf16, int name_len, uint* out_first_cluster, uint* out_data_length, ushort* out_attr, bool* out_no_fat_chain)
+// ed in by the caller). out_locs (nullable): the physical location of
+// every slot in the matched set, for the write path to edit in place.
+fn bool exfat_find_in_dir_located(uint dir_cluster, bool dir_no_fat_chain, Char16* name_utf16, int name_len, uint* out_first_cluster, uint* out_data_length, ushort* out_attr, bool* out_no_fat_chain, Exfat_set_locs* out_locs)
 {
 	Exfat_dir_cursor cur @noinit;
 	exfat_cursor_init(&cur, dir_cluster, dir_no_fat_chain);
 
 	Char16[EXFAT_NAME_MAX] candidate @noinit;
+	Exfat_set_locs locs;
 
 	for (;;)
 	{
@@ -341,8 +435,13 @@ fn bool exfat_find_in_dir(uint dir_cluster, bool dir_no_fat_chain, Char16* name_
 		uint type_byte = (uint)entry[0] & 0xFF;
 		if ((type_byte & EXFAT_ENTRY_TYPECODE_MASK) != EXFAT_TYPECODE_FILE) continue; // bitmap/upcase/label/unknown — one standalone slot, skip
 
+		// The primary File entry's own slot — captured before
+		// exfat_read_entry_set advances the cursor past the secondaries.
+		locs.sector[0] = cur.last_abs_sector;
+		locs.slot[0]   = cur.last_slot_in_sector;
+
 		uint first_cluster; uint data_length; ushort attr; bool no_fat_chain; int candidate_len;
-		bool valid = exfat_read_entry_set(&cur, entry, &attr, &first_cluster, &data_length, &no_fat_chain, &candidate, &candidate_len);
+		bool valid = exfat_read_entry_set(&cur, entry, &attr, &first_cluster, &data_length, &no_fat_chain, &candidate, &candidate_len, &locs);
 		if (!valid) continue;
 
 		if (exfat_name_eq_ci(name_utf16, name_len, &candidate, candidate_len))
@@ -351,9 +450,15 @@ fn bool exfat_find_in_dir(uint dir_cluster, bool dir_no_fat_chain, Char16* name_
 			*out_data_length = data_length;
 			*out_attr = attr;
 			*out_no_fat_chain = no_fat_chain;
+			if (out_locs != null) *out_locs = locs;
 			return true;
 		}
 	}
+}
+
+fn bool exfat_find_in_dir(uint dir_cluster, bool dir_no_fat_chain, Char16* name_utf16, int name_len, uint* out_first_cluster, uint* out_data_length, ushort* out_attr, bool* out_no_fat_chain)
+{
+	return exfat_find_in_dir_located(dir_cluster, dir_no_fat_chain, name_utf16, name_len, out_first_cluster, out_data_length, out_attr, out_no_fat_chain, null);
 }
 
 // Same segment-by-segment walk as fat32_resolve_dir, but also threads the
@@ -362,10 +467,11 @@ fn bool exfat_find_in_dir(uint dir_cluster, bool dir_no_fat_chain, Char16* name_
 // same flag a regular file's does), so every directory-cluster reference
 // past the root has to travel with its own no_fat_chain bit, not just a
 // bare cluster number.
-fn bool exfat_resolve_dir(char* path, uint* out_dir_cluster, bool* out_no_fat_chain)
+fn bool exfat_resolve_dir(char* path, uint* out_dir_cluster, bool* out_no_fat_chain, uint* out_data_length)
 {
 	uint dir_cluster = exfat_root_cluster;
 	bool no_fat_chain = false; // root directory's chain is always FAT-walked — it has no Stream Extension entry of its own, see this file's header comment
+	uint data_length = 0;      // root has no Stream Extension entry — 0 is fine, the FAT chain bounds any root walk
 	uint seg_start = 0;
 	uint i = 0;
 	for (;;)
@@ -383,11 +489,12 @@ fn bool exfat_resolve_dir(char* path, uint* out_dir_cluster, bool* out_no_fat_ch
 			Char16[EXFAT_NAME_MAX] seg_utf16 @noinit;
 			int seg_len16 = exfat_ascii_to_utf16(&seg_buf, &seg_utf16, EXFAT_NAME_MAX);
 
-			uint next_cluster; uint dummy_len; ushort attr; bool next_no_fat_chain;
-			if (!exfat_find_in_dir(dir_cluster, no_fat_chain, &seg_utf16, seg_len16, &next_cluster, &dummy_len, &attr, &next_no_fat_chain)) return false;
+			uint next_cluster; uint seg_data_len; ushort attr; bool next_no_fat_chain;
+			if (!exfat_find_in_dir(dir_cluster, no_fat_chain, &seg_utf16, seg_len16, &next_cluster, &seg_data_len, &attr, &next_no_fat_chain)) return false;
 			if (((uint)attr & EXFAT_ATTR_DIRECTORY) == 0) return false;
 			dir_cluster = next_cluster;
 			no_fat_chain = next_no_fat_chain;
+			data_length = seg_data_len;
 		}
 
 		if (path[i] == 0) break;
@@ -396,6 +503,7 @@ fn bool exfat_resolve_dir(char* path, uint* out_dir_cluster, bool* out_no_fat_ch
 	}
 	*out_dir_cluster = dir_cluster;
 	*out_no_fat_chain = no_fat_chain;
+	if (out_data_length != null) *out_data_length = data_length;
 	return true;
 }
 
@@ -448,7 +556,7 @@ fn uint exfat_read_chain(uint first_cluster, bool no_fat_chain, char* dst, uint 
 fn int exfat_read(char* name, char* dst, uint len)
 {
 	uint dir_cluster; bool dir_no_fat_chain;
-	if (!exfat_resolve_dir(name, &dir_cluster, &dir_no_fat_chain)) return -1;
+	if (!exfat_resolve_dir(name, &dir_cluster, &dir_no_fat_chain, null)) return -1;
 	char* leaf = exfat_leaf_name(name);
 
 	Char16[EXFAT_NAME_MAX] leaf_utf16 @noinit;
@@ -534,7 +642,7 @@ fn uint exfat_read_chain_at(uint first_cluster, bool no_fat_chain, char* dst, ui
 fn int exfat_read_at(char* name, char* dst, uint len, uint offset)
 {
 	uint dir_cluster; bool dir_no_fat_chain;
-	if (!exfat_resolve_dir(name, &dir_cluster, &dir_no_fat_chain)) return -1;
+	if (!exfat_resolve_dir(name, &dir_cluster, &dir_no_fat_chain, null)) return -1;
 	char* leaf = exfat_leaf_name(name);
 
 	Char16[EXFAT_NAME_MAX] leaf_utf16 @noinit;
@@ -568,7 +676,7 @@ fn bool exfat_list(char* path, char* out_buf, int max_entries, int* out_count)
 	else
 	{
 		uint parent_cluster; bool parent_no_fat_chain;
-		if (!exfat_resolve_dir(path, &parent_cluster, &parent_no_fat_chain)) return false;
+		if (!exfat_resolve_dir(path, &parent_cluster, &parent_no_fat_chain, null)) return false;
 		char* leaf = exfat_leaf_name(path);
 		Char16[EXFAT_NAME_MAX] leaf_utf16 @noinit;
 		int leaf_len16 = exfat_ascii_to_utf16(leaf, &leaf_utf16, EXFAT_NAME_MAX);
@@ -596,7 +704,7 @@ fn bool exfat_list(char* path, char* out_buf, int max_entries, int* out_count)
 		if ((type_byte & EXFAT_ENTRY_TYPECODE_MASK) != EXFAT_TYPECODE_FILE) continue;
 
 		uint first_cluster; uint data_length; ushort attr; bool no_fat_chain; int name_len;
-		bool valid = exfat_read_entry_set(&cur, entry, &attr, &first_cluster, &data_length, &no_fat_chain, &name_buf, &name_len);
+		bool valid = exfat_read_entry_set(&cur, entry, &attr, &first_cluster, &data_length, &no_fat_chain, &name_buf, &name_len, null);
 		if (!valid) continue;
 
 		// Truncated to FS_LIST_NAME_MAX-1 for display, same precedent
@@ -725,6 +833,49 @@ fn void exfat_load_upcase_table()
 	}
 }
 
+// Locates the Allocation Bitmap (root-directory entry type 0x81) and
+// caches its first cluster + byte length — the write path's cluster
+// allocator/free work entirely against this bitmap, never the FAT (an
+// exFAT volume's FAT only describes fragmented chains; a freshly
+// allocated single cluster is NoFatChain and its FAT entry is simply
+// left at 0, exactly what mkfs.exfat itself does). Same standalone-entry
+// scan shape as exfat_load_upcase_table's, kept a separate pass rather
+// than folded in: the root directory is one small cluster, and this
+// keeps each function about one thing. Leaves exfat_bitmap_cluster at 0
+// (→ writes stay disabled) if the volume somehow has no bitmap.
+fn void exfat_load_bitmap_info()
+{
+	Exfat_dir_cursor cur @noinit;
+	exfat_cursor_init(&cur, exfat_root_cluster, false);
+
+	for (;;)
+	{
+		char* entry = exfat_cursor_next(&cur);
+		if (entry == null) break;
+		if (entry[0] == EXFAT_ENTRY_TYPE_END) break;
+		if (entry[0] == EXFAT_ENTRY_TYPE_BITMAP)
+		{
+			uint* cluster_field = (uint*)&entry[EXFAT_BITMAP_FIRST_CLUSTER];
+			uint* length_field  = (uint*)&entry[EXFAT_BITMAP_DATA_LENGTH];
+			exfat_bitmap_cluster = *cluster_field;
+			exfat_bitmap_length  = *length_field;
+			return;
+		}
+
+		// Skip a whole File entry set — see exfat_load_upcase_table's own
+		// comment for why the secondaries can't be walked as top-level slots.
+		uint type_byte = (uint)entry[0] & 0xFF;
+		if ((type_byte & EXFAT_ENTRY_TYPECODE_MASK) == EXFAT_TYPECODE_FILE)
+		{
+			int secondary_count = (int)((uint)entry[EXFAT_FDE_SECONDARY_COUNT] & 0xFF);
+			for (int i = 0; i < secondary_count; i++)
+			{
+				if (exfat_cursor_next(&cur) == null) break;
+			}
+		}
+	}
+}
+
 fn void exfat_mount()
 {
 	char[SECTOR_SIZE] boot_sector @noinit;
@@ -746,16 +897,25 @@ fn void exfat_mount()
 	}
 
 	uint cluster_shift = (uint)boot_sector[EXFAT_BS_SECTORS_PER_CLUSTER_SHIFT] & 0xFF;
-	uint* fat_offset_field   = (uint*)&boot_sector[EXFAT_BS_FAT_OFFSET];
-	uint* heap_offset_field  = (uint*)&boot_sector[EXFAT_BS_CLUSTER_HEAP_OFFSET];
-	uint* root_cluster_field = (uint*)&boot_sector[EXFAT_BS_ROOT_CLUSTER];
+	uint num_fats      = (uint)boot_sector[EXFAT_BS_NUMBER_OF_FATS] & 0xFF;
+	uint* fat_offset_field    = (uint*)&boot_sector[EXFAT_BS_FAT_OFFSET];
+	uint* heap_offset_field   = (uint*)&boot_sector[EXFAT_BS_CLUSTER_HEAP_OFFSET];
+	uint* cluster_count_field = (uint*)&boot_sector[EXFAT_BS_CLUSTER_COUNT];
+	uint* root_cluster_field  = (uint*)&boot_sector[EXFAT_BS_ROOT_CLUSTER];
 
 	exfat_sectors_per_cluster = (uint)1 << cluster_shift;
 	exfat_fat_start_sector    = *fat_offset_field;
 	exfat_cluster_heap_offset = *heap_offset_field;
+	exfat_cluster_count       = *cluster_count_field;
 	exfat_root_cluster        = *root_cluster_field;
 
 	exfat_load_upcase_table();
+	exfat_load_bitmap_info();
+
+	// Enable writes only for a plain, single-FAT volume whose bitmap we
+	// actually found — see exfat_writes_ok's own comment. fsd.c3 reads
+	// this flag to decide whether to flip fs_write_disabled off.
+	exfat_writes_ok = (exfat_bitmap_cluster != 0) && (num_fats == 1);
 
 	print("fsd: exFAT mounted, partition_start=");
 	print_uint(fs_partition_start);
@@ -763,5 +923,639 @@ fn void exfat_mount()
 	print_uint(exfat_root_cluster);
 	print(" sectors_per_cluster=");
 	print_uint(exfat_sectors_per_cluster);
+	print(exfat_writes_ok ? " writes=on" : " writes=off (read-only volume layout)");
 	print("\n");
+}
+
+// ======================================================================
+// Write path — create/overwrite files, delete files and empty
+// directories, mkdir. Read-only until this session (see this file's
+// header comment and docs/devlog.md); the same later-session precedent
+// FAT32 and ext2 both followed.
+//
+// Scope of this first pass, all deliberate (narrower = less that can
+// corrupt a live volume, same reasoning fat32.c3's first write pass
+// took):
+//  - Files only ever occupy ONE cluster. fsd.c3 caps a single FS_WRITE
+//    at FS_MSG_MAX-104 (~1KB) and there is no append/offset write verb,
+//    so every file this driver writes is far smaller than one cluster
+//    (>= 4KB on every real volume). That means every allocation is
+//    exactly one cluster, always contiguous, always NoFatChain — the
+//    FAT is never written for file data (exactly what mkfs.exfat itself
+//    does: a NoFatChain cluster's FAT entry is left at 0, the
+//    Allocation Bitmap is the sole record that it's in use).
+//  - Directories this driver creates are also single-cluster and
+//    NoFatChain. A directory that fills its cluster (128 slots, ~40
+//    entries in a fresh one) can't grow — exfat_find_free_slot_run
+//    returns "no room" and the create fails. Directory extension is a
+//    later concern.
+//  - No rename/move (fsd.c3 has no exFAT branch for FS_RENAME) and no
+//    recursive delete (no exFAT branch for the recursive FS_DELETE
+//    form) — both still return -1, unchanged.
+//  - Delete of a directory only succeeds if it's empty.
+//
+// The cluster allocator works entirely against the Allocation Bitmap
+// (exfat_load_bitmap_info found it at mount). exfat_writes_ok gates the
+// whole path — fsd.c3 checks it before flipping fs_write_disabled off,
+// and every entry point below re-checks it too.
+// ======================================================================
+
+fn uint exfat_cluster_size_bytes()
+{
+	return exfat_sectors_per_cluster * SECTOR_SIZE;
+}
+
+// Zeroes every sector of `cluster` — used to make a freshly allocated
+// directory cluster a valid empty directory (all-0x00 = end-of-directory
+// from its very first slot).
+fn bool exfat_zero_cluster(uint cluster)
+{
+	char[SECTOR_SIZE] zero @noinit;
+	for (uint i = 0; i < SECTOR_SIZE; i++) zero[i] = 0;
+	uint base = exfat_cluster_to_sector(cluster);
+	for (uint s = 0; s < exfat_sectors_per_cluster; s++)
+	{
+		if (!fs_write_sector(base + s, &zero)) return false;
+	}
+	return true;
+}
+
+// Writes one 4-byte little-endian FAT entry. exFAT has a single FAT
+// (mount rejects the 2-FAT TexFAT variant), so no multi-copy loop like
+// fat32_write_fat_entry's. Only ever called to build/tear down a
+// directory's chain or tidy a freed fragmented file's — never for the
+// NoFatChain file data this driver writes.
+fn bool exfat_write_fat_entry(uint cluster, uint value)
+{
+	uint byte_off = cluster * 4;
+	uint sec = exfat_fat_start_sector + byte_off / SECTOR_SIZE;
+	uint in_sec = byte_off % SECTOR_SIZE;
+	char[SECTOR_SIZE] buf @noinit;
+	if (!fs_read_sector(sec, &buf)) return false;
+	uint* entry = (uint*)&buf[in_sec];
+	*entry = value;
+	return fs_write_sector(sec, &buf);
+}
+
+// Scans the Allocation Bitmap for the first free cluster, marks it used,
+// and returns its cluster number (2-based). Returns 0 on "volume full"
+// or any I/O error. The bitmap system file is contiguous on every real
+// exFAT volume (mkfs lays it out first and it never fragments), so its
+// sectors are read straight through from its first cluster.
+fn uint exfat_alloc_cluster()
+{
+	if (exfat_bitmap_cluster == 0) return 0;
+	uint total = exfat_cluster_count;
+	uint need_bytes = (total + 7) / 8;
+	if (need_bytes > exfat_bitmap_length) need_bytes = exfat_bitmap_length;
+
+	uint base = exfat_cluster_to_sector(exfat_bitmap_cluster);
+	char[SECTOR_SIZE] buf @noinit;
+	for (uint off = 0; off < need_bytes; off += SECTOR_SIZE)
+	{
+		uint sec = base + off / SECTOR_SIZE;
+		if (!fs_read_sector(sec, &buf)) return 0;
+		uint chunk = need_bytes - off;
+		if (chunk > SECTOR_SIZE) chunk = SECTOR_SIZE;
+		for (uint b = 0; b < chunk; b++)
+		{
+			uint byte_val = (uint)buf[b] & 0xFF;
+			if (byte_val == 0xFF) continue; // fully allocated byte
+			for (uint bit = 0; bit < 8; bit++)
+			{
+				if ((byte_val & (1u << bit)) != 0) continue;
+				uint cluster_index = (off + b) * 8 + bit; // bit 0 of byte 0 == cluster 2
+				if (cluster_index >= total) return 0;
+				buf[b] = (char)(byte_val | (1u << bit));
+				if (!fs_write_sector(sec, &buf)) return 0;
+				return cluster_index + 2;
+			}
+		}
+	}
+	return 0;
+}
+
+// Clears one cluster's bit in the Allocation Bitmap. The FAT entry (if
+// this cluster was part of a fragmented chain) is the caller's job.
+fn bool exfat_free_cluster(uint cluster)
+{
+	if (exfat_bitmap_cluster == 0 || cluster < 2) return false;
+	uint bit_index = cluster - 2;
+	if (bit_index >= exfat_cluster_count) return false;
+	uint byte_index = bit_index / 8;
+	uint sec = exfat_cluster_to_sector(exfat_bitmap_cluster) + byte_index / SECTOR_SIZE;
+	uint in_sec = byte_index % SECTOR_SIZE;
+	char[SECTOR_SIZE] buf @noinit;
+	if (!fs_read_sector(sec, &buf)) return false;
+	uint byte_val = (uint)buf[in_sec] & 0xFF;
+	buf[in_sec] = (char)(byte_val & ~(1u << (bit_index % 8)));
+	return fs_write_sector(sec, &buf);
+}
+
+// Frees every cluster backing a file or directory: a contiguous run for
+// NoFatChain, a real FAT walk otherwise (reading each link before
+// clearing it, same ordering care fat32_free_cluster_chain takes). A
+// zero/never-allocated first_cluster is a no-op success.
+fn bool exfat_free_data(uint first_cluster, uint data_length, bool no_fat_chain)
+{
+	if (first_cluster < 2 || first_cluster >= EXFAT_EOC_MIN) return true;
+	uint cluster_size = exfat_cluster_size_bytes();
+
+	if (no_fat_chain)
+	{
+		uint n = (data_length + cluster_size - 1) / cluster_size;
+		if (n == 0) n = 1;
+		for (uint i = 0; i < n; i++)
+		{
+			if (!exfat_free_cluster(first_cluster + i)) return false;
+		}
+		return true;
+	}
+
+	uint cluster = first_cluster;
+	uint guard = 0;
+	while (cluster >= 2 && cluster < EXFAT_EOC_MIN && guard <= exfat_cluster_count)
+	{
+		uint next = exfat_next_cluster(cluster);
+		if (!exfat_free_cluster(cluster)) return false;
+		exfat_write_fat_entry(cluster, 0); // best-effort tidy; the bitmap is the real record
+		cluster = next;
+		guard++;
+	}
+	return true;
+}
+
+// exFAT's 16-bit entry-set checksum: rotate right one bit, then add the
+// byte, 16-bit wraparound, over every byte of the set except the
+// 2-byte SetChecksum field itself (offsets 2..3 of the primary entry).
+fn ushort exfat_set_checksum(char* bytes, int total_slots)
+{
+	ushort sum = 0;
+	int n = total_slots * (int)EXFAT_DIRENT_SIZE;
+	for (int i = 0; i < n; i++)
+	{
+		if (i == (int)EXFAT_FDE_SET_CHECKSUM || i == (int)EXFAT_FDE_SET_CHECKSUM + 1) continue;
+		uint b = (uint)bytes[i] & 0xFF;
+		sum = (ushort)((((uint)sum & 1u) << 15) | ((uint)sum >> 1));
+		sum = (ushort)(((uint)sum + b) & 0xFFFF);
+	}
+	return sum;
+}
+
+// exFAT's 16-bit name hash: same rotate-then-add as the set checksum,
+// over the little-endian bytes of the up-cased name. Stored in the
+// Stream Extension entry so a reader can reject a non-matching name
+// without a full comparison (this driver's own read path doesn't rely
+// on it — see exfat_read_entry_set's comment — but a correct one has to
+// be written).
+fn ushort exfat_name_hash(Char16* name, int name_len)
+{
+	ushort hash = 0;
+	for (int i = 0; i < name_len; i++)
+	{
+		Char16 uc = exfat_upcase(name[i]);
+		uint lo = (uint)uc & 0xFF;
+		uint hi = ((uint)uc >> 8) & 0xFF;
+		hash = (ushort)((((uint)hash & 1u) << 15) | ((uint)hash >> 1));
+		hash = (ushort)(((uint)hash + lo) & 0xFFFF);
+		hash = (ushort)((((uint)hash & 1u) << 15) | ((uint)hash >> 1));
+		hash = (ushort)(((uint)hash + hi) & 0xFFFF);
+	}
+	return hash;
+}
+
+// Read-modify-writes one 32-byte slot into its sector. Refuses if the
+// slot is the protected file's own directory entry (fs_is_protected_
+// entry, tracked as a byte offset within the sector — same convention
+// fat32 uses).
+fn bool exfat_write_slot(uint sector, uint slot_in_sector, char* slot_bytes)
+{
+	if (fs_is_protected_entry(sector, slot_in_sector * EXFAT_DIRENT_SIZE)) return false;
+	char[SECTOR_SIZE] buf @noinit;
+	if (!fs_read_sector(sector, &buf)) return false;
+	uint off = slot_in_sector * EXFAT_DIRENT_SIZE;
+	for (uint i = 0; i < EXFAT_DIRENT_SIZE; i++) buf[off + i] = slot_bytes[i];
+	return fs_write_sector(sector, &buf);
+}
+
+// Writes `len` bytes of `src` into `cluster` (len <= one cluster), zero-
+// padding the tail of the last touched sector. Sectors fully past the
+// data are left as-is (stale, but past the entry's DataLength/
+// ValidDataLength, so no reader ever sees them) — same as
+// fat32_write_file.
+fn bool exfat_write_cluster_data(uint cluster, char* src, uint len)
+{
+	uint base = exfat_cluster_to_sector(cluster);
+	uint written = 0;
+	for (uint s = 0; s < exfat_sectors_per_cluster; s++)
+	{
+		uint chunk = 0;
+		if (written < len)
+		{
+			chunk = len - written;
+			if (chunk > SECTOR_SIZE) chunk = SECTOR_SIZE;
+		}
+		char[SECTOR_SIZE] buf @noinit;
+		for (uint i = 0; i < SECTOR_SIZE; i++) buf[i] = (i < chunk) ? src[written + i] : (char)0;
+		if (!fs_write_sector(base + s, &buf)) return false;
+		written += chunk;
+		if (written >= len) return true;
+	}
+	return true;
+}
+
+// Fills `out` (>= EXFAT_SET_BYTES_MAX bytes) with a complete, in-use
+// entry set — primary File entry, Stream Extension, and enough File Name
+// entries for `name` — and returns the total slot count. `first_cluster`
+// 0 / `data_length` 0 means an empty file (no cluster). Directories pass
+// their own allocated size as data_length. The SetChecksum is filled
+// last, over everything.
+fn int exfat_build_set(char* out, Char16* name, int name_len, ushort attr, uint first_cluster, uint data_length)
+{
+	int name_entries = (name_len + EXFAT_NAME_CHARS_PER_ENTRY - 1) / EXFAT_NAME_CHARS_PER_ENTRY;
+	if (name_entries < 1) name_entries = 1;
+	int secondary_count = 1 + name_entries;
+	int total_slots = 1 + secondary_count;
+
+	int total_bytes = total_slots * (int)EXFAT_DIRENT_SIZE;
+	for (int i = 0; i < total_bytes; i++) out[i] = 0;
+
+	// Primary: File Directory Entry.
+	out[0] = EXFAT_ENTRY_TYPE_FILE;
+	out[EXFAT_FDE_SECONDARY_COUNT] = (char)secondary_count;
+	ushort* attr_field = (ushort*)&out[EXFAT_FDE_ATTRIBUTES];
+	*attr_field = attr;
+	uint* ts = (uint*)&out[EXFAT_FDE_CREATE_TIME];
+	ts[0] = EXFAT_FIXED_TIMESTAMP; // create
+	ts[1] = EXFAT_FIXED_TIMESTAMP; // last modified  (0x0C)
+	ts[2] = EXFAT_FIXED_TIMESTAMP; // last accessed  (0x10)
+
+	// Secondary 1: Stream Extension.
+	char* st = &out[EXFAT_DIRENT_SIZE];
+	bool has_data = first_cluster >= 2 && data_length > 0;
+	st[0] = EXFAT_ENTRY_TYPE_STREAM;
+	st[EXFAT_STREAM_FLAGS] = (char)(has_data
+		? (EXFAT_STREAM_FLAG_ALLOC_POSSIBLE | EXFAT_STREAM_FLAG_NO_FAT_CHAIN)
+		: EXFAT_STREAM_FLAG_ALLOC_POSSIBLE);
+	st[EXFAT_STREAM_NAME_LENGTH] = (char)name_len;
+	ushort* nh = (ushort*)&st[EXFAT_STREAM_NAME_HASH];
+	*nh = exfat_name_hash(name, name_len);
+	uint* vdl = (uint*)&st[EXFAT_STREAM_VALID_DATA_LENGTH];
+	vdl[0] = data_length; vdl[1] = 0;
+	uint* fc = (uint*)&st[EXFAT_STREAM_FIRST_CLUSTER];
+	*fc = has_data ? first_cluster : 0;
+	uint* dl = (uint*)&st[EXFAT_STREAM_DATA_LENGTH];
+	dl[0] = data_length; dl[1] = 0;
+
+	// Secondaries 2..: File Name entries, 15 UTF-16 units each.
+	for (int e = 0; e < name_entries; e++)
+	{
+		char* ne = &out[(2 + e) * (int)EXFAT_DIRENT_SIZE];
+		ne[0] = EXFAT_ENTRY_TYPE_NAME;
+		for (int k = 0; k < EXFAT_NAME_CHARS_PER_ENTRY; k++)
+		{
+			int pos = e * EXFAT_NAME_CHARS_PER_ENTRY + k;
+			Char16 ch = (pos < name_len) ? name[pos] : (Char16)0;
+			Char16* dst = (Char16*)&ne[(int)EXFAT_NAME_CHARS + k * 2];
+			*dst = ch;
+		}
+	}
+
+	ushort* cksum = (ushort*)&out[EXFAT_FDE_SET_CHECKSUM];
+	*cksum = exfat_set_checksum(out, total_slots);
+	return total_slots;
+}
+
+// Finds `needed` consecutive free 32-byte slots inside one cluster of
+// the directory (a run never spans a cluster boundary — keeps the
+// linear stepping in exfat_place_set valid, and every set is <= 11
+// slots vs 128 per cluster). `dir_data_length` bounds a NoFatChain
+// directory's own extent; a FAT-chained one (the root, always) is
+// bounded by its chain. Returns false — the operation then fails — if
+// no run fits: this pass has no directory extension.
+fn bool exfat_find_free_slot_run(uint dir_cluster, bool dir_no_fat_chain, uint dir_data_length, int needed, uint* out_first_sector, uint* out_first_slot)
+{
+	uint cluster = dir_cluster;
+	uint clusters_left = 0;
+	if (dir_no_fat_chain)
+	{
+		uint cs = exfat_cluster_size_bytes();
+		clusters_left = (dir_data_length + cs - 1) / cs;
+		if (clusters_left == 0) clusters_left = 1;
+	}
+
+	uint guard = 0;
+	while (cluster >= 2 && cluster < EXFAT_EOC_MIN && guard <= exfat_cluster_count)
+	{
+		guard++;
+		if (dir_no_fat_chain && clusters_left == 0) break;
+
+		uint base_sector = exfat_cluster_to_sector(cluster);
+		int run = 0;
+		uint run_sector = 0;
+		uint run_slot = 0;
+		for (uint s = 0; s < exfat_sectors_per_cluster; s++)
+		{
+			char[SECTOR_SIZE] buf @noinit;
+			if (!fs_read_sector(base_sector + s, &buf)) return false;
+			for (uint slot = 0; slot < EXFAT_SLOTS_PER_SECTOR; slot++)
+			{
+				uint t = (uint)buf[slot * EXFAT_DIRENT_SIZE] & 0xFF;
+				bool is_free = (t == 0) || ((t & EXFAT_ENTRY_INUSE_BIT) == 0);
+				if (is_free)
+				{
+					if (run == 0) { run_sector = base_sector + s; run_slot = slot; }
+					run++;
+					if (run >= needed)
+					{
+						*out_first_sector = run_sector;
+						*out_first_slot = run_slot;
+						return true;
+					}
+				}
+				else
+				{
+					run = 0;
+				}
+			}
+		}
+
+		if (dir_no_fat_chain) { cluster++; clusters_left--; }
+		else { cluster = exfat_next_cluster(cluster); }
+	}
+	return false;
+}
+
+// Places a freshly built entry set into `dir` at the first free run.
+// The run is within one cluster's contiguous sectors, so slot k lands
+// at a simple linear offset from the run start.
+fn bool exfat_place_set(uint dir_cluster, bool dir_no_fat_chain, uint dir_data_length, char* set_bytes, int total_slots)
+{
+	uint first_sector;
+	uint first_slot;
+	if (!exfat_find_free_slot_run(dir_cluster, dir_no_fat_chain, dir_data_length, total_slots, &first_sector, &first_slot)) return false;
+
+	for (int k = 0; k < total_slots; k++)
+	{
+		uint flat = first_slot + (uint)k;
+		uint sec = first_sector + flat / EXFAT_SLOTS_PER_SECTOR;
+		uint slot = flat % EXFAT_SLOTS_PER_SECTOR;
+		if (!exfat_write_slot(sec, slot, &set_bytes[k * (int)EXFAT_DIRENT_SIZE])) return false;
+	}
+	return true;
+}
+
+// Clears the in-use bit (0x80) of every slot in a located entry set —
+// exFAT's whole "delete": 0x85->0x05, 0xC0->0x40, 0xC1->0x41, the rest
+// of each slot untouched. Refuses a set larger than this driver could
+// have written, or one overlapping the protected entry.
+fn bool exfat_clear_entry_set(Exfat_set_locs* locs)
+{
+	if (locs.count < 2 || locs.count > EXFAT_MAX_SET_SLOTS) return false;
+	for (int k = 0; k < locs.count; k++)
+	{
+		uint sec = locs.sector[k];
+		uint slot = locs.slot[k];
+		if (fs_is_protected_entry(sec, slot * EXFAT_DIRENT_SIZE)) return false;
+		char[SECTOR_SIZE] buf @noinit;
+		if (!fs_read_sector(sec, &buf)) return false;
+		uint off = slot * EXFAT_DIRENT_SIZE;
+		buf[off] = (char)((uint)buf[off] & ~EXFAT_ENTRY_INUSE_BIT);
+		if (!fs_write_sector(sec, &buf)) return false;
+	}
+	return true;
+}
+
+// Repoints an existing file's Stream Extension entry at new data
+// (cluster + length), recomputing the SetChecksum over the whole set.
+// Only slots 0 (primary, checksum) and 1 (stream) change.
+fn bool exfat_rewrite_stream(Exfat_set_locs* locs, uint new_first_cluster, uint new_data_length)
+{
+	if (locs.count < 2 || locs.count > EXFAT_MAX_SET_SLOTS) return false;
+
+	char[EXFAT_SET_BYTES_MAX] set_bytes @noinit;
+	for (int k = 0; k < locs.count; k++)
+	{
+		char[SECTOR_SIZE] buf @noinit;
+		if (!fs_read_sector(locs.sector[k], &buf)) return false;
+		uint off = locs.slot[k] * EXFAT_DIRENT_SIZE;
+		for (uint i = 0; i < EXFAT_DIRENT_SIZE; i++) set_bytes[(uint)k * EXFAT_DIRENT_SIZE + i] = buf[off + i];
+	}
+
+	char* st = &set_bytes[EXFAT_DIRENT_SIZE];
+	bool has_data = new_first_cluster >= 2 && new_data_length > 0;
+	st[EXFAT_STREAM_FLAGS] = (char)(has_data
+		? (EXFAT_STREAM_FLAG_ALLOC_POSSIBLE | EXFAT_STREAM_FLAG_NO_FAT_CHAIN)
+		: EXFAT_STREAM_FLAG_ALLOC_POSSIBLE);
+	uint* vdl = (uint*)&st[EXFAT_STREAM_VALID_DATA_LENGTH];
+	vdl[0] = new_data_length; vdl[1] = 0;
+	uint* fc = (uint*)&st[EXFAT_STREAM_FIRST_CLUSTER];
+	*fc = has_data ? new_first_cluster : 0;
+	uint* dl = (uint*)&st[EXFAT_STREAM_DATA_LENGTH];
+	dl[0] = new_data_length; dl[1] = 0;
+
+	ushort* cksum = (ushort*)&set_bytes[EXFAT_FDE_SET_CHECKSUM];
+	*cksum = exfat_set_checksum(&set_bytes, locs.count);
+
+	if (!exfat_write_slot(locs.sector[0], locs.slot[0], &set_bytes[0])) return false;
+	if (!exfat_write_slot(locs.sector[1], locs.slot[1], &set_bytes[EXFAT_DIRENT_SIZE])) return false;
+	return true;
+}
+
+// True if `dir` (its own chain described by no_fat_chain) contains no
+// in-use File entry — i.e. it's safe to remove. Standalone system
+// entries can't appear in a subdirectory, so any in-use 0x85 means
+// "not empty".
+fn bool exfat_dir_is_empty(uint dir_cluster, bool no_fat_chain)
+{
+	Exfat_dir_cursor cur @noinit;
+	exfat_cursor_init(&cur, dir_cluster, no_fat_chain);
+	for (;;)
+	{
+		char* entry = exfat_cursor_next(&cur);
+		if (entry == null) return true;      // end of chain
+		if (entry[0] == EXFAT_ENTRY_TYPE_END) return true;
+		if (entry[0] == EXFAT_ENTRY_TYPE_FILE) return false; // an in-use file/subdir
+	}
+}
+
+// --- FS_WRITE --------------------------------------------------------
+//
+// Create-or-overwrite, one cluster max (see this section's header).
+// Data is allocated and written first, so any failure leaves an
+// existing file untouched; the directory entry is only then created
+// (new file) or repointed (overwrite), and the old data freed last —
+// "fail toward a leak, never toward losing the file," same ordering
+// fat32_write / fat32_rename use.
+fn int exfat_write(char* name, char* src, uint len)
+{
+	if (!exfat_writes_ok) return -1;
+	if (len > exfat_cluster_size_bytes()) return -1;
+
+	uint dir_cluster; bool dir_no_fat_chain; uint dir_data_length;
+	if (!exfat_resolve_dir(name, &dir_cluster, &dir_no_fat_chain, &dir_data_length)) return -1;
+	char* leaf = exfat_leaf_name(name);
+	if (leaf[0] == 0) return -1;
+
+	Char16[EXFAT_NAME_MAX] leaf16 @noinit;
+	int leaf_len = exfat_ascii_to_utf16(leaf, &leaf16, EXFAT_NAME_MAX);
+	if (leaf_len == 0) return -1;
+
+	uint old_fc; uint old_dl; ushort old_attr; bool old_nfc;
+	Exfat_set_locs locs;
+	bool exists = exfat_find_in_dir_located(dir_cluster, dir_no_fat_chain, &leaf16, leaf_len, &old_fc, &old_dl, &old_attr, &old_nfc, &locs);
+	if (exists && ((uint)old_attr & EXFAT_ATTR_DIRECTORY) != 0) return -1; // don't overwrite a directory
+	if (exists && locs.count > EXFAT_MAX_SET_SLOTS) return -1;             // set this driver can't safely edit
+
+	uint new_cluster = 0;
+	if (len > 0)
+	{
+		new_cluster = exfat_alloc_cluster();
+		if (new_cluster == 0) return -1;
+		if (!exfat_write_cluster_data(new_cluster, src, len))
+		{
+			exfat_free_cluster(new_cluster);
+			return -1;
+		}
+	}
+
+	if (exists)
+	{
+		if (!exfat_rewrite_stream(&locs, new_cluster, len))
+		{
+			if (new_cluster != 0) exfat_free_cluster(new_cluster);
+			return -1;
+		}
+		exfat_free_data(old_fc, old_dl, old_nfc);
+	}
+	else
+	{
+		char[EXFAT_SET_BYTES_MAX] set_bytes @noinit;
+		int total_slots = exfat_build_set(&set_bytes, &leaf16, leaf_len, (ushort)EXFAT_ATTR_ARCHIVE, new_cluster, len);
+		if (!exfat_place_set(dir_cluster, dir_no_fat_chain, dir_data_length, &set_bytes, total_slots))
+		{
+			if (new_cluster != 0) exfat_free_cluster(new_cluster);
+			return -1;
+		}
+	}
+	return (int)len;
+}
+
+// --- FS_DELETE (non-recursive) --------------------------------------
+//
+// Removes a file, or an empty directory. Clears the entry set's in-use
+// bits first (so the name stops resolving even if freeing the data
+// half-fails), then frees the data clusters.
+fn int exfat_delete(char* name)
+{
+	if (!exfat_writes_ok) return -1;
+
+	uint dir_cluster; bool dir_no_fat_chain; uint dir_data_length;
+	if (!exfat_resolve_dir(name, &dir_cluster, &dir_no_fat_chain, &dir_data_length)) return -1;
+	char* leaf = exfat_leaf_name(name);
+	if (leaf[0] == 0) return -1;
+
+	Char16[EXFAT_NAME_MAX] leaf16 @noinit;
+	int leaf_len = exfat_ascii_to_utf16(leaf, &leaf16, EXFAT_NAME_MAX);
+	if (leaf_len == 0) return -1;
+
+	uint fc; uint dl; ushort attr; bool nfc;
+	Exfat_set_locs locs;
+	if (!exfat_find_in_dir_located(dir_cluster, dir_no_fat_chain, &leaf16, leaf_len, &fc, &dl, &attr, &nfc, &locs)) return -1;
+	if (locs.count > EXFAT_MAX_SET_SLOTS) return -1;
+
+	if (((uint)attr & EXFAT_ATTR_DIRECTORY) != 0)
+	{
+		if (!exfat_dir_is_empty(fc, nfc)) return -1; // non-recursive: refuse a non-empty directory
+	}
+
+	if (!exfat_clear_entry_set(&locs)) return -1;
+	exfat_free_data(fc, dl, nfc);
+	return 0;
+}
+
+// --- FS_MKDIR -------------------------------------------------------
+//
+// A new single-cluster, NoFatChain directory. exFAT directories have no
+// "." / ".." entries, so a zeroed cluster IS a valid empty directory.
+fn int exfat_mkdir(char* path)
+{
+	if (!exfat_writes_ok) return -1;
+
+	uint parent_cluster; bool parent_nfc; uint parent_data_length;
+	if (!exfat_resolve_dir(path, &parent_cluster, &parent_nfc, &parent_data_length)) return -1;
+	char* leaf = exfat_leaf_name(path);
+	if (leaf[0] == 0) return -1;
+
+	Char16[EXFAT_NAME_MAX] leaf16 @noinit;
+	int leaf_len = exfat_ascii_to_utf16(leaf, &leaf16, EXFAT_NAME_MAX);
+	if (leaf_len == 0) return -1;
+
+	uint efc; uint edl; ushort eattr; bool enfc;
+	if (exfat_find_in_dir(parent_cluster, parent_nfc, &leaf16, leaf_len, &efc, &edl, &eattr, &enfc)) return -1; // already exists
+
+	uint new_cluster = exfat_alloc_cluster();
+	if (new_cluster == 0) return -1;
+	if (!exfat_zero_cluster(new_cluster))
+	{
+		exfat_free_cluster(new_cluster);
+		return -1;
+	}
+
+	char[EXFAT_SET_BYTES_MAX] set_bytes @noinit;
+	int total_slots = exfat_build_set(&set_bytes, &leaf16, leaf_len, (ushort)EXFAT_ATTR_DIRECTORY, new_cluster, exfat_cluster_size_bytes());
+	if (!exfat_place_set(parent_cluster, parent_nfc, parent_data_length, &set_bytes, total_slots))
+	{
+		exfat_free_cluster(new_cluster);
+		return -1;
+	}
+	return 0;
+}
+
+// Backstop for the write-protected boot image (fsd.c3's FS_PROTECTED_
+// NAME) if it ever lives on an exFAT volume — normally it doesn't (it's
+// on the FAT32 boot partition, see docs/devlog.md's filesystem-topology
+// notes), so this almost always finds nothing and just logs. Mirrors
+// fat32_reserve_protected: record the primary entry's exact (sector,
+// offset) for the narrow check, and reserve the data cluster(s) at the
+// coarse sector-range level.
+fn void exfat_reserve_protected(char* name)
+{
+	Char16[EXFAT_NAME_MAX] name16 @noinit;
+	int name_len = exfat_ascii_to_utf16(name, &name16, EXFAT_NAME_MAX);
+
+	uint fc; uint dl; ushort attr; bool nfc;
+	Exfat_set_locs locs;
+	if (!exfat_find_in_dir_located(exfat_root_cluster, false, &name16, name_len, &fc, &dl, &attr, &nfc, &locs))
+	{
+		print("fsd: protected file not found, nothing to reserve for it\n");
+		return;
+	}
+	if (((uint)attr & EXFAT_ATTR_DIRECTORY) != 0)
+	{
+		print("fsd: protected file not found, nothing to reserve for it\n");
+		return;
+	}
+
+	fs_set_protected_entry(locs.sector[0], locs.slot[0] * EXFAT_DIRENT_SIZE);
+
+	uint cluster_size = exfat_cluster_size_bytes();
+	if (nfc)
+	{
+		uint n = (dl + cluster_size - 1) / cluster_size;
+		if (n == 0) n = 1;
+		for (uint i = 0; i < n; i++)
+		{
+			if (!fs_reserve_sector_range(exfat_cluster_to_sector(fc + i), exfat_sectors_per_cluster)) return;
+		}
+		return;
+	}
+	uint cluster = fc;
+	uint guard = 0;
+	while (cluster >= 2 && cluster < EXFAT_EOC_MIN && guard <= exfat_cluster_count)
+	{
+		if (!fs_reserve_sector_range(exfat_cluster_to_sector(cluster), exfat_sectors_per_cluster)) return;
+		cluster = exfat_next_cluster(cluster);
+		guard++;
+	}
 }

@@ -3,8 +3,10 @@
 set -e
 
 # Builds and populates build/disk_exfat.img — the exFAT QEMU test image
-# for scripts/launch64_exfat.sh, exercising user/fs/exfat.c3's probe/
-# mount/read/read_at/list path (see docs/devlog.md's exFAT entry).
+# for scripts/launch64_exfat.sh, exercising user/fs/exfat.c3's read path
+# (probe/mount/read/read_at/list) and, from the second exFAT session on,
+# its write path too (write/delete/mkdir via the shell's own
+# write/rm/mkdir — see docs/devlog.md's exFAT entries).
 #
 # Unlike the FAT32 (mtools) and ext2 (debugfs) test images, exFAT has no
 # pure-userspace image editor packaged anywhere — exfatprogs ships only

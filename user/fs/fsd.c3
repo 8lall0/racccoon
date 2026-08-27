@@ -401,14 +401,24 @@ fn void fs_mount(bool dynamic_mode, char* dynamic_self_name)
 	// exFAT next: its "EXFAT   " signature (exfat_probe) is just as
 	// unambiguous as ext2's magic, so it's tried before FAT32's own weak
 	// 0xAA55 fallback below — same reasoning as the ext2-before-FAT32
-	// ordering above. Read-only backend (see exfat.c3's own header
-	// comment): fs_write_disabled stays at its default `true` (this
-	// function's own top-of-file declaration) and no *_reserve_protected
-	// call is needed, since nothing here can ever reach fs_write_sector.
+	// ordering above.
 	if (exfat_probe())
 	{
 		fs_type = FS_TYPE_EXFAT;
 		exfat_mount();
+		// Writes (create/overwrite/delete/mkdir — see exfat.c3's Write
+		// path section) only if exfat_mount() found a usable volume
+		// layout: the Allocation Bitmap present, and exactly one FAT.
+		// Otherwise the backend stays read-only, same as it was before
+		// this support existed. Same protected-file sequence as the
+		// FAT32/ext2 branches — see fs_reserve_protection_summary()'s
+		// own comment for why it's shared.
+		if (exfat_writes_ok)
+		{
+			fs_write_disabled = false;
+			exfat_reserve_protected(&FS_PROTECTED_NAME);
+			fs_reserve_protection_summary();
+		}
 		if (dynamic_mode) { srv_post(dynamic_self_name); } else if (is_secondary) { srv_post("fs2"); }
 		return;
 	}
@@ -954,6 +964,14 @@ fn void main(String[] args)
 						result = ext2_delete(&filename, requester_uid);
 					}
 				}
+				else if (fs_type == FS_TYPE_EXFAT)
+				{
+					// Non-recursive only in this first write pass (see
+					// exfat.c3's Write path section) — `rm -r` on exFAT
+					// has no branch and stays -1. exfat_delete refuses a
+					// non-empty directory on its own.
+					if (!recursive) result = exfat_delete(&filename);
+				}
 			}
 			*result_len_field = result;
 			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
@@ -1020,6 +1038,10 @@ fn void main(String[] args)
 					uint requester_uid = 0xFFFFFFFF;
 					proc_info(from, null, null, (int*)&requester_uid);
 					result = ext2_mkdir(&filename, requester_uid);
+				}
+				else if (fs_type == FS_TYPE_EXFAT)
+				{
+					result = exfat_mkdir(&filename);
 				}
 			}
 			*result_len_field = result;
@@ -1089,6 +1111,12 @@ fn void main(String[] args)
 					uint requester_uid = 0xFFFFFFFF;
 					proc_info(from, null, null, (int*)&requester_uid);
 					result = ext2_write(&filename, &buf[104], (uint)req_len, requester_uid);
+				}
+				else if (fs_type == FS_TYPE_EXFAT)
+				{
+					// Like FAT32's own branch — no uid concept in the
+					// on-disk format, so nothing to look up.
+					result = exfat_write(&filename, &buf[104], (uint)req_len);
 				}
 			}
 			*result_len_field = result;

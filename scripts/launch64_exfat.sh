@@ -5,10 +5,11 @@ set -e
 # Near-duplicate of launch64.sh / launch64_ext2.sh, differing only in
 # which -drive it points at — boots the same kernel.elf against
 # build/disk_exfat.img instead of build/disk.img, to exercise
-# user/fs/exfat.c3's probe/mount/read/list path specifically (see
+# user/fs/exfat.c3's read and write paths specifically (see
 # scripts/mk_exfat_image.sh for how that image is built and populated,
-# and docs/devlog.md's exFAT entry). Not the default test path —
-# launch64.sh (FAT32) stays that.
+# and docs/devlog.md's exFAT entries). Not the default test path —
+# launch64.sh (FAT32) stays that. NOTE: this image is written in place
+# by the guest's write/rm/mkdir — rerun mk_exfat_image.sh to reset it.
 
 qemu-system-riscv64 \
   -machine virt \
