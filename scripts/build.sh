@@ -12,6 +12,16 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # Build user app first (produces build/user/shell.bin.o)
   bash scripts/build_user.sh
 
+  # The disk images built below are pristine masters — every one is
+  # rm -f'd and rebuilt from scratch on each run, so re-running this
+  # script is itself a full reset. The scripts/launch64*.sh scripts
+  # never boot these directly: each copies its master to a
+  # build/<name>.run.img throwaway first, so a guest that writes to its
+  # disk (the FAT32/ext2/exFAT write paths all do) can't carry mutations
+  # from one test run into the next (see docs/devlog.md). Clear any stale
+  # throwaways here so a fresh build never leaves an old one lying around.
+  rm -f build/*.run.img
+
   echo "==> Building disk image (FAT32)..."
   # user/fsd.c3 now reads a real FAT32 filesystem (see docs/devlog.md),
   # not the tar format this used to build. Whole-disk FAT32 (no MBR/

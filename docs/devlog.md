@@ -4,6 +4,44 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-27 (continued) — launch64*.sh boot a throwaway disk copy
+
+Full-`build.sh` + boot-test pass turned up a false alarm: `mv /wtest.txt
+/wtest2.txt` on the ext2 image printed `mv: failed` while the file
+appeared to move. Root cause was **not** `ext2_rename` (byte-identical to
+before the exFAT work, and correct — it deliberately refuses an existing
+destination, same as `fat32_rename`). It was the test harness: the boot
+run reused a `build/disk_ext2.img` that a *previous* boot had already
+written `/wtest2.txt` into (the boot's own opening `ls` showed it), so
+the rename correctly refused, and the leftover file happened to hold the
+same content the test expected.
+
+The real gap: every filesystem now has a write path, so a guest mutates
+its disk image in place, and `scripts/launch64*.sh` booted
+`build/disk_*.img` directly — so run N+1 inherited run N's writes.
+
+Fix: each `launch64*.sh` now `cp`s its image to a `build/*.run.img`
+throwaway and boots that. `build/disk_*.img` stays exactly as
+`build.sh` produced it; every launch starts from a clean image with no
+extra step. `build.sh` `rm -f build/*.run.img` at the top so a fresh
+build never leaves a stale one, and its images were already fully
+rm-and-rebuilt each run (re-running `build.sh` is itself a reset). Also
+added `cd "$(dirname "$0")"` to the launch scripts so they work from the
+repo root too, not only from `scripts/`.
+
+Verified: `launch64_exfat.sh` run twice — run 1 writes a marker file,
+run 2's `ls`/`cat` don't see it; pristine `disk_exfat.img` mtime
+unchanged. All four launch scripts boot and mount. Full `build.sh`
+(FAT32 via mtools, ext2/dual via debugfs, exFAT via mk_exfat_image.sh)
+completes clean, and re-running the ext2 `mv` test on a pristine image
+behaves exactly right (refuses existing dest, succeeds on a free one).
+
+**Files changed:** `scripts/launch64.sh`, `scripts/launch64_ext2.sh`,
+`scripts/launch64_dual.sh`, `scripts/launch64_exfat.sh`,
+`scripts/build.sh`.
+
+---
+
 ## 2026-08-27 (continued) — exFAT: rename/move + recursive delete
 
 Third exFAT session, closing the last two write verbs. `exfat_rename`
