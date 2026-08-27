@@ -1590,6 +1590,83 @@ fn int ext2_write(char* name, char* src, uint len, uint requester_uid)
 	return (int)written;
 }
 
+// Entry point dispatched from fsd.c3 for FS_WRITE_AT — the path-based
+// sibling of the fid-based P9_WRITE dispatch, which does the identical
+// thing. Same resolve / create-if-missing / permission shape as
+// ext2_write, but writes at an arbitrary offset via ext2_write_file_at
+// (which enforces the no-holes rule and the 12-direct-block cap) and
+// grows inode.size only when the write extended past the old end —
+// never shrinks it, unlike ext2_write's whole-file replace.
+fn int ext2_write_at(char* name, char* src, uint len, uint offset, uint requester_uid)
+{
+	ext2_cache_valid = false; // see ext2_cache_path's own comment
+	uint dir_inode;
+	if (!ext2_resolve_dir(name, &dir_inode)) return -1;
+	char* leaf = ext2_leaf_name(name);
+	if (leaf[0] == 0) return -1; // no name to write to (e.g. "" or a trailing slash)
+
+	uint inode_num;
+	uint entry_sector;
+	uint entry_offset;
+	uint mode;
+	bool exists = ext2_find_in_dir(dir_inode, leaf, &inode_num, &entry_sector, &entry_offset, &mode);
+	if (exists && (mode & EXT2_S_IFDIR) != 0) return -1;
+	if (!exists && offset != 0) return -1; // can't create with a hole
+
+	if (!exists)
+	{
+		if (!ext2_create_file(dir_inode, leaf, &inode_num, requester_uid)) return -1;
+		if (!ext2_find_in_dir(dir_inode, leaf, &inode_num, &entry_sector, &entry_offset, &mode)) return -1;
+	}
+
+	if (fs_is_protected_entry(entry_sector, entry_offset)) return -1;
+
+	Ext2_inode_info inode;
+	if (!ext2_read_inode(inode_num, &inode)) return -1;
+
+	if (exists && !ext2_write_allowed(&inode, requester_uid)) return -1;
+
+	int written = ext2_write_file_at(&inode, src, len, offset);
+	if (written < 0) return -1;
+
+	uint new_end = offset + (uint)written;
+	if (new_end > inode.size) inode.size = new_end;
+
+	if (!ext2_write_inode(inode_num, &inode)) return -1;
+
+	return written;
+}
+
+// Entry point dispatched from fsd.c3 for FS_STAT — size + type (0 file,
+// 1 dir) of `name`. "" is the root directory. Returns false when
+// nothing resolves there. Same resolve/find shape as ext2_read.
+fn bool ext2_stat(char* name, uint* out_size, int* out_type)
+{
+	if (name[0] == 0)
+	{
+		*out_size = 0;
+		*out_type = 1;
+		return true;
+	}
+	uint dir_inode;
+	if (!ext2_resolve_dir(name, &dir_inode)) return false;
+	char* leaf = ext2_leaf_name(name);
+
+	uint inode_num; uint es; uint eo; uint mode;
+	if (!ext2_find_in_dir(dir_inode, leaf, &inode_num, &es, &eo, &mode)) return false;
+	if ((mode & EXT2_S_IFDIR) != 0)
+	{
+		*out_size = 0;
+		*out_type = 1;
+		return true;
+	}
+	Ext2_inode_info inode;
+	if (!ext2_read_inode(inode_num, &inode)) return false;
+	*out_size = inode.size;
+	*out_type = 0;
+	return true;
+}
+
 // Checks whether a directory's own data blocks contain any real entry
 // besides "." and ".." (every subdirectory's own two self/parent
 // entries — ext2 names aren't space-padded like FAT32's, so these are

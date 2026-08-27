@@ -10,16 +10,26 @@ import std::nolibc::main_stub;
 // text > file"), so this takes the content directly as its own second
 // argument rather than trying to imitate a real Unix "write" (which
 // means something else entirely — talking to another user's terminal).
+//
+// `write -a <path> <text>` appends to the current end instead (via
+// fs_write_at + FS_OFFSET_APPEND) — for a file that doesn't exist yet
+// that's the same as a plain write from offset 0.
 fn void main(String[] args) {
-    if (args.len != 2) {
-        print("usage: write <path> <text>\n");
+    bool append = args.len == 3 && args[0].len == 2 && args[0][0] == '-' && args[0][1] == 'a';
+    if (args.len != 2 && !append) {
+        print("usage: write [-a] <path> <text>\n");
         return;
     }
 
-    int written = fs_write(args[0].ptr, args[1].ptr, (int)args[1].len);
+    char* path = append ? args[1].ptr : args[0].ptr;
+    String text = append ? args[2] : args[1];
+
+    int written = append
+        ? fs_write_at(path, text.ptr, (int)text.len, FS_OFFSET_APPEND)
+        : fs_write(path, text.ptr, (int)text.len);
     if (written < 0) {
         print("write: ");
-        print(args[0].ptr);
+        print(path);
         print(": failed\n");
     }
 }

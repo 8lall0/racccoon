@@ -295,6 +295,151 @@ fn void main() {
             } else {
                 print("exfatgrowkeep: FAILED\n");
             }
+        } else if (strcmp(cmd, "fswriteat") == 0) {
+            // FS_WRITE_AT / FS_STAT across whatever fs is mounted — so
+            // the four launch64*.sh scripts cover FAT32 / ext2 / dual /
+            // exFAT with this one test. Writes a 9000-byte file in
+            // <=1020-byte chunks (multi-cluster on FAT32/exFAT, 9 blocks
+            // on the 1KB-block QEMU ext2 images — under the 12-direct
+            // cap), reads it back and byte-compares, then checks a
+            // mid-file overwrite, an append via FS_OFFSET_APPEND, the
+            // no-holes rejection, a write to a directory, and fs_stat's
+            // size/type. Pattern byte at position p is (char)(p & 0xFF).
+            const int FWA_N = 9000;
+            char[1024] fwa_chunk @noinit;
+            bool fwa_ok = true;
+
+            // write in chunks
+            int fwa_pos = 0;
+            while (fwa_pos < FWA_N && fwa_ok) {
+                int fwa_c = FWA_N - fwa_pos;
+                if (fwa_c > 1000) fwa_c = 1000;
+                for (int fwa_i = 0; fwa_i < fwa_c; fwa_i++) {
+                    fwa_chunk[fwa_i] = (char)((fwa_pos + fwa_i) & 0xFF);
+                }
+                int fwa_w = fs_write_at("wat.bin", &fwa_chunk, fwa_c, (uint)fwa_pos);
+                if (fwa_w != fwa_c) fwa_ok = false;
+                fwa_pos += fwa_c;
+            }
+
+            // read back and compare
+            int fwa_rpos = 0;
+            while (fwa_rpos < FWA_N && fwa_ok) {
+                int fwa_rc = fs_read_at("wat.bin", &fwa_chunk, 1000, (uint)fwa_rpos);
+                if (fwa_rc <= 0) { fwa_ok = false; break; }
+                for (int fwa_j = 0; fwa_j < fwa_rc; fwa_j++) {
+                    if (fwa_chunk[fwa_j] != (char)((fwa_rpos + fwa_j) & 0xFF)) { fwa_ok = false; break; }
+                }
+                fwa_rpos += fwa_rc;
+            }
+
+            // fs_stat: 9000-byte file
+            uint fwa_size = 0;
+            int fwa_type = -1;
+            int fwa_st = fs_stat("wat.bin", &fwa_size, &fwa_type);
+            bool fwa_stat_ok = fwa_st == 0 && fwa_size == (uint)FWA_N && fwa_type == 0;
+
+            // mid-file overwrite at a non-aligned offset
+            int fwa_ov = fs_write_at("wat.bin", "ZZZZ", 4, 5001);
+            char[16] fwa_small @noinit;
+            int fwa_ovr = fs_read_at("wat.bin", &fwa_small, 8, 4999);
+            bool fwa_ov_ok = fwa_ov == 4 && fwa_ovr == 8
+                && fwa_small[0] == (char)(4999 & 0xFF)   // unchanged
+                && fwa_small[1] == (char)(5000 & 0xFF)   // unchanged
+                && fwa_small[2] == 'Z' && fwa_small[3] == 'Z'
+                && fwa_small[4] == 'Z' && fwa_small[5] == 'Z'
+                && fwa_small[6] == (char)(5005 & 0xFF);  // unchanged
+
+            // append via FS_OFFSET_APPEND
+            int fwa_ap = fs_write_at("wat.bin", "TAIL", 4, FS_OFFSET_APPEND);
+            uint fwa_size2 = 0;
+            int fwa_st2 = fs_stat("wat.bin", &fwa_size2, null);
+            int fwa_apr = fs_read_at("wat.bin", &fwa_small, 4, (uint)FWA_N);
+            bool fwa_ap_ok = fwa_ap == 4 && fwa_st2 == 0 && fwa_size2 == (uint)(FWA_N + 4)
+                && fwa_apr == 4
+                && fwa_small[0] == 'T' && fwa_small[1] == 'A' && fwa_small[2] == 'I' && fwa_small[3] == 'L';
+
+            // no holes: an offset well past the end must fail
+            int fwa_hole = fs_write_at("wat.bin", "no", 2, 99999);
+
+            // a write to an existing directory must fail
+            int fwa_md = fs_mkdir("watdir");
+            int fwa_wd = fs_write_at("watdir", "x", 1, 0);
+            int fwa_rmd = fs_delete("watdir");
+
+            int fwa_cleanup = fs_delete("wat.bin");
+
+            if (fwa_ok && fwa_stat_ok && fwa_ov_ok && fwa_ap_ok
+                && fwa_hole < 0 && fwa_md == 0 && fwa_wd < 0 && fwa_rmd == 0
+                && fwa_cleanup == 0) {
+                print("fswriteat: ok\n");
+            } else {
+                print("fswriteat: parts w="); print_uint((uint)(fwa_ok ? 1 : 0));
+                print(" stat="); print_uint((uint)(fwa_stat_ok ? 1 : 0));
+                print(" ov="); print_uint((uint)(fwa_ov_ok ? 1 : 0));
+                print(" ap="); print_uint((uint)(fwa_ap_ok ? 1 : 0));
+                print(" hole="); print_uint((uint)fwa_hole);
+                print(" md="); print_uint((uint)fwa_md);
+                print(" wd="); print_uint((uint)fwa_wd);
+                print(" rmd="); print_uint((uint)fwa_rmd);
+                print(" cl="); print_uint((uint)fwa_cleanup);
+                print("\nfswriteat: FAILED\n");
+            }
+        } else if (strcmp(cmd, "fswriteatfrag") == 0) {
+            // Interleaved growth of two files, 1000 bytes at a time,
+            // alternating — so on exFAT each file's clusters end up
+            // non-contiguous and exfat_grow_file_chain has to convert
+            // the file from NoFatChain to a real FAT chain (the one
+            // exfat_write_at path exfatgrow's directory test doesn't
+            // reach). 10000 bytes each stays under ext2's 12-direct
+            // cap, so this runs identically on all four launch scripts.
+            // Then both files are read back and byte-compared; pattern
+            // byte at position p of file k is (char)((p + k) & 0xFF).
+            const int FRAG_N = 10000;
+            char[1024] frg_chunk @noinit;
+            bool frg_ok = true;
+            int frg_pos = 0;
+            while (frg_pos < FRAG_N && frg_ok) {
+                int frg_c = FRAG_N - frg_pos;
+                if (frg_c > 1000) frg_c = 1000;
+                for (int frg_i = 0; frg_i < frg_c; frg_i++) {
+                    frg_chunk[frg_i] = (char)((frg_pos + frg_i) & 0xFF);
+                }
+                if (fs_write_at("fragA.bin", &frg_chunk, frg_c, (uint)frg_pos) != frg_c) frg_ok = false;
+                for (int frg_i = 0; frg_i < frg_c; frg_i++) {
+                    frg_chunk[frg_i] = (char)((frg_pos + frg_i + 1) & 0xFF);
+                }
+                if (fs_write_at("fragB.bin", &frg_chunk, frg_c, (uint)frg_pos) != frg_c) frg_ok = false;
+                frg_pos += frg_c;
+            }
+
+            for (int frg_k = 0; frg_k < 2 && frg_ok; frg_k++) {
+                char* frg_name = frg_k == 0 ? "fragA.bin" : "fragB.bin";
+                int frg_rp = 0;
+                while (frg_rp < FRAG_N && frg_ok) {
+                    int frg_rc = fs_read_at(frg_name, &frg_chunk, 1000, (uint)frg_rp);
+                    if (frg_rc <= 0) { frg_ok = false; break; }
+                    for (int frg_j = 0; frg_j < frg_rc; frg_j++) {
+                        if (frg_chunk[frg_j] != (char)((frg_rp + frg_j + frg_k) & 0xFF)) { frg_ok = false; break; }
+                    }
+                    frg_rp += frg_rc;
+                }
+            }
+
+            uint frg_sa = 0; uint frg_sb = 0;
+            int frg_sta = fs_stat("fragA.bin", &frg_sa, null);
+            int frg_stb = fs_stat("fragB.bin", &frg_sb, null);
+
+            int frg_ca = fs_delete("fragA.bin");
+            int frg_cb = fs_delete("fragB.bin");
+
+            if (frg_ok && frg_sta == 0 && frg_sa == (uint)FRAG_N
+                && frg_stb == 0 && frg_sb == (uint)FRAG_N
+                && frg_ca == 0 && frg_cb == 0) {
+                print("fswriteatfrag: ok\n");
+            } else {
+                print("fswriteatfrag: FAILED\n");
+            }
         } else if (strcmp(cmd, "lfntest") == 0) {
             // Proves real VFAT long-filename (LFN) support in fat32.c3:
             // reading a name a real, external tool (mtools' mcopy, this

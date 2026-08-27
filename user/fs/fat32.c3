@@ -1376,6 +1376,83 @@ fn uint fat32_write_file(uint first_cluster, char* src, uint len)
 	return bytes_written;
 }
 
+// Offset-aware counterpart to fat32_write_file — writes `len` bytes of
+// `src` starting `offset` bytes into first_cluster's chain: walks (and
+// extends, one cluster at a time) to the cluster holding `offset`, then
+// writes forward from there, extending the chain as it goes. Alongside,
+// not replacing, fat32_write_file (still used unchanged by the whole-
+// file fat32_write) — the same "keep the heavily-exercised offset-0 path
+// untouched" split fat32_read_file_at / ext2_write_file_at both made.
+// The caller owns the directory entry's size field (fat32_write_at sets
+// it to max(old, offset + written)); this touches only cluster data and
+// FAT links. Returns bytes actually written — short on a genuine failure
+// (out of space, I/O error) partway through.
+fn uint fat32_write_file_at(uint first_cluster, char* src, uint len, uint offset)
+{
+	uint cluster_size = fat32_sectors_per_cluster * SECTOR_SIZE;
+
+	// Walk to the cluster holding `offset`, allocating + linking if the
+	// chain is currently shorter — only reachable for an aligned append
+	// (fat32_write_at already rejected offset > size, so at most the one
+	// cluster right at the current end can be missing).
+	uint cluster = first_cluster;
+	uint cluster_start = 0;
+	while (cluster_start + cluster_size <= offset)
+	{
+		uint next = fat32_next_cluster(cluster);
+		if (next >= FAT32_EOC_MIN)
+		{
+			next = fat32_alloc_cluster();
+			if (next == 0) return 0;
+			if (!fat32_write_fat_entry(cluster, next)) return 0;
+			if (!fat32_write_fat_entry(next, FAT32_EOC_MIN)) return 0;
+		}
+		cluster = next;
+		cluster_start += cluster_size;
+	}
+
+	uint in_cluster = offset - cluster_start;
+	uint skip_s = in_cluster / SECTOR_SIZE;
+	uint skip_in_s = in_cluster % SECTOR_SIZE; // first written sector only
+	uint bytes_written = 0;
+	char[SECTOR_SIZE] sector_buf @noinit;
+	bool at_start = true;
+
+	while (bytes_written < len)
+	{
+		uint sector = fat32_cluster_to_sector(cluster);
+		uint start_s = at_start ? skip_s : 0;
+		for (uint s = start_s; s < fat32_sectors_per_cluster && bytes_written < len; s++)
+		{
+			uint soff = (at_start && s == skip_s) ? skip_in_s : 0;
+			uint chunk = len - bytes_written;
+			if (chunk > SECTOR_SIZE - soff) chunk = SECTOR_SIZE - soff;
+			// Read-modify-write any partially touched sector, same
+			// read-what's-really-there discipline fat32_write_file has.
+			if (soff != 0 || chunk < SECTOR_SIZE)
+			{
+				if (!fs_read_sector(sector + s, &sector_buf)) return bytes_written;
+			}
+			for (uint i = 0; i < chunk; i++) sector_buf[soff + i] = src[bytes_written + i];
+			if (!fs_write_sector(sector + s, &sector_buf)) return bytes_written;
+			bytes_written += chunk;
+		}
+		at_start = false;
+		if (bytes_written >= len) break;
+
+		uint next = fat32_next_cluster(cluster);
+		if (next >= FAT32_EOC_MIN)
+		{
+			next = fat32_alloc_cluster();
+			if (next == 0) return bytes_written;
+			if (!fat32_write_fat_entry(cluster, next)) return bytes_written;
+			if (!fat32_write_fat_entry(next, FAT32_EOC_MIN)) return bytes_written;
+		}
+		cluster = next;
+	}
+	return bytes_written;
+}
+
 fn bool fat32_update_entry_size(uint entry_sector, uint entry_offset, uint new_size)
 {
 	// Real backstop here, unlike fat32_create_file's — fsd.c3's
@@ -1451,6 +1528,87 @@ fn int fat32_write(char* name, char* src, uint len)
 	if (!fat32_update_entry_size(entry_sector, entry_offset, written)) return -1;
 
 	return (int)written;
+}
+
+// Entry point dispatched from fsd.c3 for FS_WRITE_AT — offset-aware:
+// overwrite bytes anywhere in the file, or append at the current end.
+// Same resolve / create-if-missing / relocate-to-update-size shape as
+// fat32_write, plus the no-holes rule (offset > current size rejected,
+// offset != 0 on a file that doesn't exist yet rejected). The entry's
+// size grows to max(old, offset + written), never shrinks.
+fn int fat32_write_at(char* name, char* src, uint len, uint offset)
+{
+	fat32_cache_valid = false; // see fat32_cache_path's own comment
+	uint dir_cluster;
+	if (!fat32_resolve_dir(name, &dir_cluster)) return -1;
+	char* leaf = fat32_leaf_name(name);
+	if (leaf[0] == 0) return -1; // no name to write to (e.g. "" or a trailing slash)
+
+	char[11] name11 @noinit;
+	uint dummy_lfn_sector; uint dummy_lfn_offset;
+	bool resolved = fat32_resolve_name11(dir_cluster, leaf, &name11, &dummy_lfn_sector, &dummy_lfn_offset);
+	if (!resolved) fat32_name_to_8_3(leaf, &name11);
+
+	uint cluster;
+	uint size;
+	uint entry_sector;
+	uint entry_offset;
+	char attr;
+	bool exists = resolved && fat32_find_in_dir(dir_cluster, &name11, &cluster, &size, &entry_sector, &entry_offset, &attr);
+	if (exists && (attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0) return -1;
+	if (!exists && offset != 0) return -1; // can't create with a hole
+	if (exists && offset > size) return -1; // no holes
+
+	if (!exists)
+	{
+		if (!fat32_create_file(dir_cluster, leaf, &name11, &cluster)) return -1;
+		size = 0;
+	}
+
+	uint written = fat32_write_file_at(cluster, src, len, offset);
+
+	uint final_cluster;
+	uint final_size;
+	char final_attr;
+	if (!fat32_find_in_dir(dir_cluster, &name11, &final_cluster, &final_size, &entry_sector, &entry_offset, &final_attr))
+	{
+		return -1; // should be unreachable — don't claim success if it is
+	}
+	uint new_size = offset + written;
+	if (new_size < size) new_size = size; // never shrink
+	if (!fat32_update_entry_size(entry_sector, entry_offset, new_size)) return -1;
+
+	return (int)written;
+}
+
+// Entry point dispatched from fsd.c3 for FS_STAT — size + type (0 file,
+// 1 dir) of `name`. "" is the root directory. Returns false when
+// nothing resolves there. Same resolve/find shape as fat32_read.
+fn bool fat32_stat(char* name, uint* out_size, int* out_type)
+{
+	if (name[0] == 0)
+	{
+		*out_size = 0;
+		*out_type = 1;
+		return true;
+	}
+	uint dir_cluster;
+	if (!fat32_resolve_dir(name, &dir_cluster)) return false;
+	char* leaf = fat32_leaf_name(name);
+
+	char[11] name11 @noinit;
+	uint dummy_lfn_sector; uint dummy_lfn_offset;
+	if (!fat32_resolve_name11(dir_cluster, leaf, &name11, &dummy_lfn_sector, &dummy_lfn_offset))
+	{
+		fat32_name_to_8_3(leaf, &name11);
+	}
+
+	uint cluster; uint size; uint es; uint eo; char attr;
+	if (!fat32_find_in_dir(dir_cluster, &name11, &cluster, &size, &es, &eo, &attr)) return false;
+	bool is_dir = (attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0;
+	*out_type = is_dir ? 1 : 0;
+	*out_size = is_dir ? 0 : size;
+	return true;
 }
 
 // Frees every cluster in first_cluster's chain, marking each 0 (free)

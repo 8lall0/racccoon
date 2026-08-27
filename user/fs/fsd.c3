@@ -888,7 +888,7 @@ fn void main(String[] args)
 			continue;
 		}
 
-		if (verb != FS_READ && verb != FS_READ_AT && verb != FS_WRITE && verb != FS_DELETE && verb != FS_LIST && verb != FS_MKDIR && verb != FS_RENAME) continue;
+		if (verb != FS_READ && verb != FS_READ_AT && verb != FS_WRITE && verb != FS_WRITE_AT && verb != FS_STAT && verb != FS_DELETE && verb != FS_LIST && verb != FS_MKDIR && verb != FS_RENAME) continue;
 
 		int* result_len_field = (int*)&buf;
 
@@ -1120,6 +1120,86 @@ fn void main(String[] args)
 				}
 			}
 			*result_len_field = result;
+			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
+			continue;
+		}
+
+		if (verb == FS_WRITE_AT)
+		{
+			// Wire: path 0..99, len 100..103, offset 104..107 (req_offset),
+			// data 108.. — see user.c3's fs_write_at. Offset-aware write,
+			// no holes (each backend rejects offset > the file's size).
+			if (req_len > (int)(FS_MSG_MAX - 108)) req_len = (int)(FS_MSG_MAX - 108);
+			uint wat_offset = req_offset;
+			// FS_OFFSET_APPEND sentinel → resolve to the file's current
+			// size here, so a caller can append without a prior FS_STAT.
+			if (wat_offset == FS_OFFSET_APPEND)
+			{
+				uint cur_size = 0;
+				int cur_type = 0;
+				bool found = false;
+				if (fs_type == FS_TYPE_FAT32)
+				{
+					found = fat32_stat(&filename, &cur_size, &cur_type);
+				}
+				else if (fs_type == FS_TYPE_EXT2)
+				{
+					found = ext2_stat(&filename, &cur_size, &cur_type);
+				}
+				else if (fs_type == FS_TYPE_EXFAT)
+				{
+					found = exfat_stat(&filename, &cur_size, &cur_type);
+				}
+				wat_offset = found ? cur_size : 0;
+			}
+			int result = -1;
+			if (!fs_is_protected_name(&filename))
+			{
+				if (fs_type == FS_TYPE_FAT32)
+				{
+					result = fat32_write_at(&filename, &buf[108], (uint)req_len, wat_offset);
+				}
+				else if (fs_type == FS_TYPE_EXT2)
+				{
+					// Same requester-uid lookup as FS_WRITE's own ext2
+					// branch — see its comment.
+					uint requester_uid = 0xFFFFFFFF;
+					proc_info(from, null, null, (int*)&requester_uid);
+					result = ext2_write_at(&filename, &buf[108], (uint)req_len, wat_offset, requester_uid);
+				}
+				else if (fs_type == FS_TYPE_EXFAT)
+				{
+					result = exfat_write_at(&filename, &buf[108], (uint)req_len, wat_offset);
+				}
+			}
+			*result_len_field = result;
+			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
+			continue;
+		}
+
+		if (verb == FS_STAT)
+		{
+			// Wire: path 0..99. Reply: 0..3 = 0 / -1, 4..7 = size (uint),
+			// 8 = type (0 file, 1 dir). See user.c3's fs_stat.
+			uint stat_size = 0;
+			int stat_type = 0;
+			bool ok = false;
+			if (fs_type == FS_TYPE_FAT32)
+			{
+				ok = fat32_stat(&filename, &stat_size, &stat_type);
+			}
+			else if (fs_type == FS_TYPE_EXT2)
+			{
+				ok = ext2_stat(&filename, &stat_size, &stat_type);
+			}
+			else if (fs_type == FS_TYPE_EXFAT)
+			{
+				ok = exfat_stat(&filename, &stat_size, &stat_type);
+			}
+			*result_len_field = ok ? 0 : -1;
+			uint* stat_size_field = (uint*)&buf[4];
+			*stat_size_field = stat_size;
+			buf[8] = (char)stat_type;
 			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
 			continue;
 		}

@@ -950,7 +950,10 @@ fn void print_uint(uint n) @export("print_uint") {
 // first instead of refused when set; see fat32_delete_recursive/
 // ext2_delete_recursive), 104.. = file data — reply reuses 0..3 for
 // the result (FS_READ/FS_WRITE: length or -1; FS_DELETE: 0 or -1) and,
-// for a read, 4.. for the data.
+// for a read, 4.. for the data. The offset-aware verbs each carry their
+// own layout, documented at their own const below: FS_READ_AT and
+// FS_WRITE_AT add a uint offset (data at 108 for FS_WRITE_AT so offset
+// and data don't collide), FS_STAT returns size + type.
 const uint FS_READ   = 20;
 const uint FS_WRITE  = 21;
 const uint FS_DELETE = 22;
@@ -978,6 +981,25 @@ const uint FS_RENAME = 25;
 // updated to know about it — same reasoning SYS_IPC_RECV_GEN
 // (src/entry.c3) used over widening SYS_IPC_RECV.
 const uint FS_READ_AT = 26;
+// FS_WRITE_AT: byte 0..99 = path, 100..103 = uint length, 104..107 =
+// uint offset, 108.. = data (so <= FS_MSG_MAX-108 = 1020 bytes/call —
+// chunked, like FS_READ_AT). Offset-aware write: overwrite bytes
+// anywhere in the file, or append exactly at the current end to grow
+// it. No holes — a backend rejects (-1) an offset past the file's
+// current size, same rule the P9_WRITE path already follows (devlog
+// 2026-08-21 entry 61). offset == FS_OFFSET_APPEND is resolved by fsd
+// to the file's current size, so a caller can append without a prior
+// FS_STAT. Creates the file if missing (offset must then be 0). Reply:
+// byte 0..3 = bytes written or -1. A separate verb from FS_WRITE, not a
+// widening, for the same reason FS_READ_AT is separate from FS_READ.
+const uint FS_WRITE_AT = 27;
+// FS_STAT: byte 0..99 = path ("" = the root). Reply: byte 0..3 = 0 or
+// -1 (nothing resolves there), byte 4..7 = uint size (0 for a
+// directory), byte 8 = type (0 = file, 1 = directory).
+const uint FS_STAT = 28;
+// Sentinel offset for FS_WRITE_AT meaning "append at the file's current
+// end" — fsd resolves it per-backend before dispatching.
+const uint FS_OFFSET_APPEND = 0xFFFFFFFF;
 const uint FS_MSG_MAX = 1128;
 
 // FS_LIST: byte 0..99 = directory path ("" means the root), same as
@@ -1100,6 +1122,77 @@ fn int fs_write(char* filename, char* buf, int len) @export("fs_write") {
 
     int* result_len_field = (int*)&req;
     return *result_len_field;
+}
+
+// Offset-aware write — overwrite bytes anywhere in the file, or append
+// at the current end (pass offset == FS_OFFSET_APPEND for "wherever the
+// end currently is"). Chunked: a single call carries at most
+// FS_MSG_MAX-108 bytes, so writing a larger buffer means calling this in
+// a loop advancing `offset`, the mirror image of fs_read_at. Returns
+// bytes actually written this call, or -1 (not found + a nonzero
+// offset, a hole, a directory, permission). See FS_WRITE_AT's own
+// wire-format comment.
+fn int fs_write_at(char* filename, char* buf, int len, uint offset) @export("fs_write_at") {
+    uint prefix_len = 0;
+    int fsd_pid = ns_resolve(filename, &prefix_len);
+    if (fsd_pid < 0) return -1;
+    char* stripped = &filename[prefix_len];
+
+    char[FS_MSG_MAX] req @noinit;
+    int i = 0;
+    while (stripped[i] != 0 && i < 99) {
+        req[i] = stripped[i];
+        i++;
+    }
+    req[i] = 0;
+
+    int write_len = len;
+    if (write_len < 0) write_len = 0;
+    if (write_len > (int)(FS_MSG_MAX - 108)) write_len = (int)(FS_MSG_MAX - 108);
+    uint* len_field = (uint*)&req[100];
+    *len_field = (uint)write_len;
+    uint* offset_field = (uint*)&req[104];
+    *offset_field = offset;
+    for (int j = 0; j < write_len; j++) {
+        req[108 + j] = buf[j];
+    }
+
+    uint reply_verb = 0;
+    int from = p9_call(fsd_pid, FS_WRITE_AT, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
+    if (from <= 0 || reply_verb != FS_WRITE_AT) return -1;
+
+    int* result_field = (int*)&req;
+    return *result_field;
+}
+
+// Size + type of `filename` ("" = the root directory). On success
+// returns 0 and fills *out_size (0 for a directory) and *out_type
+// (0 = file, 1 = directory), either of which may be null. Returns -1 if
+// nothing resolves there. See FS_STAT's own wire-format comment.
+fn int fs_stat(char* filename, uint* out_size, int* out_type) @export("fs_stat") {
+    uint prefix_len = 0;
+    int fsd_pid = ns_resolve(filename, &prefix_len);
+    if (fsd_pid < 0) return -1;
+    char* stripped = &filename[prefix_len];
+
+    char[FS_MSG_MAX] req @noinit;
+    int i = 0;
+    while (stripped[i] != 0 && i < 99) {
+        req[i] = stripped[i];
+        i++;
+    }
+    req[i] = 0;
+
+    uint reply_verb = 0;
+    int from = p9_call(fsd_pid, FS_STAT, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
+    if (from <= 0 || reply_verb != FS_STAT) return -1;
+
+    int* result_field = (int*)&req;
+    if (*result_field < 0) return -1;
+    uint* size_field = (uint*)&req[4];
+    if (out_size != null) *out_size = *size_field;
+    if (out_type != null) *out_type = (int)((uint)req[8] & 0xFF);
+    return 0;
 }
 
 fn int fs_delete_impl(char* filename, uint recursive) {

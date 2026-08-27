@@ -4,6 +4,87 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-27 (continued) — FS_WRITE_AT + FS_STAT across all three backends; exFAT multi-cluster files
+
+`fsd`'s thin `FS_*` verb family had no offset/append write and no way to
+learn a file's size. `FS_WRITE` is whole-file-replace capped at
+`FS_MSG_MAX-104` = 1024 bytes, so the biggest file creatable through the
+normal path API — on *any* backend — was 1 KB. (The stateful `P9_*`
+family had offset-aware `Twrite`, but ext2-only.) exFAT additionally
+still capped a file at one cluster.
+
+**New verbs** (`user/user.c3`, `user/fs/fsd.c3`):
+
+- `FS_WRITE_AT` (27) — path / len / uint offset / data at byte 108 (so
+  offset and data don't collide; ≤ 1020 B/call, chunked like
+  `FS_READ_AT`). Overwrite anywhere, or append at the end. **No holes** —
+  a backend rejects `offset > the file's size` (`-1`), same rule the
+  `P9_WRITE` path already followed. `offset == FS_OFFSET_APPEND`
+  (`0xFFFFFFFF`) is resolved by `fsd` to the file's current size via the
+  same stat hook below, so a caller can append with no prior lookup.
+- `FS_STAT` (28) — path in, `{size, type}` out (type 0 file / 1 dir; `""`
+  = the root). `fs_stat(name, *size, *type)` wrapper.
+
+Each backend got a `*_stat` and a `*_write_at`:
+
+- **exFAT** — the real work. `exfat_grow_file_chain` / `exfat_file_nth_
+  cluster` / `exfat_write_cluster_at`: a file grows a cluster at a time,
+  staying contiguous (NoFatChain, FAT untouched) while each new cluster
+  lands after the last, converting the whole run to a real FAT chain the
+  first time one doesn't — the same machinery `exfat_extend_dir` uses for
+  directories. `exfat_write` was rebuilt on it too (per the plan), though
+  `fsd`'s 1 KB payload cap means its `want` is only ever 0 or 1 in
+  practice. `exfat_rewrite_stream` gained a `no_fat_chain` param (it used
+  to force the flag on whenever there was data — wrong for a chained
+  file). The "one cluster per file" scope limit is gone from the file
+  header.
+- **FAT32** — `fat32_write_file_at` alongside `fat32_write_file` (which
+  was already multi-cluster + chain-extending, just offset-0-only), same
+  "keep the offset-0 path untouched" split `fat32_read_file_at` made.
+  `fat32_write_at` wraps it with resolve / create / `max(old, offset+n)`
+  size update.
+- **ext2** — `ext2_write_file_at` already existed (built for `P9_WRITE`);
+  `ext2_write_at` just factors the path-level glue (resolve / create /
+  `ext2_write_allowed` / grow `inode.size`) out of the `P9_WRITE`
+  dispatch. Keeps the existing 12-direct-block cap.
+
+**Hardening pass** (bounded): audited the `FS_*` surface across the three
+backends for divergence — empty path, write-to-directory, past-EOF,
+offset overflow, create-with-a-hole. Added a `leaf[0] == 0` guard to the
+new `*_write_at` (exFAT already had one; FAT32/ext2 didn't on the
+write path — pre-existing, fixed for the new functions). `/bin/write`
+gained `write -a <path> <text>` (append via the sentinel).
+
+**Verification** — two new `shell_test` builtins, run against whatever's
+mounted so the four `launch64*.sh` scripts cover FAT32 / ext2 / dual /
+exFAT:
+
+- `fswriteat` — chunked write of a 9000-byte file, read back and
+  byte-compared; `fs_stat` size/type; non-aligned mid-file overwrite
+  (bytes outside the range untouched); append via `FS_OFFSET_APPEND` (new
+  size checked); no-holes rejection; write-to-directory rejection.
+- `fswriteatfrag` — two files grown 1000 bytes at a time, alternating, so
+  on exFAT each file's clusters interleave and `exfat_grow_file_chain`
+  has to do the NoFatChain→FAT-chain conversion; both read back and
+  verified. 10000 bytes each stays under ext2's 12-direct cap.
+
+Both `ok` on all four scripts; `fsck.fat` / `e2fsck -fn` / `fsck.exfat`
+clean on every run image. `write -a` round-trip confirmed on FAT32 /
+ext2 / exFAT. Full regression clean: `bigreadtest`, `p9fswritetest`,
+`fspermtest`, `cycletest`, `lfntest`, `exfatgrow`/`exfatgrowkeep`, and
+the `/bin` `write`/`cat`/`mkdir`/`mv`/`rm -r` sequence.
+
+Not done this session: real Milk-V Duo hardware check (ext2 root +
+FAT32 boot), and Phase 5 — the broad de-duplication refactor of the
+three backends' near-identical resolve/create/dispatch shapes (the plan
+sequences it after this checkpoint).
+
+**Files changed:** `user/user.c3`, `user/fs/fsd.c3`, `user/fs/exfat.c3`,
+`user/fs/fat32.c3`, `user/fs/ext2.c3`, `user/bin/write.c3`,
+`user/shell_test.c3`.
+
+---
+
 ## 2026-08-27 (continued) — exFAT: directory extension (grow past one cluster)
 
 Closes the last deliberate exFAT write-path limit: a directory this
