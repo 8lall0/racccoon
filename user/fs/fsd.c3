@@ -966,11 +966,7 @@ fn void main(String[] args)
 				}
 				else if (fs_type == FS_TYPE_EXFAT)
 				{
-					// Non-recursive only in this first write pass (see
-					// exfat.c3's Write path section) — `rm -r` on exFAT
-					// has no branch and stays -1. exfat_delete refuses a
-					// non-empty directory on its own.
-					if (!recursive) result = exfat_delete(&filename);
+					result = recursive ? exfat_delete_recursive(&filename) : exfat_delete(&filename);
 				}
 			}
 			*result_len_field = result;
@@ -1069,6 +1065,10 @@ fn void main(String[] args)
 					uint requester_uid = 0xFFFFFFFF;
 					proc_info(from, null, null, (int*)&requester_uid);
 					result = ext2_rename(&filename, &new_filename, requester_uid);
+				}
+				else if (fs_type == FS_TYPE_EXFAT)
+				{
+					result = exfat_rename(&filename, &new_filename);
 				}
 			}
 			*result_len_field = result;

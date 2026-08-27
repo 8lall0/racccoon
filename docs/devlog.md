@@ -4,6 +4,68 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-27 (continued) — exFAT: rename/move + recursive delete
+
+Third exFAT session, closing the last two write verbs. `exfat_rename`
+(handles both a pure rename and a move to a different directory) and
+`exfat_delete_recursive` (`rm -r`); `fsd.c3` gets the two matching
+dispatch branches. `user/fs/exfat.c3` is now a full read+write backend.
+
+**Recursive delete** — `exfat_free_tree` walks the target directory with
+a cursor and, for every entry set, frees the data (recursing into
+subdirectories first, then freeing the subdirectory's own cluster).
+Unlike `fat32_delete_dir_contents` it doesn't bother clearing individual
+child entries: the whole subtree's directory clusters get freed
+wholesale anyway, so unlinking children first is just wasted writes (the
+FAT32 version marks them only because a dir cluster it *isn't* about to
+free could hold the entry). Then the top entry set is unlinked from its
+parent and its cluster freed. A protected entry anywhere in the subtree
+aborts before any free — all-or-nothing, same guarantee the FAT32/ext2
+recursive deletes give. Depth-capped at 32 (`EXFAT_MAX_DELETE_DEPTH`,
+the sibling of `FAT32_MAX_DELETE_DEPTH`).
+
+**Rename/move** — build a fresh entry set at the destination pointing at
+the *same* clusters (no data copy), place it, then clear the source
+entry set: destination safely in place before the source goes away,
+"fail toward a duplicate name, never toward a lost file," same order
+`fat32_rename` uses. Refuses an existing destination (no silent
+overwrite) and — for a directory — refuses a move into its own subtree.
+
+The one place exFAT is genuinely *simpler* than FAT32 here: **exFAT
+directories have no `.`/`..` entries**, so moving a directory to a new
+parent needs no `..` fixup at all (`fat32_rename` has a whole block for
+that) and the cycle check can't walk *up* through `..` — so
+`exfat_subtree_contains` walks *down* from the source directory instead,
+looking for the destination parent's cluster among its descendants.
+
+`exfat_build_set` gained a `no_fat_chain` parameter: everything this
+driver allocates itself is one contiguous cluster (pass `true`), but a
+rename has to carry through whatever flag the moved file/directory
+already had — a Windows-written fragmented file keeps its FAT chain, the
+entry just moves.
+
+**Verification** — QEMU (`scripts/launch64_exfat.sh`), `fsck.exfat`
+clean after each, host exFAT driver readback:
+- `rm` a non-empty dir → refused; `rm -r` the same → gone, every
+  descendant unresolvable afterwards; `rm -r` a directory holding the
+  deliberately-fragmented `bin/ls_frag` (exercises the FAT-chain free
+  inside the tree walk) → `fsck` clean.
+- pure rename (`mv /r1 /r2`), move to a subdirectory
+  (`mv /r2 /d/moved`), move a directory with contents (children still
+  reachable at the new path — no `..` to fix), move a mkfs-created
+  subdirectory.
+- `mv /parent /parent/child/parent` (into its own subtree) → refused;
+  move onto an existing name → refused.
+- ext2's own write regression (`write`/`mkdir`/`mv`/`rm -r` + `fsck.ext2`)
+  still clean — the shared `fsd.c3` changes are additive.
+
+Not tested on real Milk-V Duo hardware (exFAT has no role in its
+ext2-root + FAT32-boot layout).
+
+**Files changed:** `user/fs/exfat.c3`, `user/fs/fsd.c3`.
+
+---
+
 ## 2026-08-27 (continued) — exFAT write support: create/overwrite, delete, mkdir
 
 Second exFAT session, following the same read-then-write split FAT32 and
