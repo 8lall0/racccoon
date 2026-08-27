@@ -13,8 +13,9 @@ module user;
 // FAT32 and ext2 both followed (see docs/devlog.md), because the write
 // side is the riskier code: an allocator or directory-entry-set bug here
 // could corrupt a live volume. See the "Write path" section near the
-// bottom of this file for the deliberate scope limits (one cluster per
-// file, no directory extension).
+// bottom of this file for the deliberate scope limit that remains (one
+// cluster per file); directories now grow past their first cluster
+// (exfat_extend_dir), so a full directory no longer rejects a create.
 //
 // exFAT's on-disk model is genuinely different from FAT32's, not just a
 // renamed version of it:
@@ -74,6 +75,14 @@ const char EXFAT_ENTRY_TYPE_FILE   = (char)0x85; // File Directory Entry — pri
 // deleted forms itself).
 const char EXFAT_ENTRY_TYPE_STREAM = (char)0xC0; // Stream Extension
 const char EXFAT_ENTRY_TYPE_NAME   = (char)0xC1; // File Name
+
+// Filler byte for a directory slot that must not read as end-of-directory
+// (0x00) but carries no entry: a deleted File Name entry (0xC1 with the
+// in-use bit clear). Used to seal the trailing 0x00 slots of a directory
+// cluster when a further cluster is linked after it — see
+// exfat_seal_dir_cluster / exfat_extend_dir. Still "free" to every slot
+// scan here ((byte & 0x80) == 0), just no longer the end marker.
+const char EXFAT_ENTRY_FILLER      = (char)0x41;
 
 const uint EXFAT_ENTRY_INUSE_BIT     = 0x80;
 const uint EXFAT_ENTRY_TYPECODE_MASK = 0x1F;
@@ -477,9 +486,25 @@ fn bool exfat_find_in_dir(uint dir_cluster, bool dir_no_fat_chain, Char16* name_
 // bare cluster number.
 fn bool exfat_resolve_dir(char* path, uint* out_dir_cluster, bool* out_no_fat_chain, uint* out_data_length)
 {
+	return exfat_resolve_dir_located(path, out_dir_cluster, out_no_fat_chain, out_data_length, null, null);
+}
+
+// The fuller form the write-placement path needs. Besides the resolved
+// directory's cluster / NoFatChain / DataLength, it hands back:
+//  - out_is_root: the resolved directory is the volume root, which has
+//    no entry set of its own (nothing wrote a name for it) — its size is
+//    bounded purely by its FAT chain, so growing it needs no entry fixup.
+//  - out_locs: for a non-root directory, where its OWN entry set lives
+//    in its parent, so exfat_extend_dir can rewrite that entry's
+//    DataLength (and clear its NoFatChain flag) when the directory grows.
+//    Left untouched when out_is_root is true.
+fn bool exfat_resolve_dir_located(char* path, uint* out_dir_cluster, bool* out_no_fat_chain, uint* out_data_length, Exfat_set_locs* out_locs, bool* out_is_root)
+{
 	uint dir_cluster = exfat_root_cluster;
 	bool no_fat_chain = false; // root directory's chain is always FAT-walked — it has no Stream Extension entry of its own, see this file's header comment
 	uint data_length = 0;      // root has no Stream Extension entry — 0 is fine, the FAT chain bounds any root walk
+	bool is_root = true;
+	Exfat_set_locs locs;
 	uint seg_start = 0;
 	uint i = 0;
 	for (;;)
@@ -498,11 +523,12 @@ fn bool exfat_resolve_dir(char* path, uint* out_dir_cluster, bool* out_no_fat_ch
 			int seg_len16 = exfat_ascii_to_utf16(&seg_buf, &seg_utf16, EXFAT_NAME_MAX);
 
 			uint next_cluster; uint seg_data_len; ushort attr; bool next_no_fat_chain;
-			if (!exfat_find_in_dir(dir_cluster, no_fat_chain, &seg_utf16, seg_len16, &next_cluster, &seg_data_len, &attr, &next_no_fat_chain)) return false;
+			if (!exfat_find_in_dir_located(dir_cluster, no_fat_chain, &seg_utf16, seg_len16, &next_cluster, &seg_data_len, &attr, &next_no_fat_chain, &locs)) return false;
 			if (((uint)attr & EXFAT_ATTR_DIRECTORY) == 0) return false;
 			dir_cluster = next_cluster;
 			no_fat_chain = next_no_fat_chain;
 			data_length = seg_data_len;
+			is_root = false;
 		}
 
 		if (path[i] == 0) break;
@@ -512,6 +538,8 @@ fn bool exfat_resolve_dir(char* path, uint* out_dir_cluster, bool* out_no_fat_ch
 	*out_dir_cluster = dir_cluster;
 	*out_no_fat_chain = no_fat_chain;
 	if (out_data_length != null) *out_data_length = data_length;
+	if (out_locs != null && !is_root) *out_locs = locs;
+	if (out_is_root != null) *out_is_root = is_root;
 	return true;
 }
 
@@ -953,11 +981,15 @@ fn void exfat_mount()
 //    FAT is never written for file data (exactly what mkfs.exfat itself
 //    does: a NoFatChain cluster's FAT entry is left at 0, the
 //    Allocation Bitmap is the sole record that it's in use).
-//  - Directories this driver creates are also single-cluster and
-//    NoFatChain. A directory that fills its cluster (128 slots, ~40
-//    entries in a fresh one) can't grow — exfat_find_free_slot_run
-//    returns "no room" and the create (or a rename into it) fails.
-//    Directory extension is a later concern.
+//  - Directories this driver creates start single-cluster and
+//    NoFatChain (128 slots, ~40 short-named entries). When one fills up,
+//    exfat_place_set grows it by a cluster (exfat_extend_dir): a
+//    NoFatChain directory is converted to a real FAT chain the first
+//    time it grows (its own DataLength and NoFatChain flag rewritten in
+//    its parent entry set), the root and an already-chained directory
+//    just get one more cluster linked on the end. So a full directory no
+//    longer rejects a create / mkdir / rename-into-it — it extends,
+//    up to the volume running out of clusters.
 //  - Non-recursive delete of a directory succeeds only if it's empty
 //    (exfat_delete); the recursive form (exfat_delete_recursive) empties
 //    it first, same split as `rm` vs `rm -r`.
@@ -1241,9 +1273,10 @@ fn int exfat_build_set(char* out, Char16* name, int name_len, ushort attr, uint 
 // the directory (a run never spans a cluster boundary — keeps the
 // linear stepping in exfat_place_set valid, and every set is <= 11
 // slots vs 128 per cluster). `dir_data_length` bounds a NoFatChain
-// directory's own extent; a FAT-chained one (the root, always) is
-// bounded by its chain. Returns false — the operation then fails — if
-// no run fits: this pass has no directory extension.
+// directory's own extent; a FAT-chained one (the root, or one a previous
+// grow already converted) is bounded by its chain. Returns false if no
+// run fits in the directory's current clusters — exfat_place_set then
+// grows the directory by a cluster and asks again.
 fn bool exfat_find_free_slot_run(uint dir_cluster, bool dir_no_fat_chain, uint dir_data_length, int needed, uint* out_first_sector, uint* out_first_slot)
 {
 	uint cluster = dir_cluster;
@@ -1297,14 +1330,166 @@ fn bool exfat_find_free_slot_run(uint dir_cluster, bool dir_no_fat_chain, uint d
 	return false;
 }
 
-// Places a freshly built entry set into `dir` at the first free run.
+// Rewrites a directory's OWN entry set (located by `locs`, in its
+// parent) after its cluster chain grew by exfat_extend_dir:
+// DataLength / ValidDataLength := new_data_length, and the NoFatChain
+// flag cleared — a grown directory is always a real FAT chain now.
+// SetChecksum recomputed over the whole set. Only the primary and
+// Stream Extension slots change; the File Name slots are copied through
+// untouched so the checksum still covers them.
+fn bool exfat_grow_dir_entry(Exfat_set_locs* locs, uint new_data_length)
+{
+	if (locs.count < 2 || locs.count > EXFAT_MAX_SET_SLOTS) return false;
+
+	char[EXFAT_SET_BYTES_MAX] set_bytes @noinit;
+	for (int k = 0; k < locs.count; k++)
+	{
+		char[SECTOR_SIZE] buf @noinit;
+		if (!fs_read_sector(locs.sector[k], &buf)) return false;
+		uint off = locs.slot[k] * EXFAT_DIRENT_SIZE;
+		for (uint i = 0; i < EXFAT_DIRENT_SIZE; i++) set_bytes[(uint)k * EXFAT_DIRENT_SIZE + i] = buf[off + i];
+	}
+
+	char* st = &set_bytes[EXFAT_DIRENT_SIZE];
+	uint flags = (uint)st[EXFAT_STREAM_FLAGS] & 0xFF;
+	flags &= ~EXFAT_STREAM_FLAG_NO_FAT_CHAIN;
+	st[EXFAT_STREAM_FLAGS] = (char)flags;
+	uint* vdl = (uint*)&st[EXFAT_STREAM_VALID_DATA_LENGTH];
+	vdl[0] = new_data_length; vdl[1] = 0;
+	uint* dl = (uint*)&st[EXFAT_STREAM_DATA_LENGTH];
+	dl[0] = new_data_length; dl[1] = 0;
+
+	ushort* cksum = (ushort*)&set_bytes[EXFAT_FDE_SET_CHECKSUM];
+	*cksum = exfat_set_checksum(&set_bytes, locs.count);
+
+	if (!exfat_write_slot(locs.sector[0], locs.slot[0], &set_bytes[0])) return false;
+	if (!exfat_write_slot(locs.sector[1], locs.slot[1], &set_bytes[EXFAT_DIRENT_SIZE])) return false;
+	return true;
+}
+
+// Rewrites every EntryType 0x00 ("end of directory") slot in `cluster`
+// as EXFAT_ENTRY_FILLER, so that once a further cluster is linked after
+// this one, a reader walking the directory doesn't stop at the trailing
+// gap this cluster almost always has (a 4KB cluster is 128 slots, entry
+// sets are 3+ slots each, so the last set rarely lands flush with the
+// cluster end). The new cluster is freshly zeroed and becomes the
+// directory's one real end marker.
+fn bool exfat_seal_dir_cluster(uint cluster)
+{
+	uint base = exfat_cluster_to_sector(cluster);
+	for (uint s = 0; s < exfat_sectors_per_cluster; s++)
+	{
+		char[SECTOR_SIZE] buf @noinit;
+		if (!fs_read_sector(base + s, &buf)) return false;
+		bool dirty = false;
+		for (uint slot = 0; slot < EXFAT_SLOTS_PER_SECTOR; slot++)
+		{
+			uint off = slot * EXFAT_DIRENT_SIZE;
+			if (buf[off] == EXFAT_ENTRY_TYPE_END)
+			{
+				buf[off] = EXFAT_ENTRY_FILLER;
+				dirty = true;
+			}
+		}
+		if (dirty && !fs_write_sector(base + s, &buf)) return false;
+	}
+	return true;
+}
+
+// Grows a directory by one zeroed cluster so a new entry set can fit,
+// covering the three shapes exfat_place_set can hand it:
+//  - the volume root: always FAT-chained and has no parent entry — walk
+//    to the chain end, link a fresh cluster on, done (is_root skips the
+//    entry fixup, locs is ignored).
+//  - a FAT-chained subdirectory (the root case, or one a previous grow
+//    already converted): same chain link, plus bump DataLength in its
+//    own entry set so the on-disk size stays honest for fsck / Windows.
+//  - a NoFatChain (contiguous) subdirectory: convert it to a real FAT
+//    chain — write links across every existing cluster and the new one
+//    — then clear the NoFatChain flag and bump DataLength in its entry
+//    set. It can't revert to NoFatChain, which is fine: nothing here
+//    depends on a directory being contiguous.
+// The new cluster is zeroed (all-0x00 = end-of-directory) before it's
+// linked, so the directory reads as valid at every step. On success
+// *io_no_fat_chain is left false (a grown directory is always a chain
+// now) and *out_new_data_length is its new size, so the caller retries
+// the slot search as a chain walk.
+fn bool exfat_extend_dir(uint dir_cluster, bool* io_no_fat_chain, uint dir_data_length, bool is_root, Exfat_set_locs* locs, uint* out_new_data_length)
+{
+	uint cluster_size = exfat_cluster_size_bytes();
+
+	uint new_cluster = exfat_alloc_cluster();
+	if (new_cluster == 0) return false;
+	if (!exfat_zero_cluster(new_cluster))
+	{
+		exfat_free_cluster(new_cluster);
+		return false;
+	}
+
+	uint n_old = (dir_data_length + cluster_size - 1) / cluster_size;
+	if (n_old == 0) n_old = 1;
+
+	// The cluster the new one gets linked after — and, for a NoFatChain
+	// directory being converted, the FAT links across the whole existing
+	// run first.
+	bool ok = true;
+	uint last;
+	if (*io_no_fat_chain)
+	{
+		for (uint i = 0; i + 1 < n_old && ok; i++)
+		{
+			if (!exfat_write_fat_entry(dir_cluster + i, dir_cluster + i + 1)) ok = false;
+		}
+		last = dir_cluster + n_old - 1;
+	}
+	else
+	{
+		last = dir_cluster;
+		uint guard = 0;
+		while (guard <= exfat_cluster_count)
+		{
+			uint next = exfat_next_cluster(last);
+			if (next < 2 || next >= EXFAT_EOC_MIN) break;
+			last = next;
+			guard++;
+		}
+	}
+
+	if (ok && !exfat_seal_dir_cluster(last)) ok = false;
+	if (ok && !exfat_write_fat_entry(last, new_cluster)) ok = false;
+	if (ok && !exfat_write_fat_entry(new_cluster, EXFAT_EOC_WRITE)) ok = false;
+
+	if (!ok)
+	{
+		exfat_free_cluster(new_cluster);
+		return false;
+	}
+
+	uint new_len = (n_old + 1) * cluster_size;
+	if (!is_root && !exfat_grow_dir_entry(locs, new_len)) return false;
+
+	*io_no_fat_chain = false;
+	*out_new_data_length = new_len;
+	return true;
+}
+
+// Places a freshly built entry set into `dir` at the first free run,
+// growing the directory by a cluster (exfat_extend_dir) if none of its
+// current clusters has room. `dir_is_root` / `dir_locs` come straight
+// from exfat_resolve_dir_located and are only consulted on that grow.
 // The run is within one cluster's contiguous sectors, so slot k lands
 // at a simple linear offset from the run start.
-fn bool exfat_place_set(uint dir_cluster, bool dir_no_fat_chain, uint dir_data_length, char* set_bytes, int total_slots)
+fn bool exfat_place_set(uint dir_cluster, bool dir_no_fat_chain, uint dir_data_length, bool dir_is_root, Exfat_set_locs* dir_locs, char* set_bytes, int total_slots)
 {
 	uint first_sector;
 	uint first_slot;
-	if (!exfat_find_free_slot_run(dir_cluster, dir_no_fat_chain, dir_data_length, total_slots, &first_sector, &first_slot)) return false;
+	if (!exfat_find_free_slot_run(dir_cluster, dir_no_fat_chain, dir_data_length, total_slots, &first_sector, &first_slot))
+	{
+		bool nfc = dir_no_fat_chain;
+		uint grown_len = 0;
+		if (!exfat_extend_dir(dir_cluster, &nfc, dir_data_length, dir_is_root, dir_locs, &grown_len)) return false;
+		if (!exfat_find_free_slot_run(dir_cluster, nfc, grown_len, total_slots, &first_sector, &first_slot)) return false;
+	}
 
 	for (int k = 0; k < total_slots; k++)
 	{
@@ -1403,8 +1588,9 @@ fn int exfat_write(char* name, char* src, uint len)
 	if (!exfat_writes_ok) return -1;
 	if (len > exfat_cluster_size_bytes()) return -1;
 
-	uint dir_cluster; bool dir_no_fat_chain; uint dir_data_length;
-	if (!exfat_resolve_dir(name, &dir_cluster, &dir_no_fat_chain, &dir_data_length)) return -1;
+	uint dir_cluster; bool dir_no_fat_chain; uint dir_data_length; bool dir_is_root;
+	Exfat_set_locs dir_locs;
+	if (!exfat_resolve_dir_located(name, &dir_cluster, &dir_no_fat_chain, &dir_data_length, &dir_locs, &dir_is_root)) return -1;
 	char* leaf = exfat_leaf_name(name);
 	if (leaf[0] == 0) return -1;
 
@@ -1443,7 +1629,7 @@ fn int exfat_write(char* name, char* src, uint len)
 	{
 		char[EXFAT_SET_BYTES_MAX] set_bytes @noinit;
 		int total_slots = exfat_build_set(&set_bytes, &leaf16, leaf_len, (ushort)EXFAT_ATTR_ARCHIVE, new_cluster, len, true);
-		if (!exfat_place_set(dir_cluster, dir_no_fat_chain, dir_data_length, &set_bytes, total_slots))
+		if (!exfat_place_set(dir_cluster, dir_no_fat_chain, dir_data_length, dir_is_root, &dir_locs, &set_bytes, total_slots))
 		{
 			if (new_cluster != 0) exfat_free_cluster(new_cluster);
 			return -1;
@@ -1493,8 +1679,9 @@ fn int exfat_mkdir(char* path)
 {
 	if (!exfat_writes_ok) return -1;
 
-	uint parent_cluster; bool parent_nfc; uint parent_data_length;
-	if (!exfat_resolve_dir(path, &parent_cluster, &parent_nfc, &parent_data_length)) return -1;
+	uint parent_cluster; bool parent_nfc; uint parent_data_length; bool parent_is_root;
+	Exfat_set_locs parent_locs;
+	if (!exfat_resolve_dir_located(path, &parent_cluster, &parent_nfc, &parent_data_length, &parent_locs, &parent_is_root)) return -1;
 	char* leaf = exfat_leaf_name(path);
 	if (leaf[0] == 0) return -1;
 
@@ -1515,7 +1702,7 @@ fn int exfat_mkdir(char* path)
 
 	char[EXFAT_SET_BYTES_MAX] set_bytes @noinit;
 	int total_slots = exfat_build_set(&set_bytes, &leaf16, leaf_len, (ushort)EXFAT_ATTR_DIRECTORY, new_cluster, exfat_cluster_size_bytes(), true);
-	if (!exfat_place_set(parent_cluster, parent_nfc, parent_data_length, &set_bytes, total_slots))
+	if (!exfat_place_set(parent_cluster, parent_nfc, parent_data_length, parent_is_root, &parent_locs, &set_bytes, total_slots))
 	{
 		exfat_free_cluster(new_cluster);
 		return -1;
@@ -1661,9 +1848,9 @@ fn int exfat_delete_recursive(char* name)
 // file," same order fat32_rename uses. No overwrite (destination must
 // not already exist). Refuses moving a directory into its own subtree
 // (exfat_subtree_contains, below — exFAT directories have no ".." to
-// walk up, so this walks *down* from the source instead). No directory-
-// extension: if the destination directory's cluster is full the rename
-// fails, same limit exfat_write/exfat_mkdir already have.
+// walk up, so this walks *down* from the source instead). A full
+// destination directory grows a cluster (exfat_place_set / exfat_extend_
+// dir), same as exfat_write / exfat_mkdir.
 fn bool exfat_subtree_contains(uint ancestor_cluster, bool ancestor_nfc, uint ancestor_dl, uint target_cluster, int depth)
 {
 	if (depth >= EXFAT_MAX_DELETE_DEPTH) return true; // too deep to be sure — refuse the rename
@@ -1708,8 +1895,9 @@ fn int exfat_rename(char* old_path, char* new_path)
 	if (src_locs.count > EXFAT_MAX_SET_SLOTS) return -1;
 	if (fs_is_protected_entry(src_locs.sector[0], src_locs.slot[0] * EXFAT_DIRENT_SIZE)) return -1;
 
-	uint new_dir; bool new_dir_nfc; uint new_dir_dl;
-	if (!exfat_resolve_dir(new_path, &new_dir, &new_dir_nfc, &new_dir_dl)) return -1;
+	uint new_dir; bool new_dir_nfc; uint new_dir_dl; bool new_dir_is_root;
+	Exfat_set_locs new_dir_locs;
+	if (!exfat_resolve_dir_located(new_path, &new_dir, &new_dir_nfc, &new_dir_dl, &new_dir_locs, &new_dir_is_root)) return -1;
 	char* new_leaf = exfat_leaf_name(new_path);
 	if (new_leaf[0] == 0) return -1;
 	if (fs_is_protected_name(new_leaf)) return -1; // never let a rename mint the protected name
@@ -1730,7 +1918,7 @@ fn int exfat_rename(char* old_path, char* new_path)
 
 	char[EXFAT_SET_BYTES_MAX] set_bytes @noinit;
 	int total_slots = exfat_build_set(&set_bytes, &new16, new_len, src_attr, src_fc, src_dl, src_nfc);
-	if (!exfat_place_set(new_dir, new_dir_nfc, new_dir_dl, &set_bytes, total_slots)) return -1;
+	if (!exfat_place_set(new_dir, new_dir_nfc, new_dir_dl, new_dir_is_root, &new_dir_locs, &set_bytes, total_slots)) return -1;
 
 	// Destination entry is in place and points at the data — now the
 	// source name can go. A failure here leaves a harmless duplicate

@@ -35,6 +35,10 @@ fn void thread_body(void* arg) {
     exit();
 }
 
+// exfatgrow's listing buffer — global for the same stack-budget reason
+// bigread_buf above is (FS_LIST_ENTRY_SIZE * a generous entry count).
+char[40 * 36] exfatgrow_listbuf;
+
 // racetest: two threads (true concurrency at the IPC level — both share
 // this process's memory and can genuinely interleave mid-send) message
 // echod at once. Before SYS_IPC_SEND was hardened into a rendezvous, a
@@ -221,6 +225,75 @@ fn void main() {
                 print("cycletest: ok\n");
             } else {
                 print("cycletest: FAILED\n");
+            }
+        } else if (strcmp(cmd, "exfatgrow") == 0) {
+            // exFAT directory extension (exfat_extend_dir): a fresh
+            // directory starts as one NoFatChain cluster (~42 short-
+            // named entry sets). Create 64 subdirectories in one, which
+            // forces at least one grow — the first converts it to a real
+            // FAT chain, rewriting its own DataLength / NoFatChain flag
+            // in its parent (root) entry set. Proof it worked:
+            //   - all 64 fs_mkdir succeed (a directory that couldn't
+            //     grow would start returning -1 around the 42nd);
+            //   - a marker file written into the LAST-created child
+            //     reads back — that child's entry set only exists in the
+            //     grown directory's second cluster, so the cursor walk
+            //     had to follow the new chain link to find it;
+            //   - a nested mkdir into that same late child succeeds;
+            //   - fs_list returns a full reply (>= 30 records).
+            // Cleanup is one fs_delete_recursive, which now walks a
+            // multi-cluster directory. Only meaningful with an exFAT
+            // root (scripts/launch64_exfat.sh); on FAT32/ext2 it just
+            // re-exercises their own long-standing directory growth.
+            const int XG_N = 64;
+            int xg_parent = fs_mkdir("xg");
+            int xg_made = 0;
+            for (int xgk = 0; xgk < XG_N; xgk++) {
+                char[24] xgp @noinit;
+                char* xgpfx = "xg/d";
+                int xgi = 0;
+                while (xgpfx[xgi] != 0) { xgp[xgi] = xgpfx[xgi]; xgi++; }
+                int xgd = fmt::format_uint((uint)xgk, &xgp[xgi]);
+                xgp[xgi + xgd] = 0;
+                if (fs_mkdir(&xgp) == 0) xg_made++;
+            }
+            int xg_marker_write = fs_write("xg/d63/marker.txt", "grew\n", 5);
+            char[16] xg_buf @noinit;
+            int xg_marker_read = fs_read("xg/d63/marker.txt", &xg_buf, 16);
+            int xg_nested = fs_mkdir("xg/d63/sub");
+            int xg_list = fs_list("xg", &exfatgrow_listbuf, 40);
+            int xg_cleanup = fs_delete_recursive("xg");
+            int xg_gone = fs_read("xg/d63/marker.txt", &xg_buf, 16);
+            if (xg_parent == 0 && xg_made == XG_N && xg_marker_write == 5
+                && xg_marker_read == 5 && xg_nested == 0 && xg_list >= 30
+                && xg_cleanup == 0 && xg_gone < 0) {
+                print("exfatgrow: ok\n");
+            } else {
+                print("exfatgrow: FAILED\n");
+            }
+        } else if (strcmp(cmd, "exfatgrowkeep") == 0) {
+            // Same fill as exfatgrow but WITHOUT the cleanup — leaves a
+            // real multi-cluster directory on disk so a host fsck.exfat
+            // on the booted image can confirm the grown layout (chain,
+            // DataLength, sealed tail slots) is spec-clean. Re-run needs
+            // a pristine image (launch64_exfat.sh already boots a
+            // throwaway copy).
+            int xk_parent = fs_mkdir("xgk");
+            int xk_made = 0;
+            for (int xkk = 0; xkk < 64; xkk++) {
+                char[24] xkp @noinit;
+                char* xkpfx = "xgk/d";
+                int xki = 0;
+                while (xkpfx[xki] != 0) { xkp[xki] = xkpfx[xki]; xki++; }
+                int xkd = fmt::format_uint((uint)xkk, &xkp[xki]);
+                xkp[xki + xkd] = 0;
+                if (fs_mkdir(&xkp) == 0) xk_made++;
+            }
+            int xk_w = fs_write("xgk/d63/marker.txt", "kept\n", 5);
+            if (xk_parent == 0 && xk_made == 64 && xk_w == 5) {
+                print("exfatgrowkeep: ok\n");
+            } else {
+                print("exfatgrowkeep: FAILED\n");
             }
         } else if (strcmp(cmd, "lfntest") == 0) {
             // Proves real VFAT long-filename (LFN) support in fat32.c3:

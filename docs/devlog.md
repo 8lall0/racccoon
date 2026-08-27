@@ -4,6 +4,94 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-27 (continued) — exFAT: directory extension (grow past one cluster)
+
+Closes the last deliberate exFAT write-path limit: a directory this
+driver creates used to be one `NoFatChain` cluster forever (~42 short-
+named entry sets), and once full it rejected every `create` / `mkdir` /
+`mv`-into-it with `-1`. Now `exfat_place_set`, when none of a directory's
+current clusters has a free slot run, grows it a cluster
+(`exfat_extend_dir`) and retries.
+
+**Three directory shapes, one grow path:**
+
+- **root** — always FAT-chained, no entry set of its own: walk the chain
+  to its end, link a fresh cluster, done. `exfat_resolve_dir_located`
+  reports `is_root`, and the entry fixup below is skipped.
+- **FAT-chained subdirectory** (root's shape, or one a previous grow
+  already converted) — same chain link, plus bump `DataLength` /
+  `ValidDataLength` in its own entry set so the on-disk size stays honest
+  for `fsck` / Windows.
+- **`NoFatChain` (contiguous) subdirectory** — convert to a real FAT
+  chain: write links across every existing cluster and the new one, then
+  clear the `NoFatChain` flag and bump `DataLength` in its entry set
+  (`exfat_grow_dir_entry`, SetChecksum recomputed over the whole set). It
+  can't revert to contiguous, which is fine — nothing here needs a
+  directory to be `NoFatChain`.
+
+To reach a non-root directory's own entry set (it lives in the *parent*),
+`exfat_resolve_dir` grew a sibling `exfat_resolve_dir_located` that also
+hands back that entry's `Exfat_set_locs` and an `is_root` flag; the plain
+form is now a one-line wrapper, and only the three write-placement
+callers (`exfat_write` new-file branch, `exfat_mkdir`, `exfat_rename`
+destination) use the fuller one.
+
+**The bug the first test run caught.** `made=64` (all 64 `mkdir`s into one
+directory succeeded — a non-growing directory would have stopped at ~42),
+but writing *into* the 64th child failed, and so did a nested `mkdir`
+there. Cause: a 4KB cluster is 128 slots, entry sets are 3+ slots, so the
+last set never lands flush — the first cluster keeps 1-2 trailing
+`0x00` slots. exFAT's `0x00` means "end of this directory, and every
+later cluster too", so every reader's cursor walk stopped at that gap and
+never reached the second cluster. Deleted entries (`0x05` / `0x40` /
+`0x41`) don't have this problem — only never-used `0x00` does. Fix:
+`exfat_seal_dir_cluster` rewrites the trailing `0x00` slots of the
+cluster being extended as `EXFAT_ENTRY_FILLER` (`0x41`, a deleted File
+Name entry — still "free" to every slot scan, no longer the end marker)
+before the new cluster is linked; the freshly-zeroed new cluster becomes
+the directory's one real end marker. This also fixed a silent cluster
+leak in `rm -r` of a grown directory (`exfat_free_tree`'s own walk hit
+the same wall).
+
+**Verification** — two new `shell_test` builtins, exFAT root only
+(`scripts/launch64_exfat.sh`):
+
+- `exfatgrow` — `mkdir` 64 subdirectories in a fresh directory (forces
+  ≥1 grow + the `NoFatChain`→chain conversion), write a marker into the
+  last-created child and read it back (proves the cursor follows the new
+  chain link), nested `mkdir` into that child, `fs_list` returns a full
+  reply, then `fs_delete_recursive` the whole thing (walks the multi-
+  cluster directory). `exfatgrow: ok`. `fsck.exfat` on the booted
+  `disk_exfat.run.img` afterwards: clean, back to the fixture's 4 dirs /
+  15 files.
+- `exfatgrowkeep` — same fill, no cleanup, so a host `fsck.exfat` sees a
+  real on-disk multi-cluster directory: **clean, directories 69, files
+  16** (the chain, `DataLength`, sealed tail slots all spec-valid).
+- Pre-existing exFAT ops (`cat`, `write`+`cat`, `mkdir`+nested `write`,
+  file `mv`, directory `mv`, `rm -r`) via `/bin/*` still clean, `fsck`
+  clean.
+
+**Full regression, all four launch scripts** (fresh `scripts/build.sh`,
+each `launch64*.sh` once — `mtools` installed mid-session so the FAT32
+fixture builds again):
+
+- **`launch64.sh` (FAT32)** — `write`+`cat` round-trip, `mkdir`+nested
+  `write`, file `mv`, directory `mv`, `rm -r`; `fsck.fat` clean.
+- **`launch64_ext2.sh`** — same sequence, `e2fsck -f` clean.
+- **`launch64_dual.sh`** — both ext2 filesystems mount, `bigreadtest:
+  ok`, `write`/`mv`/`rm` on `/mnt/fs2/`; `e2fsck -f` clean.
+- **`launch64_exfat.sh`** — `exfatgrow: ok`, `exfatgrowkeep: ok`, plus
+  the standard write/`mv`/`rm -r` sequence; `fsck.exfat` clean (69 dirs
+  with the grown directory kept, back to 4 after cleanup).
+
+Build note unchanged: `scripts/build.sh` still hardcodes
+`/opt/riscv/bin/ld.lld`, so this host needs `LLVM_LLD=/usr/bin/ld.lld
+LLC=/usr/bin/llc LLVM_OBJCOPY=/usr/bin/llvm-objcopy` in front of it.
+
+**Files changed:** `user/fs/exfat.c3`, `user/shell_test.c3`.
+
+---
+
 ## 2026-08-27 (continued) — launch64*.sh boot a throwaway disk copy
 
 Full-`build.sh` + boot-test pass turned up a false alarm: `mv /wtest.txt
