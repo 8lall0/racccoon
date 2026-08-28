@@ -315,15 +315,28 @@ Generation counters back most of the stale-reference handling:
      the whole send → recv-reply round-trip in the kernel and aborts
      cleanly if the target dies at any point (also retires `p9_call`'s
      `P9_STRAY` bounce dance). Touches every 9P client wrapper.
-2. **A `svc` / `init` supervisor.** A userspace process (or the kernel's
-   respawn loop generalised) holding a table of
-   `{binary, name, restart-policy}`; `SYS_JOIN` on each server, re-`exec`
-   on exit. Plan 9-flavoured: a small `/bin/init` that owns the tree.
+2. **A supervisor. DONE (first pass)** — commit `7b5b97c`.
+   `src/supervisor.c3`: a `Service` table registered from `kernel_main`,
+   `supervisor_tick()` from the timer trap (~1/s) respawns any exited
+   server, updates its `*_pid` global, and `reseat_namespace_mounts()`
+   re-points every live process's mounts at the replacement. Restart
+   cap 5. `fsdkilltest` in `shell_test.c3`. **Only fsd/fsd2/procd/envd**
+   — the device drivers need MMIO/DMA re-mapping + carry hardcoded-pid
+   conventions (`fsd.c3`'s `DISKD_PID=3`), and echod's pid 2 is
+   hardcoded in the shell's `ping`. Extending to those means first
+   removing the pid hardcodes (name-resolution instead) and verifying
+   each driver's bring-up is idempotent on a respawn.
+   - Kernel-side, not a userspace `/bin/init`: the servers' privileged
+     setup (`setup_*_mappings`) is kernel-only, and the binaries are
+     embedded in the kernel image, not on disk — a userspace init would
+     need "servers live in the filesystem" + a "grant me device access"
+     syscall first. Revisit once §1 (file structure) lands.
 3. **Client re-attach contract.** Document that a `p9_*` op returning −1
    means "re-`attach` and re-`walk`"; the shell / libraries do this
    transparently. `ns_resolve` already returns the *new* pid after a
-   supervised respawn, so this is a client-library change, not a kernel
-   one.
+   supervised respawn (the reseat above makes it transparent for the
+   simple attach-walk-read-clunk-per-call path — `fsdkilltest` proves
+   it), so this only matters for a client holding a long-lived fid.
 4. **State policy per server.** Respawned servers come up empty.
    `fsd`: fine, re-reads from disk. `envd`: holds per-process env —
    either persist it to a file under `/usr/$user/lib` or accept the

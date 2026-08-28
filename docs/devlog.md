@@ -4,6 +4,51 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-29 (continued) — resiliency: boot-server supervisor
+
+`docs/roadmap.md` §5.2. A crashed server used to stay dead — the kernel
+only ever respawned the shell, and only when nothing was runnable.
+
+**`src/supervisor.c3`** (`7b5b97c`): a `Service` table (fsd, fsd2,
+procd, envd), registered from `kernel_main` right after each server
+spawns. `supervisor_tick()` runs once per timer tick (~1/s) from
+`handle_trap`'s `SCAUSE_SUPERVISOR_TIMER` case — **not** the idle loop,
+because idle is starved whenever any process stays permanently
+`PROC_RUNNABLE` (usbd on the Duo, netd's link poll on QEMU). On a
+server's death (`proc_by_pid` mismatch on pid+generation):
+
+- `create_process()` + `setup_fsd_mappings()` for fsd/fsd2,
+- update the `*_pid` global `create_process()`'s namespace seeding
+  reads (so *new* processes get the right pid),
+- `reseat_namespace_mounts()` — walk every live process, re-point any
+  namespace mount that named the dead instance, so already-booted
+  processes pick up the replacement on their next `ns_resolve()`,
+- restart cap 5, then give up + log.
+
+**Only the pure-IPC / trivial-setup servers.** Device drivers need
+MMIO/DMA re-mapping and some carry hardcoded-pid conventions
+(`fsd.c3`'s `DISKD_PID=3`); echod's pid 2 is baked into the shell's
+`ping`. Kernel-side rather than a userspace `/bin/init` because the
+privileged `setup_*_mappings` is kernel-only and the server binaries
+are embedded in the kernel image, not on disk.
+
+**Bug found:** `io::print` faults inside the timer trap (`No method
+'write_byte'` — the std::io output target isn't wired up in that
+context, and the panic printer then fails the same way → "Panic inside
+of panic"). The supervisor writes straight to the console via
+`board::console_putchar`.
+
+**Verified QEMU:** new `fsdkilltest` — `kill` fsd outright →
+`svc: respawned fsd` → `fsd: FAT32 mounted` → the shell's `fs_read`
+works again *through the healed mount, without the client re-mounting
+anything*. Full p9/ipc/fs regression (`ipcdeathtest` / `p9fstest` /
+`p9fswritetest` / `mounttest` / `srvtest` / `hotplugtest` / `killtest` /
+`threadjointest` / `mutextest` / `racetest` / `envtest` / `runtest` /
+`fswriteat`) unchanged. Real Duo: clean boot, no spurious respawns,
+`ls` + `cat`.
+
+---
+
 ## 2026-08-29 (continued) — resiliency: IPC rendezvous no longer hangs on peer death
 
 First slice of `docs/roadmap.md` §5. The IPC rendezvous had no failure
