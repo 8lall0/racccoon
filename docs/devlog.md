@@ -63,6 +63,12 @@ Verified QEMU: `srvtest` / `nstest` / `threadjointest` (99) /
 `cat`. `p9fstest` / `mounttest` / `hardentest` fail — identically on
 pre-change `38d619a`, so pre-existing (unrelated).
 
+**`hardentest` fixed** (`20d88ab`) — it wasn't a kernel bug. The test
+called `syscall(31, …)` as its "unrecognized number," but 31/32/33
+(`SYS_KBD_PUSH` etc.) were added since, so that was a valid
+`SYS_KBD_PUSH` (push a NUL keystroke) returning 0. The `default:` case
+denied unknown syscalls correctly all along. Now uses `999`.
+
 ---
 
 ## 2026-08-28 (continued) — user: shared mmio/hex/panic helpers
