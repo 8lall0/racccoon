@@ -433,6 +433,345 @@ struct Trap_frame @packed
 	ulong sp;
 }
 
+// Extracted from handle_syscall's SYS_KILL case (2026-08-28 probe of
+// the c3c switch-call landmine — see the case site). Kills an
+// arbitrary target process: the write half of /proc/<pid>/ctl
+// (user/procd.c3). Permission: root (uid 0) kills anyone, else only
+// a same-uid caller — and only a *direct* SYS_KILL; procd is root so
+// its own ctl handler re-checks the real requester first. a1 =
+// expected generation (0 = wildcard), same stale-slot guard as
+// SYS_JOIN. Known gap: a process blocked waiting on the target
+// stays blocked forever (same as SYS_IPC_SEND's stale-pid gap).
+fn void sys_kill(Trap_frame* f) @noinline
+{
+	int kill_pid = (int)f.a0;
+	uint kill_expected_generation = (uint)f.a1;
+	if (kill_pid == current_proc.pid)
+	{
+		// Same self-deadlock-shaped reasoning as SYS_JOIN's
+		// own self-check, though the failure mode here is
+		// different (this would tear down the very page
+		// table the code performing the teardown is running
+		// under) — reject; SYS_EXIT already exists for
+		// killing yourself.
+		f.a0 = (ulong)(-1);
+		return;
+	}
+	Process* kill_target = proc_by_pid(kill_pid);
+	if (kill_target == null || (kill_expected_generation != 0 && kill_target.generation != kill_expected_generation))
+	{
+		f.a0 = (ulong)(-1);
+		return;
+	}
+	if (current_proc.uid != 0 && current_proc.uid != kill_target.uid)
+	{
+		f.a0 = (ulong)(-1);
+		return;
+	}
+
+	// Leak-safety half of blocking_depth's own fix
+	// (process.c3): this kill tears kill_target down regardless
+	// of what it was doing (the same "any other process
+	// currently blocked... is left blocked forever" gap this
+	// case already accepts, just below) — without this, a
+	// target killed while genuinely mid one of the blocking
+	// waits that incremented blocking_depth would leak that
+	// increment permanently. blocking_depth is only ever
+	// consulted by fork_entry()'s own check now (not
+	// kernel_entry's shared tail — see blocking_depth's own
+	// comment for why not), so a leak here wouldn't wedge the
+	// whole system, just make every future freshly-rfork()'d
+	// child's own first sret conservatively start with
+	// interrupts off — still worth closing cleanly rather than
+	// leaving an ever-growing counter. kill_target.in_blocking_wait
+	// isn't reset here: the slot is about to become PROC_UNUSED
+	// and gets explicitly reset on its next reuse (SYS_RFORK's
+	// own child.in_blocking_wait = false, create_process()'s
+	// equivalent).
+	if (kill_target.in_blocking_wait) blocking_depth--;
+
+	// Same page-table-teardown-if-not-shared logic as
+	// SYS_EXIT above, just targeting kill_target instead of
+	// current_proc — see that case's own comment for the
+	// full reasoning (shared-table rfork(RFPROC|RFMEM)
+	// siblings, the 3-level Sv39 walk, etc.). Inlined for the
+	// same reason SYS_EXIT is: a call out to a moderately
+	// complex function from inside this switch has
+	// reproducibly broken boot before.
+	bool kill_table_shared = false;
+	for (int kshare_i = 0; kshare_i < PROCS_MAX; kshare_i++)
+	{
+		if (&procs[kshare_i] == kill_target) continue;
+		if (procs[kshare_i].state == PROC_UNUSED) continue;
+		if (procs[kshare_i].page_table == kill_target.page_table)
+		{
+			kill_table_shared = true;
+			break;
+		}
+	}
+
+	if (!kill_table_shared)
+	{
+		ulong* kill_table2 = kill_target.page_table;
+		for (uint kvpn2 = 0; kvpn2 < 512; kvpn2++)
+		{
+			if ((kill_table2[kvpn2] & PAGE_V) == 0) continue;
+			ulong* kill_table1 = (ulong*)pte_to_paddr(kill_table2[kvpn2]);
+
+			for (uint kvpn1 = 0; kvpn1 < 512; kvpn1++)
+			{
+				if ((kill_table1[kvpn1] & PAGE_V) == 0) continue;
+				ulong* kill_table0 = (ulong*)pte_to_paddr(kill_table1[kvpn1]);
+
+				for (uint kvpn0 = 0; kvpn0 < 512; kvpn0++)
+				{
+					if ((kill_table0[kvpn0] & PAGE_V) == 0) continue;
+					if (kill_table0[kvpn0] & PAGE_U)
+					{
+						uptr kill_leaf_paddr = pte_to_paddr(kill_table0[kvpn0]);
+						free_pages(kill_leaf_paddr, 1);
+					}
+				}
+
+				free_pages((uptr)kill_table0, 1);
+			}
+
+			free_pages((uptr)kill_table1, 1);
+		}
+		free_pages((uptr)kill_table2, 1);
+	}
+
+	kill_target.state = PROC_UNUSED;
+	kill_target.pid = 0;
+	f.a0 = 0;
+}
+
+// exec()/exit() teardown: frees every page this process's table owns
+// (PAGE_U leaves + the on-demand 2nd/3rd-level tables + the root),
+// unless an rfork(RFPROC|RFMEM) sibling still shares the same
+// page_table pointer. Then marks the slot PROC_UNUSED and yield()s,
+// which never returns (the scan can't pick a PROC_UNUSED self).
+// (Was inlined in handle_syscall as a c3c-0.8.2 landmine workaround;
+// 0.8.3 probe 2026-08-28 showed the extraction is safe now.)
+fn void sys_exit() @noinline
+{
+		bool exit_table_shared = false;
+		for (int share_i = 0; share_i < PROCS_MAX; share_i++)
+		{
+			if (&procs[share_i] == current_proc) continue;
+			if (procs[share_i].state == PROC_UNUSED) continue;
+			if (procs[share_i].page_table == current_proc.page_table)
+			{
+				exit_table_shared = true;
+				break;
+			}
+		}
+
+		if (!exit_table_shared)
+		{
+			ulong* exiting_table2 = current_proc.page_table;
+			for (uint vpn2 = 0; vpn2 < 512; vpn2++)
+			{
+				if ((exiting_table2[vpn2] & PAGE_V) == 0) continue;
+				ulong* table1 = (ulong*)pte_to_paddr(exiting_table2[vpn2]);
+
+				for (uint vpn1 = 0; vpn1 < 512; vpn1++)
+				{
+					if ((table1[vpn1] & PAGE_V) == 0) continue;
+					ulong* table0 = (ulong*)pte_to_paddr(table1[vpn1]);
+
+					for (uint vpn0 = 0; vpn0 < 512; vpn0++)
+					{
+						if ((table0[vpn0] & PAGE_V) == 0) continue;
+						if (table0[vpn0] & PAGE_U)
+						{
+							uptr leaf_paddr = pte_to_paddr(table0[vpn0]);
+							free_pages(leaf_paddr, 1);
+						}
+					}
+
+					free_pages((uptr)table0, 1);
+				}
+
+				free_pages((uptr)table1, 1);
+			}
+			free_pages((uptr)exiting_table2, 1);
+		}
+
+		current_proc.state = PROC_UNUSED;
+		current_proc.pid = 0;
+
+		// yield() never returns here: current_proc is now PROC_UNUSED,
+		// so its scan can't match itself, and switch_context's `ret`
+		// jumps permanently into whatever process it picks instead.
+		yield();
+}
+
+// rfork(): the RFPROC (new process) / RFMEM (share address space =
+// thread) primitive. RFMEM -> child.page_table aliases the parent's;
+// otherwise a fresh root table + a byte-for-byte copy of every PAGE_U
+// leaf. Namespace is always copied. The child's first-resume state is
+// a copy of this trap frame (a0=0) plus sepc as a 32nd word, consumed
+// by fork_entry() (process.c3). Returns the child pid to the parent.
+fn void sys_rfork(Trap_frame* f) @noinline
+{
+		int rfork_flags = (int)f.a0;
+		uint* rfork_gen_out_check = (uint*)(uptr)f.a1;
+		if ((rfork_flags & RFPROC) == 0
+			|| (rfork_gen_out_check != null && !user_range_valid(current_proc.page_table, (uptr)rfork_gen_out_check, 4, true)))
+		{
+			f.a0 = (ulong)(-1);
+			return;
+		}
+
+		Process* child = null;
+		int child_i;
+		for (child_i = 0; child_i < PROCS_MAX; child_i++)
+		{
+			if (procs[child_i].state == PROC_UNUSED)
+			{
+				child = &procs[child_i];
+				break;
+			}
+		}
+		if (!child)
+		{
+			f.a0 = (ulong)(-1);
+			return;
+		}
+
+		if (rfork_flags & RFMEM)
+		{
+			// True sharing: same root table pointer, so every mapping
+			// either process makes or already has is visible to
+			// both — this is what makes it a "thread" rather than a
+			// process. SYS_EXIT's own free loop above has a guard
+			// specifically for this case.
+			child.page_table = current_proc.page_table;
+		}
+		else
+		{
+			// Independent copy: fresh root table, same kernel-range +
+			// PLIC identity mapping create_process always does, then
+			// every PAGE_U leaf in the parent's table gets a fresh
+			// physical page with a byte-for-byte copy, mapped at the
+			// same vaddr with the same flags — map_page() allocates
+			// the child's own intermediate (2nd/3rd level) tables on
+			// demand as each leaf is mapped, exactly like
+			// create_process already relies on, so this walk only
+			// needs to find the parent's leaves and their flags, not
+			// manage the child's table structure itself. Same walk
+			// shape as SYS_EXIT's free loop above (now 3 levels for
+			// Sv39, not 2), copy instead of free.
+			ulong* child_table = (ulong*)alloc_pages(1);
+			for (uptr paddr = (uptr)&__kernel_map_base; paddr < (uptr)&__free_ram_end; paddr += PAGE_SIZE)
+			{
+				map_page(child_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+			}
+			map_device_page(child_table, board::PLIC_PRIORITY_PAGE, board::PLIC_PRIORITY_PAGE, PAGE_R | PAGE_W);
+			map_device_page(child_table, board::PLIC_ENABLE_PAGE, board::PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
+			map_device_page(child_table, board::PLIC_CLAIM_PAGE, board::PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
+
+			ulong* parent_table2 = current_proc.page_table;
+			for (uint vpn2 = 0; vpn2 < 512; vpn2++)
+			{
+				if ((parent_table2[vpn2] & PAGE_V) == 0) continue;
+				ulong* parent_table1 = (ulong*)pte_to_paddr(parent_table2[vpn2]);
+
+				for (uint vpn1 = 0; vpn1 < 512; vpn1++)
+				{
+					if ((parent_table1[vpn1] & PAGE_V) == 0) continue;
+					ulong* parent_table0 = (ulong*)pte_to_paddr(parent_table1[vpn1]);
+
+					for (uint vpn0 = 0; vpn0 < 512; vpn0++)
+					{
+						if ((parent_table0[vpn0] & PAGE_V) == 0) continue;
+						if ((parent_table0[vpn0] & PAGE_U) == 0) continue;
+
+						uptr parent_leaf_paddr = pte_to_paddr(parent_table0[vpn0]);
+						uptr child_leaf_paddr  = alloc_pages(1);
+						mem::copy((void*)child_leaf_paddr, (void*)parent_leaf_paddr, (sz)PAGE_SIZE);
+
+						uptr child_vaddr  = ((uptr)vpn2 << 30) | ((uptr)vpn1 << 21) | ((uptr)vpn0 << 12);
+						uint parent_flags = (uint)(parent_table0[vpn0] & 0x1f); // V|R|W|X|U — see page.c3's map_page encoding
+						map_page(child_table, child_vaddr, child_leaf_paddr, parent_flags);
+					}
+				}
+			}
+			child.page_table = child_table;
+		}
+
+		// Namespace: always copied, regardless of RFMEM — cheap
+		// (4 x Mount), and there's no mount/unmount syscall yet to
+		// make "shared" vs. "copied" observably different. The seam
+		// a future RFNAMEG-equivalent would slot into.
+		for (int ns_i = 0; ns_i < NS_MOUNTS_MAX; ns_i++)
+		{
+			child.namespace[ns_i] = current_proc.namespace[ns_i];
+		}
+
+		// Build the child's first-resume state: a copy of this
+		// trap's own Trap_frame (a0 zeroed — the child's return
+		// value), plus this trap's own resume address as an extra
+		// 32nd word, since sepc is a single CSR fork_entry can't
+		// otherwise inherit. See fork_entry's own comment in
+		// process.c3 for how this block gets consumed. 32 words of
+		// 8 bytes now (Sv64 port), not 4.
+		uptr* child_sp = (uptr*)&child.stack;
+		child_sp += STACK_SIZE / 8;
+		child_sp -= 32;
+
+		mem::copy((void*)child_sp, f, (sz)Trap_frame::size);
+		Trap_frame* child_frame = (Trap_frame*)child_sp;
+		child_frame.a0 = 0;
+		child_sp[31] = (uptr)(read_reg("sepc") + 4);
+
+		for (int rf_j = 0; rf_j < 12; rf_j++)
+		{
+			*(--child_sp) = 0;
+		}
+		*(--child_sp) = (uptr)&fork_entry;
+
+		child.has_message = false;
+		// Same reused-slot reasoning as has_message above — a
+		// previous occupant of this slot could have been killed
+		// while genuinely mid a blocking wait (SYS_KILL's own
+		// leak-safety check, below in this same file, only cleans up
+		// blocking_depth itself, not this per-process flag). See
+		// Process.in_blocking_wait's own comment (process.c3).
+		child.in_blocking_wait = false;
+		child.pid   = child_i + 1;
+		child.generation++;
+		child.sp    = (uptr)child_sp;
+		child.state = PROC_RUNNABLE;
+		// Unlike create_process() (always 0 — see Process.parent_pid's
+		// own comment, process.c3), rfork's own child genuinely does
+		// have a parent: this forking process, right now. Captured
+		// for SYS_PARENT_INFO below, built for user/envd.c3's own
+		// lazy env-inheritance but open to any caller, same reasoning
+		// as SYS_PROC_INFO's own comment.
+		child.parent_pid = current_proc.pid;
+		child.parent_generation = current_proc.generation;
+		// Inherited unchanged — the only way it ever changes is
+		// SYS_SETUID, which the child can call on itself just like
+		// any other process (see that case's own comment).
+		child.uid = current_proc.uid;
+
+		// Optional out-pointer (a1), same "null means don't care"
+		// convention as SYS_IPC_RECV's type_out — lets the caller
+		// capture this child's generation for a later SYS_JOIN to
+		// check against, so a join can tell "this pid exited" apart
+		// from "this pid got reused by something else." generation
+		// itself stays a plain uint (a counter, not an address).
+		uint* rfork_gen_out = (uint*)(uptr)f.a1;
+		if (rfork_gen_out != null)
+		{
+			*rfork_gen_out = child.generation;
+		}
+
+		f.a0 = (ulong)child.pid;
+}
+
 fn void handle_syscall(Trap_frame* f) @noinline
 {
 	switch (f.a3)
@@ -459,82 +798,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			current_proc.in_blocking_wait = false;
 			blocking_depth--;
 		case SYS_EXIT:
-			// Inlined rather than factored into a process.c3 function on
-			// purpose: a call to a moderately complex freshly-defined
-			// function from inside this switch (proc.c3's free_process_pages,
-			// taking Process*) reproducibly broke boot before even reaching
-			// SYS_EXIT at runtime — same unexplained-c3c-bug shape as the
-			// SYS_READFILE/WRITEFILE extraction below, just with a different
-			// parameter type this time, so it's not specifically about
-			// Trap_frame*. Not going to keep chasing it; inline is proven
-			// safe both times.
-			//
-			// Frees everything this process's page table owns: every leaf
-			// page mapped PAGE_U (its private image pages — never the
-			// shared kernel-identity or virtio-MMIO mappings, which lack
-			// PAGE_U precisely because they're not this process's own
-			// memory), every on-demand 2nd/3rd-level table map_page
-			// allocated for it, and the top-level table itself. Sv39: 3
-			// levels (table2/table1/table0), not RV32/Sv32's 2 — see
-			// page.c3.
-			//
-			// Skipped entirely if some other live process shares this
-			// exact page_table pointer — an rfork(RFPROC|RFMEM) sibling
-			// (see SYS_RFORK below). page_table pointers are never aliased
-			// any other way (every ordinary create_process call gets its
-			// own fresh alloc_pages(1) result), so this linear
-			// PROCS_MAX-sized scan is a correct, sufficient stand-in for a
-			// real refcount at this scale — no new field needed.
-			bool exit_table_shared = false;
-			for (int share_i = 0; share_i < PROCS_MAX; share_i++)
-			{
-				if (&procs[share_i] == current_proc) continue;
-				if (procs[share_i].state == PROC_UNUSED) continue;
-				if (procs[share_i].page_table == current_proc.page_table)
-				{
-					exit_table_shared = true;
-					break;
-				}
-			}
-
-			if (!exit_table_shared)
-			{
-				ulong* exiting_table2 = current_proc.page_table;
-				for (uint vpn2 = 0; vpn2 < 512; vpn2++)
-				{
-					if ((exiting_table2[vpn2] & PAGE_V) == 0) continue;
-					ulong* table1 = (ulong*)pte_to_paddr(exiting_table2[vpn2]);
-
-					for (uint vpn1 = 0; vpn1 < 512; vpn1++)
-					{
-						if ((table1[vpn1] & PAGE_V) == 0) continue;
-						ulong* table0 = (ulong*)pte_to_paddr(table1[vpn1]);
-
-						for (uint vpn0 = 0; vpn0 < 512; vpn0++)
-						{
-							if ((table0[vpn0] & PAGE_V) == 0) continue;
-							if (table0[vpn0] & PAGE_U)
-							{
-								uptr leaf_paddr = pte_to_paddr(table0[vpn0]);
-								free_pages(leaf_paddr, 1);
-							}
-						}
-
-						free_pages((uptr)table0, 1);
-					}
-
-					free_pages((uptr)table1, 1);
-				}
-				free_pages((uptr)exiting_table2, 1);
-			}
-
-			current_proc.state = PROC_UNUSED;
-			current_proc.pid = 0;
-
-			// yield() never returns here: current_proc is now PROC_UNUSED,
-			// so its scan can't match itself, and switch_context's `ret`
-			// jumps permanently into whatever process it picks instead.
-			yield();
+			sys_exit();
 		case SYS_IPC_SEND:
 			// Inline for the same reason as SYS_EXIT above — this is the
 			// pattern proven not to trigger the unexplained c3c reboot
@@ -947,165 +1211,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				*fs_is_secondary_out = current_proc.is_secondary_fs;
 			}
 		case SYS_RFORK:
-			// Inline for the same reason as every other case in this
-			// switch — see SYS_EXIT's comment. See process.c3's
-			// fork_entry() for how the child actually resumes, and
-			// docs/devlog.md for the full design rationale.
-			int rfork_flags = (int)f.a0;
-			uint* rfork_gen_out_check = (uint*)(uptr)f.a1;
-			if ((rfork_flags & RFPROC) == 0
-				|| (rfork_gen_out_check != null && !user_range_valid(current_proc.page_table, (uptr)rfork_gen_out_check, 4, true)))
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-
-			Process* child = null;
-			int child_i;
-			for (child_i = 0; child_i < PROCS_MAX; child_i++)
-			{
-				if (procs[child_i].state == PROC_UNUSED)
-				{
-					child = &procs[child_i];
-					break;
-				}
-			}
-			if (!child)
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-
-			if (rfork_flags & RFMEM)
-			{
-				// True sharing: same root table pointer, so every mapping
-				// either process makes or already has is visible to
-				// both — this is what makes it a "thread" rather than a
-				// process. SYS_EXIT's own free loop above has a guard
-				// specifically for this case.
-				child.page_table = current_proc.page_table;
-			}
-			else
-			{
-				// Independent copy: fresh root table, same kernel-range +
-				// PLIC identity mapping create_process always does, then
-				// every PAGE_U leaf in the parent's table gets a fresh
-				// physical page with a byte-for-byte copy, mapped at the
-				// same vaddr with the same flags — map_page() allocates
-				// the child's own intermediate (2nd/3rd level) tables on
-				// demand as each leaf is mapped, exactly like
-				// create_process already relies on, so this walk only
-				// needs to find the parent's leaves and their flags, not
-				// manage the child's table structure itself. Same walk
-				// shape as SYS_EXIT's free loop above (now 3 levels for
-				// Sv39, not 2), copy instead of free.
-				ulong* child_table = (ulong*)alloc_pages(1);
-				for (uptr paddr = (uptr)&__kernel_map_base; paddr < (uptr)&__free_ram_end; paddr += PAGE_SIZE)
-				{
-					map_page(child_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
-				}
-				map_device_page(child_table, board::PLIC_PRIORITY_PAGE, board::PLIC_PRIORITY_PAGE, PAGE_R | PAGE_W);
-				map_device_page(child_table, board::PLIC_ENABLE_PAGE, board::PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
-				map_device_page(child_table, board::PLIC_CLAIM_PAGE, board::PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
-
-				ulong* parent_table2 = current_proc.page_table;
-				for (uint vpn2 = 0; vpn2 < 512; vpn2++)
-				{
-					if ((parent_table2[vpn2] & PAGE_V) == 0) continue;
-					ulong* parent_table1 = (ulong*)pte_to_paddr(parent_table2[vpn2]);
-
-					for (uint vpn1 = 0; vpn1 < 512; vpn1++)
-					{
-						if ((parent_table1[vpn1] & PAGE_V) == 0) continue;
-						ulong* parent_table0 = (ulong*)pte_to_paddr(parent_table1[vpn1]);
-
-						for (uint vpn0 = 0; vpn0 < 512; vpn0++)
-						{
-							if ((parent_table0[vpn0] & PAGE_V) == 0) continue;
-							if ((parent_table0[vpn0] & PAGE_U) == 0) continue;
-
-							uptr parent_leaf_paddr = pte_to_paddr(parent_table0[vpn0]);
-							uptr child_leaf_paddr  = alloc_pages(1);
-							mem::copy((void*)child_leaf_paddr, (void*)parent_leaf_paddr, (sz)PAGE_SIZE);
-
-							uptr child_vaddr  = ((uptr)vpn2 << 30) | ((uptr)vpn1 << 21) | ((uptr)vpn0 << 12);
-							uint parent_flags = (uint)(parent_table0[vpn0] & 0x1f); // V|R|W|X|U — see page.c3's map_page encoding
-							map_page(child_table, child_vaddr, child_leaf_paddr, parent_flags);
-						}
-					}
-				}
-				child.page_table = child_table;
-			}
-
-			// Namespace: always copied, regardless of RFMEM — cheap
-			// (4 x Mount), and there's no mount/unmount syscall yet to
-			// make "shared" vs. "copied" observably different. The seam
-			// a future RFNAMEG-equivalent would slot into.
-			for (int ns_i = 0; ns_i < NS_MOUNTS_MAX; ns_i++)
-			{
-				child.namespace[ns_i] = current_proc.namespace[ns_i];
-			}
-
-			// Build the child's first-resume state: a copy of this
-			// trap's own Trap_frame (a0 zeroed — the child's return
-			// value), plus this trap's own resume address as an extra
-			// 32nd word, since sepc is a single CSR fork_entry can't
-			// otherwise inherit. See fork_entry's own comment in
-			// process.c3 for how this block gets consumed. 32 words of
-			// 8 bytes now (Sv64 port), not 4.
-			uptr* child_sp = (uptr*)&child.stack;
-			child_sp += STACK_SIZE / 8;
-			child_sp -= 32;
-
-			mem::copy((void*)child_sp, f, (sz)Trap_frame::size);
-			Trap_frame* child_frame = (Trap_frame*)child_sp;
-			child_frame.a0 = 0;
-			child_sp[31] = (uptr)(read_reg("sepc") + 4);
-
-			for (int rf_j = 0; rf_j < 12; rf_j++)
-			{
-				*(--child_sp) = 0;
-			}
-			*(--child_sp) = (uptr)&fork_entry;
-
-			child.has_message = false;
-			// Same reused-slot reasoning as has_message above — a
-			// previous occupant of this slot could have been killed
-			// while genuinely mid a blocking wait (SYS_KILL's own
-			// leak-safety check, below in this same file, only cleans up
-			// blocking_depth itself, not this per-process flag). See
-			// Process.in_blocking_wait's own comment (process.c3).
-			child.in_blocking_wait = false;
-			child.pid   = child_i + 1;
-			child.generation++;
-			child.sp    = (uptr)child_sp;
-			child.state = PROC_RUNNABLE;
-			// Unlike create_process() (always 0 — see Process.parent_pid's
-			// own comment, process.c3), rfork's own child genuinely does
-			// have a parent: this forking process, right now. Captured
-			// for SYS_PARENT_INFO below, built for user/envd.c3's own
-			// lazy env-inheritance but open to any caller, same reasoning
-			// as SYS_PROC_INFO's own comment.
-			child.parent_pid = current_proc.pid;
-			child.parent_generation = current_proc.generation;
-			// Inherited unchanged — the only way it ever changes is
-			// SYS_SETUID, which the child can call on itself just like
-			// any other process (see that case's own comment).
-			child.uid = current_proc.uid;
-
-			// Optional out-pointer (a1), same "null means don't care"
-			// convention as SYS_IPC_RECV's type_out — lets the caller
-			// capture this child's generation for a later SYS_JOIN to
-			// check against, so a join can tell "this pid exited" apart
-			// from "this pid got reused by something else." generation
-			// itself stays a plain uint (a counter, not an address).
-			uint* rfork_gen_out = (uint*)(uptr)f.a1;
-			if (rfork_gen_out != null)
-			{
-				*rfork_gen_out = child.generation;
-			}
-
-			f.a0 = (ulong)child.pid;
+			sys_rfork(f);
 		case SYS_NS_UNMOUNT:
 			// Removes one of the *caller's own* namespace mounts by
 			// exact prefix match (str_eq, not the longest-prefix match
@@ -1290,137 +1396,13 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			if (uid_out != null) *uid_out = queried.uid;
 			f.a0 = 0;
 		case SYS_KILL:
-			// Kills an arbitrary target process — the write half of
-			// /proc/<pid>/ctl (user/procd.c3), the first write path
-			// /proc has ever needed. Real permission check now
-			// (Process.uid, process.c3): root (uid 0) may kill anyone,
-			// otherwise only a process with the exact same uid as the
-			// target. Note this only protects a *direct* SYS_KILL
-			// call — procd itself is always root, so its own ctl
-			// handler (user/procd.c3) needs and has its own separate
-			// check on the real requester's uid before it ever gets
-			// here, or this call arriving *as procd* would bypass the
-			// check below entirely. See docs/devlog.md for that half.
-			//
-			// expected_generation (a1) mirrors SYS_JOIN's own
-			// join_generation: 0 is a wildcard ("kill whatever's at
-			// this pid right now" — generation starts at 0 and
-			// create_process (process.c3) always increments it past 0
-			// before a slot goes live, so 0 is never a valid live
-			// generation); any other value must match exactly,
-			// closing the same stale-pid race SYS_JOIN/
-			// Mount.server_generation already close elsewhere.
-			// procd's own ctl handler always fetches the live
-			// generation via SYS_PROC_INFO immediately before calling
-			// this, rather than passing 0.
-			//
-			// Known, accepted limitation: any other process currently
-			// blocked waiting on the killed target specifically (a
-			// sender mid-rendezvous in SYS_IPC_SEND, waiting for
-			// msg_acked) is left blocked forever — nothing forcibly
-			// unblocks a waiter when its counterpart is killed out
-			// from under it. Same class of gap as SYS_IPC_SEND's own
-			// stale-pid comment above, not attempted here.
-			int kill_pid = (int)f.a0;
-			uint kill_expected_generation = (uint)f.a1;
-			if (kill_pid == current_proc.pid)
-			{
-				// Same self-deadlock-shaped reasoning as SYS_JOIN's
-				// own self-check, though the failure mode here is
-				// different (this would tear down the very page
-				// table the code performing the teardown is running
-				// under) — reject; SYS_EXIT already exists for
-				// killing yourself.
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			Process* kill_target = proc_by_pid(kill_pid);
-			if (kill_target == null || (kill_expected_generation != 0 && kill_target.generation != kill_expected_generation))
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			if (current_proc.uid != 0 && current_proc.uid != kill_target.uid)
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-
-			// Leak-safety half of blocking_depth's own fix
-			// (process.c3): this kill tears kill_target down regardless
-			// of what it was doing (the same "any other process
-			// currently blocked... is left blocked forever" gap this
-			// case already accepts, just below) — without this, a
-			// target killed while genuinely mid one of the blocking
-			// waits that incremented blocking_depth would leak that
-			// increment permanently. blocking_depth is only ever
-			// consulted by fork_entry()'s own check now (not
-			// kernel_entry's shared tail — see blocking_depth's own
-			// comment for why not), so a leak here wouldn't wedge the
-			// whole system, just make every future freshly-rfork()'d
-			// child's own first sret conservatively start with
-			// interrupts off — still worth closing cleanly rather than
-			// leaving an ever-growing counter. kill_target.in_blocking_wait
-			// isn't reset here: the slot is about to become PROC_UNUSED
-			// and gets explicitly reset on its next reuse (SYS_RFORK's
-			// own child.in_blocking_wait = false, create_process()'s
-			// equivalent).
-			if (kill_target.in_blocking_wait) blocking_depth--;
-
-			// Same page-table-teardown-if-not-shared logic as
-			// SYS_EXIT above, just targeting kill_target instead of
-			// current_proc — see that case's own comment for the
-			// full reasoning (shared-table rfork(RFPROC|RFMEM)
-			// siblings, the 3-level Sv39 walk, etc.). Inlined for the
-			// same reason SYS_EXIT is: a call out to a moderately
-			// complex function from inside this switch has
-			// reproducibly broken boot before.
-			bool kill_table_shared = false;
-			for (int kshare_i = 0; kshare_i < PROCS_MAX; kshare_i++)
-			{
-				if (&procs[kshare_i] == kill_target) continue;
-				if (procs[kshare_i].state == PROC_UNUSED) continue;
-				if (procs[kshare_i].page_table == kill_target.page_table)
-				{
-					kill_table_shared = true;
-					break;
-				}
-			}
-
-			if (!kill_table_shared)
-			{
-				ulong* kill_table2 = kill_target.page_table;
-				for (uint kvpn2 = 0; kvpn2 < 512; kvpn2++)
-				{
-					if ((kill_table2[kvpn2] & PAGE_V) == 0) continue;
-					ulong* kill_table1 = (ulong*)pte_to_paddr(kill_table2[kvpn2]);
-
-					for (uint kvpn1 = 0; kvpn1 < 512; kvpn1++)
-					{
-						if ((kill_table1[kvpn1] & PAGE_V) == 0) continue;
-						ulong* kill_table0 = (ulong*)pte_to_paddr(kill_table1[kvpn1]);
-
-						for (uint kvpn0 = 0; kvpn0 < 512; kvpn0++)
-						{
-							if ((kill_table0[kvpn0] & PAGE_V) == 0) continue;
-							if (kill_table0[kvpn0] & PAGE_U)
-							{
-								uptr kill_leaf_paddr = pte_to_paddr(kill_table0[kvpn0]);
-								free_pages(kill_leaf_paddr, 1);
-							}
-						}
-
-						free_pages((uptr)kill_table0, 1);
-					}
-
-					free_pages((uptr)kill_table1, 1);
-				}
-				free_pages((uptr)kill_table2, 1);
-			}
-
-			kill_target.state = PROC_UNUSED;
-			kill_target.pid = 0;
-			f.a0 = 0;
+			// PROBE (2026-08-28): extracted to sys_kill() to test whether
+			// c3c 0.8.3 fixed the "call a moderately-complex function from
+			// handle_syscall's switch reboot-loops from the first syscall"
+			// landmine that hit 3x on 0.8.2 (see SYS_EXIT + docs/devlog.md
+			// 2026-08-14). Boots clean on QEMU + Duo => rest of the split
+			// is safe; reboot loop => revert, landmine still live.
+			sys_kill(f);
 		case SYS_SRV_POST:
 			// Posts current_proc (always self — no pid argument; there's
 			// no reason to let one process post another's pid even in a
