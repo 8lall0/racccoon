@@ -4,6 +4,48 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 (continued) — kernel: device IRQs go through an Irq_route table
+
+Consolidation, not a feature. Three interrupt-driven drivers (diskd,
+sdd, usbd) had each landed their PLIC routing ad-hoc, and it showed:
+`handle_trap`'s external-interrupt branch was three near-identical
+`if (irq == board::IRQ_X && X_pid != 0) { wake X }` blocks plus a
+hand-maintained disable-on-fire condition, and `SYS_DRIVER_IRQ_ARM` was
+a pid-switch (`usbd_pid → IRQ_USB`, `sdd_pid → IRQ_SDHCI`). Adding
+interrupt-driven ethernet RX would have meant editing both spots again.
+
+**Now:** a fixed `Irq_route` table (`{irq, pid, level, used}`, 8 slots)
+in `process.c3`. Each driver registers one route from its
+`setup_*_mappings` — where it already has its pid and its `board::IRQ_*`
+constant in hand. `handle_trap` does one `irq_route_by_irq()` lookup,
+posts `DISKD_IRQ_NOTIFY` to `route.pid`, `plic_complete`s, then disables
+the source iff `route == null || route.level`. A `level=false` route
+(virtio-mmio — diskd acks it via the virtio ISR register) stays
+enabled; that replaces the old `handled_irq` special case exactly.
+`SYS_DRIVER_IRQ_ARM` → `irq_route_by_pid(current_proc.pid)`.
+
+- `diskd_pid` / `sdd_pid` / `usbd_pid` / `ethd_pid` / `netd_pid` are
+  gone — grep confirmed they were read *only* in those two IRQ spots.
+  The `*_dma_paddr` / `*_vq_paddr` globals the `SYS_*_INFO` syscalls
+  hand back are untouched.
+- ethd registers `{IRQ_ETH, level=true}` now, inert until
+  `board::plic_init` arms source 31. Interrupt-driven ethernet RX is
+  then: arm the source + unmask the dwmac interrupt + wait on the
+  notify — no kernel routing edit.
+- `irq == 0` is the "device absent on this board" sentinel
+  (`board::IRQ_USB` etc. are 0 on QEMU) and `plic_claim`'s spurious
+  return; `irq_route_register(0, …)` and `irq_route_by_irq(0)` both
+  no-op, so QEMU (only virtio-blk real) and Duo (USB/SDHCI/ETH real,
+  virtio 0) both stay correct.
+
+**Verified.** QEMU: boots, `fsd: FAT32 mounted` (diskd served reads
+through its `DISKD_IRQ_NOTIFY` wait, whose only source is the new
+lookup). Real Duo: ext2 mounts via SDMA, USB hub + keyboard + pad
+enumerate, shell responsive, no storm — both `level=true` routes and
+the re-arm path exercised.
+
+---
+
 ## 2026-08-28 (continued) — xpad SETUP STALL: a non-periodic complete-split issued in the same microframe as the start-split; the interrupt-driven wait removed the slack that hid it
 
 The 8BitDo SN30 Pro (full-speed, hub port 4) had been failing
