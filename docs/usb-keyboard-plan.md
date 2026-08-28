@@ -174,12 +174,13 @@ Typing at the `>` prompt works, `ls` runs.
 - Software auto-repeat: `kbd_tick()` (every keyboard poll) re-emits the
   last held mapped key — ~500 ms delay, ~40 ms interval. **Works.**
 - Caps Lock **LED**: `usb_hid_set_report_leds` (`SET_REPORT`, Output
-  report) — doesn't light on a low-speed keyboard behind the hi-speed
-  hub, because this driver has never done an OUT-data control transfer
-  over a split transaction. Skipped when `s.split_active` (no error
-  spam); a directly-attached full-speed keyboard would get it. Cosmetic;
-  fix noted in `dwc2.c3` (~line 1152, CSPLIT OUT size 0). `Hid_session`
-  gained `ctrl_max_packet` + `iface_num` for it.
+  report). First hardware round it didn't light — the OUT-data control
+  transfer was mis-shaped over a split transaction (this hub Hi-Speeds,
+  so everything behind it splits). Fixed in `hc_transfer_once_split`:
+  force HCTSIZ size 0 on a CSPLIT OUT (control/bulk path), matching the
+  interrupt path and vendor Linux. Also fixes split bulk OUT (MSC
+  writes) for free. `Hid_session` gained `ctrl_max_packet` +
+  `iface_num`.
 
 ---
 
@@ -193,7 +194,6 @@ Typing at the `>` prompt works, `ls` runs.
 | Real-Duo-only | QEMU `virt` has no DWC2 (`board::HAS_USB` is Duo-only) — no QEMU leg to this, same as the rest of the USB stack |
 | One keyboard + one mouse | two session slots (`Hid_session[2]`); a 2nd device of the *same* kind overwrites its slot |
 | Combo receiver (kbd+mouse in one device) | matches the mouse branch → its keyboard interface goes unpolled; real fix is binding both interfaces of one device to their own slots |
-| Caps Lock LED over a split transaction | not lit — OUT-data control transfer unproven on this driver's split path (`dwc2.c3` ~line 1152); Caps *function* is unaffected |
 
 ---
 

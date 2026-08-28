@@ -9,19 +9,27 @@ Running log of work sessions with Claude Code. Newest entry on top.
 `user/usb/{kbd,dwc2,usbd}.c3`. No QEMU path (no DWC2).
 
 **Hardware result:** auto-repeat works (hold a key → repeats), Caps Lock
-letter-case toggle works, Shift + Caps+Shift correct. The one gap: the
-physical Caps Lock **LED** doesn't light. `SET_REPORT` has an OUT data
-stage, and this driver has never done an OUT-data control transfer over
-a USB 2.0 split transaction — every prior one (GET_DESCRIPTOR,
-SET_CONFIGURATION, …) was no-data or IN-data. The user's keyboard is
-low-speed behind the hi-speed hub, so it splits. Likely fix if wanted:
-`dwc2.c3`'s control/bulk complete-split path (~line 1152) should force
-HCTSIZ size 0 for a CSPLIT OUT, the way its interrupt path already
-does (see the comment there). Not chased — the LED is cosmetic and the
-Caps function doesn't depend on it. `usb_hid_poll_slot` now **skips the
-SET_REPORT entirely when `s.split_active`** so it doesn't burn the 3 s
-NAK budget + print an error per toggle; a directly-attached full-speed
-keyboard still gets its LED.
+letter-case toggle works, Shift + Caps+Shift correct.
+
+**Caps Lock LED** — first hardware round it didn't light. `SET_REPORT`
+has an OUT data stage, and this driver had never done an OUT-data
+control transfer over a USB 2.0 split transaction (every prior one —
+GET_DESCRIPTOR, SET_CONFIGURATION, … — was no-data or IN-data). This
+hub goes Hi-Speed and *everything* behind it splits (the low-speed
+keyboard, the full-speed mouse), so the LED transfer was silently
+mis-shaped.
+
+Fix applied (`hc_transfer_once_split`, control/bulk complete-split
+path): force HCTSIZ transfer-size 0 on a CSPLIT OUT — the OUT payload
+already went out with the start-split, so the complete-split only polls
+"done yet?" and must not expect FIFO data. This is exactly the rule the
+interrupt complete-split path already followed (`csplit_xfer_len =
+is_in ? xfer_len : 0`), and vendor Linux 5.10's own
+`dwc2_hc_start_transfer()` applies it to both. `*actual_len_out` still
+comes out right (remaining stays 0 → `xfer_len - 0`). Also corrects
+split *bulk* OUT (MSC writes) for free, though nothing exercises that
+over this hub yet. `usb_hid_poll_slot` attempts the SET_REPORT
+unconditionally again.
 
 - **Caps Lock**: press of usage `0x39` toggles `g_kbd_caps_lock`;
   `kbd_usage_to_bytes` XORs it with Shift for letters only (digits /
@@ -44,8 +52,8 @@ keyboard still gets its LED.
 generic branch still early-returns on NAK).
 
 **Hardware-verified:** held key repeats; Caps Lock toggles letter case;
-Shift and Caps+Shift correct. LED is a known gap over split transactions
-(see above).
+Shift and Caps+Shift correct. Caps LED fixed via the CSPLIT-OUT-size-0
+change above (pending the re-flash confirmation).
 
 ---
 

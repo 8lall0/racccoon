@@ -1149,7 +1149,20 @@ fn int hc_transfer_once_split(uint dev_addr, uint ep_num, uint eptype, bool is_i
     uint ssplit_frame = usb_reg_read(USB_HFNUM) & 0xFFFF;
     for (;;)
     {
-        uint csplit_hctsiz = (xfer_len & USB_HCTSIZ_XFERSIZE_MASK)
+        // Real vendor Linux 5.10's dwc2_hc_start_transfer(): "For CSPLIT
+        // OUT Transfer, set the size to 0 so the core doesn't expect any
+        // data written to the FIFO" — the OUT payload already went out
+        // with the start-split; a complete-split OUT just polls "done
+        // yet?". The interrupt complete-split path above already does
+        // this; the control/bulk path here never did because every
+        // other caller (GET_DESCRIPTOR, GET_PORT_STATUS, ...) does IN
+        // data stages. The one OUT-data control transfer this driver
+        // makes is SET_REPORT for the Caps Lock LED — without this it
+        // silently never reaches a low-speed keyboard behind the hub.
+        // *actual_len_out below still comes out right: remaining stays 0,
+        // so xfer_len - 0 = xfer_len ("all bytes sent").
+        uint csplit_xfer_len = is_in ? xfer_len : 0;
+        uint csplit_hctsiz = (csplit_xfer_len & USB_HCTSIZ_XFERSIZE_MASK)
             | (num_packets << USB_HCTSIZ_PKTCNT_SHIFT)
             | (cur_pid << USB_HCTSIZ_PID_SHIFT);
         usb_reg_write(USB_HC0_HCTSIZ, csplit_hctsiz);
