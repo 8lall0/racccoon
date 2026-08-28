@@ -47,8 +47,16 @@ size/type, non-aligned mid-file overwrite, append via
 `fswriteatfrag` (two files grown interleaved, read back verified). All
 `ok` on real silicon.
 
-Still to do: reflash the production-shell kernel for normal use (same
-`--OLD_FIP` recipe, `shell.bin.o` instead of `shell_test`).
+Reflashing the production-shell kernel afterward is now
+`scripts/reflash_duo.sh` (`DUO_SD_PART=/dev/sdX1 bash
+scripts/reflash_duo.sh`): `build_duo.sh` → `llvm-objcopy` →
+`make_loader2nd.py` → `fiptool.py genfip --OLD_FIP <card's fip.bin>
+--LOADER_2ND` → parse-back sanity check → udisksctl-mount DUOBOOT,
+timestamped backup of the current `fip.bin`, copy the new one in. No
+sudo (DUOBOOT is FAT32), no `build_fsbl` (only fiptool.py itself is
+needed from `$DUO_SDK`). Pipeline verified end-to-end minus the flash
+this session; `fiptool.py` auto-located under `$DUO_SDK` or
+`~/Workspace/duo-buildroot-sdk`.
 
 ---
 

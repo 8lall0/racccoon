@@ -1,0 +1,121 @@
+#!/bin/bash
+#
+# End-to-end Milk-V Duo reflash, no sudo and no built SDK required:
+#
+#   build_duo.sh (kernel_duo.elf, production shell)
+#     -> llvm-objcopy -> raw binary
+#     -> scripts/make_loader2nd.py -> loader2nd_duo.bin
+#     -> fiptool.py genfip --OLD_FIP <the fip.bin already on the card>
+#        --LOADER_2ND <new kernel> -> fip_duo.bin
+#     -> udisksctl-mount DUOBOOT, back up its fip.bin, copy the new one in
+#
+# --OLD_FIP reuses every non-kernel section (BL2/FSBL, MONITOR/OpenSBI,
+# DDR_PARAM, CHIP_CONF) straight from the image currently on the card, so
+# this needs only a *checkout* of duo-buildroot-sdk for fiptool.py itself
+# — not a `build_fsbl` run, not the vendor Docker image. See
+# docs/devlog.md's 2026-08-28 real-hardware entry.
+#
+# This flashes the PRODUCTION shell (user/shell.c3). For a throwaway test
+# kernel with user/shell_test.c3's dev builtins, see build.sh's own
+# shell-swap trick and the devlog.
+#
+# Does NOT touch partitioning, EXT2TEST, or /bin on the root partition
+# (that one is root-owned — `sudo DUO_ROOT_PARTITION=/dev/sdX2 bash
+# scripts/populate_duo_bin.sh` if a /bin binary's source changed).
+#
+# Usage:
+#   DUO_SD_PART=/dev/sda1 bash scripts/reflash_duo.sh
+#
+# Env:
+#   DUO_SD_PART   the DUOBOOT FAT32 partition — REQUIRED, no default
+#                 (device paths vary by machine/session; `lsblk` shows it,
+#                 labelled DUOBOOT)
+#   FIPTOOL       path to fiptool.py — default derived from $DUO_SDK, then
+#                 ~/Workspace/duo-buildroot-sdk
+#   LLVM_LLD / LLC / LLVM_OBJCOPY  passed through to build_duo.sh; on a
+#                 host without /opt/riscv set these to /usr/bin/*
+
+set -e
+
+DUO_SD_PART=${DUO_SD_PART:?set DUO_SD_PART to the DUOBOOT FAT32 partition, e.g. /dev/sda1 — no default}
+LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+# --- locate fiptool.py ----------------------------------------------------
+if [ -z "${FIPTOOL:-}" ]; then
+  for cand in \
+    "${DUO_SDK:-}/fsbl/plat/cv180x/fiptool.py" \
+    "$HOME/Workspace/duo-buildroot-sdk/fsbl/plat/cv180x/fiptool.py" \
+    "$HOME/Workspace/duo-buildroot-sdk/fsbl/plat/cv181x/fiptool.py"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && FIPTOOL="$cand" && break
+  done
+fi
+[ -n "${FIPTOOL:-}" ] && [ -f "$FIPTOOL" ] || {
+  echo "fiptool.py not found — set FIPTOOL=/path/to/duo-buildroot-sdk/fsbl/plat/cv180x/fiptool.py" >&2
+  exit 1
+}
+echo "==> fiptool: $FIPTOOL"
+
+# --- build the kernel ---------------------------------------------------
+bash scripts/build_duo.sh
+
+echo "==> Extracting raw binary from kernel_duo.elf..."
+$LLVM_OBJCOPY -O binary build/kernel_duo.elf build/kernel_duo_raw.bin
+
+echo "==> Prepending the 32-byte LOADER_2ND (\"BL33\") header..."
+python3 scripts/make_loader2nd.py build/kernel_duo_raw.bin build/loader2nd_duo.bin
+
+# --- mount DUOBOOT ----------------------------------------------------
+udisksctl mount -b "$DUO_SD_PART" >/dev/null 2>&1 || true
+MNT=$(findmnt -n -o TARGET --source "$DUO_SD_PART" | head -1)
+[ -n "$MNT" ] || { echo "could not mount $DUO_SD_PART" >&2; exit 1; }
+echo "==> DUOBOOT mounted at $MNT"
+[ -f "$MNT/fip.bin" ] || { echo "$MNT/fip.bin missing — is $DUO_SD_PART really DUOBOOT?" >&2; exit 1; }
+
+# --- repackage via --OLD_FIP ----------------------------------------
+cp "$MNT/fip.bin" build/fip_old_from_sd.bin
+echo "==> Repackaging fip.bin (reusing BL2/MONITOR/DDR_PARAM/CHIP_CONF from the card)..."
+python3 "$FIPTOOL" genfip \
+  "$ROOT/build/fip_duo.bin" \
+  --OLD_FIP "$ROOT/build/fip_old_from_sd.bin" \
+  --MONITOR_RUNADDR=0x80000000 \
+  --BLCP_2ND_RUNADDR=0 \
+  --LOADER_2ND="$ROOT/build/loader2nd_duo.bin" >/dev/null
+
+# --- verify -----------------------------------------------------------
+python3 - "$FIPTOOL" <<'PYEOF'
+import sys, os
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+import fiptool
+f = fiptool.FIP()
+f.read_fip("build/fip_duo.bin")
+runaddr = f.ldr_2nd_hdr["RUNADDR"].toint()
+magic = bytes(f.ldr_2nd_hdr["MAGIC"].content)
+mon = f.param2["MONITOR_RUNADDR"].toint()
+rest = len(getattr(f, "rest_fip", b""))
+ok = runaddr == 0x80200000 and magic == b"BL33" and mon == 0x80000000 and rest == 0
+print(f"    LOADER_2ND magic={magic!r} runaddr={runaddr:#x}  MONITOR runaddr={mon:#x}  trailing={rest}")
+l2 = open("build/loader2nd_duo.bin", "rb").read()
+sec = bytes(f.body2["LOADER_2ND"].content)
+if l2[32:] != sec[32:32 + len(l2) - 32]:
+    print("    ERROR: LOADER_2ND body does not match loader2nd_duo.bin", file=sys.stderr)
+    sys.exit(1)
+if not ok:
+    print("    ERROR: fip sanity check failed", file=sys.stderr)
+    sys.exit(1)
+print("    fip_duo.bin verified")
+PYEOF
+
+# --- flash ----------------------------------------------------------
+BAK="$MNT/fip.bin.bak-$(date +%Y%m%d-%H%M%S)"
+echo "==> Backing up current fip.bin -> $(basename "$BAK")"
+cp "$MNT/fip.bin" "$BAK"
+echo "==> Copying build/fip_duo.bin -> $MNT/fip.bin"
+cp build/fip_duo.bin "$MNT/fip.bin"
+sync
+udisksctl unmount -b "$DUO_SD_PART" >/dev/null 2>&1 || umount "$MNT" 2>/dev/null || true
+
+echo "==> Done. Move the SD to the Duo and power-cycle."
+echo "    (restore $(basename "$BAK") over fip.bin if it doesn't boot)"
