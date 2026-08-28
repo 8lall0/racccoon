@@ -52,16 +52,18 @@ in `/adm` and per-user config under `/usr/$user/lib`.
 
 ### Work
 
-- Decide the tree (above is a starting point).
-- Seed it in `scripts/build.sh`'s image builder (the ext2 path — see the
-  existing `disk-ext2/` fixtures) and document how to lay it down on a
-  fresh Duo partition.
-- A `namespace(1)`-style view: the shell should be able to print the
-  current process's mount table (reads `/proc/$pid/ns` or similar — a
-  new `/proc` file).
-- `bind`/`mount`/`unmount` as shell builtins or `/bin` programs
-  (`SYS_NS_MOUNT`/`_UNMOUNT` already exist; `bind` — remap one existing
-  name to another within the namespace — may need a new verb).
+- **Tree defined + seeded. DONE** (`3b044ab`) — `docs/filesystem-layout.md`
+  is the reference; `scripts/build.sh` seeds it into the QEMU ext2
+  images, `scripts/populate_duo_bin.sh` onto the real Duo.
+  `/adm/users` starts as `0:root`.
+- **Hardcoded server pids removed. DONE** (`f025db5`) — `echod` (was
+  pid 2, baked into `namespace[0]`) and `fsd`'s block driver (was
+  `DISKD_PID=3`) now come from `echod_pid` / a `SYS_FS_PARTITION_INFO`
+  out-param. Unblocks supervising those + is general hygiene.
+- Still to do: a `namespace(1)`-style view (shell prints the current
+  process's mount table — a new `/proc` file), and `bind`/`mount`/
+  `unmount` as shell builtins (`SYS_NS_MOUNT`/`_UNMOUNT` exist; `bind`
+  may need a new verb). Deferred until §2 shapes the requirements.
 
 ### Not doing
 

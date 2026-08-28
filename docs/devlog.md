@@ -4,6 +4,46 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-29 (continued) — §1: Plan 9 file structure + hardcoded server pids removed
+
+Roadmap §1, two commits.
+
+**Hardcoded pids gone** (`f025db5`). Two servers were addressed by a
+literal pid that only worked because of spawn order: `echod` (created
+first → pid 2, baked into `create_process`'s `namespace[0]`) and the
+block driver (`fsd.c3`'s `DISKD_PID = 3`). Both blocked supervising
+those servers (a respawn lands elsewhere).
+- `echod_pid` global; `namespace[0]` ("/srv/echo/") seeds from it.
+  `echod` is now in the supervisor table.
+- `storage_pid` global; `SYS_FS_PARTITION_INFO` gains an `a2` out-param
+  for it; `fsd.c3`'s `g_diskd_pid` starts 0 and boot `fsd`/`fsd2` set it
+  from that syscall (the dynamic USB instance already resolved its
+  backend by name).
+
+**Canonical root tree** (`3b044ab`). `docs/filesystem-layout.md` is the
+reference:
+
+```
+/bin /lib /usr /usr/root /adm /adm/users /tmp /mnt    real ext2 dirs
+/proc/ /srv/ /env/ /mnt/fs2/                           namespace mounts
+```
+
+No `/dev` (devices are servers), no `/etc` (host config → `/adm`).
+`scripts/build.sh` seeds it into the QEMU ext2 images via `debugfs`;
+`scripts/populate_duo_bin.sh` creates it on the real Duo. `/adm/users`
+starts `0:root` — §2 defines the real format.
+
+Verified QEMU (`launch64_ext2`): `ls` → `bin/ lib/ usr/ adm/ tmp/
+mnt/`, `cat adm/users` → `0:root`, `ls usr` → `root/`; full p9/ipc/fs
+regression (`ping` / `p9fstest` / `p9fswritetest` / `mounttest` /
+`srvtest` / `sandboxtest` / `fsdkilltest` / `runtest` / `killtest` /
+`mutextest`) unchanged. Real Duo: clean boot, `ls` + `cat`.
+
+Still in §1: a namespace view (`/proc/$pid/ns`), `bind`/`mount`
+builtins — deferred until §2 (user model) shapes them.
+
+---
+
 ## 2026-08-29 (continued) — resiliency: SYS_IPC_CALL, the client RPC round-trip as one syscall
 
 Roadmap §5.1b — closes the last "hang forever" IPC path and retires
