@@ -128,11 +128,14 @@ dance).
 
 ---
 
-## 2026-08-29 — session summary: xpad STALL fixed, then a long cleanup pass
+## 2026-08-29 — session summary: xpad STALL → cleanup pass → roadmap → resiliency
 
-One session (spanning 2026-08-28 into the 29th). Started on a reported
-bug, then turned into structural cleanup once that was closed. Per-topic
-entries below; the arc:
+One long session (2026-08-28 into the 29th). A reported bug, then
+structural cleanup, then — prompted by the user thinking about where
+the project goes next — a roadmap doc and the first two slices of it.
+Per-topic entries below; the arc:
+
+### Bug + cleanup
 
 1. **xpad SETUP STALL** (`581954e`) — the 8BitDo pad had stopped
    enumerating (`GET_DESCRIPTOR(18)` → `HCINT=0x0a` STALL) ever since
@@ -142,14 +145,13 @@ entries below; the arc:
    issued the non-periodic complete-split in the *same microframe* as
    the start-split. Fine while `hc_wait_chhltd` `yield()`-polled; the
    interrupt-driven wait tight-spins. Fix: a 150µs gap. The pad's
-   interrupt-IN is still silent — that's the separate, long-standing
+   interrupt-IN is still silent — the separate, long-standing
    8BitDo-specific issue.
 
 2. **Irq_route table** (`f2f7270`) — `handle_trap`'s three hand-written
    per-device IRQ branches + the pid-switch in `SYS_DRIVER_IRQ_ARM`
    collapsed to one `{irq,pid,level}` lookup. Five write-only `*_pid`
-   globals deleted; ethd's route pre-registered so interrupt-driven RX
-   is now an arm-the-source change, no kernel routing edit.
+   globals deleted; ethd's route pre-registered.
 
 3. **Shared user helpers** (`55de499`) — `mmio_read32`/`write32`,
    `print_hex8`/`32`, `panic()` had byte-identical copies in 5–6 driver
@@ -158,22 +160,54 @@ entries below; the arc:
 4. **`handle_syscall` split, 1700 → 340 lines**
    (`79e0e68` / `5c9525d` / `23bd80a`) — every case ≥40 lines
    (`SYS_EXEC` 416, `SYS_RFORK`, `SYS_KILL`, `SYS_EXIT`, + 11 medium)
-   extracted to `sys_*(f)` functions; the switch is now a dispatch
-   table. This had been blocked for a year by an undiagnosed c3c 0.8.2
-   codegen bug (factoring a function out of that switch reboot-looped
-   the kernel from the first syscall, hit 3×). **Probed on 0.8.3 with
-   `SYS_KILL` — the bug is gone.** Verified the whole way on QEMU
-   (`launch64_dual`) + real Duo.
+   extracted to `sys_*(f)` functions. Blocked for a year by an
+   undiagnosed c3c 0.8.2 codegen bug (factoring a function out of that
+   switch reboot-looped the kernel from the first syscall, hit 3×).
+   **Probed on 0.8.3 with `SYS_KILL` — the bug is gone.**
 
-5. **`hardentest` fixed** (`20d88ab`) — a rotted test, not a kernel
-   bug: it called `syscall(31)` as its "unrecognized number", but 31 is
-   `SYS_KBD_PUSH` now. `p9fstest`/`mounttest` "failures" were just the
-   wrong disk image (FAT32-only vs `disk_dual`).
+5. **`hardentest` fixed** (`20d88ab`) — a rotted test: it called
+   `syscall(31)` as its "unrecognized number", but 31 is `SYS_KBD_PUSH`
+   now. `p9fstest`/`mounttest` "failures" were just the wrong disk image
+   (FAT32-only vs `disk_dual`).
 
-**Deferred:** timebase dedup (5 identical `*_TIMEBASE_HZ` Duo consts) —
-the clean fix is a `timebase_info()` syscall but `kbd.c3` bakes the
-value into a compile-time `const`; poor ratio. Interrupt-driven
-ethernet RX still waits on a test peer.
+### Direction
+
+6. **`README.md` rewritten** (`6993f71`) — the old three lines still
+   said "32-bit toy following the tutorial." Now describes the actual
+   thing: a `rv64imac` microkernel, QEMU + Milk-V Duo, the real feature
+   set, build/run/flash.
+
+7. **`docs/roadmap.md`** (`0877437` / `a92369f` / …) — the post-bring-up
+   plan, direction agreed with the user: Plan 9 file structure, Plan 9
+   user model, hardware FPU (the float-panic is deferred port work —
+   the C906 *has* an FPU, the toolchain is just built hardware-float so
+   it ships no soft-float multilib), a `/bin/wasm` interpreter, and
+   §5 resiliency + §6 a real 9P translator (later — today's protocol is
+   9P-*inspired*, not wire-compatible).
+
+### Resiliency (§5)
+
+8. **IPC rendezvous peer-death** (`262d45b`) — `ipc_send`/`ipc_reply`
+   return −1 instead of hanging forever when the peer exits mid-
+   transfer. `Process.ipc_wait_pid` + `sys_exit`/`sys_kill` sweep.
+
+9. **Boot-server supervisor** (`7b5b97c`) — `src/supervisor.c3`:
+   fsd/fsd2/procd/envd respawn on exit (from the timer trap, not the
+   starvable idle loop), with `reseat_namespace_mounts()` so existing
+   clients transparently reconnect. `fsdkilltest` proves the full
+   loop. Device drivers not yet supervised (hardcoded-pid conventions).
+
+10. **`SYS_IPC_CALL`** (`6879b89`) — the client RPC round-trip as one
+    syscall. Closes the last hang (client stuck in `ipc_recv` after a
+    server dies post-request), and its inbox reservation retires
+    `p9_call`'s `P9_STRAY` bounce. `p9_call` is now a 5-line shim.
+
+**After this session there are no "hang forever" IPC paths, and a
+crashed fsd recovers on its own.**
+
+**Deferred:** timebase dedup (poor ratio — `kbd.c3` compile-time
+const); interrupt-driven ethernet RX (needs a test peer); device-driver
+supervision (needs the pid hardcodes gone first).
 
 ---
 
