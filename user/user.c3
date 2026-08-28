@@ -45,6 +45,7 @@ const int SYS_ETHD_INFO     = 30; // ethd-only: returns its DMA region's physica
 const int SYS_KBD_PUSH      = 31; // usbd-only: pushes one decoded USB-keyboard byte into the kernel keystroke queue SYS_GETCHAR drains — see src/entry.c3's case
 const int SYS_DRIVER_IRQ_ARM = 32; // usbd/sdd: re-enable this driver's PLIC source (handle_trap disables it on each fire — level-triggered); dispatched by caller pid — see src/entry.c3's case
 const int SYS_SDD_INFO      = 33; // sdd-only: returns its SDMA staging buffer's physical address — same shape as SYS_USBD_INFO
+const int SYS_IPC_CALL      = 34; // one-shot RPC: deliver a request and block for the reply, all in the kernel — reply can't be pre-empted by a stray sender, aborts -1 if the server dies at any point — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -99,17 +100,16 @@ fn int rfork(int flags, uint* generation_out) @export("rfork") {
 // no more traffic to fsd will ever happen, but before SYS_EXEC actually
 // touches this process's image. A caller that wants to talk to the
 // child right after exec() succeeds (its pid is unaffected, so it's
-// still reachable) has no other way to know when that's actually safe:
-// this process's single inbox slot (src/entry.c3's SYS_IPC_RECV) has no
-// per-sender filtering, so an outside message sent too early can land
-// while a fs_read_at() call is still waiting on fsd's own reply and get
-// mistaken for it (p9_call() below now bounces those back rather than
-// misreading them, but a blind bounce-and-retry from the outside can
-// still starve fsd's real reply out indefinitely if fsd's own round
-// trip — cluster-chain walking through diskd, for a deep offset — runs
-// longer than the retry backoff guessed). Found and fixed exactly this
-// way debugging exec()'s own runtest (user/shell.c3, docs/devlog.md):
-// the retry-based version failed outright rather than just being slow.
+// still reachable) has no other way to know when that's actually safe.
+// This process's single inbox slot has no per-sender filtering, so an
+// outside message sent too early used to be able to land while a
+// fs_read_at() call was still waiting on fsd's reply and get mistaken
+// for it — the whole reason for the notify. That race is now closed at
+// the source: SYS_IPC_CALL (which p9_call rides) reserves the inbox for
+// the server's reply, so a too-early notify just waits its turn. The
+// notify still matters for ordering (the caller shouldn't race the
+// child's own first ipc_recv), it's just no longer load-bearing for
+// correctness. Found debugging exec()'s runtest — see docs/devlog.md.
 //
 // argv (argc entries, null/0 for none) rides in the same buf, packed
 // right after the image content as NUL-separated strings ("foo\0bar\0"
@@ -379,6 +379,18 @@ fn int ipc_send(int dest_pid, uint type, char* data, int len) @export("ipc_send"
     return syscall4(SYS_IPC_SEND, dest_pid, (long)type, (long)data, len);
 }
 
+// One-shot RPC. `buf` holds `req_len` request bytes on entry and gets up
+// to `buf_cap` reply bytes written back (in-place — the kernel copies the
+// request out before it copies the reply in). `reply_type_out` (optional)
+// receives the reply verb. Returns the replier's pid on success, -1 if
+// the target never existed, exited, or was killed at any point during the
+// call. Replaces the ipc_send + filtered-ipc_recv + P9_STRAY dance that
+// p9_call used to open-code.
+fn int ipc_call(int dest_pid, uint verb, char* buf, int req_len, int buf_cap, uint* reply_type_out) @export("ipc_call") {
+    long packed = ((long)(req_len & 0xFFFF) << 16) | (long)(buf_cap & 0xFFFF);
+    return syscall5(SYS_IPC_CALL, dest_pid, (long)verb, (long)buf, packed, (long)reply_type_out);
+}
+
 // Same as ipc_send(), plus an optional expected_generation (0 =
 // wildcard, same convention as kill()'s own) checked against the
 // target's live Process.generation before delivery — the reply-side
@@ -454,54 +466,31 @@ const uint P9_REMOVE = 10; // request: remove a fid's file — always consumes t
 // for what's really the same request with one bit different.
 const uint P9_DMDIR = 0x80000000;
 
-// Reserved verb p9_call() bounces stray senders with — see its own
-// comment. Deliberately far outside every real verb's range (P9_TWALK/
-// P9_TREAD/FS_*, all small, hand-assigned small ints) so it can never
-// collide with a genuine reply.
-const uint P9_STRAY = 0xFFFFFFFF;
-
 // Sends a 9P-lite request and blocks for the reply in one call — the
 // pattern every client actually wants, matching 9P's own synchronous
 // request/reply model. reply_verb (optional, pass null if unneeded) lets
 // the caller confirm the reply actually answers the request it sent,
 // rather than trusting the byte content alone.
 //
-// Filters by sender: SYS_IPC_RECV has a single, unfiltered inbox slot per
-// process (src/entry.c3) — delivery happens the instant the slot is free,
-// whether or not this process is actually the one "expecting" it right
-// now. A totally unrelated sender (e.g. exec()'s own caller getting
-// pinged by someone else while exec() is mid-flight, doing its own
-// p9_call round trips with fsd to load the new image) can land a message
-// in that same slot before dest_pid's real reply does, and a plain
-// ipc_recv_type() would happily hand that stray message back as if it
-// were the reply. Found the hard way debugging exec()'s runtest: an
-// early ping from the test's own parent process landed in the child's
-// inbox before fsd's real FS_READ_AT reply, got consumed here instead,
-// and the resulting garbage "reply" corrupted exec()'s read loop.
-//
-// A message from anyone but dest_pid gets bounced straight back to its
-// own sender as P9_STRAY (using the generation SYS_IPC_RECV_GEN captured,
-// so a reused pid can't be misled), then this keeps waiting for the real
-// reply — dest_pid isn't going anywhere mid-round-trip. The bounce isn't
-// just cleanup: without it the stray sender's own ipc_send() would have
-// already returned (true rendezvous — it only needed *a* consuming recv,
-// not this call's actual reply) and it would then block forever in its
-// own ipc_recv() waiting for a reply that silent discarding would never
-// send. P9_STRAY lets that sender recognize "not it, retry" instead.
+// Now a thin shim over the kernel's SYS_IPC_CALL, which owns the whole
+// round-trip: it reserves this process's inbox for dest_pid's reply
+// (so a stray sender — e.g. exec()'s "ready" notify landing while a
+// process is mid p9_call to fsd — just waits its turn instead of being
+// mistaken for the reply and bounced), and it returns -1 if dest_pid
+// exits or is killed at any point, including while we wait for the
+// reply. SYS_IPC_CALL is in-place (request in `buf`, reply written
+// back), so if the caller passed a separate `data` buffer, move it into
+// `reply_buf` first — every real caller but p9_read already passes the
+// same buffer for both.
 fn int p9_call(int dest_pid, uint verb, char* data, int len, char* reply_buf, int reply_len, uint* reply_verb) {
-    int sent = ipc_send(dest_pid, verb, data, len);
-    if (sent < 0) return sent;
-    for (;;) {
-        uint from_type = 0;
-        uint from_gen = 0;
-        int from = ipc_recv_type_gen(reply_buf, reply_len, &from_type, &from_gen);
-        if (from < 0) return from;
-        if (from == dest_pid) {
-            if (reply_verb != null) *reply_verb = from_type;
-            return from;
-        }
-        ipc_reply(from, P9_STRAY, reply_buf, 0, from_gen);
+    if (data != reply_buf) {
+        int n = len < reply_len ? len : reply_len;
+        for (int i = 0; i < n; i++) { reply_buf[i] = data[i]; }
     }
+    uint rt = 0;
+    int from = ipc_call(dest_pid, verb, reply_buf, len, reply_len, &rt);
+    if (reply_verb != null) { *reply_verb = rt; }
+    return from;
 }
 
 // --- Real 9P (P9_ATTACH/P9_WALK/P9_OPEN/P9_READ/P9_CLUNK) — thin

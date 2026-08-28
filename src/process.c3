@@ -363,6 +363,13 @@ struct Process
 	uint ipc_wait_generation;
 	bool ipc_peer_died;
 
+	// True for the whole duration of a SYS_IPC_CALL — reserves this
+	// process's inbox so only ipc_wait_pid (the call target) can write
+	// it, and the reply can't be pre-empted by a stray ipc_send from a
+	// third party (which just waits in its own phase-A loop until the
+	// call completes). Replaces user-space p9_call's old P9_STRAY bounce.
+	bool in_call_reply_wait;
+
 	uint msg_from_generation; // sender's own Process.generation, captured at delivery — lets
 	                          // a receiver that intends to reply later (SYS_IPC_RECV_GEN/
 	                          // SYS_IPC_REPLY, src/entry.c3) confirm msg_from still names the
@@ -832,6 +839,7 @@ fn Process* create_process(void* image, uint image_size)
 	proc.ipc_wait_pid = 0;
 	proc.ipc_wait_generation = 0;
 	proc.ipc_peer_died = false;
+	proc.in_call_reply_wait = false;
 
 	// Default namespace: "/srv/echo/" resolves to echod, which is always
 	// pid 2 (see kernel.c3 — it's the first process spawned after idle,

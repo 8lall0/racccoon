@@ -82,6 +82,7 @@ const SYS_ETHD_INFO     = 30; // ethd-only: returns its DMA region's physical ad
 const SYS_KBD_PUSH      = 31; // usbd-only in practice: pushes one decoded USB-keyboard byte into the kernel keystroke queue SYS_GETCHAR drains (src/kbd.c3) — see its case below
 const SYS_DRIVER_IRQ_ARM = 32; // interrupt-driven driver: re-enable this driver's PLIC source, disabled by handle_trap on each fire (level source); the source is the one the caller registered in the Irq_route table (process.c3) — see its case below
 const SYS_SDD_INFO      = 33; // sdd-only: returns its SDMA staging buffer's physical address — see its case below
+const SYS_IPC_CALL      = 34; // one-shot RPC: deliver a request to a server and block for its reply, all in the kernel — the reply can't be pre-empted by a stray sender, and the whole thing aborts with -1 if the server dies at any point (see its case below); user-space p9_call is now just this
 
 // Generous cap on the image SYS_EXEC will install — real racccoon
 // binaries (build/user/*.bin) run 70-105KB; this leaves real headroom
@@ -754,6 +755,7 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		child.ipc_wait_pid = 0;
 		child.ipc_wait_generation = 0;
 		child.ipc_peer_died = false;
+		child.in_call_reply_wait = false;
 		child.pid   = child_i + 1;
 		child.generation++;
 		child.sp    = (uptr)child_sp;
@@ -1221,9 +1223,26 @@ fn bool ipc_peer_gone() @noinline
 	return peer == null || peer.generation != current_proc.ipc_wait_generation;
 }
 
-// Wakes every process blocked in ipc_send/ipc_reply toward `victim`
-// (which is about to become PROC_UNUSED) so those calls return -1
-// rather than blocking forever. Call before the victim's pid is zeroed.
+// Can the current process deposit a message into `target`'s inbox right
+// now? No if a message is already sitting there unconsumed, or if
+// `target` is mid-SYS_IPC_CALL and has its inbox reserved for the reply
+// from someone other than us. A stray sender just spins in its phase-A
+// loop until the reservation lifts (rather than the old P9_STRAY bounce).
+fn bool ipc_inbox_available(Process* target) @noinline
+{
+	if (target.has_message) { return false; }
+	if (target.in_call_reply_wait
+		&& !(current_proc.pid == target.ipc_wait_pid
+			&& current_proc.generation == target.ipc_wait_generation))
+	{
+		return false;
+	}
+	return true;
+}
+
+// Wakes every process blocked in ipc_send/ipc_reply/ipc_call toward
+// `victim` (which is about to become PROC_UNUSED) so those calls return
+// -1 rather than blocking forever. Call before the victim's pid is zeroed.
 fn void ipc_wake_waiters_on(Process* victim) @noinline
 {
 	for (int iw = 0; iw < PROCS_MAX; iw++)
@@ -1281,11 +1300,12 @@ fn void sys_ipc_send(Trap_frame* f) @noinline
 
 		// Wait for the target's inbox to actually be free — a
 		// previous sender's message that hasn't been consumed yet
-		// must never be silently overwritten. Busy-poll like
-		// SYS_GETCHAR: nothing specifically wakes a queued sender
+		// must never be silently overwritten, and if the target is
+		// mid-ipc_call its inbox is reserved for the reply. Busy-poll
+		// like SYS_GETCHAR: nothing specifically wakes a queued sender
 		// when the slot frees up, it's whoever notices next. If the
 		// target exits meanwhile, ipc_peer_gone() bails us out.
-		while (ipc_target.has_message)
+		while (!ipc_inbox_available(ipc_target))
 		{
 			yield();
 			if (ipc_peer_gone())
@@ -1376,7 +1396,7 @@ fn void sys_ipc_reply(Trap_frame* f) @noinline
 		current_proc.ipc_wait_generation = reply_target.generation;
 		current_proc.ipc_peer_died = false;
 
-		while (reply_target.has_message)
+		while (!ipc_inbox_available(reply_target))
 		{
 			yield();
 			if (ipc_peer_gone())
@@ -1415,6 +1435,125 @@ fn void sys_ipc_reply(Trap_frame* f) @noinline
 		}
 		current_proc.ipc_wait_pid = 0;
 		f.a0 = 0;
+}
+
+// ipc call: the full client-side RPC round-trip in one syscall — deliver
+// a request to `dest` and block for `dest`'s reply. Everything ipc_send +
+// a filtered ipc_recv used to do in user space (p9_call), plus:
+//  - the reply CANNOT be pre-empted by a stray sender: in_call_reply_wait
+//    reserves our inbox for `dest` for the whole call, so a third party's
+//    ipc_send just waits its turn (no P9_STRAY bounce needed);
+//  - it aborts with -1 if `dest` exits/is killed at ANY point, including
+//    while we wait for the reply — the gap the plain ipc_send peer-death
+//    fix couldn't reach (that only covered the send rendezvous).
+// Buffer is in-place: `buf` holds `req_len` request bytes on entry, gets
+// up to `buf_cap` reply bytes written back. a4 packs (req_len<<16)|buf_cap
+// (both <= MSG_MAX). a5 = optional uint* for the reply verb. Returns the
+// replier's pid (== dest) on success, -1 on failure.
+fn void sys_ipc_call(Trap_frame* f) @noinline
+{
+	int   call_dest     = (int)f.a0;
+	uint  call_verb     = (uint)f.a1;
+	char* call_buf      = (char*)(uptr)f.a2;
+	ulong call_packed   = f.a4;
+	uint* call_type_out = (uint*)(uptr)f.a5;
+
+	int call_req_len = (int)((call_packed >> 16) & 0xFFFF);
+	int call_buf_cap = (int)(call_packed & 0xFFFF);
+	if (call_req_len < 0) { call_req_len = 0; }
+	if (call_req_len > MSG_MAX) { call_req_len = MSG_MAX; }
+	if (call_buf_cap < 0) { call_buf_cap = 0; }
+	if (call_buf_cap > MSG_MAX) { call_buf_cap = MSG_MAX; }
+
+	int call_span = call_req_len > call_buf_cap ? call_req_len : call_buf_cap;
+	if (!user_range_valid(current_proc.page_table, (uptr)call_buf, (ulong)call_span, true)
+		|| (call_type_out != null && !user_range_valid(current_proc.page_table, (uptr)call_type_out, 4, true)))
+	{
+		f.a0 = (ulong)(-1);
+		return;
+	}
+
+	Process* call_target = proc_by_pid(call_dest);
+	if (!call_target)
+	{
+		f.a0 = (ulong)(-1);
+		return;
+	}
+
+	current_proc.ipc_wait_pid = call_dest;
+	current_proc.ipc_wait_generation = call_target.generation;
+	current_proc.ipc_peer_died = false;
+	// Reserve our inbox for call_target's reply for the whole call —
+	// from here so a stray sender is held off even during phases 1/2.
+	current_proc.in_call_reply_wait = true;
+
+	// Phase 1: deposit the request into the target's inbox.
+	while (!ipc_inbox_available(call_target))
+	{
+		yield();
+		if (ipc_peer_gone())
+		{
+			current_proc.in_call_reply_wait = false;
+			current_proc.ipc_wait_pid = 0;
+			f.a0 = (ulong)(-1);
+			return;
+		}
+	}
+	mem::copy(&call_target.msg_data, call_buf, (sz)call_req_len);
+	call_target.msg_from = current_proc.pid;
+	call_target.msg_from_generation = current_proc.generation;
+	call_target.msg_type = call_verb;
+	current_proc.msg_acked = false;
+	call_target.has_message = true;
+	if (call_target.state == PROC_BLOCKED) { call_target.state = PROC_RUNNABLE; }
+
+	// Phase 2: wait for the target to consume the request.
+	while (!current_proc.msg_acked)
+	{
+		if (ipc_peer_gone())
+		{
+			current_proc.in_call_reply_wait = false;
+			current_proc.ipc_wait_pid = 0;
+			current_proc.state = PROC_RUNNABLE;
+			f.a0 = (ulong)(-1);
+			return;
+		}
+		current_proc.state = PROC_BLOCKED;
+		yield();
+	}
+
+	// Phase 3: wait for the reply. in_call_reply_wait keeps our inbox
+	// reserved, so whatever lands is call_target's reply.
+	while (!current_proc.has_message)
+	{
+		if (ipc_peer_gone())
+		{
+			current_proc.in_call_reply_wait = false;
+			current_proc.ipc_wait_pid = 0;
+			current_proc.state = PROC_RUNNABLE;
+			f.a0 = (ulong)(-1);
+			return;
+		}
+		current_proc.state = PROC_BLOCKED;
+		yield();
+	}
+
+	int call_reply_from = current_proc.msg_from;
+	mem::copy(call_buf, &current_proc.msg_data, (sz)call_buf_cap);
+	if (call_type_out != null) { *call_type_out = current_proc.msg_type; }
+	current_proc.has_message = false;
+	current_proc.in_call_reply_wait = false;
+	current_proc.ipc_wait_pid = 0;
+
+	// Ack the replier — it's parked in sys_ipc_reply's phase B.
+	Process* call_replier = proc_by_pid(call_reply_from);
+	if (call_replier != null)
+	{
+		call_replier.msg_acked = true;
+		if (call_replier.state == PROC_BLOCKED) { call_replier.state = PROC_RUNNABLE; }
+	}
+
+	f.a0 = (ulong)call_reply_from;
 }
 
 // ipc recv: block until a message lands in this process's inbox, copy it out.
@@ -1994,6 +2133,8 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			sys_exit();
 		case SYS_IPC_SEND:
 			sys_ipc_send(f);
+		case SYS_IPC_CALL:
+			sys_ipc_call(f);
 		case SYS_IPC_REPLY:
 			sys_ipc_reply(f);
 		case SYS_IPC_RECV:
