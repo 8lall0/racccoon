@@ -949,7 +949,7 @@ fn void exfat_mount()
 	char[SECTOR_SIZE] boot_sector @noinit;
 	if (!fs_read_sector(0, &boot_sector))
 	{
-		fs_panic("failed to read boot sector");
+		panic("fsd: ", "failed to read boot sector");
 	}
 
 	// Signature already confirmed by exfat_probe() (fs_mount() only calls
@@ -961,7 +961,7 @@ fn void exfat_mount()
 		// Every other part of this project assumes 512-byte sectors —
 		// panic clearly rather than silently mishandle a nonstandard one,
 		// same precedent fat32_mount()'s own check follows.
-		fs_panic("exFAT volume doesn't use 512-byte sectors");
+		panic("fsd: ", "exFAT volume doesn't use 512-byte sectors");
 	}
 
 	uint cluster_shift = (uint)boot_sector[EXFAT_BS_SECTORS_PER_CLUSTER_SHIFT] & 0xFF;

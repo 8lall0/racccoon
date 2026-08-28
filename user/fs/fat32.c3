@@ -2275,7 +2275,7 @@ fn void fat32_mount()
 	char[SECTOR_SIZE] boot_sector @noinit;
 	if (!fs_read_sector(0, &boot_sector))
 	{
-		fs_panic("failed to read boot sector");
+		panic("fsd: ", "failed to read boot sector");
 	}
 
 	// Signature already confirmed by fat32_probe() (fs_mount() only
@@ -2286,7 +2286,7 @@ fn void fat32_mount()
 	{
 		// Every other part of this project assumes 512-byte sectors —
 		// panic clearly rather than silently mishandle a nonstandard one.
-		fs_panic("FAT32 volume doesn't use 512-byte sectors");
+		panic("fsd: ", "FAT32 volume doesn't use 512-byte sectors");
 	}
 
 	char   sectors_per_cluster = boot_sector[FAT32_BPB_SECTORS_PER_CLUSTER];

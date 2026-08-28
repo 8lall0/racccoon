@@ -105,24 +105,7 @@ const uint GPIO_REG_EXT_PORT = 0x50;
 // same convention as user/block/sdhci.c3's own SD_TIMEBASE_HZ.
 const ulong GPIOD_TIMEBASE_HZ = 25000000;
 
-fn uint mmio_read32(uptr addr)
-{
-    ulong v;
-    asm
-    {
-        lw v, [addr];
-    }
-    return (uint)v;
-}
-
-fn void mmio_write32(uptr addr, uint v)
-{
-    ulong vv = (ulong)v;
-    asm
-    {
-        sw vv, [addr];
-    }
-}
+// mmio_read32 / mmio_write32: user/user.c3 (shared).
 
 const int GPIO_PIN_COUNT = 3;
 char[GPIO_PIN_COUNT] gpio_pin_bank_letter; // 'A' or 'C'

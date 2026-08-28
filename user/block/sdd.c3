@@ -26,17 +26,6 @@ const uint DISKD_READ    = 10;
 const uint DISKD_WRITE   = 11;
 const uint DISKD_MSG_MAX = 516;
 
-fn void sdd_panic(char* msg)
-{
-	print("sdd: ");
-	print(msg);
-	print("\n");
-	// See user/block/diskd.c3's diskd_panic comment for why this is
-	// exit(), not an empty `for(;;){}` loop — same UB/optimizer hazard
-	// applies here.
-	exit();
-}
-
 fn void sdd_init()
 {
 	sdd_pad_power_clock_init();
@@ -44,7 +33,7 @@ fn void sdd_init()
 
 	if (!sdd_enumerate())
 	{
-		sdd_panic("card enumeration failed");
+		panic("sdd: ", "card enumeration failed");
 	}
 	print("sdd: card ready\n");
 

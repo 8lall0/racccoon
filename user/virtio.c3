@@ -85,39 +85,11 @@ struct Virtio_virtq @packed
 // subject to that kind of reordering (the same property src/entry.c3's
 // read_reg/write_reg macros rely on).
 //
-// RV64 port: `addr` and every local bound into this block-form asm
-// widen to `uptr`/`ulong` — a plain 32-bit `uint` in that binding
-// position is rejected by c3c on a 64-bit target, the same restriction
-// that forced src/kernel/sbi.c3's params wider (see docs/devlog.md).
-// Separately, `lw` is a *signed* word load — on RV32 that didn't matter
-// (the register was only ever 32 bits wide anyway), but on RV64 it
-// sign-extends into the full 64-bit register. For mmio_read32 that's
-// harmless (the (uint) truncation below immediately discards whatever
-// landed in the upper 32 bits), but mmio_read64 combines two such loads
-// into one *unsigned* 64-bit value via shift+or, where a sign-extended
-// upper word would corrupt the result — masked off explicitly there.
-// `lwu` (a real zero-extending load) would be the more direct fix, but
-// c3c's block-form asm doesn't recognize it ("Unknown instruction for
-// the current target") — `lw` + an explicit mask is the workaround.
-fn uint mmio_read32(uptr addr)
-{
-	ulong v;
-	asm
-	{
-		lw v, [addr];
-	}
-	return (uint)v;
-}
-
-fn void mmio_write32(uptr addr, uint v)
-{
-	ulong vv = (ulong)v;
-	asm
-	{
-		sw vv, [addr];
-	}
-}
-
+// mmio_read32 / mmio_write32 are in user/user.c3 (shared). mmio_read64
+// stays here — only virtio needs it, and its shift+or of two *signed*
+// `lw` loads would be corrupted by a sign-extended upper word without
+// the explicit masks below (`lwu` would be the direct fix but c3c's
+// block-form asm doesn't recognise it).
 fn ulong mmio_read64(uptr addr)
 {
 	ulong lo;

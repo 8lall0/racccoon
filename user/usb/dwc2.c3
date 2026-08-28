@@ -317,24 +317,7 @@ fn ulong usb_us_to_ticks(ulong us)
     return us * USB_TIMEBASE_HZ / 1000000;
 }
 
-fn uint mmio_read32(uptr addr)
-{
-    ulong v;
-    asm
-    {
-        lw v, [addr];
-    }
-    return (uint)v;
-}
-
-fn void mmio_write32(uptr addr, uint v)
-{
-    ulong vv = (ulong)v;
-    asm
-    {
-        sw vv, [addr];
-    }
-}
+// mmio_read32 / mmio_write32: user/user.c3 (shared).
 
 fn uint usb_reg_read(uint offset) { return mmio_read32((uptr)(USB_BASE + offset)); }
 fn void usb_reg_write(uint offset, uint v) { mmio_write32((uptr)(USB_BASE + offset), v); }
@@ -392,21 +375,7 @@ fn void usb_set_split_context(bool active, uint hub_addr, uint hub_port, bool is
     g_device_is_low_speed = is_low_speed;
 }
 
-const char[16] HEX_DIGITS = "0123456789abcdef";
-
-fn void print_hex32(uint v)
-{
-    for (int shift = 28; shift >= 0; shift -= 4)
-    {
-        putchar(HEX_DIGITS[(v >> shift) & 0xF]);
-    }
-}
-
-fn void print_hex8(uint v)
-{
-    putchar(HEX_DIGITS[(v >> 4) & 0xF]);
-    putchar(HEX_DIGITS[v & 0xF]);
-}
+// print_hex32 / print_hex8: user/user.c3 (shared).
 
 // Gated by USBD_VERBOSE — for the one-time-but-verbose register-level
 // bring-up milestones. Meaningful, low-frequency status uses plain
@@ -434,16 +403,6 @@ fn void print_hprt0_raw(char* label)
     print(" prtconnsts=");
     print_uint(hprt0 & USB_HPRT0_PRTCONNSTS);
     print("\n");
-}
-
-fn void usbd_panic(char* msg)
-{
-    print("usbd: ");
-    print(msg);
-    print("\n");
-    // Same UB/optimizer hazard as diskd_panic/sdd_panic's own comment
-    // — exit(), not an empty for(;;){} loop.
-    exit();
 }
 
 // Core soft reset — used twice (once at init, once again right after
@@ -587,7 +546,7 @@ fn void usbd_init()
     }
     if (snpsid == 0x00000000 || snpsid == 0xFFFFFFFF)
     {
-        usbd_panic("GSNPSID readback looks wrong — MMIO mapping or clock/reset gating is probably not right yet");
+        panic("usbd: ", "GSNPSID readback looks wrong — MMIO mapping or clock/reset gating is probably not right yet");
     }
 
     // GHWCFG2 — fixed, synthesis-time core capability bits (unlike
@@ -610,7 +569,7 @@ fn void usbd_init()
 
     if (!usb_core_reset())
     {
-        usbd_panic("initial core soft reset failed");
+        panic("usbd: ", "initial core soft reset failed");
     }
     usbd_vprint("core reset (1/2) done\n");
 
@@ -623,7 +582,7 @@ fn void usbd_init()
 
     if (!usb_core_reset())
     {
-        usbd_panic("post-PHY-config core soft reset failed");
+        panic("usbd: ", "post-PHY-config core soft reset failed");
     }
     usbd_vprint("core reset (2/2) done\n");
 

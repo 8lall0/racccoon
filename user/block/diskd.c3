@@ -60,46 +60,27 @@ Virtio_virtq*   vq;
 Virtio_blk_req* req;
 uptr            req_paddr;
 
-fn void diskd_panic(char* msg)
-{
-	print("diskd: ");
-	print(msg);
-	print("\n");
-	// Not `for (;;) {}`: an empty infinite loop with no side effects is
-	// UB by C/LLVM's rules and is a real optimizer target, not just a
-	// theoretical one — under -O2 this got silently dropped, falling
-	// straight through back into diskd_init()'s caller with diskd in a
-	// half-initialized state instead of actually halting, which is what
-	// caused the repeated "diskd: invalid device id" prints and eventual
-	// illegal-instruction crash this was found chasing (see
-	// docs/devlog.md). exit() is both correct (this really is fatal —
-	// nothing after this point can do anything useful) and immune to
-	// the same class of bug, since it's a real syscall with a real
-	// side effect the optimizer can't reason away.
-	exit();
-}
-
 fn void diskd_init()
 {
 	uptr vq_paddr;
 	if (diskd_info(&vq_paddr, &req_paddr) < 0)
 	{
-		diskd_panic("failed to get buffer info");
+		panic("diskd: ", "failed to get buffer info");
 	}
 	vq  = (Virtio_virtq*)vq_paddr;
 	req = (Virtio_blk_req*)req_paddr;
 
 	if (reg_read32(VIRTIO_REG_MAGIC) != 0x74726976)
 	{
-		diskd_panic("invalid magic value");
+		panic("diskd: ", "invalid magic value");
 	}
 	if (reg_read32(VIRTIO_REG_VERSION) != 1)
 	{
-		diskd_panic("invalid version");
+		panic("diskd: ", "invalid version");
 	}
 	if (reg_read32(VIRTIO_REG_DEVICE_ID) != 2)
 	{
-		diskd_panic("invalid device id");
+		panic("diskd: ", "invalid device id");
 	}
 
 	reg_write32(VIRTIO_REG_DEVICE_STATUS, 0);

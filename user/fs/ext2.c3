@@ -852,7 +852,7 @@ fn void ext2_mount()
 	char[SECTOR_SIZE] sb_sector @noinit;
 	if (!fs_read_sector(EXT2_SUPERBLOCK_SECTOR, &sb_sector))
 	{
-		fs_panic("failed to read ext2 superblock");
+		panic("fsd: ", "failed to read ext2 superblock");
 	}
 
 	// Magic already confirmed by ext2_probe() (fs_mount() only calls
@@ -871,7 +871,7 @@ fn void ext2_mount()
 		// Every other part of this driver assumes a block fits in
 		// EXT2_MAX_BLOCK_SIZE — panic clearly rather than silently
 		// mishandle a larger one (see this file's own header comment).
-		fs_panic("ext2 block size too large for this driver");
+		panic("fsd: ", "ext2 block size too large for this driver");
 	}
 	ext2_sectors_per_block = ext2_block_size / SECTOR_SIZE;
 	ext2_blocks_per_group  = *blocks_per_group;
@@ -901,7 +901,7 @@ fn void ext2_mount()
 		char[EXT2_MAX_BLOCK_SIZE] bgdt_scan_buf @noinit;
 		if (!ext2_read_block(ext2_first_data_block + 1 + bb, &bgdt_scan_buf))
 		{
-			fs_panic("failed to read ext2 block group descriptor");
+			panic("fsd: ", "failed to read ext2 block group descriptor");
 		}
 		for (uint d = 0; d < descriptors_per_block; d++)
 		{
@@ -921,7 +921,7 @@ fn void ext2_mount()
 	{
 		// Root (inode 2, always in group 0 by format convention) not
 		// being a directory means a corrupt volume — panic clearly.
-		fs_panic("ext2 root inode is not a directory");
+		panic("fsd: ", "ext2 root inode is not a directory");
 	}
 
 	print("fsd: ext2 mounted, block_size=");

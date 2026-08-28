@@ -244,17 +244,6 @@ struct Fs9_fid_entry
 }
 Fs9_fid_entry[FS9_FID_MAX] fs9_fids;
 
-fn void fs_panic(char* msg)
-{
-	print("fsd: ");
-	print(msg);
-	print("\n");
-	// Not an empty `for(;;){}` loop — see user/diskd.c3's diskd_panic
-	// comment for why that's a real UB/optimizer hazard, not a
-	// theoretical one, in this exact codebase.
-	exit();
-}
-
 // --- Write protection ---------------------------------------------
 
 // A reserved-sector-range allowlist, enforced in diskd_rw() — see this
@@ -463,7 +452,7 @@ fn void fs_mount(bool dynamic_mode, char* dynamic_self_name)
 	bool is_secondary = false;
 	if (!dynamic_mode && fs_partition_info(&fs_partition_start, &is_secondary) < 0)
 	{
-		fs_panic("failed to get partition info");
+		panic("fsd: ", "failed to get partition info");
 	}
 
 	// ext2 first: its magic is a specific 16-bit value at a fixed byte
@@ -546,7 +535,7 @@ fn void fs_mount(bool dynamic_mode, char* dynamic_self_name)
 		return;
 	}
 
-	// Deliberately NOT fs_panic()/exit() here, unlike every other failure
+	// Deliberately NOT panic()/exit() here, unlike every other failure
 	// in this function — this one is a normal, expected outcome (the
 	// second fsd instance, booting against an image/card that only has
 	// one partition — see boards/*/board.c3's HAS_SECOND_FS_PARTITION),

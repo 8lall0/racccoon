@@ -57,23 +57,7 @@ fn void reg_write32(uint offset, uint v) { virtio_reg_write32(VIRTIO_NET_PADDR, 
 fn void reg_fetch_or32(uint offset, uint v) { virtio_reg_fetch_or32(VIRTIO_NET_PADDR, offset, v); }
 fn ushort reg_read16(uint offset) { return virtio_reg_read16(VIRTIO_NET_PADDR, offset); }
 
-const char[16] HEX_DIGITS = "0123456789abcdef";
-
-fn void print_hex8(uint v)
-{
-    putchar(HEX_DIGITS[(v >> 4) & 0xF]);
-    putchar(HEX_DIGITS[v & 0xF]);
-}
-
-fn void netd_panic(char* msg)
-{
-    print("netd: ");
-    print(msg);
-    print("\n");
-    // Same UB/optimizer hazard as diskd_panic's own comment — exit(),
-    // not an empty for(;;){} loop.
-    exit();
-}
+// print_hex8 / panic: user/user.c3 (shared).
 
 fn void netd_setup_queue(Virtio_virtq* vq, uptr vq_paddr, int queue_index)
 {
@@ -329,15 +313,15 @@ fn void main()
 
     if (reg_read32(VIRTIO_REG_MAGIC) != 0x74726976)
     {
-        netd_panic("invalid magic value");
+        panic("netd: ", "invalid magic value");
     }
     if (reg_read32(VIRTIO_REG_VERSION) != 1)
     {
-        netd_panic("invalid version");
+        panic("netd: ", "invalid version");
     }
     if (reg_read32(VIRTIO_REG_DEVICE_ID) != VIRTIO_NET_DEVICE_ID)
     {
-        netd_panic("invalid device id");
+        panic("netd: ", "invalid device id");
     }
 
     reg_write32(VIRTIO_REG_DEVICE_STATUS, 0);

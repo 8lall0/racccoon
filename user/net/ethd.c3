@@ -52,25 +52,7 @@ const char[6] ETHD_OUR_MAC = { (char)0x02, (char)0x00, (char)0x00, (char)0x00, (
 // down, self-test pass/fail, DHCP bound) stays visible regardless.
 const bool ETHD_VERBOSE = false;
 
-const char[16] HEX_DIGITS = "0123456789abcdef";
-
-fn void print_hex32(uint v)
-{
-    for (int shift = 28; shift >= 0; shift -= 4)
-    {
-        putchar(HEX_DIGITS[(v >> shift) & 0xF]);
-    }
-}
-
-fn void ethd_panic(char* msg)
-{
-    print("ethd: ");
-    print(msg);
-    print("\n");
-    // Same UB/optimizer hazard as diskd_panic/sdd_panic/usbd_panic's
-    // own comment — exit(), not an empty for(;;){} loop.
-    exit();
-}
+// print_hex32 / panic: user/user.c3 (shared).
 
 fn uint ethd_init()
 {
@@ -159,8 +141,8 @@ fn uint ethd_init()
         }
     }
 
-    ethd_panic("no PHY responded with the expected PHYID1 on any scanned MDIO address");
-    return 0; // unreachable — ethd_panic() calls exit()
+    panic("ethd: ", "no PHY responded with the expected PHYID1 on any scanned MDIO address");
+    return 0; // unreachable — panic() calls exit()
 }
 
 // Minimal DHCP client (RFC 2131): DISCOVER -> OFFER -> REQUEST -> ACK,

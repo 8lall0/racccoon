@@ -941,6 +941,59 @@ fn void print_uint(uint n) @export("print_uint") {
     }
 }
 
+// --- Hex printing + raw MMIO -----------------------------------------
+// Every device-register driver (dwc2, sdhci, dwmac, gpiod, virtio, ...)
+// wants these and had its own byte-identical copy; they live here now
+// since user.c3 is linked into every user program.
+const char[16] HEX_DIGITS = "0123456789abcdef";
+
+fn void print_hex8(uint v) @export("print_hex8") {
+    putchar(HEX_DIGITS[(v >> 4) & 0xF]);
+    putchar(HEX_DIGITS[v & 0xF]);
+}
+
+fn void print_hex32(uint v) @export("print_hex32") {
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        putchar(HEX_DIGITS[(v >> shift) & 0xF]);
+    }
+}
+
+// Plain 32-bit MMIO load/store. Block-form `asm {}` (not the opaque-
+// string form rdtime() needs): `lw`/`sw` are ordinary instructions the
+// compiler models, and the memory operand carries the side effect.
+// `addr` and the bound locals must be `uptr`/`ulong` — a 32-bit `uint`
+// in that binding position is rejected by c3c on a 64-bit target. `lw`
+// sign-extends into the full 64-bit register; harmless for mmio_read32
+// since the `(uint)` truncation discards the upper word (a 64-bit MMIO
+// read would need explicit masking — see user/virtio.c3's mmio_read64).
+// `lwu` would be the direct fix but block-form asm doesn't recognise it.
+fn uint mmio_read32(uptr addr) @export("mmio_read32") {
+    ulong v;
+    asm {
+        lw v, [addr];
+    }
+    return (uint)v;
+}
+
+fn void mmio_write32(uptr addr, uint v) @export("mmio_write32") {
+    ulong vv = (ulong)v;
+    asm {
+        sw vv, [addr];
+    }
+}
+
+// Fatal error from a driver: print "<prefix><msg>" and exit(). NOT an
+// empty for(;;){} — that's UB by LLVM's rules and a real optimizer
+// target (it got silently dropped under -O2 once, falling through into
+// a half-initialized caller; see docs/devlog.md). exit() is a real
+// syscall with a side effect the optimizer can't reason away.
+fn void panic(char* prefix, char* msg) @export("user_panic") {
+    print(prefix);
+    print(msg);
+    print("\n");
+    exit();
+}
+
 // --- File access via fsd (user/fsd.c3) — the only way to touch a file
 // now that SYS_READFILE/SYS_WRITEFILE are gone from the kernel. All
 // three resolve `filename` through this process's own namespace (the

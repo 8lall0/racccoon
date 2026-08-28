@@ -80,24 +80,7 @@ fn ulong eth_us_to_ticks(ulong us)
     return us * ETH_TIMEBASE_HZ / 1000000;
 }
 
-fn uint mmio_read32(uptr addr)
-{
-    ulong v;
-    asm
-    {
-        lw v, [addr];
-    }
-    return (uint)v;
-}
-
-fn void mmio_write32(uptr addr, uint v)
-{
-    ulong vv = (ulong)v;
-    asm
-    {
-        sw vv, [addr];
-    }
-}
+// mmio_read32 / mmio_write32: user/user.c3 (shared).
 
 fn uint mac_reg_read(uint offset) { return mmio_read32((uptr)(ETH_BASE + offset)); }
 fn void mac_reg_write(uint offset, uint v) { mmio_write32((uptr)(ETH_BASE + offset), v); }

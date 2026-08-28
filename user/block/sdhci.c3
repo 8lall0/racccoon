@@ -171,24 +171,7 @@ bool g_sdd_dma_ok = false;      // set by sdd_init once SD_CAPABILITIES is read
 uptr g_sdd_dma_paddr = 0;       // the DMA staging buffer (SYS_SDD_INFO), 0 until sdd.c3 sets it
 uint g_sd_dma_addr_pending = 0; // sd_send_cmd writes this to SD_DMA_ADDRESS + sets SD_TRNS_DMA for the next data command, then clears it
 
-fn uint mmio_read32(uptr addr)
-{
-	ulong v;
-	asm
-	{
-		lw v, [addr];
-	}
-	return (uint)v;
-}
-
-fn void mmio_write32(uptr addr, uint v)
-{
-	ulong vv = (ulong)v;
-	asm
-	{
-		sw vv, [addr];
-	}
-}
+// mmio_read32 / mmio_write32: user/user.c3 (shared).
 
 fn uint sd_reg_read(uint offset) { return mmio_read32((uptr)(SD_BASE + offset)); }
 fn void sd_reg_write(uint offset, uint v) { mmio_write32((uptr)(SD_BASE + offset), v); }
@@ -539,15 +522,7 @@ fn bool sd_send_cmd(uint index, uint arg, uint resp_flags, bool data)
 	return true;
 }
 
-const char[16] HEX_DIGITS = "0123456789abcdef";
-
-fn void print_hex32(uint v)
-{
-	for (int shift = 28; shift >= 0; shift -= 4)
-	{
-		putchar(HEX_DIGITS[(v >> shift) & 0xF]);
-	}
-}
+// print_hex32 / print_hex8: user/user.c3 (shared).
 
 // Raises SDCLK from whatever slow clock BootROM left running (see
 // sdd_pad_power_clock_init's own comment — deliberately never
