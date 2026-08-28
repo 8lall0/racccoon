@@ -4,6 +4,45 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 (continued) — entry: the handle_syscall extraction landmine is gone on c3c 0.8.3
+
+`handle_syscall` was a 1700-line function; its biggest cases (`SYS_EXEC`
+416 lines, `SYS_RFORK` 160, `SYS_KILL` 132, `SYS_EXIT` 77) were kept
+inline because factoring a moderately-complex function out of that
+`switch` **reboot-looped the kernel from the very first syscall**, 3×,
+on c3c 0.8.2 (see 2026-08-14 entry — never diagnosed, always fixed by
+re-inlining).
+
+**Probed on c3c 0.8.3** (this machine): extracted `SYS_KILL` →
+`sys_kill(f)` in `entry.c3` (same file, fewest confounders). Boots
+clean single-cycle on QEMU **and** real Duo; `killtest` passes
+(including the page-table teardown path). **The landmine is fixed.**
+
+So also pulled out `sys_exit()` (uses no `f` — pure `current_proc`
+teardown + `yield()`) and `sys_rfork(f)`. `handle_syscall`: 1700 →
+1366 lines; the three are now named, jump-to functions above it.
+
+- **Gotcha found mid-probe:** a blanket `break;`→`return;` conversion
+  is wrong — a `break` inside a `for`/`while` in the case body must
+  stay. The reliable discriminator in this switch: a `break` whose
+  preceding line is an `f.a0 = …;` bailout assignment is switch-level
+  → `return`; anything else is a loop break → stays. (`sys_kill`'s
+  shared-page-table loop break got miscompiled to `return` first;
+  caught because `killtest`'s echod isn't an rfork sibling so that
+  path never ran — fixed before commit.)
+
+**Verified:** QEMU — `rforktest` / `threadtest` / `threadjointest`
+(`thread_result = 99`) / `mutextest` (16/16) / `killtest` / `hello` /
+`exit`. Real Duo — clean boot, USB enumerates, ext2 mounts via SDMA,
+`ls` + `cat` (each fork→exec→exit).
+
+**`SYS_EXEC` (416 lines, dozens of bailout paths) deliberately left
+inline** — mechanical extraction there is exactly where a
+break-vs-return slip would hide. Own focused pass. Update
+[[racccoon-refactor-backlog]] when done.
+
+---
+
 ## 2026-08-28 (continued) — user: shared mmio/hex/panic helpers
 
 Cleanup. Every device-register driver had its own byte-identical copy
