@@ -159,13 +159,14 @@ GET_PORT_STATUS STALL right after keyboard enum). See devlog.
 Add `SYS_KBD_PUSH` + the ring buffer + the `SYS_GETCHAR` drain. usbd
 pushes instead of printing.
 **Verify (Duo):** at the `>` prompt, type `ls` on the USB keyboard, press
-Enter — it runs. Backspace edits the line. Ctrl-C interrupts. Serial
-console still works at the same time (type half a command on each).
+Enter — it runs. Backspace edits the line. Serial console still works at
+the same time. (Ctrl-C has no effect — racccoon has no SIGINT; `0x03`
+just enters the line buffer, same as over serial.)
 
-Done (devlog 2026-08-28): `src/kbd.c3` ring buffer, `SYS_KBD_PUSH` (=31),
-`SYS_GETCHAR` drains the queue then the serial console, `kbd_emit()`
-pushes. `kbdpush` shell_test builtin. QEMU: pushed bytes appear at the
-next prompt untyped. Real-Duo typing-at-the-prompt check still pending.
+Done + **verified on real Duo** (devlog 2026-08-28): `src/kbd.c3` ring
+buffer, `SYS_KBD_PUSH` (=31), `SYS_GETCHAR` drains the queue then the
+serial console, `kbd_emit()` pushes. `kbdpush` shell_test builtin.
+Typing at the `>` prompt works, `ls` runs.
 
 ### Stage 4 — polish
 - Caps Lock: track state from the keyboard's Caps usage (`0x39`), XOR

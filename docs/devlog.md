@@ -33,8 +33,13 @@ never reached `getchar()`. Now there's a kernel keystroke queue.
 
 Verified in QEMU: `> kbdpush` → `kbdpush: queued 15 bytes` →
 `> kbd-queue-works` appears on the next prompt line untyped →
-`kbd-queue-works: command not found`. The kernel path works; real-Duo
-check is a keyboard typing at the `>` prompt.
+`kbd-queue-works: command not found`.
+
+**Confirmed on the real Duo:** typing works at the `>` prompt, `ls`
+runs (Enter → CR). Ctrl-C produces no visible effect — correct:
+racccoon has no SIGINT / job control, so `0x03` just lands in the line
+buffer, exactly as it does from the serial console. Nothing to fix;
+the earlier "Ctrl-C interrupts" note in the plan was an over-assumption.
 
 ---
 
