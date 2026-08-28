@@ -42,28 +42,32 @@ uint g_hub_num_ports = 0;
 bool g_hub_root_is_high_speed = false;
 bool[8] g_hub_port_connected; // index 0 unused (ports are 1-based); sized to USB_HUB_MAX_PORTS_TRACKED
 
-// Active HID interrupt-IN devices (keyboard + mouse) — the cooperative
-// equivalent of msc.c3's own g_msc_* session state. A session is
-// established by usb_hid_begin_session() when
-// usb_enumerate_hub_port_device() recognizes a boot keyboard/mouse (or
-// any other interrupt-IN device), polled one shot at a time by
-// usb_hid_poll() from main()'s loop, cleared on disconnect by
-// usb_hid_clear_session(). Replaces the old
-// usbd_generic_interrupt_read_loop(): that was a for(;;) that never
-// returned, so a single plugged-in mouse froze usb_msc_ipc_poll() and
-// usb_poll_hub_ports() dead (docs/devlog.md, USB keyboard planning).
+// Active interrupt-IN input devices (keyboard, mouse, gamepad) — the
+// cooperative equivalent of msc.c3's own g_msc_* session state. A
+// session is established by usb_hid_begin_session() when
+// usb_enumerate_hub_port_device() recognizes a boot keyboard/mouse, an
+// Xbox pad, or any other interrupt-IN device; polled one shot at a time
+// by usb_hid_poll() from main()'s loop; cleared on disconnect by
+// usb_hid_clear_session(). Replaces two old for(;;) read loops
+// (usbd_generic_interrupt_read_loop, usbd_xpad_read_loop) that never
+// returned, so a single plugged-in device froze usb_msc_ipc_poll() and
+// usb_poll_hub_ports() dead (docs/devlog.md).
 //
-// Two slots: HID_SLOT_KEYBOARD and HID_SLOT_OTHER (mouse / generic), so
-// a keyboard and a mouse work at the same time — a normal desk setup.
-// A second device of the same kind overwrites its slot (still a real
-// limitation, but a rare one). split_* is the device's own
-// split-transaction context, captured at begin-session and re-asserted
-// before every poll: usb_msc_ipc_poll() and hub (re-)enumeration both
-// overwrite dwc2.c3's global g_split_* in between our polls.
+// One slot per `kind` (HID_SLOT_* == the kind's own value), so a
+// keyboard, a mouse and a gamepad all work at once. A second device of
+// the same kind overwrites its slot — rare. split_* is the device's
+// own split-transaction context, captured at begin-session and
+// re-asserted before every poll: usb_msc_ipc_poll() and hub
+// (re-)enumeration both overwrite dwc2.c3's global g_split_* in between
+// our polls.
+const uint HID_KIND_GENERIC  = 0; // raw hex dump (mouse, unknown interrupt-IN)
+const uint HID_KIND_KEYBOARD = 1; // decoded by kbd.c3
+const uint HID_KIND_XPAD     = 2; // decoded by xpad.c3
+
 struct Hid_session
 {
     bool present;
-    bool is_keyboard;   // true -> reports go to kbd.c3; false -> raw hex dump
+    uint kind;          // HID_KIND_* — how usb_hid_poll_slot interprets each report
     uint hub_port;
     uint dev_addr;
     uint ep_num;
@@ -80,9 +84,11 @@ struct Hid_session
     bool split_low_speed;
 }
 
-const uint HID_SLOT_KEYBOARD = 0;
-const uint HID_SLOT_OTHER    = 1;
-const uint HID_SLOT_COUNT    = 2;
+// One slot per kind — the slot index IS the HID_KIND_* value.
+const uint HID_SLOT_KEYBOARD = HID_KIND_KEYBOARD;
+const uint HID_SLOT_OTHER    = HID_KIND_GENERIC;
+const uint HID_SLOT_XPAD     = HID_KIND_XPAD;
+const uint HID_SLOT_COUNT    = 3;
 Hid_session[HID_SLOT_COUNT] g_hid;
 
 // Re-checks every known hub port for a connection state change since
@@ -632,7 +638,7 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         print_uint(ep_in_max_packet);
         print(", bInterval=");
         print_uint(ep_in_interval);
-        print("ms, reading reports\n");
+        print("ms\n");
 
         // real Linux's own xpad_send_led_command(), XTYPE_XBOX360 case:
         // {0x01, 0x03, command}, command = (pad_nr % 4) + 2 — pad_nr is
@@ -659,7 +665,11 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
             print("usbd: xpad: no interrupt OUT endpoint found, skipping LED command\n");
         }
 
-        usbd_xpad_read_loop(USB_DOWNSTREAM_ADDR, ep_in_addr & 0x0F, ep_in_max_packet, ep_in_interval);
+        // Cooperative session (like keyboard/mouse) rather than a
+        // for(;;) loop — keeps the split context, xpad.c3 decodes each
+        // report from usb_hid_poll_slot().
+        xpad_reset_state();
+        usb_hid_begin_session(HID_KIND_XPAD, USB_DOWNSTREAM_ADDR, ep_in_addr & 0x0F, ep_in_max_packet, ep_in_interval, port);
         return;
     }
 
@@ -681,8 +691,8 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
     // BEFORE the keyboard check so a gaming mouse that also exposes a
     // boot-keyboard companion interface (for its programmable buttons —
     // vid 0x0951 pid 0x1729 was the real one that forced this) is
-    // treated as the mouse it is, polled on its mouse interface. Raw
-    // hex-dump session (is_keyboard = false), same as the generic
+    // treated as the mouse it is, polled on its mouse interface. A
+    // HID_KIND_GENERIC session (raw hex dump), same as the generic
     // fallback — no mouse-report decode layer yet.
     if (usb_find_interface(&config_buf[0], 256, USB_CLASS_HID, USB_HID_SUBCLASS_BOOT, USB_HID_PROTOCOL_MOUSE, &iface_num, &num_endpoints, &ep_start))
     {
@@ -712,7 +722,7 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         print("ms\n");
 
         // Keep the split context (same reasoning as the generic branch).
-        usb_hid_begin_session(USB_DOWNSTREAM_ADDR, m_ep_addr & 0x0F, m_ep_max_packet, m_ep_interval, port, false);
+        usb_hid_begin_session(HID_KIND_GENERIC, USB_DOWNSTREAM_ADDR, m_ep_addr & 0x0F, m_ep_max_packet, m_ep_interval, port);
         return;
     }
 
@@ -773,7 +783,7 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         // Same "keep the split context, don't clear it" reasoning as
         // the generic branch below.
         kbd_reset_state();
-        usb_hid_begin_session(USB_DOWNSTREAM_ADDR, kbd_ep_addr & 0x0F, kbd_ep_max_packet, kbd_ep_interval, port, true);
+        usb_hid_begin_session(HID_KIND_KEYBOARD, USB_DOWNSTREAM_ADDR, kbd_ep_addr & 0x0F, kbd_ep_max_packet, kbd_ep_interval, port);
         // Extra bits kbd.c3 needs for its Caps Lock LED SET_REPORT —
         // not worth widening usb_hid_begin_session's signature for a
         // keyboard-only detail.
@@ -811,7 +821,7 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         // function (after the port reset) is exactly what usb_hid_poll()
         // needs to keep talking to this device, so usb_hid_begin_session()
         // captures it instead of clearing it.
-        usb_hid_begin_session(USB_DOWNSTREAM_ADDR, generic_ep_addr & 0x0F, generic_ep_max_packet, generic_ep_interval, port, false);
+        usb_hid_begin_session(HID_KIND_GENERIC, USB_DOWNSTREAM_ADDR, generic_ep_addr & 0x0F, generic_ep_max_packet, generic_ep_interval, port);
         return;
     }
 
@@ -821,16 +831,16 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
     usb_set_split_context(false, 0, 0, false);
 }
 
-// Records the just-enumerated HID interrupt-IN endpoint in its slot
-// (HID_SLOT_KEYBOARD for a keyboard, HID_SLOT_OTHER for a mouse /
-// anything else — so the two coexist). Mirror of msc.c3's own
-// tail-of-usb_enumerate_msc_device() state capture. Interrupt endpoints
-// always start at DATA0 right after SET_CONFIGURATION (same reasoning
-// as usbd_xpad_read_loop's own pid_toggle init). next_due = now, so the
-// first poll fires on the next main-loop pass.
-fn void usb_hid_begin_session(uint dev_addr, uint ep_num, uint max_packet, uint interval_ms, uint hub_port, bool is_keyboard)
+// Records the just-enumerated interrupt-IN endpoint in its kind's slot
+// (HID_SLOT_* == HID_KIND_*), so a keyboard, mouse and gamepad coexist.
+// Mirror of msc.c3's own tail-of-usb_enumerate_msc_device() state
+// capture. Interrupt endpoints always start at DATA0 right after
+// SET_CONFIGURATION (real, sourced — control's own rule is "restart at
+// DATA1 after SETUP"; interrupt/bulk persist their toggle instead).
+// next_due = now, so the first poll fires on the next main-loop pass.
+fn void usb_hid_begin_session(uint kind, uint dev_addr, uint ep_num, uint max_packet, uint interval_ms, uint hub_port)
 {
-    Hid_session* s = &g_hid[is_keyboard ? HID_SLOT_KEYBOARD : HID_SLOT_OTHER];
+    Hid_session* s = &g_hid[kind];
 
     uint paced_interval_ms = interval_ms == 0 ? 1 : interval_ms;
     s.interval_ticks = usb_us_to_ticks((ulong)paced_interval_ms * 1000);
@@ -841,7 +851,7 @@ fn void usb_hid_begin_session(uint dev_addr, uint ep_num, uint max_packet, uint 
     s.pid_toggle     = USB_PID_DATA0;
     s.hub_port       = hub_port;
     s.report_count   = 0;
-    s.is_keyboard    = is_keyboard;
+    s.kind           = kind;
 
     // Snapshot the split context dwc2.c3 currently holds for this device
     // (our caller set it right after the port reset) so usb_hid_poll()
@@ -871,9 +881,9 @@ fn void usb_hid_clear_session(uint disconnected_port)
 
 // One non-blocking poll of one HID session slot, paced to that
 // endpoint's own bInterval via next_due — early-returns until the next
-// report is due or when the slot is empty. A keyboard slot's reports go
-// to kbd.c3's decode; the other slot gets the raw hex dump the old
-// usbd_generic_interrupt_read_loop() produced.
+// report is due or when the slot is empty. Reports are handed to the
+// decode layer for the slot's kind (kbd.c3 / xpad.c3), or hex-dumped
+// for HID_KIND_GENERIC.
 fn void usb_hid_poll_slot(uint slot)
 {
     Hid_session* s = &g_hid[slot];
@@ -884,15 +894,17 @@ fn void usb_hid_poll_slot(uint slot)
     s.next_due = now + s.interval_ticks;
 
     // Re-assert this device's split context — usb_msc_ipc_poll(), hub
-    // polling, and the other HID slot all overwrite dwc2.c3's global
+    // polling, and the other HID slots all overwrite dwc2.c3's global
     // g_split_* between our polls (see the Hid_session comment).
     usb_set_split_context(s.split_active, s.split_hub_addr, s.split_hub_port, s.split_low_speed);
 
-    char[16] report @noinit;
+    // 32 bytes covers every report this driver sees: keyboard 8, mouse
+    // 6-8, Xbox pad 20.
+    char[32] report @noinit;
     uint report_len;
-    bool got = usb_interrupt_poll(s.dev_addr, s.ep_num, s.max_packet, &s.pid_toggle, &report[0], 16, &report_len);
+    bool got = usb_interrupt_poll(s.dev_addr, s.ep_num, s.max_packet, &s.pid_toggle, &report[0], 32, &report_len);
 
-    if (s.is_keyboard)
+    if (s.kind == HID_KIND_KEYBOARD)
     {
         if (got) { kbd_handle_report(&report[0], report_len); }
         // kbd_tick() drives software auto-repeat, so it must run every
@@ -914,8 +926,14 @@ fn void usb_hid_poll_slot(uint slot)
 
     if (!got) { return; }
 
-    // Non-keyboard HID (a mouse, or an unknown interrupt-IN device):
-    // just dump the raw report, exactly what the old
+    if (s.kind == HID_KIND_XPAD)
+    {
+        xpad_handle_report(&report[0], report_len);
+        return;
+    }
+
+    // HID_KIND_GENERIC — a mouse or an unknown interrupt-IN device: just
+    // dump the raw report, exactly what the old
     // usbd_generic_interrupt_read_loop() did.
     s.report_count++;
     print("usbd: generic-hid: report #");
@@ -923,7 +941,7 @@ fn void usb_hid_poll_slot(uint slot)
     print(" len=");
     print_uint(report_len);
     print(":");
-    uint dump_len = report_len < 16 ? report_len : 16;
+    uint dump_len = report_len < 32 ? report_len : 32;
     for (uint i = 0; i < dump_len; i++)
     {
         putchar(' ');
@@ -939,103 +957,6 @@ fn void usb_hid_poll()
     for (uint i = 0; i < HID_SLOT_COUNT; i++)
     {
         usb_hid_poll_slot(i);
-    }
-}
-
-fn void print_button_change(char* name, bool now, bool before)
-{
-    if (now == before) { return; }
-    print("usbd: xpad: ");
-    print(name);
-    print(now ? " pressed\n" : " released\n");
-}
-
-// Polls the controller's own interrupt IN endpoint forever, printing
-// button/stick state changes as they happen — the direct, interactive
-// proof this all works. No IPC/game-input-subsystem integration (no
-// real consumer exists yet for that) — this phase's own scope is
-// "prove the USB stack can talk to a real interrupt-endpoint device
-// end to end," not building a general input subsystem.
-fn void usbd_xpad_read_loop(uint dev_addr, uint ep_num, uint max_packet, uint interval_ms)
-{
-    Xpad_state last_state;
-    Xpad_state state;
-    // Interrupt/bulk endpoints always start at DATA0 right after
-    // configuration — real, sourced difference from control's own
-    // "always restart at DATA1 after SETUP" rule (see
-    // usb_interrupt_poll's own comment for the full toggle-persistence
-    // reasoning this then relies on for every poll after the first).
-    uint pid_toggle = USB_PID_DATA0;
-
-    // Real hosts schedule a periodic (interrupt) endpoint at exactly
-    // its own declared bInterval — every prior poll before this fix
-    // ignored it entirely and just hammered the endpoint back-to-back
-    // (thousands of attempts/sec), which on real hardware got a clean
-    // NAK every single time, never once XFERCOMP, even with the
-    // controller actively being used (docs/devlog.md has the full
-    // trace). A malformed/zero bInterval is clamped to 1ms — full-
-    // speed interrupt endpoints (which this one is, forced by
-    // USB_HCFG_FSLSSUPP) encode bInterval directly in 1ms frame
-    // units, per USB 2.0 spec chapter 9.6.6, so no 2^(n-1) microframe
-    // decoding is needed the way a high-speed endpoint would require.
-    uint paced_interval_ms = interval_ms == 0 ? 1 : interval_ms;
-    ulong interval_ticks = usb_us_to_ticks((ulong)paced_interval_ms * 1000);
-
-    for (;;)
-    {
-        ulong poll_start = rdtime();
-        char[32] report @noinit;
-        uint report_len;
-        if (usb_interrupt_poll(dev_addr, ep_num, max_packet, &pid_toggle, &report[0], 32, &report_len))
-        {
-            if (xpad_parse_report(&report[0], report_len, &state))
-            {
-                print_button_change("A", state.a, last_state.a);
-                print_button_change("B", state.b, last_state.b);
-                print_button_change("X", state.x, last_state.x);
-                print_button_change("Y", state.y, last_state.y);
-                print_button_change("start", state.start, last_state.start);
-                print_button_change("back", state.back, last_state.back);
-                print_button_change("guide", state.guide, last_state.guide);
-                print_button_change("LB", state.bumper_l, last_state.bumper_l);
-                print_button_change("RB", state.bumper_r, last_state.bumper_r);
-                print_button_change("L3", state.thumb_l, last_state.thumb_l);
-                print_button_change("R3", state.thumb_r, last_state.thumb_r);
-                print_button_change("dpad-up", state.dpad_up, last_state.dpad_up);
-                print_button_change("dpad-down", state.dpad_down, last_state.dpad_down);
-                print_button_change("dpad-left", state.dpad_left, last_state.dpad_left);
-                print_button_change("dpad-right", state.dpad_right, last_state.dpad_right);
-
-                if (state.trigger_l != last_state.trigger_l || state.trigger_r != last_state.trigger_r)
-                {
-                    print("usbd: xpad: triggers l=");
-                    print_uint(state.trigger_l);
-                    print(" r=");
-                    print_uint(state.trigger_r);
-                    print("\n");
-                }
-                if (state.stick_lx != last_state.stick_lx || state.stick_ly != last_state.stick_ly
-                    || state.stick_rx != last_state.stick_rx || state.stick_ry != last_state.stick_ry)
-                {
-                    print("usbd: xpad: sticks lx=");
-                    print_int(state.stick_lx);
-                    print(" ly=");
-                    print_int(state.stick_ly);
-                    print(" rx=");
-                    print_int(state.stick_rx);
-                    print(" ry=");
-                    print_int(state.stick_ry);
-                    print("\n");
-                }
-
-                last_state = state;
-            }
-        }
-
-        // Pace to bInterval, not a bare spin — see this function's own
-        // comment above. yield()-based, same SYS_YIELD deadlock
-        // reasoning as main()'s own polling loop below.
-        while (rdtime() - poll_start < interval_ticks) { yield(); }
     }
 }
 

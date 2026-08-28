@@ -114,3 +114,73 @@ fn bool xpad_parse_report(char* data, uint len, Xpad_state* out)
 
     return true;
 }
+
+// Last decoded pad state, for the change detection in
+// xpad_handle_report. Zeroed by xpad_reset_state() when usbd.c3 begins
+// an xpad session.
+Xpad_state g_xpad_last;
+
+fn void xpad_reset_state()
+{
+    Xpad_state zero;
+    g_xpad_last = zero;
+}
+
+fn void xpad_print_button_change(char* name, bool now, bool before)
+{
+    if (now == before) { return; }
+    print("usbd: xpad: ");
+    print(name);
+    print(now ? " pressed\n" : " released\n");
+}
+
+// One interrupt-IN report from usbd.c3's cooperative HID poll. Prints
+// every button / trigger / stick change since the last report, then
+// stores it. No IPC / game-input subsystem — there's no consumer for
+// that yet; this is still "prove the USB stack talks to the pad end to
+// end," now without a for(;;) loop hogging usbd (docs/devlog.md).
+fn void xpad_handle_report(char* report, uint len)
+{
+    Xpad_state state;
+    if (!xpad_parse_report(report, len, &state)) { return; }
+
+    xpad_print_button_change("A", state.a, g_xpad_last.a);
+    xpad_print_button_change("B", state.b, g_xpad_last.b);
+    xpad_print_button_change("X", state.x, g_xpad_last.x);
+    xpad_print_button_change("Y", state.y, g_xpad_last.y);
+    xpad_print_button_change("start", state.start, g_xpad_last.start);
+    xpad_print_button_change("back", state.back, g_xpad_last.back);
+    xpad_print_button_change("guide", state.guide, g_xpad_last.guide);
+    xpad_print_button_change("LB", state.bumper_l, g_xpad_last.bumper_l);
+    xpad_print_button_change("RB", state.bumper_r, g_xpad_last.bumper_r);
+    xpad_print_button_change("L3", state.thumb_l, g_xpad_last.thumb_l);
+    xpad_print_button_change("R3", state.thumb_r, g_xpad_last.thumb_r);
+    xpad_print_button_change("dpad-up", state.dpad_up, g_xpad_last.dpad_up);
+    xpad_print_button_change("dpad-down", state.dpad_down, g_xpad_last.dpad_down);
+    xpad_print_button_change("dpad-left", state.dpad_left, g_xpad_last.dpad_left);
+    xpad_print_button_change("dpad-right", state.dpad_right, g_xpad_last.dpad_right);
+
+    if (state.trigger_l != g_xpad_last.trigger_l || state.trigger_r != g_xpad_last.trigger_r)
+    {
+        print("usbd: xpad: triggers l=");
+        print_uint(state.trigger_l);
+        print(" r=");
+        print_uint(state.trigger_r);
+        print("\n");
+    }
+    if (state.stick_lx != g_xpad_last.stick_lx || state.stick_ly != g_xpad_last.stick_ly
+        || state.stick_rx != g_xpad_last.stick_rx || state.stick_ry != g_xpad_last.stick_ry)
+    {
+        print("usbd: xpad: sticks lx=");
+        print_int(state.stick_lx);
+        print(" ly=");
+        print_int(state.stick_ly);
+        print(" rx=");
+        print_int(state.stick_rx);
+        print(" ry=");
+        print_int(state.stick_ry);
+        print("\n");
+    }
+
+    g_xpad_last = state;
+}

@@ -4,6 +4,37 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 (continued) — xpad folded into the cooperative HID session model
+
+Cleanup, not a feature. `usbd_xpad_read_loop()` was the last `for(;;)`
+in usbd — an Xbox pad plugged in still froze `usb_msc_ipc_poll()` /
+`usb_poll_hub_ports()` / the keyboard / the mouse, exactly the problem
+stages 1-2 of the keyboard work fixed for everything else.
+
+- `Hid_session` grew a `kind` field (`HID_KIND_GENERIC` / `_KEYBOARD` /
+  `_XPAD`) in place of the `bool is_keyboard`; the slot array went from
+  2 to 3, one slot per kind (slot index == kind value). Keyboard, mouse
+  and gamepad now all work at once.
+- `usb_hid_begin_session()` takes `kind` as its first arg; the four
+  dispatch branches pass the right one.
+- `usb_hid_poll_slot()` routes reports by `s.kind` — kbd.c3, xpad.c3, or
+  the raw hex dump. Its report buffer went 16 → 32 bytes (the Xbox pad
+  report is 20).
+- New in `xpad.c3`: `g_xpad_last`, `xpad_reset_state()`,
+  `xpad_handle_report()` (parse + per-change print), and
+  `xpad_print_button_change()` — moved out of usbd.c3 along with the
+  button/stick decode, so xpad.c3 owns the whole "what the pad's bytes
+  mean" layer, matching its own header comment. `print_int` stays in
+  usbd.c3 (dwc2.c3 uses it too).
+
+Net −9 lines. Builds clean (Duo + QEMU); no QEMU path for USB. Not
+hardware-tested — needs an Xbox pad + keyboard + mouse plugged at once,
+though the Xbox-clone pad in the parts box has never streamed input
+(device-specific, see 2026-08-25) so the realistic check is "pad
+enumerates, keyboard + mouse keep working alongside it."
+
+---
+
 ## 2026-08-28 — session summary: camera scoped out, USB keyboard shipped
 
 Two things this session. Detail in the per-topic entries below.
