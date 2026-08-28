@@ -42,6 +42,47 @@ uint g_hub_num_ports = 0;
 bool g_hub_root_is_high_speed = false;
 bool[8] g_hub_port_connected; // index 0 unused (ports are 1-based); sized to USB_HUB_MAX_PORTS_TRACKED
 
+// Active HID interrupt-IN devices (keyboard + mouse) — the cooperative
+// equivalent of msc.c3's own g_msc_* session state. A session is
+// established by usb_hid_begin_session() when
+// usb_enumerate_hub_port_device() recognizes a boot keyboard/mouse (or
+// any other interrupt-IN device), polled one shot at a time by
+// usb_hid_poll() from main()'s loop, cleared on disconnect by
+// usb_hid_clear_session(). Replaces the old
+// usbd_generic_interrupt_read_loop(): that was a for(;;) that never
+// returned, so a single plugged-in mouse froze usb_msc_ipc_poll() and
+// usb_poll_hub_ports() dead (docs/devlog.md, USB keyboard planning).
+//
+// Two slots: HID_SLOT_KEYBOARD and HID_SLOT_OTHER (mouse / generic), so
+// a keyboard and a mouse work at the same time — a normal desk setup.
+// A second device of the same kind overwrites its slot (still a real
+// limitation, but a rare one). split_* is the device's own
+// split-transaction context, captured at begin-session and re-asserted
+// before every poll: usb_msc_ipc_poll() and hub (re-)enumeration both
+// overwrite dwc2.c3's global g_split_* in between our polls.
+struct Hid_session
+{
+    bool present;
+    bool is_keyboard;   // true -> reports go to kbd.c3; false -> raw hex dump
+    uint hub_port;
+    uint dev_addr;
+    uint ep_num;
+    uint max_packet;
+    uint pid_toggle;
+    ulong interval_ticks;
+    ulong next_due;      // rdtime() value the next poll is due at
+    uint report_count;
+    bool split_active;
+    uint split_hub_addr;
+    uint split_hub_port;
+    bool split_low_speed;
+}
+
+const uint HID_SLOT_KEYBOARD = 0;
+const uint HID_SLOT_OTHER    = 1;
+const uint HID_SLOT_COUNT    = 2;
+Hid_session[HID_SLOT_COUNT] g_hid;
+
 // Re-checks every known hub port for a connection state change since
 // the last check — the same GetPortStatus this file's own initial hub
 // walk already does, just repeated. A newly-connected port gets the
@@ -56,6 +97,16 @@ fn void usb_poll_hub_ports()
     uint ports = g_hub_num_ports < USB_HUB_MAX_PORTS_TRACKED ? g_hub_num_ports : USB_HUB_MAX_PORTS_TRACKED - 1;
     for (uint port = 1; port <= ports; port++)
     {
+        // GetPortStatus talks straight to the hub — never a split
+        // transaction. Reset the context first, every iteration: an
+        // active HID session (usb_hid_poll) leaves dwc2.c3's global
+        // g_split_* pointing at its own downstream device, and a
+        // hot-plug enumerate on an *earlier* port in this same loop can
+        // leave it pointing at a low-speed device — a real STALL on the
+        // next port's status read otherwise (docs/devlog.md).
+        // usb_hid_poll() re-asserts the HID context on its next pass.
+        usb_set_split_context(false, 0, 0, false);
+
         char[4] port_status;
         if (!usb_get_port_status(g_hub_addr, g_hub_max_packet0, port, &port_status[0])) { continue; }
 
@@ -75,6 +126,7 @@ fn void usb_poll_hub_ports()
             print_uint(port);
             print(": disconnected\n");
             usb_msc_clear_session(port);
+            usb_hid_clear_session(port);
         }
     }
 }
@@ -303,6 +355,16 @@ fn void usb_enumerate_device()
         bool root_is_high_speed = ((hprt0 & USB_HPRT0_PRTSPD_MASK) >> USB_HPRT0_PRTSPD_SHIFT) == 0;
         for (uint port = 1; port <= num_ports; port++)
         {
+            // GET_PORT_STATUS below talks straight to the hub — reset
+            // the split context first. usb_enumerate_hub_port_device()
+            // for a *previous* port may have left it pointing at a
+            // downstream device (msc clears it on the way out, but an
+            // HID keyboard/mouse session deliberately keeps it for
+            // usb_hid_poll) — a real STALL on the next port's status
+            // read, hit on hardware (docs/devlog.md). Same guard as
+            // usb_poll_hub_ports().
+            usb_set_split_context(false, 0, 0, false);
+
             char[4] port_status;
             if (usb_get_port_status(USB_ENUM_ADDR, max_packet0, port, &port_status[0]))
             {
@@ -378,6 +440,13 @@ fn void print_int(int v)
 // this device's own speed is known from usb_reset_hub_port).
 fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint port, bool root_is_high_speed)
 {
+    // usb_reset_hub_port() below (SET_FEATURE(PORT_RESET) + status
+    // polling) talks straight to the hub, before this function knows
+    // the new device's speed and sets its own context — clear whatever
+    // a prior device (an HID session that keeps its context, a
+    // low-speed sibling port) left in dwc2.c3's global first.
+    usb_set_split_context(false, 0, 0, false);
+
     uint device_speed;
     if (!usb_reset_hub_port(hub_addr, hub_max_packet0, port, &device_speed))
     {
@@ -606,13 +675,112 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         return;
     }
 
-    // Diagnostic fallback: not xpad, not mass storage, but if it has
-    // ANY interrupt IN endpoint at all (a plain mouse/keyboard almost
-    // certainly does), read it generically — real-hardware round
-    // testing whether split-interrupt IN works at all through this
-    // hub for some other, completely boring device, independent of
-    // whatever's specific to the XInput pad this driver otherwise
-    // targets (docs/devlog.md).
+    // HID boot mouse (class 3 / subclass 1 / protocol 2) — matched
+    // BEFORE the keyboard check so a gaming mouse that also exposes a
+    // boot-keyboard companion interface (for its programmable buttons —
+    // vid 0x0951 pid 0x1729 was the real one that forced this) is
+    // treated as the mouse it is, polled on its mouse interface. Raw
+    // hex-dump session (is_keyboard = false), same as the generic
+    // fallback — no mouse-report decode layer yet.
+    if (usb_find_interface(&config_buf[0], 256, USB_CLASS_HID, USB_HID_SUBCLASS_BOOT, USB_HID_PROTOCOL_MOUSE, &iface_num, &num_endpoints, &ep_start))
+    {
+        if (!usb_set_configuration(USB_DOWNSTREAM_ADDR, max_packet0, 1))
+        {
+            print("usbd: mouse: SET_CONFIGURATION failed\n");
+            usb_set_split_context(false, 0, 0, false);
+            return;
+        }
+
+        uint m_ep_addr;
+        uint m_ep_max_packet;
+        uint m_ep_interval;
+        if (!usb_iface_first_interrupt_in(&config_buf[0], 256, ep_start, num_endpoints, &m_ep_addr, &m_ep_max_packet, &m_ep_interval))
+        {
+            print("usbd: mouse: no interrupt IN endpoint on the mouse interface\n");
+            usb_set_split_context(false, 0, 0, false);
+            return;
+        }
+
+        print("usbd: mouse: boot mouse on interface ");
+        print_uint(iface_num);
+        print(", interrupt IN 0x");
+        print_hex8(m_ep_addr);
+        print(", bInterval=");
+        print_uint(m_ep_interval);
+        print("ms\n");
+
+        // Keep the split context (same reasoning as the generic branch).
+        usb_hid_begin_session(USB_DOWNSTREAM_ADDR, m_ep_addr & 0x0F, m_ep_max_packet, m_ep_interval, port, false);
+        return;
+    }
+
+    // HID boot keyboard (class 3 / subclass 1 / protocol 1) — matched
+    // before the generic interrupt-IN fallback below so a plain
+    // keyboard goes through kbd.c3's decode instead of the raw hex
+    // dump. A composite keyboard (keyboard + consumer-control) matches
+    // here on its boot-keyboard interface; the other interfaces are
+    // left alone.
+    if (usb_find_interface(&config_buf[0], 256, USB_CLASS_HID, USB_HID_SUBCLASS_BOOT, USB_HID_PROTOCOL_KEYBOARD, &iface_num, &num_endpoints, &ep_start))
+    {
+        if (!usb_set_configuration(USB_DOWNSTREAM_ADDR, max_packet0, 1))
+        {
+            print("usbd: kbd: SET_CONFIGURATION failed\n");
+            usb_set_split_context(false, 0, 0, false);
+            return;
+        }
+
+        uint kbd_ep_addr;
+        uint kbd_ep_max_packet;
+        uint kbd_ep_interval;
+        if (!usb_iface_first_interrupt_in(&config_buf[0], 256, ep_start, num_endpoints, &kbd_ep_addr, &kbd_ep_max_packet, &kbd_ep_interval))
+        {
+            print("usbd: kbd: no interrupt IN endpoint on the keyboard interface\n");
+            usb_set_split_context(false, 0, 0, false);
+            return;
+        }
+
+        // HID init: pin the report format to the fixed 8-byte boot
+        // layout, and stop the device re-sending unchanged reports (no
+        // hardware auto-repeat). Neither is fatal if the keyboard NAKs
+        // it — most work in boot-ish mode anyway — so log and continue.
+        if (usb_hid_set_protocol(USB_DOWNSTREAM_ADDR, max_packet0, iface_num, 0))
+        {
+            print("usbd: kbd: boot protocol selected\n");
+        }
+        else
+        {
+            print("usbd: kbd: SET_PROTOCOL failed (continuing)\n");
+        }
+        if (usb_hid_set_idle(USB_DOWNSTREAM_ADDR, max_packet0, iface_num, 0))
+        {
+            print("usbd: kbd: idle rate 0 (report-on-change)\n");
+        }
+        else
+        {
+            print("usbd: kbd: SET_IDLE failed (continuing)\n");
+        }
+
+        print("usbd: kbd: keyboard on interface ");
+        print_uint(iface_num);
+        print(", interrupt IN 0x");
+        print_hex8(kbd_ep_addr);
+        print(", bInterval=");
+        print_uint(kbd_ep_interval);
+        print("ms\n");
+
+        // Same "keep the split context, don't clear it" reasoning as
+        // the generic branch below.
+        kbd_reset_state();
+        usb_hid_begin_session(USB_DOWNSTREAM_ADDR, kbd_ep_addr & 0x0F, kbd_ep_max_packet, kbd_ep_interval, port, true);
+        return;
+    }
+
+    // Not xpad, not mass storage, not a boot keyboard, but if it has
+    // ANY interrupt IN endpoint at all (a mouse almost certainly does),
+    // register it as the active HID session and let usb_hid_poll()
+    // service it cooperatively from main()'s loop. Started life as a
+    // real-hardware diagnostic for "does split-interrupt IN work at all
+    // through this hub for a boring device" (docs/devlog.md).
     uint generic_ep_addr;
     uint generic_ep_max_packet;
     uint generic_ep_interval;
@@ -630,8 +798,13 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         print_uint(generic_ep_max_packet);
         print(", bInterval=");
         print_uint(generic_ep_interval);
-        print("ms, reading reports\n");
-        usbd_generic_interrupt_read_loop(USB_DOWNSTREAM_ADDR, generic_ep_addr & 0x0F, generic_ep_max_packet, generic_ep_interval);
+        print("ms, cooperative polling\n");
+        // No usb_set_split_context(false, ...) here, unlike the xpad/msc
+        // branches above — the split context set earlier in this
+        // function (after the port reset) is exactly what usb_hid_poll()
+        // needs to keep talking to this device, so usb_hid_begin_session()
+        // captures it instead of clearing it.
+        usb_hid_begin_session(USB_DOWNSTREAM_ADDR, generic_ep_addr & 0x0F, generic_ep_max_packet, generic_ep_interval, port, false);
         return;
     }
 
@@ -641,38 +814,111 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
     usb_set_split_context(false, 0, 0, false);
 }
 
-// Diagnostic-only: polls an arbitrary interrupt IN endpoint forever,
-// printing the raw report bytes whenever one arrives — see this
-// function's own call site for why this exists (usb_find_any_interrupt_in).
-fn void usbd_generic_interrupt_read_loop(uint dev_addr, uint ep_num, uint max_packet, uint interval_ms)
+// Records the just-enumerated HID interrupt-IN endpoint in its slot
+// (HID_SLOT_KEYBOARD for a keyboard, HID_SLOT_OTHER for a mouse /
+// anything else — so the two coexist). Mirror of msc.c3's own
+// tail-of-usb_enumerate_msc_device() state capture. Interrupt endpoints
+// always start at DATA0 right after SET_CONFIGURATION (same reasoning
+// as usbd_xpad_read_loop's own pid_toggle init). next_due = now, so the
+// first poll fires on the next main-loop pass.
+fn void usb_hid_begin_session(uint dev_addr, uint ep_num, uint max_packet, uint interval_ms, uint hub_port, bool is_keyboard)
 {
-    uint pid_toggle = USB_PID_DATA0;
-    uint paced_interval_ms = interval_ms == 0 ? 1 : interval_ms;
-    ulong interval_ticks = usb_us_to_ticks((ulong)paced_interval_ms * 1000);
-    uint poll_num = 0;
+    Hid_session* s = &g_hid[is_keyboard ? HID_SLOT_KEYBOARD : HID_SLOT_OTHER];
 
-    for (;;)
+    uint paced_interval_ms = interval_ms == 0 ? 1 : interval_ms;
+    s.interval_ticks = usb_us_to_ticks((ulong)paced_interval_ms * 1000);
+    s.next_due       = rdtime();
+    s.dev_addr       = dev_addr;
+    s.ep_num         = ep_num;
+    s.max_packet     = max_packet;
+    s.pid_toggle     = USB_PID_DATA0;
+    s.hub_port       = hub_port;
+    s.report_count   = 0;
+    s.is_keyboard    = is_keyboard;
+
+    // Snapshot the split context dwc2.c3 currently holds for this device
+    // (our caller set it right after the port reset) so usb_hid_poll()
+    // can re-assert it after unrelated transfers clobber the global —
+    // see the Hid_session comment.
+    s.split_active    = g_split_active;
+    s.split_hub_addr  = g_split_hub_addr;
+    s.split_hub_port  = g_split_hub_port;
+    s.split_low_speed = g_device_is_low_speed;
+
+    s.present = true;
+}
+
+// Mirror of usb_msc_clear_session — called from usb_poll_hub_ports()
+// when a hub port goes empty. Clears whichever slot(s) that port held.
+// Safe to call unconditionally.
+fn void usb_hid_clear_session(uint disconnected_port)
+{
+    for (uint i = 0; i < HID_SLOT_COUNT; i++)
     {
-        ulong poll_start = rdtime();
-        char[16] report @noinit;
-        uint report_len;
-        poll_num++;
-        if (usb_interrupt_poll(dev_addr, ep_num, max_packet, &pid_toggle, &report[0], 16, &report_len))
+        if (g_hid[i].present && g_hid[i].hub_port == disconnected_port)
         {
-            print("usbd: generic-hid: report #");
-            print_uint(poll_num);
-            print(" len=");
-            print_uint(report_len);
-            print(":");
-            uint dump_len = report_len < 16 ? report_len : 16;
-            for (uint i = 0; i < dump_len; i++)
-            {
-                putchar(' ');
-                print_hex8((uint)report[i] & 0xFF);
-            }
-            print("\n");
+            g_hid[i].present = false;
         }
-        while (rdtime() - poll_start < interval_ticks) { yield(); }
+    }
+}
+
+// One non-blocking poll of one HID session slot, paced to that
+// endpoint's own bInterval via next_due — early-returns until the next
+// report is due or when the slot is empty. A keyboard slot's reports go
+// to kbd.c3's decode; the other slot gets the raw hex dump the old
+// usbd_generic_interrupt_read_loop() produced.
+fn void usb_hid_poll_slot(uint slot)
+{
+    Hid_session* s = &g_hid[slot];
+    if (!s.present) { return; }
+
+    ulong now = rdtime();
+    if (now < s.next_due) { return; }
+    s.next_due = now + s.interval_ticks;
+
+    // Re-assert this device's split context — usb_msc_ipc_poll(), hub
+    // polling, and the other HID slot all overwrite dwc2.c3's global
+    // g_split_* between our polls (see the Hid_session comment).
+    usb_set_split_context(s.split_active, s.split_hub_addr, s.split_hub_port, s.split_low_speed);
+
+    char[16] report @noinit;
+    uint report_len;
+    if (!usb_interrupt_poll(s.dev_addr, s.ep_num, s.max_packet, &s.pid_toggle, &report[0], 16, &report_len))
+    {
+        return;
+    }
+
+    if (s.is_keyboard)
+    {
+        kbd_handle_report(&report[0], report_len);
+        return;
+    }
+
+    // Non-keyboard HID (a mouse, or an unknown interrupt-IN device):
+    // just dump the raw report, exactly what the old
+    // usbd_generic_interrupt_read_loop() did.
+    s.report_count++;
+    print("usbd: generic-hid: report #");
+    print_uint(s.report_count);
+    print(" len=");
+    print_uint(report_len);
+    print(":");
+    uint dump_len = report_len < 16 ? report_len : 16;
+    for (uint i = 0; i < dump_len; i++)
+    {
+        putchar(' ');
+        print_hex8((uint)report[i] & 0xFF);
+    }
+    print("\n");
+}
+
+// Polls every HID session slot — called from main()'s loop and its
+// idle tail.
+fn void usb_hid_poll()
+{
+    for (uint i = 0; i < HID_SLOT_COUNT; i++)
+    {
+        usb_hid_poll_slot(i);
     }
 }
 
@@ -797,6 +1043,7 @@ fn void main()
     for (;;)
     {
         usb_msc_ipc_poll();
+        usb_hid_poll();
 
         uint hprt0 = usb_reg_read(USB_HPRT0);
         bool connected = (hprt0 & USB_HPRT0_PRTCONNSTS) != 0;
@@ -846,7 +1093,18 @@ fn void main()
         // keystroke (SYS_GETCHAR), since this kernel's own design
         // means that alone holds interrupts globally disabled for as
         // long as it lasts.
+        //
+        // usb_hid_poll() runs throughout this idle window, not just
+        // once per ~100ms outer pass: a HID endpoint's bInterval is
+        // ~8ms and each slot is internally paced (next_due), so
+        // quantizing it to this loop's 100ms would drop mouse motion /
+        // keystrokes under any real use. Cheap early-return per slot
+        // when nothing's attached.
         ulong poll_start = rdtime();
-        while (rdtime() - poll_start < usb_us_to_ticks(100000)) { yield(); }
+        while (rdtime() - poll_start < usb_us_to_ticks(100000))
+        {
+            usb_hid_poll();
+            yield();
+        }
     }
 }

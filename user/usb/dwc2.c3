@@ -155,6 +155,18 @@ const uint USB_CLASS_MASS_STORAGE     = 0x08;
 const uint USB_MSC_SUBCLASS_SCSI      = 0x06;
 const uint USB_MSC_PROTOCOL_BULK_ONLY = 0x50;
 
+// HID class (USB HID 1.11): interface class 0x03. Subclass 1 = "boot
+// interface" (a fixed report layout the host can use without parsing
+// the report descriptor); interface protocol 1 = keyboard, 2 = mouse.
+// A gaming mouse commonly exposes BOTH a boot-mouse interface and a
+// boot-keyboard companion interface (for its programmable buttons) —
+// usbd.c3's dispatch checks mouse before keyboard so such a device is
+// treated as the mouse it is.
+const uint USB_CLASS_HID              = 0x03;
+const uint USB_HID_SUBCLASS_BOOT     = 0x01;
+const uint USB_HID_PROTOCOL_KEYBOARD = 0x01;
+const uint USB_HID_PROTOCOL_MOUSE    = 0x02;
+
 // Endpoint descriptor accessors (USB 2.0 spec chapter 9) — plain
 // functions on a raw pointer into a Configuration descriptor blob,
 // same style as eth_proto.c3's own read_be16/read_be32 helpers, rather
@@ -1538,6 +1550,46 @@ fn bool usb_set_interface(uint dev_addr, uint max_packet0, uint iface_num, uint 
     return usb_control_transfer(dev_addr, max_packet0, &setup[0], null, 0, true);
 }
 
+// HID class request SET_PROTOCOL (HID 1.11 section 7.2.6): select boot
+// (0) or report (1) protocol on a HID interface. bmRequestType 0x21 =
+// host-to-device, class, interface; wValue = protocol; wIndex =
+// interface; no data stage. A plain boot keyboard powers up in report
+// protocol, so this is what actually pins the report format to the
+// fixed 8-byte boot layout kbd.c3 parses.
+fn bool usb_hid_set_protocol(uint dev_addr, uint max_packet0, uint iface_num, uint protocol)
+{
+    char[8] setup;
+    setup[0] = (char)0x21;
+    setup[1] = (char)0x0B; // SET_PROTOCOL
+    setup[2] = (char)(protocol & 0xFF);
+    setup[3] = (char)0;
+    setup[4] = (char)(iface_num & 0xFF);
+    setup[5] = (char)0;
+    setup[6] = (char)0;
+    setup[7] = (char)0;
+    return usb_control_transfer(dev_addr, max_packet0, &setup[0], null, 0, true);
+}
+
+// HID class request SET_IDLE (HID 1.11 section 7.2.4): how often the
+// device re-sends an unchanged report. duration is in 4ms units;
+// duration 0 = "only when the report actually changes", which is what
+// this driver wants (no polling-driven duplicate reports, and no
+// hardware key auto-repeat — software repeat is handled later). wValue
+// hi byte = duration, lo byte = report ID (0 = all reports).
+fn bool usb_hid_set_idle(uint dev_addr, uint max_packet0, uint iface_num, uint duration)
+{
+    char[8] setup;
+    setup[0] = (char)0x21;
+    setup[1] = (char)0x0A; // SET_IDLE
+    setup[2] = (char)0;                  // wValue lo = report ID 0
+    setup[3] = (char)(duration & 0xFF);  // wValue hi = duration
+    setup[4] = (char)(iface_num & 0xFF);
+    setup[5] = (char)0;
+    setup[6] = (char)0;
+    setup[7] = (char)0;
+    return usb_control_transfer(dev_addr, max_packet0, &setup[0], null, 0, true);
+}
+
 fn bool usb_get_hub_descriptor(uint dev_addr, uint max_packet0, void* buf, uint len)
 {
     char[8] setup;
@@ -1633,6 +1685,41 @@ fn bool usb_find_any_interrupt_in(char* config_buf, uint len, uint* ep_addr_out,
             }
         }
         i += b_length;
+    }
+    return false;
+}
+
+// Like usb_find_any_interrupt_in, but scoped to ONE interface: walks
+// endpoint descriptors starting at ep_start (the offset
+// usb_find_interface hands back), bounded by num_endpoints real
+// endpoint descriptors or the next Interface descriptor, whichever
+// comes first. This is what a composite device (keyboard + consumer-
+// control, keyboard + mouse) needs — usb_find_any_interrupt_in would
+// happily return a sibling interface's endpoint.
+fn bool usb_iface_first_interrupt_in(char* config_buf, uint len, uint ep_start, uint num_endpoints, uint* ep_addr_out, uint* max_packet_out, uint* interval_out)
+{
+    uint off = ep_start;
+    uint eps_seen = 0;
+    while (off + 1 < len && eps_seen < num_endpoints)
+    {
+        uint b_length = (uint)config_buf[off] & 0xFF;
+        if (b_length == 0) { break; }
+        uint b_type = (uint)config_buf[off + 1] & 0xFF;
+        if (b_type == USB_DESC_TYPE_INTERFACE) { break; }
+        if (b_type == USB_DESC_TYPE_ENDPOINT)
+        {
+            char* ep_desc = &config_buf[off];
+            uint addr = usb_ep_desc_address(ep_desc);
+            if (usb_ep_desc_xfer_type(ep_desc) == USB_EP_XFERTYPE_INTERRUPT && (addr & 0x80) != 0)
+            {
+                *ep_addr_out = addr;
+                *max_packet_out = usb_ep_desc_max_packet(ep_desc);
+                *interval_out = usb_ep_desc_interval(ep_desc);
+                return true;
+            }
+            eps_seen++;
+        }
+        off += b_length;
     }
     return false;
 }

@@ -4,6 +4,275 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 (continued) — USB keyboard stage 2: boot-report decode — WORKING ON REAL HARDWARE
+
+**Confirmed on the real Milk-V Duo** (low-speed keyboard vid=0x1a2c
+pid=0x0b2a, on the IO-board hub, split transactions). SET_PROTOCOL(0) +
+SET_IDLE(0) both accepted; `usbd: kbd: keyboard on interface 0,
+interrupt IN 0x81, bInterval=10ms`; then every keystroke decoded
+correctly on serial — letters, Shift→uppercase, Shift+digits→`!@#$%`,
+Enter→`<0x0d>`. Cooperative `usb_hid_poll()` (stage 1) kept the shell
+prompt and `ethd` running alongside it.
+
+One real bug surfaced and fixed the same session (see the split-context
+note below). New `user/usb/kbd.c3` + `dwc2.c3`/`usbd.c3` glue; QEMU +
+Duo both build clean — there's no QEMU path for any of this (no DWC2 in
+`virt`).
+
+### Split-context leak (stage 1 latent bug, exposed here)
+
+First boot showed `usbd: hub port 4: GET_PORT_STATUS failed` (a
+complete-split STALL) right after the keyboard enumerated. Cause:
+`usb_hid_begin_session()` deliberately keeps dwc2.c3's global
+`g_split_*` pointing at the (low-speed) keyboard so `usb_hid_poll()`
+can re-assert it — but the enclosing hub-walk loop in
+`usb_enumerate_device()` then did its *next* `usb_get_port_status()`
+(a transfer straight to the hub) with that stale low-speed split
+context still set → STALL. The old infinite read-loop had masked this
+by never letting the walk continue. `msc.c3` avoids it by clearing the
+context on the way out; HID can't, because it needs it.
+
+Fix: `usb_set_split_context(false, …)` is now asserted right before
+every hub-directed transfer — first statement of the port loop in
+`usb_enumerate_device()`, first statement of the port loop in
+`usb_poll_hub_ports()` (was once-before-the-loop, now per-iteration so
+a hot-plug enum on an earlier port can't poison a later one), and at
+the top of `usb_enumerate_hub_port_device()` before `usb_reset_hub_port()`.
+Per-device paths still set their own context after; `usb_hid_poll()`
+re-asserts the keyboard's on its next pass.
+
+Re-flashed and confirmed: `usbd: hub port 4: empty` (clean, no STALL),
+keyboard still decodes every key.
+
+### Second hardware round: mouse misclassified, single HID slot
+
+Plugged a keyboard **and** a gaming mouse (Kingston/HyperX, vid 0x0951
+pid 0x1729). Two problems:
+
+1. The mouse is a composite HID device — a boot-mouse interface *and* a
+   boot-keyboard companion interface for its programmable buttons. The
+   `usb_find_interface(3, 1, 1)` keyboard match grabbed the companion,
+   so usbd treated the mouse as a keyboard and polled the wrong
+   interface — no mouse data at all.
+2. Only one HID session slot (`g_hid_*` singleton), so the real
+   keyboard's session then overwrote the mouse's. Keyboard + mouse
+   could never coexist.
+
+Fixes:
+
+- **`Hid_session[2] g_hid`** — `HID_SLOT_KEYBOARD` + `HID_SLOT_OTHER`
+  (mouse/generic). `usb_hid_begin_session()` writes the slot for its
+  kind; `usb_hid_poll()` loops both; `usb_hid_clear_session()` clears
+  by port across both. A keyboard and a mouse now work at once; a
+  second device of the same kind still overwrites its slot (rare).
+- **Dispatch order**: a new boot-mouse branch (`3/1/2`) is checked
+  *before* the keyboard branch (`3/1/2` → raw hex-dump session on the
+  mouse interface, `is_keyboard = false`), so a gaming mouse with a
+  keyboard companion is treated as the mouse it is. HID class/subclass/
+  protocol constants moved to `dwc2.c3` (`USB_CLASS_HID`,
+  `USB_HID_SUBCLASS_BOOT`, `USB_HID_PROTOCOL_KEYBOARD/MOUSE`).
+- Known limitation kept: a true keyboard+mouse *combo receiver* would
+  now match the mouse branch and its keyboard would go unpolled —
+  acceptable, combos were already out of scope; the real fix is
+  binding both interfaces of one device to their own slots.
+
+**Third round confirmed:** keyboard (port 3) + gaming mouse (port 2) at
+once — `usbd: mouse: boot mouse on interface 0, interrupt IN 0x81`,
+6-byte reports (16-bit deltas) streaming on movement, `usbd: kbd: '7'`
+… decoding correctly at the same time. Clean hub walk, `port 4: empty`.
+The mouse now works *better* than in stage 1 (its own interface, not a
+misgrabbed keyboard companion, and it coexists with the keyboard).
+
+`mountusb` (MSC + a HID device attached) not separately re-run, but MSC
+dispatch order is unchanged and `usb_msc_ipc_poll` still runs with
+split cleared — the risk from these changes is low.
+
+- **`user/usb/kbd.c3`** (new, ~185 lines, xpad.c3-style device layer):
+  - `kbd_handle_report(report, len)` — takes one 8-byte boot report
+    from `usb_hid_poll()`, diffs `[2..7]` against `g_kbd_prev` for
+    newly-held keys, ignores an ErrorRollOver (`[2] == 0x01`) report
+    without disturbing `g_kbd_prev`.
+  - `kbd_usage_to_bytes(usage, mods, out) -> n` — US-QWERTY HID-usage →
+    ASCII: letters (Shift = upper, Ctrl = `0x01..0x1A` so Ctrl-C etc.
+    match the serial console), number row + shifted symbols, the
+    `-=[]\;',./` cluster + shifted forms, Enter→`\r`, Backspace→`0x08`,
+    Tab, Space, Esc, and arrows → ANSI `ESC [ A/B/C/D`. Unmapped keys
+    (F-keys, keypad, Caps/Num/Scroll Lock) return 0.
+  - `kbd_emit(c)` — stage 2 just prints `usbd: kbd: 'x'` /
+    `usbd: kbd: <0xNN>`; stage 3 swaps this body for the `SYS_KBD_PUSH`
+    kernel-queue push that actually feeds the shell.
+- **`dwc2.c3`**: `usb_hid_set_protocol()` (SET_PROTOCOL, `bmRequestType
+  0x21`, `bRequest 0x0B`) + `usb_hid_set_idle()` (SET_IDLE, `0x0A`),
+  and `usb_iface_first_interrupt_in()` — an interface-scoped endpoint
+  finder (vs. `usb_find_any_interrupt_in`'s whole-config scan) so a
+  composite keyboard's keyboard interface is the one that's picked.
+- **`usbd.c3`**: `usb_hid_begin_session()` gains an `is_keyboard` flag
+  (`g_hid_is_keyboard`); `usb_hid_poll()` routes a keyboard session's
+  reports to `kbd_handle_report()` and everything else to the existing
+  raw hex dump. New dispatch branch in `usb_enumerate_hub_port_device`
+  matches HID `3/1/1` *before* the generic fallback: SET_CONFIGURATION
+  → find the interrupt-IN endpoint → SET_PROTOCOL(0) + SET_IDLE(0)
+  (both non-fatal, logged) → `kbd_reset_state()` → begin session.
+- **`scripts/build_user.sh`**: `kbd.c3` added to the `usbd` link line.
+
+Scope kept tight: US layout only, no auto-repeat (SET_IDLE(0) kills the
+hardware one; software repeat is stage 4), no shell wiring yet — a
+keystroke prints to serial, it doesn't reach `getchar()`. Caps Lock
+ignored until stage 4.
+
+**Hardware result:** keyboard decode confirmed working (see the stage 2
+entry above, same session). Mouse + `mountusb` regression from stage 1
+still needs a dedicated check.
+
+---
+
+## 2026-08-28 (continued) — USB keyboard stage 1: cooperative HID polling
+
+Built, not yet hardware-verified (needs a reflash + a real USB
+mouse/keyboard). `user/usb/usbd.c3` only; QEMU + Duo builds both clean.
+
+The problem: `usb_enumerate_hub_port_device()`'s generic-HID branch
+called `usbd_generic_interrupt_read_loop()`, a `for (;;)` that never
+returned. Once any mouse/keyboard enumerated, usbd was stuck in it —
+`usb_msc_ipc_poll()` and `usb_poll_hub_ports()` never ran again, so a
+USB stick plugged after a mouse was invisible and `mountusb` couldn't
+work.
+
+The fix — mirror `msc.c3`'s session model:
+
+- **`g_hid_*` module state** (`present`, `hub_port`, `dev_addr`,
+  `ep_num`, `max_packet`, `pid_toggle`, `interval_ticks`, `next_due`,
+  `report_count`) + a captured copy of this device's split-transaction
+  context (`g_hid_split_*`).
+- **`usb_hid_begin_session()`** replaces the read-loop call: stores the
+  endpoint, snapshots `dwc2.c3`'s current `g_split_*` (set by the
+  enclosing enumerate path), sets `g_hid_present`. Deliberately does
+  *not* `usb_set_split_context(false, …)` on the way out, unlike the
+  xpad/msc branches — the HID session needs that context kept.
+- **`usb_hid_poll()`** — one non-blocking `usb_interrupt_poll`, paced by
+  `g_hid_next_due` against the endpoint's bInterval, re-asserting the
+  HID split context first (since `usb_msc_ipc_poll` / hub polling
+  clobber the global in between). Still just prints the raw report
+  bytes — same diagnostic output the old loop produced; the keyboard
+  decode layer slots in here next stage.
+- **`usb_hid_clear_session(port)`** — mirror of `usb_msc_clear_session`,
+  called from the hub-port disconnect branch.
+- **`main()` loop**: `usb_hid_poll()` runs at the top *and* throughout
+  the ~100 ms idle tail (was a bare `while (…) { yield(); }`) — a
+  keyboard's ~8 ms bInterval would otherwise be quantized to 100 ms and
+  drop keystrokes. `usb_hid_poll()` early-returns until due / when
+  nothing's attached, so the idle spin stays cheap.
+- **`usb_poll_hub_ports()`**: now asserts `usb_set_split_context(false,
+  …)` up front (it always talks straight to the hub). No-op in the
+  full-speed-hub config this project runs, but makes the ownership
+  explicit now that an active HID session leaves the global pointing at
+  a downstream device.
+
+`usbd_xpad_read_loop()` still has its own `for (;;)` — left alone, xpad
+isn't the keyboard target and folding it in would widen the diff.
+Whole-hub-unplug (root-port disconnect) still doesn't clear the HID/MSC
+sessions — matches MSC's existing behaviour; a stale session just
+fails its transfers harmlessly.
+
+**To verify on hardware:** reflash, plug the known-good USB mouse
+through the hub — `usbd: generic-hid: report #N …` lines should still
+appear on motion — then plug a USB stick and confirm `mountusb` now
+works with the mouse still attached.
+
+---
+
+## 2026-08-28 (continued) — planning: USB keyboard support
+
+Camera set aside as the big item; USB keyboard picked as the next actual
+feature — much smaller, because the whole USB stack + interrupt-IN reads
+are already proven on real hardware (mouse). Plan written up as
+`docs/usb-keyboard-plan.md`.
+
+Shape of the work (no code yet):
+
+- **Structural refactor**: usbd's HID read path is an infinite `for(;;)`
+  loop today (`usbd_generic_interrupt_read_loop`) — it takes over the
+  process, killing MSC IPC + hub polling. Replace with stored endpoint
+  state + a single-shot `usb_hid_poll()` in `main()`'s loop, on a split
+  cadence (~16 ms for HID, existing ~100 ms–1 s for MSC/hub).
+- **`user/usb/kbd.c3`** (new, xpad.c3-style): 8-byte HID boot report
+  (modifier byte + 6 keycodes), diff prev vs cur for newly-pressed keys,
+  US-layout HID-usage→ASCII table incl. Shift / Ctrl / Enter / Backspace
+  / arrows-as-escape-sequences.
+- **HID init**: `SET_PROTOCOL(0)` + `SET_IDLE(0)` via the existing
+  `usb_control_transfer`.
+- **Delivery**: new `SYS_KBD_PUSH` (= 31) syscall → small kernel ring
+  buffer → drained by `SYS_GETCHAR` alongside `board::console_getchar()`.
+  Shell and all consumers unchanged; serial + USB feed one stream.
+- **Dispatch**: match HID class 3 / subclass 1 / protocol 1 before the
+  generic interrupt-IN fallback in `usb_enumerate_hub_device`.
+
+Stages: (1) cooperative-poll refactor, verify mouse + MSC still coexist;
+(2) kbd.c3 parse/decode, print to serial; (3) kernel queue + real shell
+input; (4) Caps Lock, software auto-repeat, commit.
+
+Real-Duo-only (no DWC2 in QEMU), same as the rest of USB. US layout only,
+no auto-repeat before stage 4 — documented, not bugs.
+
+---
+
+## 2026-08-28 (continued) — planning: MIPI CSI camera (GC2083) bring-up
+
+No code this session — a survey + feasibility pass + staged plan for the
+camera, written up in full as `docs/camera-plan.md`.
+
+Sensor decision: **CAM-GC2083** (Milk-V's own 16-pin module, ships with
+the right 0.5 mm FPC) rather than adapting the Freenove/OV5647 the user
+already bought — its RPi 15-pin 1.0 mm 3.3 V connector needs an active
+adapter board (Platima "Duo Cam Board", clearance/limited stock) and the
+mechanical/electrical unknown isn't worth carrying when there's no QEMU
+model to fall back on. The OV5647 camera goes unused for now.
+
+Key findings from `~/Workspace/duo-buildroot-sdk`:
+
+- **Pipeline map** (CV1800B, from `cv180x_base.dtsi`): `csi_mac0`
+  @ `0x0A0C2000`, `csi_wrap0` @ `0x0A0D0000`, `pad_ctrl` @ `0x03001C30`,
+  VIP `base` @ `0x0A0C8000`, `vi` (ISP-FE + RAW + DMA-to-DRAM)
+  @ `0x0A000000` (512 KB), `vpss`/`sc` @ `0x0A080000`. SENSOR_RSTN =
+  GPIOA2 active-low. MCLK 24 MHz off the CAM0 PLL.
+- **GC2083**: I²C `0x37`, 16-bit reg / 8-bit data, chip-ID `0x2083` at
+  `0x03f0`/`0x03f1`, single fixed mode `1920x1080p30` RAW10 2-lane
+  (2.59 MB/frame packed), no sub-res mode — crop in the receiver.
+- **Sourcing split** (this is the whole risk):
+  - open — `gc2083_sensor_ctl.c` / `gc2083_cmos.c` (sensor control, in
+    source); the FreeRTOS **cv1835** CIF HAL (`cif_drv.c` +
+    register-field headers), whose base addresses *match* the CV1800B
+    DTS, covering D-PHY RX + CSI-2 decode;
+  - closed — `cv180x_vi.ko` / `cvi_mipi_rx.ko` are prebuilt blobs; the
+    `vi` block (the only path from CSI-MAC to DRAM — the CSI wrap has no
+    DMA-address register) has no source. Rosetta stone is the cv1835 VIP
+    HAL (`isp_drv.c`: `ISP_DUMP_PRERAW`, `ispblk_dma_setaddr`,
+    `ispblk_crop_config`), but cv1835→cv1800b ISP-register parity is
+    unverified.
+
+Staged plan (see `docs/camera-plan.md` for detail):
+
+0. sourcing spike (go/no-go gate for stages 4–5) + `i2cd`, a new
+   DesignWare I²C1 master driver — *both doable before the camera
+   arrives*
+1. sensor power/clock/reset + read chip-ID over I²C — first real
+   milestone
+2. full GC2083 mode register script (streaming blind)
+3. CIF / D-PHY RX / CSI-2 RX — link + error counters clean (the fallback
+   finish line if the gate says no)
+4. `vi` raw dump → one RAW10 frame to a file → host debayer (the risky
+   stage)
+5. `camd` service + `capture` tool + double-buffered continuous capture
+
+New infra the plan needs: `HAS_CAMERA` board flag + constants, a large
+**contiguous uncached** DMA frame buffer (~633 pages, with a cache flush
+the 1-page usb/eth buffers never needed), `i2cd` as its own driver
+process, GPIOA2 added to `gpiod`'s allowlist for SENSOR_RSTN. No QEMU
+camera model — real-Duo-only from stage 1 on, which breaks the usual
+verify-on-both cadence.
+
+---
+
 ## 2026-08-28 (continued) — real Milk-V Duo confirmation: FS_WRITE_AT / FS_STAT / hardening / dispatch table
 
 The whole arc from this session — `FS_WRITE_AT` + `FS_STAT`, the
