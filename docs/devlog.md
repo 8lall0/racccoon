@@ -4,6 +4,57 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 — session summary: camera scoped out, USB keyboard shipped
+
+Two things this session. Detail in the per-topic entries below.
+
+**MIPI CSI camera (GC2083) — evaluated, planned, deferred.** Full
+sourcing pass against `~/Workspace/duo-buildroot-sdk`: the sensor layer
+and the CIF / D-PHY / CSI-2 RX layer are in source (the FreeRTOS
+cv1835 CIF HAL's base addresses match CV1800B), but the `vi` block —
+the only path from CSI-MAC to DRAM — is a closed `.ko` blob. Wrote
+`docs/camera-plan.md` (staged plan, go/no-go gate on a blob-RE spike,
+`i2cd` as a useful first step). User chose to set it aside as the big
+item and do USB keyboard instead. GC2083 module ordered; nothing built.
+
+**USB keyboard — done, all four stages verified on the real Duo, merged
+to master** (`bfccd6f..bd3cef1`, branch `usb-keyboard`, now deleted).
+
+- Stage 1: replaced usbd's infinite HID read-loop with a cooperative
+  session model (`usb_hid_poll` from main's loop), so a plugged-in
+  mouse no longer freezes MSC IPC / hub polling.
+- Stage 2: `user/usb/kbd.c3` — HID boot-report decode, US layout,
+  `SET_PROTOCOL(0)` / `SET_IDLE(0)`.
+- Stage 3: `src/kbd.c3` kernel keystroke queue + `SYS_KBD_PUSH` (31);
+  `SYS_GETCHAR` drains it alongside the serial console. Keys reach the
+  shell, everything else unchanged.
+- Stage 4: Caps Lock (state + LED) and software auto-repeat.
+
+Four hardware bugs surfaced and fixed along the way, in rough order of
+how nasty they'd have been left alone:
+
+1. **CSPLIT OUT transfer-size** (`hc_transfer_once_split`): the
+   control/bulk complete-split path never zeroed HCTSIZ size for an OUT,
+   so the driver's first-ever OUT-data control transfer (the LED
+   SET_REPORT) silently mis-shaped over a split. This hub Hi-Speeds, so
+   **every device behind it splits** — and this same bug meant USB
+   mass-storage *writes* through this hub were latently broken too.
+2. **Split-context leak**: an HID session keeps dwc2.c3's global
+   `g_split_*` pointed at its device for `usb_hid_poll` to re-assert;
+   the hub-walk loops then STALLed their next GET_PORT_STATUS. Fixed by
+   asserting non-split before every hub-directed transfer.
+3. **Single HID slot**: keyboard and mouse couldn't coexist. Now
+   `Hid_session[2]`.
+4. **Gaming-mouse misclassification**: a mouse with a boot-keyboard
+   companion interface was treated as a keyboard. Added a `3/1/2` mouse
+   dispatch branch before `3/1/1`.
+
+Known limits (see `docs/usb-keyboard-plan.md`): US QWERTY only, one
+keyboard + one mouse, combo receivers match as mouse, no SIGINT so
+Ctrl-C is just a byte.
+
+---
+
 ## 2026-08-28 (continued) — USB keyboard stage 4: Caps Lock + software auto-repeat
 
 `user/usb/{kbd,dwc2,usbd}.c3`. No QEMU path (no DWC2).
