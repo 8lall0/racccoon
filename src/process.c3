@@ -351,6 +351,18 @@ struct Process
 	// concurrent senders possible (see docs/devlog.md).
 	bool has_message;
 	int  msg_from;
+
+	// Set to the peer's (pid, generation) while this process is blocked
+	// inside SYS_IPC_SEND / SYS_IPC_REPLY waiting on that peer — 0/stale
+	// the rest of the time (only read while ipc_wait_pid != 0). If the
+	// peer exits or is killed mid-rendezvous, sys_exit / sys_kill's
+	// sweep sets ipc_peer_died on us and marks us RUNNABLE; the
+	// send/reply loop then returns -1 instead of blocking forever on a
+	// rendezvous that can never complete. See docs/roadmap.md §5.
+	int  ipc_wait_pid;
+	uint ipc_wait_generation;
+	bool ipc_peer_died;
+
 	uint msg_from_generation; // sender's own Process.generation, captured at delivery — lets
 	                          // a receiver that intends to reply later (SYS_IPC_RECV_GEN/
 	                          // SYS_IPC_REPLY, src/entry.c3) confirm msg_from still names the
@@ -815,6 +827,11 @@ fn Process* create_process(void* image, uint image_size)
 	// previous occupant that happened to be killed mid a blocking wait.
 	// See Process.in_blocking_wait's own comment.
 	proc.in_blocking_wait = false;
+	// Same reason: a reused slot must not inherit "I'm waiting on pid X"
+	// or a stale "my peer died" from a previous occupant.
+	proc.ipc_wait_pid = 0;
+	proc.ipc_wait_generation = 0;
+	proc.ipc_peer_died = false;
 
 	// Default namespace: "/srv/echo/" resolves to echod, which is always
 	// pid 2 (see kernel.c3 — it's the first process spawned after idle,

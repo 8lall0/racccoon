@@ -490,6 +490,10 @@ fn void sys_kill(Trap_frame* f) @noinline
 	// equivalent).
 	if (kill_target.in_blocking_wait) blocking_depth--;
 
+	// Same as sys_exit: unblock anyone parked in ipc_send/ipc_reply
+	// toward the process we're killing, before its pid is zeroed below.
+	ipc_wake_waiters_on(kill_target);
+
 	// Same page-table-teardown-if-not-shared logic as
 	// SYS_EXIT above, just targeting kill_target instead of
 	// current_proc — see that case's own comment for the
@@ -555,6 +559,12 @@ fn void sys_kill(Trap_frame* f) @noinline
 // 0.8.3 probe 2026-08-28 showed the extraction is safe now.)
 fn void sys_exit() @noinline
 {
+		// Anyone parked in ipc_send/ipc_reply toward us would hang
+		// forever on a rendezvous we can no longer complete — wake them
+		// with a failure. Before pid is cleared below (the sweep keys
+		// on pid+generation).
+		ipc_wake_waiters_on(current_proc);
+
 		bool exit_table_shared = false;
 		for (int share_i = 0; share_i < PROCS_MAX; share_i++)
 		{
@@ -740,6 +750,10 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		// blocking_depth itself, not this per-process flag). See
 		// Process.in_blocking_wait's own comment (process.c3).
 		child.in_blocking_wait = false;
+		// Same reused-slot reasoning — don't inherit a stale IPC wait.
+		child.ipc_wait_pid = 0;
+		child.ipc_wait_generation = 0;
+		child.ipc_peer_died = false;
 		child.pid   = child_i + 1;
 		child.generation++;
 		child.sp    = (uptr)child_sp;
@@ -1193,16 +1207,44 @@ fn void sys_exec(Trap_frame* f) @noinline
 		f.a1 = (ulong)exec_argv_base;
 }
 
+// True while this process is blocked in ipc_send/ipc_reply toward a
+// peer that has since exited or been killed: either sys_exit/sys_kill's
+// sweep already flagged us (ipc_peer_died), or the peer's slot is now
+// empty / holds a different instance. Both send and reply poll this in
+// their wait loops and bail with -1 instead of hanging forever on a
+// rendezvous the dead peer can never complete. See docs/roadmap.md §5.
+fn bool ipc_peer_gone() @noinline
+{
+	if (current_proc.ipc_wait_pid == 0) { return false; }
+	if (current_proc.ipc_peer_died) { return true; }
+	Process* peer = proc_by_pid(current_proc.ipc_wait_pid);
+	return peer == null || peer.generation != current_proc.ipc_wait_generation;
+}
+
+// Wakes every process blocked in ipc_send/ipc_reply toward `victim`
+// (which is about to become PROC_UNUSED) so those calls return -1
+// rather than blocking forever. Call before the victim's pid is zeroed.
+fn void ipc_wake_waiters_on(Process* victim) @noinline
+{
+	for (int iw = 0; iw < PROCS_MAX; iw++)
+	{
+		Process* w = &procs[iw];
+		if (w == victim || w.state == PROC_UNUSED) { continue; }
+		if (w.ipc_wait_pid == victim.pid && w.ipc_wait_generation == victim.generation)
+		{
+			w.ipc_peer_died = true;
+			if (w.state == PROC_BLOCKED) { w.state = PROC_RUNNABLE; }
+		}
+	}
+}
+
 // ipc send: rendezvous a message into the target's single inbox slot and block until it acks.
 // (was inline in handle_syscall; extracted 2026-08-29.)
 fn void sys_ipc_send(Trap_frame* f) @noinline
 {
-		// Inline for the same reason as SYS_EXIT above — this is the
-		// pattern proven not to trigger the unexplained c3c reboot
-		// bug in this switch. dest_pid/type/data are a0-a2 as usual;
-		// len is a4, since a3 is always the syscall number (see
-		// syscall4 in user/user.c3 — this is the one syscall that
-		// needs a 4th argument).
+		// dest_pid/type/data are a0-a2 as usual; len is a4, since a3 is
+		// always the syscall number (see syscall4 in user/user.c3 —
+		// this is the one syscall that needs a 4th argument).
 		int ipc_dest_pid = (int)f.a0;
 		uint ipc_type    = (uint)f.a1;
 		char* ipc_data   = (char*)(uptr)f.a2;
@@ -1233,14 +1275,25 @@ fn void sys_ipc_send(Trap_frame* f) @noinline
 			return;
 		}
 
+		current_proc.ipc_wait_pid = ipc_dest_pid;
+		current_proc.ipc_wait_generation = ipc_target.generation;
+		current_proc.ipc_peer_died = false;
+
 		// Wait for the target's inbox to actually be free — a
 		// previous sender's message that hasn't been consumed yet
 		// must never be silently overwritten. Busy-poll like
 		// SYS_GETCHAR: nothing specifically wakes a queued sender
-		// when the slot frees up, it's whoever notices next.
+		// when the slot frees up, it's whoever notices next. If the
+		// target exits meanwhile, ipc_peer_gone() bails us out.
 		while (ipc_target.has_message)
 		{
 			yield();
+			if (ipc_peer_gone())
+			{
+				current_proc.ipc_wait_pid = 0;
+				f.a0 = (ulong)(-1);
+				return;
+			}
 		}
 
 		mem::copy(&ipc_target.msg_data, ipc_data, (sz)ipc_copy_len);
@@ -1260,12 +1313,21 @@ fn void sys_ipc_send(Trap_frame* f) @noinline
 		// they do (targeted at us specifically via msg_from, not just
 		// "the inbox looks empty again", which could just as easily
 		// mean a different sender's message arrived and got consumed
-		// instead).
+		// instead). If the target dies still holding our message,
+		// sys_exit/sys_kill's sweep sets ipc_peer_died + wakes us.
 		while (!current_proc.msg_acked)
 		{
+			if (ipc_peer_gone())
+			{
+				current_proc.ipc_wait_pid = 0;
+				current_proc.state = PROC_RUNNABLE;
+				f.a0 = (ulong)(-1);
+				return;
+			}
 			current_proc.state = PROC_BLOCKED;
 			yield();
 		}
+		current_proc.ipc_wait_pid = 0;
 		f.a0 = 0;
 }
 
@@ -1310,9 +1372,19 @@ fn void sys_ipc_reply(Trap_frame* f) @noinline
 			return;
 		}
 
+		current_proc.ipc_wait_pid = reply_dest_pid;
+		current_proc.ipc_wait_generation = reply_target.generation;
+		current_proc.ipc_peer_died = false;
+
 		while (reply_target.has_message)
 		{
 			yield();
+			if (ipc_peer_gone())
+			{
+				current_proc.ipc_wait_pid = 0;
+				f.a0 = (ulong)(-1);
+				return;
+			}
 		}
 
 		mem::copy(&reply_target.msg_data, reply_data, (sz)reply_copy_len);
@@ -1326,11 +1398,22 @@ fn void sys_ipc_reply(Trap_frame* f) @noinline
 			reply_target.state = PROC_RUNNABLE;
 		}
 
+		// A client that dies between sending its request and consuming
+		// our reply would otherwise leave us here forever — the sweep
+		// in sys_exit/sys_kill wakes us with ipc_peer_died instead.
 		while (!current_proc.msg_acked)
 		{
+			if (ipc_peer_gone())
+			{
+				current_proc.ipc_wait_pid = 0;
+				current_proc.state = PROC_RUNNABLE;
+				f.a0 = (ulong)(-1);
+				return;
+			}
 			current_proc.state = PROC_BLOCKED;
 			yield();
 		}
+		current_proc.ipc_wait_pid = 0;
 		f.a0 = 0;
 }
 

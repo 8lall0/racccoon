@@ -1892,6 +1892,34 @@ fn void main() {
                     print("hotplugtest: FAILED\n");
                 }
             }
+        } else if (strcmp(cmd, "ipcdeathtest") == 0) {
+            // Proves the IPC rendezvous no longer hangs forever when the
+            // peer dies mid-transfer (src/entry.c3 sys_exit /
+            // ipc_wake_waiters_on, docs/roadmap.md §5). A child is
+            // spawned that never calls ipc_recv and just exit()s after a
+            // short busy delay; the parent ipc_send()s to it and would
+            // block in the phase-2 rendezvous forever without the fix.
+            // With it, the child's exit sweeps the parent awake with -1.
+            uint idt_gen = 0;
+            int idt_pid = rfork(RFPROC, &idt_gen);
+            if (idt_pid < 0) {
+                print("ipcdeathtest: rfork failed\n");
+            } else if (idt_pid == 0) {
+                // Long enough for the parent to reach its ipc_send and
+                // park in the rendezvous; then vanish without ever
+                // receiving.
+                for (uint idt_i = 0; idt_i < 3000000; idt_i++) { }
+                exit();
+            } else {
+                char[8] idt_msg = "hi";
+                int idt_r = ipc_send(idt_pid, 1, &idt_msg, 2);
+                int idt_joined = join(idt_pid, idt_gen);
+                if (idt_r < 0 && idt_joined == 0) {
+                    print("ipcdeathtest: ok (send returned -1, no hang)\n");
+                } else {
+                    print("ipcdeathtest: FAILED\n");
+                }
+            }
         } else if (strcmp(cmd, "rforktest") == 0) {
             // Plain rfork(RFPROC): the child gets an independent copy of
             // this process's address space (src/entry.c3's SYS_RFORK,
