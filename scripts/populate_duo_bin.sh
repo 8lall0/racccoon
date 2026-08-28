@@ -55,8 +55,16 @@ MNT=$(mktemp -d)
 echo "==> Mounting $DUO_ROOT_PARTITION..."
 mount "$DUO_ROOT_PARTITION" "$MNT"
 
-echo "==> Ensuring $MNT/bin/ exists..."
-mkdir -p "$MNT/bin"
+echo "==> Ensuring the canonical root tree exists..."
+# docs/filesystem-layout.md / roadmap §1 — kept in sync by hand with the
+# same list in scripts/build.sh (the QEMU images). /proc /srv /env are
+# namespace mounts, not real dirs.
+for d in bin lib usr usr/root adm tmp mnt; do
+  mkdir -p "$MNT/$d"
+done
+if [ ! -e "$MNT/adm/users" ]; then
+  printf '0:root\n' > "$MNT/adm/users"
+fi
 
 for b in $BINARIES; do
   echo "==> Copying build/user/$b.bin -> $MNT/bin/$b..."

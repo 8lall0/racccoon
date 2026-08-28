@@ -128,14 +128,16 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "write disk-ext2/subdir/nested.txt nestdir/inner.txt" build/disk_ext2.img > /dev/null
   debugfs -w -R "mkdir nestdir/innerdir" build/disk_ext2.img > /dev/null
   debugfs -w -R "write disk-ext2/subdir/nested.txt nestdir/innerdir/inner2.txt" build/disk_ext2.img > /dev/null
-  # mnt/ — a real, initially-empty directory, Plan9-style (see
-  # docs/devlog.md and build/disk_dual_root_part.img's own comment
-  # below for the full reasoning) — this image is ext2-only, so it's
-  # the realistic single-mount default topology real hardware now has.
-  debugfs -w -R "mkdir mnt" build/disk_ext2.img > /dev/null
-  # disk_ext2's own bin/ — same exec()-testing purpose as disk.img's own
-  # bin/ above.
-  debugfs -w -R "mkdir bin" build/disk_ext2.img > /dev/null
+  # The canonical Plan 9-style root tree (docs/filesystem-layout.md,
+  # roadmap §1). /proc /srv /env are namespace mounts, not real dirs, so
+  # they're absent here. Kept in sync by hand with the same list in
+  # scripts/populate_duo_bin.sh (real Duo) — same convention as the
+  # binary list below.
+  for d in bin lib usr usr/root adm tmp mnt; do
+    debugfs -w -R "mkdir $d" build/disk_ext2.img > /dev/null
+  done
+  printf '0:root\n' > build/adm_users_fixture
+  debugfs -w -R "write build/adm_users_fixture adm/users" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_ext2.img > /dev/null
   for u in cat ls write rm mkdir mv usbrw fsd gpio; do
@@ -186,8 +188,12 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # namespace-prefix resolution (intercepts before this directory's own
   # listing is ever consulted) — this exists purely so `ls /mnt`/`ls
   # mnt` behaves sensibly, not because anything reads its contents.
-  debugfs -w -R "mkdir mnt" build/disk_dual_root_part.img > /dev/null
-  debugfs -w -R "mkdir bin" build/disk_dual_root_part.img > /dev/null
+  # Canonical root tree — same set as disk_ext2.img above / the real
+  # Duo (docs/filesystem-layout.md).
+  for d in bin lib usr usr/root adm tmp mnt; do
+    debugfs -w -R "mkdir $d" build/disk_dual_root_part.img > /dev/null
+  done
+  debugfs -w -R "write build/adm_users_fixture adm/users" build/disk_dual_root_part.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_root_part.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_root_part.img > /dev/null
   for u in cat ls write rm mkdir mv usbrw fsd gpio; do
