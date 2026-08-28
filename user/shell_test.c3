@@ -861,10 +861,12 @@ fn void main() {
             print("hardentest: SYS_FUTEX_WAIT on a null pointer ");
             print(ht_null_futex < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
 
-            // One past the highest syscall number user/user.c3 defines
-            // today (SYS_ETHD_INFO = 30) — genuinely unrecognized, not
-            // reserved for anything.
-            int ht_bad_syscall = syscall(31, 0, 0, 0);
+            // Well past the highest syscall number the kernel's switch
+            // has a case for (33 today) — genuinely unrecognized, with
+            // enough headroom that adding real syscalls won't silently
+            // turn this into a call to one of them (which is exactly
+            // what happened when this used a number just past the end).
+            int ht_bad_syscall = syscall(999, 0, 0, 0);
             print("hardentest: unrecognized syscall number ");
             print(ht_bad_syscall < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
 
