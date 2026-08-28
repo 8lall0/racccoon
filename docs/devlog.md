@@ -4,6 +4,38 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 (continued) — user: shared mmio/hex/panic helpers
+
+Cleanup. Every device-register driver had its own byte-identical copy
+of `mmio_read32`/`mmio_write32` (dwc2, sdhci, dwmac, gpiod, virtio),
+`print_hex8`/`print_hex32` + a `HEX_DIGITS` const (dwc2, sdhci, ethd,
+netd), and a `<prefix>_panic(char*)` that differed only in the log
+prefix (diskd, sdd, ethd, usbd, netd, fsd). `user/user.c3` is linked
+into every user program, so all of it moved there:
+
+- `mmio_read32` / `mmio_write32` — `mmio_read64` stays in `virtio.c3`,
+  the only caller, and its signed-`lw` masking is the reason it's
+  special
+- `print_hex8` / `print_hex32` / `HEX_DIGITS`
+- `panic(char* prefix, char* msg)` — callers pass `"diskd: "` etc.; the
+  UB/optimizer rationale for `exit()` over an empty `for(;;){}` (it got
+  dropped under -O2 once) is documented in the one place now
+
+Net −150 lines, no behaviour change. Verified: QEMU (diskd, netd `mac=`
+via the shared `print_hex8`, fsd) and real Duo (sdd SDMA + ext2, ethd
+bring-up with `print_hex32` register dumps, gpiod, USB hub + keyboard +
+pad).
+
+Not done — **the per-driver `*_TIMEBASE_HZ` / `*_us_to_ticks`
+duplication** (5 identical `25000000` consts on the Duo side, plus
+netd's genuinely-different `10000000` for QEMU). A `timebase_info()`
+syscall (precedent: `fs_partition_info`) is the clean fix but
+`kbd.c3` bakes `USB_TIMEBASE_HZ` into a compile-time `const`
+(`KBD_REPEAT_DELAY_TICKS`) that would have to become runtime, and it's
+~49 call sites. Deferred as a poor effort/payoff ratio for now.
+
+---
+
 ## 2026-08-28 (continued) — kernel: device IRQs go through an Irq_route table
 
 Consolidation, not a feature. Three interrupt-driven drivers (diskd,
