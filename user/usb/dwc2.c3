@@ -371,6 +371,7 @@ bool g_split_active = false;
 uint g_split_hub_addr = 0;
 uint g_split_hub_port = 0;
 uint g_split_intr_diag_count = 0; // diagnostic-only, see hc_transfer_once_split's own USBD_VERBOSE-gated prints
+uint g_split_np_diag_count = 0;   // diagnostic-only, non-periodic (control/bulk) split trace
 
 // Real, sourced gap found on real hardware (docs/devlog.md): every
 // device this driver had ever talked to before now was full or
@@ -1049,6 +1050,7 @@ fn int hc_transfer_once_split(uint dev_addr, uint ep_num, uint eptype, bool is_i
         | (USB_HCSPLT_XACTPOS_ALL << USB_HCSPLT_XACTPOS_SHIFT);
 
     bool diag_this_call = USBD_VERBOSE && is_interrupt && g_split_intr_diag_count < 10;
+    bool diag_np = USBD_VERBOSE && !is_interrupt && g_split_np_diag_count < 30;
 
     // --- Start-split. Interrupt splits align to a specific target
     // microframe first (see this function's own header comment);
@@ -1078,6 +1080,25 @@ fn int hc_transfer_once_split(uint dev_addr, uint ep_num, uint eptype, bool is_i
     uint hcint;
     if (hc_wait_chhltd(&hcint) != 0) { return -1; }
     usb_reg_write(USB_HC0_HCINT, USB_HCINT_ALL_MASK);
+
+    if (diag_np)
+    {
+        g_split_np_diag_count++;
+        print("usbd: np-split #");
+        print_uint(g_split_np_diag_count);
+        print(" addr=");
+        print_uint(dev_addr);
+        print(" ep=");
+        print_uint(ep_num);
+        print(is_in ? " IN" : " OUT");
+        print(" pid=");
+        print_uint(pid);
+        print(" len=");
+        print_uint(xfer_len);
+        print(": SSPLIT HCINT=0x");
+        print_hex32(hcint);
+        print("\n");
+    }
 
     if (!(hcint & USB_HCINT_ACK))
     {
@@ -1209,8 +1230,21 @@ fn int hc_transfer_once_split(uint dev_addr, uint ep_num, uint eptype, bool is_i
 
     // --- Complete-split, control/bulk (non-periodic): retry the SAME
     // complete-split within a short elapsed-frame budget. Real,
-    // sourced from U-Boot's own chunk_msg() and confirmed working —
-    // kept exactly as-is.
+    // sourced from U-Boot's own chunk_msg() and confirmed working.
+
+    // Don't issue the complete-split in the same microframe as the
+    // start-split — USB 2.0 11.18.4 has the host schedule the CSPLIT in
+    // the microframe(s) *following* the SSPLIT, and a fast full-speed
+    // hub TT polled too early can report a bogus STALL rather than NYET.
+    // The old yield()-polling hc_wait_chhltd always burned more than a
+    // microframe here for free; once the interrupt-driven wait landed
+    // (aa86a49) it tight-spins and issued the CSPLIT immediately, which
+    // STALLed the 8BitDo pad's GET_DESCRIPTOR(18) SETUP stage every
+    // boot. ~150us = >1 microframe, well inside the retry loop's 4-frame
+    // budget below. See docs/devlog.md's "xpad SETUP STALL" entry.
+    ulong csplit_gap = rdtime();
+    while (rdtime() - csplit_gap < usb_us_to_ticks(150)) { }
+
     uint ssplit_frame = usb_reg_read(USB_HFNUM) & 0xFFFF;
     for (;;)
     {

@@ -4,6 +4,66 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 (continued) — xpad SETUP STALL: a non-periodic complete-split issued in the same microframe as the start-split; the interrupt-driven wait removed the slack that hid it
+
+The 8BitDo SN30 Pro (full-speed, hub port 4) had been failing
+`GET_DESCRIPTOR(18)` with `HCINT=0x0000000a` (CHHLTD|STALL) on the
+split SETUP stage every boot since the strong-order MMIO / interrupt-
+driven USB change (`aa86a49`). The earlier entry called it "the
+pre-existing 8BitDo split quirk, unrelated" — **wrong**. Timeline from
+the devlog itself: before `aa86a49` the pad enumerated fully, took the
+EP0 vendor "magic message" with no STALL, and drove its rumble motors
+over interrupt-OUT; only its interrupt-IN was ever silent. After
+`aa86a49` it couldn't get past `GET_DESC(18)`. A regression, not the
+quirk.
+
+**Root cause: the non-periodic (control/bulk) complete-split went out
+in the same microframe as the start-split.** USB 2.0 §11.18.4 has the
+host schedule a CSPLIT in the microframe(s) *following* its SSPLIT; a
+fast full-speed hub TT polled too early can return STALL instead of
+NYET. `hc_transfer_once_split`'s non-periodic path never gated the
+CSPLIT on the frame counter (the interrupt path does), it just looped
+`hc_wait_chhltd` → issue CSPLIT. That was fine as long as
+`hc_wait_chhltd` `yield()`-polled — a `yield()` round-trip reliably
+burned more than a 125µs microframe. `aa86a49`'s interrupt-driven
+`hc_wait_chhltd` tight-spins, so the CSPLIT started firing immediately.
+The low-speed keyboard on port 1 is ~8× slower on the downstream bus,
+so its TT was still busy when the CSPLIT landed — it never raced, which
+is why `aa86a49` looked clean.
+
+Diagnosed by accident: a `USBD_VERBOSE` build enumerated the pad fine,
+verbose-off didn't. The only per-transfer difference was a ~2.6ms UART
+`print` before each SETUP stage — an artificial delay. That plus the
+`np-split` trace (every SSPLIT cleanly ACKed, `HCINT=0x22`; failure
+purely on the complete-split) pointed straight at CSPLIT timing.
+
+**Fix** (`user/usb/dwc2.c3`): a ~150µs busy-wait (>1 microframe) before
+the non-periodic complete-split loop. Well inside that loop's existing
+4-frame retry budget. One line of actual code. Bisected on hardware:
+this alone fixes it — `addr_settle` stays 10ms, no MMIO changes.
+
+Also added: `g_split_np_diag_count` + a `USBD_VERBOSE`-gated
+non-periodic-split trace in `hc_transfer_once_split` (parallels the
+existing `g_split_intr_diag_count`).
+
+**Verified on real Duo:** `usbd: hub port 4: enumerated device
+vid=0x045e pid=0x028e`, `xpad: controller found ... interrupt IN
+endpoint 0x81`, `xpad: LED command sent`. Keyboard on port 1 and the
+hub still enumerate. The pad's interrupt-IN then returns
+`complete-split NAK` forever again — back to the *original*,
+documented, device-specific 8BitDo silence that needs a bus analyzer
+(`racccoon-xpad-input`). Not a regression; not this fix's problem.
+
+**Considered and dropped:** reverting Strong Order on the DWC2 register
+block (a `PTE_NONCACHED_BITS` / `map_noncached_page` split, SO reserved
+for the PLIC claim register). Plausible on its own merits — SO on a DMA
+scribble-buffer is genuinely wrong, and it's just a perf tax on
+side-effect-free registers — but it is NOT what fixed the STALL
+(verbose-off + weak-NC still STALLed), so it's left for a separate
+change if ever wanted.
+
+---
+
 ## 2026-08-28 (continued) — sdd: SDMA + interrupt-driven completion
 
 With the strong-order MMIO fix (entry below) the PLIC is usable, so
@@ -106,8 +166,12 @@ is correct — RVSPOC uses 1.
 fully (device + config descriptors, `SET_ADDRESS`, hub descriptor,
 multi-TT, 4-port scan) via interrupts, no storm, sdd/fsd/ethd all still
 come up (the strong-order change touches every device mapping — no
-regression). The port-4 STALL is the pre-existing 8BitDo split quirk,
-unrelated.
+regression). *(Correction, later the same day: the port-4 STALL was NOT
+the pre-existing quirk — it was a real regression, but from the
+interrupt-driven `hc_wait_chhltd` in this same change, not the MMIO
+ordering. It tight-spins where the old one `yield()`-polled, so a
+non-periodic complete-split started firing in the start-split's own
+microframe. See the "xpad SETUP STALL" entry above.)*
 
 **Latency:** `hc_wait_chhltd` tight-spins on `ipc_poll_type` only for
 the first ~300us of a wait (a control/interrupt transfer or NAK cycle
