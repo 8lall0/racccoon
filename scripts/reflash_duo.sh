@@ -19,6 +19,10 @@
 # kernel with user/shell_test.c3's dev builtins, see build.sh's own
 # shell-swap trick and the devlog.
 #
+# Keeps exactly one rollback copy on DUOBOOT: any older fip.bin.bak-* is
+# pruned and this run's outgoing fip.bin is saved as
+# fip.bin.bak-<timestamp> before the new one is written.
+#
 # Does NOT touch partitioning, EXT2TEST, or /bin on the root partition
 # (that one is root-owned — `sudo DUO_ROOT_PARTITION=/dev/sdX2 bash
 # scripts/populate_duo_bin.sh` if a /bin binary's source changed).
@@ -109,8 +113,15 @@ print("    fip_duo.bin verified")
 PYEOF
 
 # --- flash ----------------------------------------------------------
+# Keep exactly one rollback copy: drop any older fip.bin.bak-* before
+# writing this run's. `back up the outgoing kernel, then flash` still
+# holds — the copy is made from the current fip.bin, which is only
+# overwritten after.
+shopt -s nullglob
+for old in "$MNT"/fip.bin.bak-*; do rm -f "$old"; done
+shopt -u nullglob
 BAK="$MNT/fip.bin.bak-$(date +%Y%m%d-%H%M%S)"
-echo "==> Backing up current fip.bin -> $(basename "$BAK")"
+echo "==> Backing up current fip.bin -> $(basename "$BAK") (older backups pruned)"
 cp "$MNT/fip.bin" "$BAK"
 echo "==> Copying build/fip_duo.bin -> $MNT/fip.bin"
 cp build/fip_duo.bin "$MNT/fip.bin"

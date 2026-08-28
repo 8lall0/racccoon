@@ -52,7 +52,8 @@ Reflashing the production-shell kernel afterward is now
 scripts/reflash_duo.sh`): `build_duo.sh` → `llvm-objcopy` →
 `make_loader2nd.py` → `fiptool.py genfip --OLD_FIP <card's fip.bin>
 --LOADER_2ND` → parse-back sanity check → udisksctl-mount DUOBOOT,
-timestamped backup of the current `fip.bin`, copy the new one in. No
+prune older `fip.bin.bak-*`, keep one timestamped backup of the
+outgoing `fip.bin`, copy the new one in. No
 sudo (DUOBOOT is FAT32), no `build_fsbl` (only fiptool.py itself is
 needed from `$DUO_SDK`). Pipeline verified end-to-end minus the flash
 this session; `fiptool.py` auto-located under `$DUO_SDK` or
