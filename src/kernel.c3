@@ -156,6 +156,8 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		Process* fsd_proc = create_process((void*)&_binary_fsd_bin_start, (uint)((uptr)&_binary_fsd_bin_end - (uptr)&_binary_fsd_bin_start));
 		setup_fsd_mappings(fsd_proc, board::FS_PARTITION_START_SECTOR, false);
 		fsd_pid = fsd_proc.pid;
+		supervisor_register("fsd", (char*)&_binary_fsd_bin_start, (char*)&_binary_fsd_bin_end,
+			true, board::FS_PARTITION_START_SECTOR, false, &fsd_pid, fsd_proc);
 		io::print("fsd created\n");
 
 		// A second, simultaneously-mounted fsd instance, reachable under
@@ -173,6 +175,8 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 			Process* fsd2_proc = create_process((void*)&_binary_fsd_bin_start, (uint)((uptr)&_binary_fsd_bin_end - (uptr)&_binary_fsd_bin_start));
 			setup_fsd_mappings(fsd2_proc, board::FS_PARTITION_2_START_SECTOR, true);
 			fsd2_pid = fsd2_proc.pid;
+			supervisor_register("fsd2", (char*)&_binary_fsd_bin_start, (char*)&_binary_fsd_bin_end,
+				true, board::FS_PARTITION_2_START_SECTOR, true, &fsd2_pid, fsd2_proc);
 			io::print("fsd2 created\n");
 		}
 	}
@@ -188,6 +192,8 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	// namespace" ordering constraint as fsd_pid/fsd2_pid above.
 	Process* procd_proc = create_process((void*)&_binary_procd_bin_start, (uint)((uptr)&_binary_procd_bin_end - (uptr)&_binary_procd_bin_start));
 	procd_pid = procd_proc.pid;
+	supervisor_register("procd", (char*)&_binary_procd_bin_start, (char*)&_binary_procd_bin_end,
+		false, 0, false, &procd_pid, procd_proc);
 	io::print("procd created\n");
 
 	// envd (the "/env/" server, user/envd.c3) — same unconditional,
@@ -198,6 +204,8 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	// (create_process's default namespace population, right below).
 	Process* envd_proc = create_process((void*)&_binary_envd_bin_start, (uint)((uptr)&_binary_envd_bin_end - (uptr)&_binary_envd_bin_start));
 	envd_pid = envd_proc.pid;
+	supervisor_register("envd", (char*)&_binary_envd_bin_start, (char*)&_binary_envd_bin_end,
+		false, 0, false, &envd_pid, envd_proc);
 	io::print("envd created\n");
 
 	// The shell — created explicitly here, BEFORE usbd below, not left

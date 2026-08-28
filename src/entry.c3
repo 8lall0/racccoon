@@ -2388,6 +2388,15 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 			arm_timer(board::TIMEBASE_HZ);
 			timer_tick_count += 1;
 
+			// Boot-server supervision (src/supervisor.c3, docs/roadmap.md
+			// §5.2): re-spawn fsd/fsd2/procd/envd if they've exited. Runs
+			// here, not from the idle loop, because idle is starved
+			// whenever any process stays permanently PROC_RUNNABLE
+			// (usbd on the Duo, netd's link poll on QEMU). Cheap when
+			// nothing has died (SVC_MAX * O(1)); create_process() is
+			// already trap-safe (SYS_RFORK does the same work).
+			supervisor_tick();
+
 			// Real preemption: force a reschedule on every tick, not
 			// just when a process happens to yield() on its own. See
 			// enable_timer_interrupts()'s own comment above for why

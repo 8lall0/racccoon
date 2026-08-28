@@ -1892,6 +1892,30 @@ fn void main() {
                     print("hotplugtest: FAILED\n");
                 }
             }
+        } else if (strcmp(cmd, "fsdkilltest") == 0) {
+            // Proves the boot-server supervisor (src/supervisor.c3,
+            // docs/roadmap.md §5.2): kill fsd outright, then confirm it
+            // comes back on its own and file reads work again — via the
+            // healed namespace mount, without this process re-mounting
+            // anything.
+            char[64] fk_buf @noinit;
+            int fk_before = fs_read("hello.txt", &fk_buf, 64);
+            int fk_fsd = ns_resolve("hello.txt", null);
+            int fk_killed = kill(fk_fsd, 0); // 0 = wildcard generation
+            // Wait real wall-clock time (the supervisor ticks ~1/s from
+            // the timer) and keep retrying the read. rdtime() the same
+            // way mutextest/cycletest do — real time, not an insn count.
+            ulong fk_deadline = rdtime() + 30000000; // ~3s at QEMU's 10MHz
+            int fk_after = -1;
+            while (fk_after < 0 && rdtime() < fk_deadline) {
+                yield();
+                fk_after = fs_read("hello.txt", &fk_buf, 64);
+            }
+            if (fk_before >= 0 && fk_killed == 0 && fk_after >= 0) {
+                print("fsdkilltest: ok (fsd killed, respawned, reads work)\n");
+            } else {
+                print("fsdkilltest: FAILED\n");
+            }
         } else if (strcmp(cmd, "ipcdeathtest") == 0) {
             // Proves the IPC rendezvous no longer hangs forever when the
             // peer dies mid-transfer (src/entry.c3 sys_exit /
