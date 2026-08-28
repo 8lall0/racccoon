@@ -4,6 +4,52 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 — fsd: FS_* verb dispatch table
+
+The nine path-based `FS_*` verbs (`FS_READ` / `FS_READ_AT` / `FS_WRITE` /
+`FS_WRITE_AT` / `FS_STAT` / `FS_DELETE` / `FS_LIST` / `FS_MKDIR` /
+`FS_RENAME`) each carried its own `if (fs_type == FAT32) … else if
+(EXT2) … else if (EXFAT) …` triple inline in `fsd`'s main loop — ~295
+lines of near-identical branch, and exactly the shape that shipped the
+empty-leaf bug the day before (the guard existed on exFAT, not the other
+two, because they're hand-maintained copies).
+
+Replaced with **one `Fs_ops` function-pointer table per backend**
+(`fsd.c3`). `main()`'s loop parses the request into an `Fs_req` once,
+then a `switch (verb)` does the small per-verb glue that genuinely isn't
+uniform — which wire bytes the payload sits at (`buf[104]` vs `buf[108]`),
+which gate applies (protected-name for the writes, `fs_write_disabled`
+for mkdir/rename), and the `FS_OFFSET_APPEND` sentinel — and calls
+`fs_ops.<verb>(&r)`. Each backend gets nine trivial adapter functions
+(`fat32_op_read`, …) that unpack `Fs_req` into its real entry point;
+`fs_ops` is set next to `fs_type` in `fs_mount()`.
+
+This is the **first vtable in the codebase**, and the file header comment
+that used to say "no function-pointer indirection … two backends through
+a couple of `if`s don't need it" now explains why nine verbs × three
+backends crossed that line. The `P9_*` block (separate protocol,
+ext2-only) is untouched.
+
+`ext2`-only detail folded in: the `requester_uid` for the five write
+verbs now lives in the `ext2_op_*` adapters (`r.uid`), set by the
+switch from the existing `fsd_requester_uid(from)` helper.
+
+Net `fsd.c3`: −54 lines, and the only fs-type branch left in the whole
+FS_* path is the mount-time `fs_ops =` assignment. Adding a fourth
+backend is one `Fs_ops` literal + its adapters.
+
+**Verification:** full regression on all four `launch64*.sh` —
+`fsneg`, `fswriteat`, `fswriteatfrag`, `lfntest`, `cycletest`,
+`p9fstest`, `p9fswritetest`, `p9mkdirtest`, `fspermtest`, `hardentest`,
+`exfatgrow`, `bigreadtest`, `mounttest`, and the `/bin`
+`write`/`cat`/`mkdir`/`mv`/`rm -r` sequence — all pass. `fsck.fat` /
+`e2fsck -fn` / `fsck.exfat` clean on every run image. Behaviourally
+identical to the inline dispatch.
+
+**Files changed:** `user/fs/fsd.c3`.
+
+---
+
 ## 2026-08-27 (continued) — fs ecosystem hardening pass (Phase 5)
 
 Follow-on to the FS_WRITE_AT / FS_STAT checkpoint. The plan's Phase 5 was

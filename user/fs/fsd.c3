@@ -13,14 +13,19 @@ import std::nolibc::mem;
 // This file is the filesystem-agnostic core: the IPC/wire protocol,
 // low-level sector I/O, and write-protection machinery — none of which
 // care which on-disk format is actually mounted. Real filesystem
-// structure (FAT32, ext2, ...) lives in user/fs/*.c3, each exposing a
-// small, consistently-named set of functions this file dispatches to
-// based on fs_type, set once at mount time by probing each backend in
-// turn (see fs_mount()). No function-pointer/vtable indirection: this
-// codebase has no precedent for that anywhere (structs here are plain
-// data — Process/Mount in src/process.c3, @packed wire/hardware layouts
-// like Virtio_blk_req), and two backends dispatched through a couple of
-// `if`s don't need it. Every file here — fsd.c3 and every user/fs/*.c3 —
+// structure (FAT32, ext2, exFAT) lives in user/fs/*.c3, each exposing a
+// small, consistently-named set of entry points. The nine path-based
+// FS_* verbs reach them through one Fs_ops function-pointer table per
+// backend (see the "FS_* verb dispatch table" section below), picked
+// once at mount time by probing each backend in turn (see fs_mount()).
+// This is the one place the codebase uses a vtable: an earlier version
+// pasted a `fs_type` FAT32/ext2/exFAT `if` triple into all nine verb
+// branches, and the divergence that invites shipped a real bug (the
+// empty-leaf guard existed on exFAT but not the other two — see
+// docs/devlog.md). Nine verbs times three backends is past the point
+// where three hand-maintained copies are the simpler thing. The P9_*
+// block below is separate (its own protocol, ext2-only) and untouched.
+// Every file here — fsd.c3 and every user/fs/*.c3 —
 // shares `module user;` (matching every other user-mode file, e.g. how
 // fsd.c3 and user.c3 already shared one module before this split), so
 // functions across files call each other directly with no extra
@@ -97,15 +102,117 @@ int g_diskd_pid = 3;
 // it to read sector 0 / a superblock at all.
 uint fs_partition_start;
 
-// Which backend is mounted — set once by fs_mount(), read by main()'s
-// dispatch. Plain int constants, not an enum: no enum usage anywhere
-// else in this codebase (grepped for precedent before adding one), and
-// two named constants dispatched through `if`s don't need the ceremony.
+// Which backend is mounted — set once by fs_mount(), still handy for the
+// P9_* block below and a couple of log lines. Plain int constants, not
+// an enum: no enum usage anywhere else in this codebase.
 const int FS_TYPE_NONE  = 0;
 const int FS_TYPE_FAT32 = 1;
 const int FS_TYPE_EXT2  = 2;
 const int FS_TYPE_EXFAT = 3;
 int fs_type = FS_TYPE_NONE;
+
+// --- FS_* verb dispatch table ----------------------------------------
+//
+// The nine path-based FS_* verbs (FS_READ/FS_READ_AT/FS_WRITE/
+// FS_WRITE_AT/FS_STAT/FS_DELETE/FS_LIST/FS_MKDIR/FS_RENAME) go through
+// one Fs_ops table per backend instead of a fs_type `if` triple pasted
+// into every verb branch — the empty-leaf divergence that shipped a real
+// bug (see docs/devlog.md's hardening entry) was exactly the kind of
+// thing three hand-maintained copies invite. main()'s loop parses the
+// request into an Fs_req once, does the small amount of per-verb glue
+// that genuinely isn't uniform (payload offset, protected-name gate,
+// fs_write_disabled gate, the append sentinel), and calls fs_ops.<verb>.
+// Adding a backend is one Fs_ops literal + its adapters; the P9_* block
+// is unaffected (separate protocol, ext2-only, handled before this).
+struct Fs_req
+{
+	char* name;      // primary path, null-terminated (wire bytes 0..99)
+	char* name2;     // second path — FS_RENAME only (wire bytes 100..199)
+	char* data;      // write payload, a pointer into the live wire buffer
+	char* buf;       // the whole IPC buffer — reply-payload verbs (read/
+	                 // read_at/list) write straight into buf[4..]
+	uint  len;       // requested / max length, already clamped >= 0
+	uint  offset;    // FS_READ_AT / FS_WRITE_AT (append sentinel already resolved)
+	uint  uid;       // requester uid, 0xFFFFFFFF if unknown — ext2 adapters only
+	bool  recursive; // FS_DELETE: empty a non-empty directory instead of refusing
+	uint  out_size;  // FS_STAT: filled by the adapter
+	int   out_type;  // FS_STAT: filled by the adapter (0 file, 1 dir)
+}
+
+alias FsVerbFn = fn int (Fs_req*);
+
+struct Fs_ops
+{
+	FsVerbFn read;
+	FsVerbFn read_at;
+	FsVerbFn write;
+	FsVerbFn write_at;
+	FsVerbFn stat;
+	FsVerbFn remove;   // FS_DELETE (`delete` reads badly next to the verb name)
+	FsVerbFn list;
+	FsVerbFn mkdir;
+	FsVerbFn rename;
+}
+
+// Set by fs_mount() alongside fs_type; null until a backend mounts (the
+// unmounted second fsd instance — every FS_* verb then replies -1).
+Fs_ops* fs_ops = null;
+
+fn int fs_list_max()
+{
+	// How many FS_LIST_ENTRY_SIZE records fit in one reply after the
+	// 4-byte count header — no pagination, see user.c3's own comment.
+	return (int)((FS_MSG_MAX - 4) / FS_LIST_ENTRY_SIZE);
+}
+
+fn int fat32_op_read(Fs_req* r)     { return fat32_read(r.name, &r.buf[4], r.len); }
+fn int fat32_op_read_at(Fs_req* r)  { return fat32_read_at(r.name, &r.buf[4], r.len, r.offset); }
+fn int fat32_op_write(Fs_req* r)    { return fat32_write(r.name, r.data, r.len); }
+fn int fat32_op_write_at(Fs_req* r) { return fat32_write_at(r.name, r.data, r.len, r.offset); }
+fn int fat32_op_stat(Fs_req* r)     { return fat32_stat(r.name, &r.out_size, &r.out_type) ? 0 : -1; }
+fn int fat32_op_remove(Fs_req* r)   { return r.recursive ? fat32_delete_recursive(r.name) : fat32_delete(r.name); }
+fn int fat32_op_list(Fs_req* r)     { int c = -1; if (!fat32_list(r.name, &r.buf[4], fs_list_max(), &c)) c = -1; return c; }
+fn int fat32_op_mkdir(Fs_req* r)    { return fat32_mkdir(r.name); }
+fn int fat32_op_rename(Fs_req* r)   { return fat32_rename(r.name, r.name2); }
+
+fn int ext2_op_read(Fs_req* r)     { return ext2_read(r.name, &r.buf[4], r.len); }
+fn int ext2_op_read_at(Fs_req* r)  { return ext2_read_at(r.name, &r.buf[4], r.len, r.offset); }
+fn int ext2_op_write(Fs_req* r)    { return ext2_write(r.name, r.data, r.len, r.uid); }
+fn int ext2_op_write_at(Fs_req* r) { return ext2_write_at(r.name, r.data, r.len, r.offset, r.uid); }
+fn int ext2_op_stat(Fs_req* r)     { return ext2_stat(r.name, &r.out_size, &r.out_type) ? 0 : -1; }
+fn int ext2_op_remove(Fs_req* r)   { return r.recursive ? ext2_delete_recursive(r.name, r.uid) : ext2_delete(r.name, r.uid); }
+fn int ext2_op_list(Fs_req* r)     { int c = -1; if (!ext2_list(r.name, &r.buf[4], fs_list_max(), &c)) c = -1; return c; }
+fn int ext2_op_mkdir(Fs_req* r)    { return ext2_mkdir(r.name, r.uid); }
+fn int ext2_op_rename(Fs_req* r)   { return ext2_rename(r.name, r.name2, r.uid); }
+
+fn int exfat_op_read(Fs_req* r)     { return exfat_read(r.name, &r.buf[4], r.len); }
+fn int exfat_op_read_at(Fs_req* r)  { return exfat_read_at(r.name, &r.buf[4], r.len, r.offset); }
+fn int exfat_op_write(Fs_req* r)    { return exfat_write(r.name, r.data, r.len); }
+fn int exfat_op_write_at(Fs_req* r) { return exfat_write_at(r.name, r.data, r.len, r.offset); }
+fn int exfat_op_stat(Fs_req* r)     { return exfat_stat(r.name, &r.out_size, &r.out_type) ? 0 : -1; }
+fn int exfat_op_remove(Fs_req* r)   { return r.recursive ? exfat_delete_recursive(r.name) : exfat_delete(r.name); }
+fn int exfat_op_list(Fs_req* r)     { int c = -1; if (!exfat_list(r.name, &r.buf[4], fs_list_max(), &c)) c = -1; return c; }
+fn int exfat_op_mkdir(Fs_req* r)    { return exfat_mkdir(r.name); }
+fn int exfat_op_rename(Fs_req* r)   { return exfat_rename(r.name, r.name2); }
+
+const Fs_ops FAT32_OPS = {
+	.read = &fat32_op_read, .read_at = &fat32_op_read_at,
+	.write = &fat32_op_write, .write_at = &fat32_op_write_at,
+	.stat = &fat32_op_stat, .remove = &fat32_op_remove,
+	.list = &fat32_op_list, .mkdir = &fat32_op_mkdir, .rename = &fat32_op_rename,
+};
+const Fs_ops EXT2_OPS = {
+	.read = &ext2_op_read, .read_at = &ext2_op_read_at,
+	.write = &ext2_op_write, .write_at = &ext2_op_write_at,
+	.stat = &ext2_op_stat, .remove = &ext2_op_remove,
+	.list = &ext2_op_list, .mkdir = &ext2_op_mkdir, .rename = &ext2_op_rename,
+};
+const Fs_ops EXFAT_OPS = {
+	.read = &exfat_op_read, .read_at = &exfat_op_read_at,
+	.write = &exfat_op_write, .write_at = &exfat_op_write_at,
+	.stat = &exfat_op_stat, .remove = &exfat_op_remove,
+	.list = &exfat_op_list, .mkdir = &exfat_op_mkdir, .rename = &exfat_op_rename,
+};
 
 // Real 9P (read-only), against ext2 only — see docs/devlog.md. No new
 // verb constants or client wrappers needed: P9_ATTACH/P9_WALK/
@@ -367,6 +474,7 @@ fn void fs_mount(bool dynamic_mode, char* dynamic_self_name)
 	if (ext2_probe())
 	{
 		fs_type = FS_TYPE_EXT2;
+		fs_ops = &EXT2_OPS;
 		ext2_mount();
 		// Write protection: build the reserved-range allowlist before
 		// ever allowing a write — fs_write_disabled starts true (see
@@ -405,6 +513,7 @@ fn void fs_mount(bool dynamic_mode, char* dynamic_self_name)
 	if (exfat_probe())
 	{
 		fs_type = FS_TYPE_EXFAT;
+		fs_ops = &EXFAT_OPS;
 		exfat_mount();
 		// Writes (create/overwrite/delete/mkdir — see exfat.c3's Write
 		// path section) only if exfat_mount() found a usable volume
@@ -425,6 +534,7 @@ fn void fs_mount(bool dynamic_mode, char* dynamic_self_name)
 	if (fat32_probe())
 	{
 		fs_type = FS_TYPE_FAT32;
+		fs_ops = &FAT32_OPS;
 		fat32_mount();
 		fs_write_disabled = false;
 		// See the ext2 branch's own comment above — same reasoning.
@@ -950,300 +1060,136 @@ fn void main(String[] args)
 		uint* offset_field = (uint*)&buf[104];
 		uint req_offset = *offset_field;
 
-		if (verb == FS_DELETE)
+		// One table lookup, then the small amount of per-verb glue that
+		// genuinely isn't uniform across backends: which wire bytes the
+		// payload sits at, and which gate applies (protected-name for the
+		// writes, fs_write_disabled for mkdir/rename, the append
+		// sentinel). Everything filesystem-specific is in fs_ops, set at
+		// mount — the FS_TYPE `if` triple that used to be pasted into
+		// every one of these branches is gone.
+		if (fs_ops == null)
 		{
-			// Same protected-name fast gate as FS_WRITE — the real
-			// backstop for both is each backend's own fs_is_protected_
-			// entry() check (matching the exact sector/offset reserved
-			// at mount time), this is just an obvious, cheap first
-			// refusal before either backend even runs.
-			//
-			// req_len doubles as the recursive flag here (see user.c3's
-			// wire-format comment) — FS_DELETE has no length of its own
-			// to send, and this byte range is already read and clamped
-			// above for FS_READ/FS_WRITE's sake.
-			bool recursive = req_len != 0;
-			int result = -1;
-			if (!fs_is_protected_name(&filename))
-			{
-				if (fs_type == FS_TYPE_FAT32)
-				{
-					result = recursive ? fat32_delete_recursive(&filename) : fat32_delete(&filename);
-				}
-				else if (fs_type == FS_TYPE_EXT2)
-				{
-					// Same requester-uid lookup either way — see
-					// FS_WRITE's own ext2 branch for why.
-					uint requester_uid = fsd_requester_uid(from);
-					if (recursive)
-					{
-						result = ext2_delete_recursive(&filename, requester_uid);
-					}
-					else
-					{
-						result = ext2_delete(&filename, requester_uid);
-					}
-				}
-				else if (fs_type == FS_TYPE_EXFAT)
-				{
-					result = recursive ? exfat_delete_recursive(&filename) : exfat_delete(&filename);
-				}
-			}
-			*result_len_field = result;
+			// The unmounted second fsd instance — nothing to serve.
+			*result_len_field = -1;
 			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
 			continue;
 		}
 
-		if (verb == FS_LIST)
-		{
-			// req_len/the recursive-flag byte range aren't used here — a
-			// listing only ever sends the directory path (see user.c3's
-			// wire-format comment). max_entries is bounded by how many
-			// FS_LIST_ENTRY_SIZE records actually fit in one reply
-			// (FS_MSG_MAX - 4, the same 4-byte result-count header every
-			// other verb here uses) — no pagination, see user.c3's own
-			// comment.
-			int max_entries = (int)((FS_MSG_MAX - 4) / FS_LIST_ENTRY_SIZE);
-			int count = -1;
-			if (fs_type == FS_TYPE_FAT32)
-			{
-				if (!fat32_list(&filename, &buf[4], max_entries, &count)) count = -1;
-			}
-			else if (fs_type == FS_TYPE_EXT2)
-			{
-				if (!ext2_list(&filename, &buf[4], max_entries, &count)) count = -1;
-			}
-			else if (fs_type == FS_TYPE_EXFAT)
-			{
-				if (!exfat_list(&filename, &buf[4], max_entries, &count)) count = -1;
-			}
-			*result_len_field = count;
-			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
-			continue;
-		}
+		Fs_req r;
+		r.name = &filename;
+		r.name2 = &new_filename;
+		r.buf = &buf;
+		r.data = null;
+		r.len = 0;
+		r.offset = req_offset;
+		r.uid = 0xFFFFFFFF;
+		r.recursive = false;
+		r.out_size = 0;
+		r.out_type = 0;
 
-		if (verb == FS_MKDIR)
-		{
-			// No protected-name check needed here the way FS_WRITE/FS_DELETE
-			// have one: mkdir can never target the protected file's own name
-			// (fat32_mkdir/ext2_mkdir's own "already exists" check already
-			// refuses that, since the protected file's entry is right there).
-			// fs_write_disabled is still checked explicitly, though — every
-			// write mkdir would attempt goes through fs_write_sector ->
-			// diskd_rw(), which refuses on its own if writes are disabled
-			// (mount still in progress, or fs_reserve_sector_range()
-			// overflow), so this is a cheap early exit, not a correctness
-			// requirement — avoids allocating a cluster/inode/block just to
-			// have the very next write on it refused anyway.
-			int result = -1;
-			if (!fs_write_disabled)
-			{
-				if (fs_type == FS_TYPE_FAT32)
-				{
-					result = fat32_mkdir(&filename);
-				}
-				else if (fs_type == FS_TYPE_EXT2)
-				{
-					// Same requester-uid lookup as FS_WRITE's own ext2
-					// branch — mkdir itself stays unrestricted (see
-					// ext2_mkdir's own comment), this just stamps the
-					// new directory with its real creator so a later
-					// rmdir (ext2_delete, which already covers empty
-					// directories the same as regular files) can tell
-					// them apart from anyone else.
-					uint requester_uid = fsd_requester_uid(from);
-					result = ext2_mkdir(&filename, requester_uid);
-				}
-				else if (fs_type == FS_TYPE_EXFAT)
-				{
-					result = exfat_mkdir(&filename);
-				}
-			}
-			*result_len_field = result;
-			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
-			continue;
-		}
-
-		if (verb == FS_RENAME)
-		{
-			// Same fs_write_disabled early-exit reasoning as FS_MKDIR's own
-			// comment — cheap, not a correctness requirement, the real
-			// backstop is diskd_rw() itself.
-			int result = -1;
-			if (!fs_write_disabled)
-			{
-				if (fs_type == FS_TYPE_FAT32)
-				{
-					result = fat32_rename(&filename, &new_filename);
-				}
-				else if (fs_type == FS_TYPE_EXT2)
-				{
-					// Same requester-uid lookup as FS_WRITE/FS_DELETE/
-					// FS_MKDIR's own ext2 branches, same reasoning — see
-					// their comments.
-					uint requester_uid = fsd_requester_uid(from);
-					result = ext2_rename(&filename, &new_filename, requester_uid);
-				}
-				else if (fs_type == FS_TYPE_EXFAT)
-				{
-					result = exfat_rename(&filename, &new_filename);
-				}
-			}
-			*result_len_field = result;
-			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
-			continue;
-		}
-
-		if (verb == FS_WRITE)
-		{
-			if (req_len > (int)(FS_MSG_MAX - 104)) req_len = (int)(FS_MSG_MAX - 104);
-			// Protected-name check here is a fast, obvious first gate,
-			// checked before any backend even sees the request;
-			// diskd_rw()'s reserved-sector check (see this file's
-			// header comment) is the real backstop if this one is ever
-			// bypassed.
-			int result = -1;
-			if (!fs_is_protected_name(&filename))
-			{
-				if (fs_type == FS_TYPE_FAT32)
-				{
-					result = fat32_write(&filename, &buf[104], (uint)req_len);
-				}
-				else if (fs_type == FS_TYPE_EXT2)
-				{
-					// ext2 is the only backend with an on-disk uid to
-					// enforce — see fsd_requester_uid's own comment.
-					uint requester_uid = fsd_requester_uid(from);
-					result = ext2_write(&filename, &buf[104], (uint)req_len, requester_uid);
-				}
-				else if (fs_type == FS_TYPE_EXFAT)
-				{
-					// Like FAT32's own branch — no uid concept in the
-					// on-disk format, so nothing to look up.
-					result = exfat_write(&filename, &buf[104], (uint)req_len);
-				}
-			}
-			*result_len_field = result;
-			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
-			continue;
-		}
-
-		if (verb == FS_WRITE_AT)
-		{
-			// Wire: path 0..99, len 100..103, offset 104..107 (req_offset),
-			// data 108.. — see user.c3's fs_write_at. Offset-aware write,
-			// no holes (each backend rejects offset > the file's size).
-			if (req_len > (int)(FS_MSG_MAX - 108)) req_len = (int)(FS_MSG_MAX - 108);
-			uint wat_offset = req_offset;
-			// FS_OFFSET_APPEND sentinel → resolve to the file's current
-			// size here, so a caller can append without a prior FS_STAT.
-			if (wat_offset == FS_OFFSET_APPEND)
-			{
-				uint cur_size = 0;
-				int cur_type = 0;
-				bool found = false;
-				if (fs_type == FS_TYPE_FAT32)
-				{
-					found = fat32_stat(&filename, &cur_size, &cur_type);
-				}
-				else if (fs_type == FS_TYPE_EXT2)
-				{
-					found = ext2_stat(&filename, &cur_size, &cur_type);
-				}
-				else if (fs_type == FS_TYPE_EXFAT)
-				{
-					found = exfat_stat(&filename, &cur_size, &cur_type);
-				}
-				wat_offset = found ? cur_size : 0;
-			}
-			int result = -1;
-			if (!fs_is_protected_name(&filename))
-			{
-				if (fs_type == FS_TYPE_FAT32)
-				{
-					result = fat32_write_at(&filename, &buf[108], (uint)req_len, wat_offset);
-				}
-				else if (fs_type == FS_TYPE_EXT2)
-				{
-					// Same requester-uid lookup as FS_WRITE's own ext2
-					// branch — see its comment.
-					uint requester_uid = fsd_requester_uid(from);
-					result = ext2_write_at(&filename, &buf[108], (uint)req_len, wat_offset, requester_uid);
-				}
-				else if (fs_type == FS_TYPE_EXFAT)
-				{
-					result = exfat_write_at(&filename, &buf[108], (uint)req_len, wat_offset);
-				}
-			}
-			*result_len_field = result;
-			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
-			continue;
-		}
-
-		if (verb == FS_STAT)
-		{
-			// Wire: path 0..99. Reply: 0..3 = 0 / -1, 4..7 = size (uint),
-			// 8 = type (0 file, 1 dir). See user.c3's fs_stat.
-			uint stat_size = 0;
-			int stat_type = 0;
-			bool ok = false;
-			if (fs_type == FS_TYPE_FAT32)
-			{
-				ok = fat32_stat(&filename, &stat_size, &stat_type);
-			}
-			else if (fs_type == FS_TYPE_EXT2)
-			{
-				ok = ext2_stat(&filename, &stat_size, &stat_type);
-			}
-			else if (fs_type == FS_TYPE_EXFAT)
-			{
-				ok = exfat_stat(&filename, &stat_size, &stat_type);
-			}
-			*result_len_field = ok ? 0 : -1;
-			uint* stat_size_field = (uint*)&buf[4];
-			*stat_size_field = stat_size;
-			buf[8] = (char)stat_type;
-			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
-			continue;
-		}
-
-		if (verb == FS_READ_AT)
-		{
-			if (req_len > (int)(FS_MSG_MAX - 4)) req_len = (int)(FS_MSG_MAX - 4);
-			int result = -1;
-			if (fs_type == FS_TYPE_FAT32)
-			{
-				result = fat32_read_at(&filename, &buf[4], (uint)req_len, req_offset);
-			}
-			else if (fs_type == FS_TYPE_EXT2)
-			{
-				result = ext2_read_at(&filename, &buf[4], (uint)req_len, req_offset);
-			}
-			else if (fs_type == FS_TYPE_EXFAT)
-			{
-				result = exfat_read_at(&filename, &buf[4], (uint)req_len, req_offset);
-			}
-			*result_len_field = result;
-			ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
-			continue;
-		}
-
-		if (req_len > (int)(FS_MSG_MAX - 4)) req_len = (int)(FS_MSG_MAX - 4);
 		int result = -1;
-		if (fs_type == FS_TYPE_FAT32)
+		switch (verb)
 		{
-			result = fat32_read(&filename, &buf[4], (uint)req_len);
+			case FS_READ:
+			{
+				if (req_len > (int)(FS_MSG_MAX - 4)) req_len = (int)(FS_MSG_MAX - 4);
+				r.len = (uint)req_len;
+				result = fs_ops.read(&r);
+			}
+			case FS_READ_AT:
+			{
+				if (req_len > (int)(FS_MSG_MAX - 4)) req_len = (int)(FS_MSG_MAX - 4);
+				r.len = (uint)req_len;
+				result = fs_ops.read_at(&r);
+			}
+			case FS_LIST:
+			{
+				// max_entries / no-pagination is fs_list_max()'s and
+				// user.c3's concern — nothing to set up here.
+				result = fs_ops.list(&r);
+			}
+			case FS_STAT:
+			{
+				// Reply: 0..3 = 0/-1, 4..7 = size (uint), 8 = type
+				// (0 file, 1 dir). The adapter fills r.out_size/out_type.
+				result = fs_ops.stat(&r);
+				uint* stat_size_field = (uint*)&buf[4];
+				*stat_size_field = r.out_size;
+				buf[8] = (char)r.out_type;
+			}
+			case FS_WRITE:
+			{
+				if (req_len > (int)(FS_MSG_MAX - 104)) req_len = (int)(FS_MSG_MAX - 104);
+				r.len = (uint)req_len;
+				r.data = &buf[104];
+				// Protected-name fast gate — an obvious first refusal
+				// before any backend runs; diskd_rw()'s reserved-sector
+				// check is the real backstop.
+				if (!fs_is_protected_name(&filename))
+				{
+					r.uid = fsd_requester_uid(from);
+					result = fs_ops.write(&r);
+				}
+			}
+			case FS_WRITE_AT:
+			{
+				// Wire: len 100..103, offset 104..107, data 108.. — see
+				// user.c3's fs_write_at.
+				if (req_len > (int)(FS_MSG_MAX - 108)) req_len = (int)(FS_MSG_MAX - 108);
+				r.len = (uint)req_len;
+				r.data = &buf[108];
+				// FS_OFFSET_APPEND → the file's current size (0 if it
+				// doesn't exist yet), so a caller can append with no
+				// prior FS_STAT. The stat adapter only touches
+				// r.out_size/out_type, not the reply buffer.
+				if (r.offset == FS_OFFSET_APPEND)
+				{
+					r.offset = (fs_ops.stat(&r) == 0) ? r.out_size : 0;
+				}
+				if (!fs_is_protected_name(&filename))
+				{
+					r.uid = fsd_requester_uid(from);
+					result = fs_ops.write_at(&r);
+				}
+			}
+			case FS_DELETE:
+			{
+				// req_len doubles as the recursive flag (see user.c3's
+				// wire-format comment) — FS_DELETE sends no length of its
+				// own. Same protected-name fast gate as FS_WRITE.
+				r.recursive = req_len != 0;
+				if (!fs_is_protected_name(&filename))
+				{
+					r.uid = fsd_requester_uid(from);
+					result = fs_ops.remove(&r);
+				}
+			}
+			case FS_MKDIR:
+			{
+				// No protected-name check — mkdir can't target the
+				// protected file's name (the backend's own "already
+				// exists" refuses it). fs_write_disabled IS checked: a
+				// cheap early exit before allocating a cluster/inode the
+				// next write would just get refused on anyway (the real
+				// backstop is diskd_rw()).
+				if (!fs_write_disabled)
+				{
+					r.uid = fsd_requester_uid(from);
+					result = fs_ops.mkdir(&r);
+				}
+			}
+			case FS_RENAME:
+			{
+				// Same fs_write_disabled early-exit reasoning as FS_MKDIR.
+				if (!fs_write_disabled)
+				{
+					r.uid = fsd_requester_uid(from);
+					result = fs_ops.rename(&r);
+				}
+			}
 		}
-		else if (fs_type == FS_TYPE_EXT2)
-		{
-			result = ext2_read(&filename, &buf[4], (uint)req_len);
-		}
-		else if (fs_type == FS_TYPE_EXFAT)
-		{
-			result = exfat_read(&filename, &buf[4], (uint)req_len);
-		}
-		*result_len_field = result;
 
+		*result_len_field = result;
 		ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
 	}
 }
