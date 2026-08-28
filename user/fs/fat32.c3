@@ -1371,7 +1371,7 @@ fn uint fat32_write_file(uint first_cluster, char* src, uint len)
 			if (!fat32_write_fat_entry(cluster, next)) return bytes_written;
 			if (!fat32_write_fat_entry(next, FAT32_EOC_MIN)) return bytes_written;
 		}
-		cluster = next;
+			cluster = next;
 	}
 	return bytes_written;
 }
@@ -1495,6 +1495,7 @@ fn int fat32_write(char* name, char* src, uint len)
 	uint dir_cluster;
 	if (!fat32_resolve_dir(name, &dir_cluster)) return -1;
 	char* leaf = fat32_leaf_name(name);
+	if (leaf[0] == 0) return -1; // "" or a trailing slash — no name to write
 
 	char[11] name11 @noinit;
 	uint dummy_lfn_sector; uint dummy_lfn_offset;
@@ -1699,6 +1700,7 @@ fn int fat32_delete(char* name)
 	uint dir_cluster;
 	if (!fat32_resolve_dir(name, &dir_cluster)) return -1;
 	char* leaf = fat32_leaf_name(name);
+	if (leaf[0] == 0) return -1; // "" or a trailing slash — nothing to delete
 
 	char[11] name11 @noinit;
 	uint lfn_sector = 0; uint lfn_offset = 0;
@@ -1847,6 +1849,7 @@ fn int fat32_delete_recursive(char* name)
 	uint dir_cluster;
 	if (!fat32_resolve_dir(name, &dir_cluster)) return -1;
 	char* leaf = fat32_leaf_name(name);
+	if (leaf[0] == 0) return -1; // "" or a trailing slash — nothing to delete
 
 	char[11] name11 @noinit;
 	uint lfn_sector = 0; uint lfn_offset = 0;
@@ -2014,6 +2017,7 @@ fn int fat32_mkdir(char* path)
 	uint parent_cluster;
 	if (!fat32_resolve_dir(path, &parent_cluster)) return -1;
 	char* leaf = fat32_leaf_name(path);
+	if (leaf[0] == 0) return -1; // "" or a trailing slash — no directory name
 
 	char[11] name11 @noinit;
 	uint dummy_lfn_sector; uint dummy_lfn_offset;
@@ -2155,6 +2159,7 @@ fn int fat32_rename(char* old_path, char* new_path)
 	uint old_parent_cluster;
 	if (!fat32_resolve_dir(old_path, &old_parent_cluster)) return -1;
 	char* old_leaf = fat32_leaf_name(old_path);
+	if (old_leaf[0] == 0) return -1; // "" or a trailing slash — nothing to rename
 	char[11] old_name11 @noinit;
 	uint old_lfn_sector = 0; uint old_lfn_offset = 0;
 	if (!fat32_resolve_name11(old_parent_cluster, old_leaf, &old_name11, &old_lfn_sector, &old_lfn_offset))
@@ -2173,6 +2178,7 @@ fn int fat32_rename(char* old_path, char* new_path)
 	uint new_parent_cluster;
 	if (!fat32_resolve_dir(new_path, &new_parent_cluster)) return -1;
 	char* new_leaf = fat32_leaf_name(new_path);
+	if (new_leaf[0] == 0) return -1; // "" or a trailing slash — no destination name
 	char[11] new_name11 @noinit;
 	uint dummy_new_lfn_sector; uint dummy_new_lfn_offset;
 	bool new_resolved = fat32_resolve_name11(new_parent_cluster, new_leaf, &new_name11, &dummy_new_lfn_sector, &dummy_new_lfn_offset);

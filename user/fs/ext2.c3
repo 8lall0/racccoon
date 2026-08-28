@@ -1559,6 +1559,7 @@ fn int ext2_write(char* name, char* src, uint len, uint requester_uid)
 	uint dir_inode;
 	if (!ext2_resolve_dir(name, &dir_inode)) return -1;
 	char* leaf = ext2_leaf_name(name);
+	if (leaf[0] == 0) return -1; // "" or a trailing slash — no name to write
 
 	uint inode_num;
 	uint entry_sector;
@@ -1737,6 +1738,7 @@ fn int ext2_delete(char* name, uint requester_uid)
 	uint dir_inode;
 	if (!ext2_resolve_dir(name, &dir_inode)) return -1;
 	char* leaf = ext2_leaf_name(name);
+	if (leaf[0] == 0) return -1; // "" or a trailing slash — nothing to delete
 
 	uint inode_num;
 	uint entry_sector;
@@ -1936,6 +1938,7 @@ fn int ext2_delete_recursive(char* name, uint requester_uid)
 	uint dir_inode;
 	if (!ext2_resolve_dir(name, &dir_inode)) return -1;
 	char* leaf = ext2_leaf_name(name);
+	if (leaf[0] == 0) return -1; // "" or a trailing slash — nothing to delete
 
 	uint inode_num;
 	uint entry_sector;
@@ -2088,6 +2091,7 @@ fn int ext2_mkdir(char* path, uint requester_uid)
 	uint parent_inode;
 	if (!ext2_resolve_dir(path, &parent_inode)) return -1;
 	char* leaf = ext2_leaf_name(path);
+	if (leaf[0] == 0) return -1; // "" or a trailing slash — no directory name
 
 	return ext2_mkdir_resolved(parent_inode, leaf, requester_uid);
 }
@@ -2244,6 +2248,7 @@ fn int ext2_rename(char* old_path, char* new_path, uint requester_uid)
 	uint old_parent_inode;
 	if (!ext2_resolve_dir(old_path, &old_parent_inode)) return -1;
 	char* old_leaf = ext2_leaf_name(old_path);
+	if (old_leaf[0] == 0) return -1; // "" or a trailing slash — nothing to rename
 
 	uint inode_num;
 	uint old_entry_sector;
@@ -2268,6 +2273,7 @@ fn int ext2_rename(char* old_path, char* new_path, uint requester_uid)
 	uint new_parent_inode;
 	if (!ext2_resolve_dir(new_path, &new_parent_inode)) return -1;
 	char* new_leaf = ext2_leaf_name(new_path);
+	if (new_leaf[0] == 0) return -1; // "" or a trailing slash — no destination name
 
 	// Moving a directory: refuse if the destination's own parent chain
 	// runs through the directory being moved — see

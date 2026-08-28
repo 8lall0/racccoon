@@ -4,6 +4,58 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-27 (continued) — fs ecosystem hardening pass (Phase 5)
+
+Follow-on to the FS_WRITE_AT / FS_STAT checkpoint. The plan's Phase 5 was
+"broad de-duplication refactor of the three backends' near-identical
+resolve/create/dispatch shapes." On a closer look that's mostly a vtable
+waiting to happen — the shared *structure* is thin (FAT32 does 8.3-name
+mangling, ext2 uses names directly, exFAT transcodes to UTF-16), and
+collapsing it means touching the heavily-exercised offset-0 read/write
+paths for a marginal line count win, against this codebase's clear
+preference for explicit code. Scoped it down to the parts that actually
+pay off:
+
+**Real bug found by the new negative-case test.** `fs_write("")` and
+`fs_delete("")` *succeeded* on FAT32 and ext2 — exFAT rejects an empty
+leaf name (`leaf[0] == 0`, added during the directory-extension work),
+but `fat32_write` / `fat32_delete` / `fat32_delete_recursive` /
+`fat32_mkdir` / `fat32_rename` and their ext2 twins never got the same
+guard. `fs_write("")` was creating a real, bogus, un-nameable directory
+entry. Added the `leaf[0] == 0` guard to all ten entry points, bringing
+FAT32/ext2 in line with exFAT — an empty path or a trailing slash is now
+`-1` everywhere.
+
+**`fsd` request hardening.** `filename` / `new_filename` are `mem::copy`'d
+100 bytes out of the wire buffer — the `user.c3` wrappers null-terminate
+at ≤ 99, but a buggy or hostile client could send 100 non-null bytes and
+every backend's string walk would run off the end. Force `[99] = 0` after
+each copy.
+
+**`fsd` dedup.** The `uint requester_uid = 0xFFFFFFFF; proc_info(from,
+null, null, (int*)&requester_uid);` pair (+ a paragraph of comment
+explaining the fail-closed reasoning) was copy-pasted at 8 dispatch
+sites. Replaced with one `fsd_requester_uid(from)` helper carrying the
+canonical comment; call sites are one line each now.
+
+**New regression:** `fsneg` shell_test builtin — 17 negative-case
+assertions (empty path on write/write_at/delete; missing file on
+read/read_at/stat; `mkdir` collision; write / write_at to a directory;
+`list` of a file; `rename` onto an existing name), each of which must
+return `-1` on all three backends. Runs against whatever is mounted, so
+the four `launch64*.sh` scripts cover FAT32 / ext2 / dual / exFAT.
+
+**Verification:** `fsneg: ok` on all four. Full regression re-run clean:
+`fswriteat`, `fswriteatfrag`, `lfntest`, `cycletest`, `p9fswritetest`,
+`fspermtest`, `exfatgrow`, `bigreadtest`, `/bin`
+`write`/`cat`/`mkdir`/`mv`/`rm -r`. `fsck.fat` / `e2fsck -fn` /
+`fsck.exfat` clean on every run image.
+
+**Files changed:** `user/fs/fsd.c3`, `user/fs/fat32.c3`, `user/fs/ext2.c3`,
+`user/shell_test.c3`.
+
+---
+
 ## 2026-08-27 (continued) — FS_WRITE_AT + FS_STAT across all three backends; exFAT multi-cluster files
 
 `fsd`'s thin `FS_*` verb family had no offset/append write and no way to

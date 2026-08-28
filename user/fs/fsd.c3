@@ -552,6 +552,24 @@ fn void fs_parse_mbr_partition_start(uint* out_start)
 	}
 }
 
+// The uid of the process that sent request `from`, for the ext2 backend
+// to enforce i_uid ownership against (fat32/exfat have no uid concept in
+// their on-disk format). fsd is a boot-time server, always root, acting
+// on a real requester's behalf — it can't trust its own identity the way
+// SYS_KILL/SYS_SRV_POST trust current_proc, so it looks up who *actually*
+// asked. A failed lookup (the requester's process is already gone, a rare
+// race) returns 0xFFFFFFFF, which is never a real uid and never root, so
+// the backend's own check fails closed (an existing file's overwrite gets
+// refused rather than silently trusted). Every FS_WRITE / FS_WRITE_AT /
+// FS_DELETE / FS_MKDIR / FS_RENAME ext2 arm, and the P9_* write arms, use
+// this.
+fn uint fsd_requester_uid(int from)
+{
+	uint uid = 0xFFFFFFFF;
+	proc_info(from, null, null, (int*)&uid);
+	return uid;
+}
+
 fn void main(String[] args)
 {
 	if (args.len == 1)
@@ -748,8 +766,7 @@ fn void main(String[] args)
 				int result = -1;
 				if (fid < (uint)FS9_FID_MAX && fs9_fids[fid].used && fs9_fids[fid].is_dir)
 				{
-					uint requester_uid = 0xFFFFFFFF;
-					proc_info(from, null, null, (int*)&requester_uid);
+					uint requester_uid = fsd_requester_uid(from);
 					uint dir_inode = fs9_fids[fid].inode_num;
 					uint new_inode_num;
 					// ext2_mkdir_resolved doesn't hand back a new
@@ -814,8 +831,7 @@ fn void main(String[] args)
 					&& !fs9_fids[fid].is_dir)
 				{
 					if (p9_count > FS_MSG_MAX - 12) p9_count = FS_MSG_MAX - 12;
-					uint requester_uid = 0xFFFFFFFF;
-					proc_info(from, null, null, (int*)&requester_uid);
+					uint requester_uid = fsd_requester_uid(from);
 					// Re-read fresh rather than trust anything cached
 					// on the fid — same "re-derive, don't trust stale
 					// state" discipline P9_READ already follows.
@@ -866,8 +882,7 @@ fn void main(String[] args)
 					{
 						if (fs9_fids[fid].has_entry)
 						{
-							uint requester_uid = 0xFFFFFFFF;
-							proc_info(from, null, null, (int*)&requester_uid);
+							uint requester_uid = fsd_requester_uid(from);
 							Ext2_inode_info inode;
 							if (ext2_read_inode(fs9_fids[fid].inode_num, &inode))
 							{
@@ -905,6 +920,11 @@ fn void main(String[] args)
 		// that backend, not here.
 		char[100] filename @noinit;
 		mem::copy(&filename, &buf, 100);
+		// The wrappers in user.c3 null-terminate at <= 99 chars, but a
+		// buggy or hostile client could send 100 non-null bytes — force
+		// the terminator so every backend's own string walk stays inside
+		// this buffer no matter what arrived on the wire.
+		filename[99] = 0;
 		// FS_RENAME-only (see user.c3's own wire-format comment) — every
 		// other verb's byte 100.. means something else entirely (a
 		// length, a recursive flag, listing output), captured unconditionally
@@ -915,6 +935,7 @@ fn void main(String[] args)
 		{
 			new_filename[i] = buf[100 + i];
 		}
+		new_filename[99] = 0; // same untrusted-length guard as filename above
 		uint* len_field = (uint*)&buf[100];
 		int req_len = (int)*len_field;
 		// Untrusted input — clamp rather than trust the caller not to
@@ -953,8 +974,7 @@ fn void main(String[] args)
 				{
 					// Same requester-uid lookup either way — see
 					// FS_WRITE's own ext2 branch for why.
-					uint requester_uid = 0xFFFFFFFF;
-					proc_info(from, null, null, (int*)&requester_uid);
+					uint requester_uid = fsd_requester_uid(from);
 					if (recursive)
 					{
 						result = ext2_delete_recursive(&filename, requester_uid);
@@ -1031,8 +1051,7 @@ fn void main(String[] args)
 					// rmdir (ext2_delete, which already covers empty
 					// directories the same as regular files) can tell
 					// them apart from anyone else.
-					uint requester_uid = 0xFFFFFFFF;
-					proc_info(from, null, null, (int*)&requester_uid);
+					uint requester_uid = fsd_requester_uid(from);
 					result = ext2_mkdir(&filename, requester_uid);
 				}
 				else if (fs_type == FS_TYPE_EXFAT)
@@ -1062,8 +1081,7 @@ fn void main(String[] args)
 					// Same requester-uid lookup as FS_WRITE/FS_DELETE/
 					// FS_MKDIR's own ext2 branches, same reasoning — see
 					// their comments.
-					uint requester_uid = 0xFFFFFFFF;
-					proc_info(from, null, null, (int*)&requester_uid);
+					uint requester_uid = fsd_requester_uid(from);
 					result = ext2_rename(&filename, &new_filename, requester_uid);
 				}
 				else if (fs_type == FS_TYPE_EXFAT)
@@ -1093,23 +1111,9 @@ fn void main(String[] args)
 				}
 				else if (fs_type == FS_TYPE_EXT2)
 				{
-					// FAT32's own on-disk format has no uid concept to
-					// enforce against — only ext2 needs the real
-					// requester's own uid (Process.uid, src/process.c3),
-					// looked up here rather than trusted from this
-					// process's own identity: fsd is always root, so
-					// ext2_write's own enforcement would see nothing but
-					// root unless told who *actually* asked — the same
-					// backdoor shape procd's own /proc/ctl "kill" handler
-					// had before this session's permission-model entry
-					// fixed it, closed the same way. A failed lookup
-					// (the requester's own process no longer exists, a
-					// real if rare race) fails closed: 0xFFFFFFFF never
-					// matches a real uid and is never root, so an
-					// existing file's own overwrite gets refused rather
-					// than silently trusted.
-					uint requester_uid = 0xFFFFFFFF;
-					proc_info(from, null, null, (int*)&requester_uid);
+					// ext2 is the only backend with an on-disk uid to
+					// enforce — see fsd_requester_uid's own comment.
+					uint requester_uid = fsd_requester_uid(from);
 					result = ext2_write(&filename, &buf[104], (uint)req_len, requester_uid);
 				}
 				else if (fs_type == FS_TYPE_EXFAT)
@@ -1163,8 +1167,7 @@ fn void main(String[] args)
 				{
 					// Same requester-uid lookup as FS_WRITE's own ext2
 					// branch — see its comment.
-					uint requester_uid = 0xFFFFFFFF;
-					proc_info(from, null, null, (int*)&requester_uid);
+					uint requester_uid = fsd_requester_uid(from);
 					result = ext2_write_at(&filename, &buf[108], (uint)req_len, wat_offset, requester_uid);
 				}
 				else if (fs_type == FS_TYPE_EXFAT)

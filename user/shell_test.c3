@@ -39,6 +39,10 @@ fn void thread_body(void* arg) {
 // bigread_buf above is (FS_LIST_ENTRY_SIZE * a generous entry count).
 char[40 * 36] exfatgrow_listbuf;
 
+// fsneg's throwaway read/list target — nothing reads it back, it just
+// needs to be a valid buffer for the calls that are expected to fail.
+char[64] fsneg_scratch;
+
 // racetest: two threads (true concurrency at the IPC level — both share
 // this process's memory and can genuinely interleave mid-send) message
 // echod at once. Before SYS_IPC_SEND was hardened into a rendezvous, a
@@ -384,6 +388,41 @@ fn void main() {
                 print(" rmd="); print_uint((uint)fwa_rmd);
                 print(" cl="); print_uint((uint)fwa_cleanup);
                 print("\nfswriteat: FAILED\n");
+            }
+        } else if (strcmp(cmd, "fsneg") == 0) {
+            // Negative-case consistency across the FS_* verbs — every one
+            // of these must return -1 on all three backends (run via the
+            // four launch64*.sh). Guards the "harden the fs ecosystem"
+            // edges: empty path, missing file, wrong node type, name
+            // collisions.
+            int n_we = fs_write("", "x", 1);                 // empty path
+            int n_wae = fs_write_at("", "x", 1, 0);          // empty path
+            int n_de = fs_delete("");                        // empty path
+            int n_rd = fs_read("ngnope.txt", &fsneg_scratch, 16);   // missing
+            int n_rda = fs_read_at("ngnope.txt", &fsneg_scratch, 16, 0); // missing
+            uint n_sz = 0; int n_ty = 0;
+            int n_ste = fs_stat("ngnope.txt", &n_sz, &n_ty);        // missing
+
+            int n_mk1 = fs_mkdir("ngdir");                   // ok (0)
+            int n_mk2 = fs_mkdir("ngdir");                   // already exists -> -1
+            int n_wd = fs_write("ngdir", "x", 1);           // write to a dir -> -1
+            int n_wad = fs_write_at("ngdir", "x", 1, 0);    // write_at to a dir -> -1
+            int n_ld = fs_stat("ngdir", &n_sz, &n_ty);      // ok, type 1
+            bool n_dir_ok = n_ld == 0 && n_ty == 1;
+
+            int n_cf = fs_write("ngf.txt", "hi", 2);        // ok (2)
+            int n_lf = fs_list("ngf.txt", &fsneg_scratch, 4); // list a file -> -1
+            int n_rnf = fs_rename("ngf.txt", "ngdir");      // dest exists -> -1
+            int n_rmf = fs_delete("ngf.txt");               // ok (0)
+            int n_rmd = fs_delete("ngdir");                 // ok (0)
+
+            if (n_we < 0 && n_wae < 0 && n_de < 0 && n_rd < 0 && n_rda < 0
+                && n_ste < 0 && n_mk1 == 0 && n_mk2 < 0 && n_wd < 0 && n_wad < 0
+                && n_dir_ok && n_cf == 2 && n_lf < 0 && n_rnf < 0
+                && n_rmf == 0 && n_rmd == 0) {
+                print("fsneg: ok\n");
+            } else {
+                print("fsneg: FAILED\n");
             }
         } else if (strcmp(cmd, "fswriteatfrag") == 0) {
             // Interleaved growth of two files, 1000 bytes at a time,
