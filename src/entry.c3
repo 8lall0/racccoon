@@ -1193,6 +1193,695 @@ fn void sys_exec(Trap_frame* f) @noinline
 		f.a1 = (ulong)exec_argv_base;
 }
 
+// ipc send: rendezvous a message into the target's single inbox slot and block until it acks.
+// (was inline in handle_syscall; extracted 2026-08-29.)
+fn void sys_ipc_send(Trap_frame* f) @noinline
+{
+		// Inline for the same reason as SYS_EXIT above — this is the
+		// pattern proven not to trigger the unexplained c3c reboot
+		// bug in this switch. dest_pid/type/data are a0-a2 as usual;
+		// len is a4, since a3 is always the syscall number (see
+		// syscall4 in user/user.c3 — this is the one syscall that
+		// needs a 4th argument).
+		int ipc_dest_pid = (int)f.a0;
+		uint ipc_type    = (uint)f.a1;
+		char* ipc_data   = (char*)(uptr)f.a2;
+		int ipc_len      = (int)f.a4;
+		int ipc_copy_len = ipc_len > MSG_MAX ? MSG_MAX : ipc_len;
+		if (ipc_copy_len < 0) ipc_copy_len = 0;
+		if (!user_range_valid(current_proc.page_table, (uptr)ipc_data, (ulong)ipc_copy_len, false))
+		{
+			f.a0 = (ulong)(-1);
+			return;
+		}
+		// proc_by_pid here only ever guards against a plain dead/
+		// never-existed pid (e.g. a stale hardcoded pid like echod's
+		// or diskd's, if one of those ever exited). The stale-
+		// namespace-pid hazard this comment used to describe — a
+		// Mount entry silently resolving to an unrelated process that
+		// reused a dead target's slot, found while building the
+		// second, simultaneously-mounted fsd (docs/devlog.md) — is
+		// now closed one layer up, in SYS_NS_RESOLVE's own generation
+		// check (see Mount.server_generation's comment, process.c3):
+		// a caller can never obtain a hijacked pid through namespace
+		// resolution in the first place, so this check doesn't need
+		// to re-derive that distinction itself.
+		Process* ipc_target = proc_by_pid(ipc_dest_pid);
+		if (!ipc_target)
+		{
+			f.a0 = (ulong)(-1);
+			return;
+		}
+
+		// Wait for the target's inbox to actually be free — a
+		// previous sender's message that hasn't been consumed yet
+		// must never be silently overwritten. Busy-poll like
+		// SYS_GETCHAR: nothing specifically wakes a queued sender
+		// when the slot frees up, it's whoever notices next.
+		while (ipc_target.has_message)
+		{
+			yield();
+		}
+
+		mem::copy(&ipc_target.msg_data, ipc_data, (sz)ipc_copy_len);
+		ipc_target.msg_from = current_proc.pid;
+		ipc_target.msg_from_generation = current_proc.generation;
+		ipc_target.msg_type = ipc_type;
+		current_proc.msg_acked = false;
+		ipc_target.has_message = true;
+		if (ipc_target.state == PROC_BLOCKED)
+		{
+			ipc_target.state = PROC_RUNNABLE;
+		}
+
+		// True rendezvous: don't return to the caller until the
+		// receiver has actually consumed *this* message — SYS_IPC_RECV
+		// and SYS_IPC_POLL both wake us explicitly via msg_acked once
+		// they do (targeted at us specifically via msg_from, not just
+		// "the inbox looks empty again", which could just as easily
+		// mean a different sender's message arrived and got consumed
+		// instead).
+		while (!current_proc.msg_acked)
+		{
+			current_proc.state = PROC_BLOCKED;
+			yield();
+		}
+		f.a0 = 0;
+}
+
+// ipc reply: hand a reply back to a sender parked in ipc_send, unblocking it.
+// (was inline in handle_syscall; extracted 2026-08-29.)
+fn void sys_ipc_reply(Trap_frame* f) @noinline
+{
+		// Same shape as SYS_IPC_SEND above (kept as a full,
+		// separate copy rather than factored out — same
+		// inlining reason as SYS_EXIT/SYS_KILL), plus one
+		// addition: an optional expected_generation (a5) check
+		// on the target, mirroring SYS_KILL's own wildcard
+		// convention (0 = don't care). This is the piece that
+		// actually closes the reply-side stale-pid window —
+		// SYS_IPC_SEND's own proc_by_pid check only ever
+		// guarded against a dead/never-existed pid, never
+		// against "this pid, but a different process now"; a
+		// server built to reply safely calls SYS_IPC_RECV_GEN
+		// (below) to capture the requester's generation right
+		// when the request arrives, then passes it straight
+		// back in here. Without that captured generation, a
+		// server whose reply lands after the original requester
+		// has already exited and had its pid slot reused would
+		// otherwise silently misdeliver the reply to the new,
+		// unrelated occupant.
+		int reply_dest_pid = (int)f.a0;
+		uint reply_type    = (uint)f.a1;
+		char* reply_data   = (char*)(uptr)f.a2;
+		int reply_len      = (int)f.a4;
+		uint reply_expected_generation = (uint)f.a5;
+		int reply_copy_len = reply_len > MSG_MAX ? MSG_MAX : reply_len;
+		if (reply_copy_len < 0) reply_copy_len = 0;
+		if (!user_range_valid(current_proc.page_table, (uptr)reply_data, (ulong)reply_copy_len, false))
+		{
+			f.a0 = (ulong)(-1);
+			return;
+		}
+		Process* reply_target = proc_by_pid(reply_dest_pid);
+		if (!reply_target || (reply_expected_generation != 0 && reply_target.generation != reply_expected_generation))
+		{
+			f.a0 = (ulong)(-1);
+			return;
+		}
+
+		while (reply_target.has_message)
+		{
+			yield();
+		}
+
+		mem::copy(&reply_target.msg_data, reply_data, (sz)reply_copy_len);
+		reply_target.msg_from = current_proc.pid;
+		reply_target.msg_from_generation = current_proc.generation;
+		reply_target.msg_type = reply_type;
+		current_proc.msg_acked = false;
+		reply_target.has_message = true;
+		if (reply_target.state == PROC_BLOCKED)
+		{
+			reply_target.state = PROC_RUNNABLE;
+		}
+
+		while (!current_proc.msg_acked)
+		{
+			current_proc.state = PROC_BLOCKED;
+			yield();
+		}
+		f.a0 = 0;
+}
+
+// ipc recv: block until a message lands in this process's inbox, copy it out.
+// (was inline in handle_syscall; extracted 2026-08-29.)
+fn void sys_ipc_recv(Trap_frame* f) @noinline
+{
+		// a2 (previously always 0 from user.c3's original ipc_recv) is
+		// now an optional out-pointer for the message's type/verb —
+		// null means "don't care", same as every existing call site
+		// still passes.
+		char* recv_buf       = (char*)(uptr)f.a0;
+		int recv_len         = (int)f.a1;
+		uint* recv_type_out  = (uint*)(uptr)f.a2;
+		int recv_valid_len = recv_len > MSG_MAX ? MSG_MAX : recv_len;
+		if (recv_valid_len < 0) recv_valid_len = 0;
+		if (!user_range_valid(current_proc.page_table, (uptr)recv_buf, (ulong)recv_valid_len, true)
+			|| (recv_type_out != null && !user_range_valid(current_proc.page_table, (uptr)recv_type_out, 4, true)))
+		{
+			f.a0 = (ulong)(-1);
+			return;
+		}
+		current_proc.in_blocking_wait = true;
+		blocking_depth++;
+		for (;;)
+		{
+			if (current_proc.has_message)
+			{
+				int recv_copy_len = recv_len > MSG_MAX ? MSG_MAX : recv_len;
+				if (recv_copy_len < 0) recv_copy_len = 0;
+				mem::copy(recv_buf, &current_proc.msg_data, (sz)recv_copy_len);
+				if (recv_type_out != null)
+				{
+					*recv_type_out = current_proc.msg_type;
+				}
+				f.a0 = (ulong)current_proc.msg_from;
+				current_proc.has_message = false;
+
+				// Wake the sender: it's genuinely blocked (see
+				// SYS_IPC_SEND) waiting specifically for this ack,
+				// not just for the inbox to look empty from the
+				// outside.
+				Process* recv_acked_sender = proc_by_pid(current_proc.msg_from);
+				if (recv_acked_sender != null)
+				{
+					recv_acked_sender.msg_acked = true;
+					if (recv_acked_sender.state == PROC_BLOCKED)
+					{
+						recv_acked_sender.state = PROC_RUNNABLE;
+					}
+				}
+				break;
+			}
+			current_proc.state = PROC_BLOCKED;
+			yield();
+		}
+		current_proc.in_blocking_wait = false;
+		blocking_depth--;
+}
+
+// ipc recv (generation-aware): like ipc_recv but also reports the sender's generation.
+// (was inline in handle_syscall; extracted 2026-08-29.)
+fn void sys_ipc_recv_gen(Trap_frame* f) @noinline
+{
+		// Same shape as SYS_IPC_RECV above (kept as a full,
+		// separate copy, same reasoning as SYS_IPC_REPLY's own
+		// comment), plus one addition: also writes the sender's
+		// captured Process.generation (a3) out through a new
+		// optional out-pointer (a4) — the piece a server needs
+		// to later reply safely via SYS_IPC_REPLY instead of
+		// plain SYS_IPC_SEND. A distinct syscall number, not a
+		// widened SYS_IPC_RECV, on purpose: every existing
+		// SYS_IPC_RECV caller only ever sets a0-a2 (see
+		// user.c3's plain 3-arg syscall() wrapper), leaving a4
+		// holding whatever garbage was there before — reading it
+		// as a live out-pointer on the *same* syscall number
+		// would risk writing through that garbage for every
+		// caller that hasn't been updated to know about this.
+		char* recv_gen_buf       = (char*)(uptr)f.a0;
+		int recv_gen_len         = (int)f.a1;
+		uint* recv_gen_type_out  = (uint*)(uptr)f.a2;
+		uint* recv_gen_from_generation_out = (uint*)(uptr)f.a4;
+		int recv_gen_valid_len = recv_gen_len > MSG_MAX ? MSG_MAX : recv_gen_len;
+		if (recv_gen_valid_len < 0) recv_gen_valid_len = 0;
+		if (!user_range_valid(current_proc.page_table, (uptr)recv_gen_buf, (ulong)recv_gen_valid_len, true)
+			|| (recv_gen_type_out != null && !user_range_valid(current_proc.page_table, (uptr)recv_gen_type_out, 4, true))
+			|| (recv_gen_from_generation_out != null && !user_range_valid(current_proc.page_table, (uptr)recv_gen_from_generation_out, 4, true)))
+		{
+			f.a0 = (ulong)(-1);
+			return;
+		}
+		current_proc.in_blocking_wait = true;
+		blocking_depth++;
+		for (;;)
+		{
+			if (current_proc.has_message)
+			{
+				int recv_gen_copy_len = recv_gen_len > MSG_MAX ? MSG_MAX : recv_gen_len;
+				if (recv_gen_copy_len < 0) recv_gen_copy_len = 0;
+				mem::copy(recv_gen_buf, &current_proc.msg_data, (sz)recv_gen_copy_len);
+				if (recv_gen_type_out != null)
+				{
+					*recv_gen_type_out = current_proc.msg_type;
+				}
+				if (recv_gen_from_generation_out != null)
+				{
+					*recv_gen_from_generation_out = current_proc.msg_from_generation;
+				}
+				f.a0 = (ulong)current_proc.msg_from;
+				current_proc.has_message = false;
+
+				Process* recv_gen_acked_sender = proc_by_pid(current_proc.msg_from);
+				if (recv_gen_acked_sender != null)
+				{
+					recv_gen_acked_sender.msg_acked = true;
+					if (recv_gen_acked_sender.state == PROC_BLOCKED)
+					{
+						recv_gen_acked_sender.state = PROC_RUNNABLE;
+					}
+				}
+				break;
+			}
+			current_proc.state = PROC_BLOCKED;
+			yield();
+		}
+		current_proc.in_blocking_wait = false;
+		blocking_depth--;
+}
+
+// ipc poll: non-blocking inbox check — copy a pending message out or report empty.
+// (was inline in handle_syscall; extracted 2026-08-29.)
+fn void sys_ipc_poll(Trap_frame* f) @noinline
+{
+		// Non-blocking counterpart to SYS_IPC_RECV: checks once,
+		// never sets PROC_BLOCKED, never yields. Exists for diskd's
+		// completion-wait (user/diskd.c3), which genuinely needs an
+		// interrupt to fire to make progress — and a *blocking*
+		// ipc_recv there is unsafe: sstatus.SIE has no per-process
+		// save/restore (kernel_entry only saves GPRs), and
+		// switch_context unconditionally resets sscratch to a fixed
+		// "top of this process's stack" value on every switch,
+		// including when *resuming* a process that's paused mid-trap
+		// (not freshly entering one). That reset is only correct for
+		// a fresh trap entry; enabling interrupts while blocked mid-
+		// trap risks a nested trap building its frame at that fixed
+		// address, colliding with — and corrupting — the still-in-
+		// progress outer frame lower on the same stack. Confirmed
+		// empirically: doing exactly that (enable_interrupts() right
+		// before yield() in SYS_IPC_RECV's loop) turned an
+		// intermittent hang into an intermittent page-fault panic
+		// instead of fixing it. Polling from genuine user-mode code
+		// sidesteps the whole problem: this process is never parked
+		// mid-trap between polls, so sstatus.SIE's natural value
+		// (on, from user_entry) is safe to leave alone, and the
+		// interrupt can fire and get routed normally in between.
+		char* poll_buf      = (char*)(uptr)f.a0;
+		int poll_len        = (int)f.a1;
+		uint* poll_type_out = (uint*)(uptr)f.a2;
+		if (!current_proc.has_message)
+		{
+			f.a0 = (ulong)(-1);
+			return;
+		}
+		int poll_copy_len = poll_len > MSG_MAX ? MSG_MAX : poll_len;
+		if (poll_copy_len < 0) poll_copy_len = 0;
+		if (!user_range_valid(current_proc.page_table, (uptr)poll_buf, (ulong)poll_copy_len, true)
+			|| (poll_type_out != null && !user_range_valid(current_proc.page_table, (uptr)poll_type_out, 4, true)))
+		{
+			f.a0 = (ulong)(-1);
+			return;
+		}
+		mem::copy(poll_buf, &current_proc.msg_data, (sz)poll_copy_len);
+		if (poll_type_out != null)
+		{
+			*poll_type_out = current_proc.msg_type;
+		}
+		f.a0 = (ulong)current_proc.msg_from;
+		current_proc.has_message = false;
+
+		// Same "wake the real sender" step as SYS_IPC_RECV — normally
+		// a no-op here, since diskd's only use of this is for the
+		// synthetic interrupt notify (msg_from=0, which proc_by_pid
+		// always rejects, so there's no real sender to wake), but
+		// correct regardless if that ever changes.
+		Process* poll_acked_sender = proc_by_pid(current_proc.msg_from);
+		if (poll_acked_sender != null)
+		{
+			poll_acked_sender.msg_acked = true;
+			if (poll_acked_sender.state == PROC_BLOCKED)
+			{
+				poll_acked_sender.state = PROC_RUNNABLE;
+			}
+		}
+}
+
+// namespace resolve: walk this process's mount table for the longest prefix match, return the server pid (live generation checked).
+// (was inline in handle_syscall; extracted 2026-08-29.)
+fn void sys_ns_resolve(Trap_frame* f) @noinline
+{
+		// Inline for the same reason as every other case in this
+		// switch — see SYS_EXIT's comment. Walks the caller's own
+		// namespace (never a different process's — resolution is
+		// always relative to whoever's asking) for the first mount
+		// whose prefix matches the given path, longest-prefix-first so
+		// a more specific mount always wins over a broader one that
+		// also matches. Returns -1 (in f.a0, read as signed by the
+		// caller) if nothing matches.
+		char* ns_path = (char*)(uptr)f.a0;
+		uint* ns_prefix_len_out_check = (uint*)(uptr)f.a1;
+		if (!user_range_valid(current_proc.page_table, (uptr)ns_path, NS_PREFIX_MAX, false)
+			|| (ns_prefix_len_out_check != null && !user_range_valid(current_proc.page_table, (uptr)ns_prefix_len_out_check, 4, true)))
+		{
+			f.a0 = (ulong)(-1);
+			return;
+		}
+		int ns_result = -1;
+		int ns_best_len = -1;
+		for (int m = 0; m < NS_MOUNTS_MAX; m++)
+		{
+			if (current_proc.namespace[m].server_pid == 0) continue;
+			// Generation check closes the stale-pid hazard documented
+			// on Mount.server_generation (process.c3): if the process
+			// that originally held this pid has since exited and the
+			// slot was reused (or never got this far at all), either
+			// proc_by_pid returns null or its live generation won't
+			// match what was recorded when this entry was bound —
+			// either way, treat it exactly like server_pid == 0 rather
+			// than resolve to the wrong, unrelated process.
+			Process* ns_target = proc_by_pid(current_proc.namespace[m].server_pid);
+			if (!ns_target || ns_target.generation != current_proc.namespace[m].server_generation) continue;
+			char* ns_prefix = &current_proc.namespace[m].prefix[0];
+			if (!str_starts_with(ns_path, ns_prefix)) continue;
+
+			int ns_len = 0;
+			while (ns_prefix[ns_len] != 0) ns_len++;
+			if (ns_len > ns_best_len)
+			{
+				ns_best_len = ns_len;
+				ns_result = current_proc.namespace[m].server_pid;
+			}
+		}
+		f.a0 = (ulong)(iptr)ns_result;
+
+		// Optional out-pointer (a1), same "null means don't care"
+		// convention as SYS_RFORK's generation out-pointer above —
+		// lets the caller strip the matched prefix itself (see
+		// user/user.c3's fs_read/fs_write) before building a wire-
+		// format request, so a server mounted under a non-empty
+		// prefix (e.g. the second fsd, under "/2/") still only ever
+		// sees the bare remainder, exactly like the "" catch-all
+		// mount already did by construction (its own prefix length
+		// is always 0). 0 when nothing matched — the caller already
+		// has -1 in f.a0 to detect that case, this just avoids
+		// leaving the out-pointer's target uninitialized.
+		uint* ns_prefix_len_out = (uint*)(uptr)f.a1;
+		if (ns_prefix_len_out != null)
+		{
+			*ns_prefix_len_out = (uint)(ns_best_len < 0 ? 0 : ns_best_len);
+		}
+}
+
+// join: block until the target pid/generation is gone (exited or slot reused).
+// (was inline in handle_syscall; extracted 2026-08-29.)
+fn void sys_join(Trap_frame* f) @noinline
+{
+		// Blocks until the joined process is actually gone — plain
+		// polling (check, yield(), recheck), the same proven shape
+		// as SYS_GETCHAR's own retry loop, not an event-driven wake.
+		//
+		// "Actually gone" means either the slot is empty
+		// (proc_by_pid returns null) *or* it's been reused by an
+		// unrelated process — detected via the join_generation the
+		// caller captured when it created this pid (rfork's or
+		// threadcreate's optional generation_out), compared against
+		// Process.generation (src/process.c3), which increments on
+		// every reuse of a slot and never resets. Without this
+		// check, a pid recycled into a new process (always possible,
+		// since a slot's next occupant gets the exact same pid —
+		// pid = slot index + 1) would look identical to the
+		// original process still running, and join would wait for
+		// the wrong thing.
+		int join_pid = (int)f.a0;
+		uint join_generation = (uint)f.a1;
+		if (join_pid == current_proc.pid)
+		{
+			// Can't wait for yourself to disappear while you're the
+			// one running — always self-deadlock. Reject rather than
+			// hang.
+			f.a0 = (ulong)(-1);
+			return;
+		}
+		// Stays PROC_RUNNABLE throughout, same as SYS_GETCHAR's own
+		// loop above — deliberately not PROC_BLOCKED: that state
+		// only ever gets cleared by something *else* explicitly
+		// flipping it back (SYS_IPC_SEND does this for a receiver).
+		// Nothing does that for a join — SYS_EXIT only ever touches
+		// its own process's state — so setting PROC_BLOCKED here
+		// would make this process permanently unschedulable the
+		// moment it's set, even after the joined pid actually exits.
+		current_proc.in_blocking_wait = true;
+		blocking_depth++;
+		for (;;)
+		{
+			Process* join_target = proc_by_pid(join_pid);
+			if (join_target == null) break;
+			if (join_target.generation != join_generation) break;
+			yield();
+		}
+		current_proc.in_blocking_wait = false;
+		blocking_depth--;
+		f.a0 = 0;
+}
+
+// futex wait: block while the user word still holds the expected value.
+// (was inline in handle_syscall; extracted 2026-08-29.)
+fn void sys_futex_wait(Trap_frame* f) @noinline
+{
+		// Blocks while the user-space word at addr still equals
+		// expected. The check-then-block sequence below is atomic
+		// with respect to any concurrent SYS_FUTEX_WAKE precisely
+		// because kernel-mode code is never preempted (see
+		// enable_timer_interrupts()'s own comment above arm_timer)
+		// — no other process's SYS_FUTEX_WAKE can run between this
+		// read and setting PROC_BLOCKED, so a wake can never be
+		// lost in that window. Returns immediately (no block, no
+		// yield) if the value already differs — same as any real
+		// futex, the caller (user/user.c3's Mutex.lock) always
+		// re-checks its own condition either way, spuriously or
+		// not.
+		int* futex_addr     = (int*)(uptr)f.a0;
+		int futex_expected  = (int)f.a1;
+		if (!user_range_valid(current_proc.page_table, (uptr)futex_addr, 4, false))
+		{
+			f.a0 = (ulong)(-1);
+			return;
+		}
+		if (*futex_addr != futex_expected)
+		{
+			f.a0 = 0;
+			return;
+		}
+		current_proc.futex_addr = (uptr)futex_addr;
+		current_proc.in_blocking_wait = true;
+		blocking_depth++;
+		for (;;)
+		{
+			// PROC_BLOCKED, not PROC_RUNNABLE the way SYS_JOIN
+			// stays above: unlike a join, something always does
+			// explicitly clear this — SYS_FUTEX_WAKE below, the
+			// only other place futex_addr is ever touched.
+			current_proc.state = PROC_BLOCKED;
+			yield();
+			if (current_proc.futex_addr == 0) break;
+		}
+		current_proc.in_blocking_wait = false;
+		blocking_depth--;
+		f.a0 = 0;
+}
+
+// proc info: report another process's state / generation / uid.
+// (was inline in handle_syscall; extracted 2026-08-29.)
+fn void sys_proc_info(Trap_frame* f) @noinline
+{
+		// Read-only, no permission check — process existence/state
+		// isn't sensitive in this kernel's threat model (no
+		// user/permission concept at all), the same way an
+		// unprivileged `ps` is fine on a real Unix. Built for
+		// procd (user/procd.c3), the "/proc/" server, but open to
+		// any caller — there's no reason to restrict it further
+		// than that. uid (a4, optional out-pointer, null means
+		// don't care — same convention as state_out/generation_out)
+		// is the same "not sensitive, an identity not a secret"
+		// reasoning — real Unix `ps` shows everyone's uid too. Added
+		// alongside the new Process.uid field specifically so
+		// procd's own ctl handler can look up the *real* requester's
+		// uid (not its own, always root) before calling kill() —
+		// see that case's own comment. a4, not a3: a3 is always the
+		// syscall number (see syscall4's own comment, user.c3) —
+		// this is why proc_info()'s wrapper now uses syscall4
+		// instead of the plain 3-arg syscall(), same shape
+		// fs_read_at already uses for its own 4th argument. Safe to
+		// widen this specific wrapper directly rather than adding a
+		// new syscall number the way SYS_IPC_RECV_GEN did over
+		// SYS_IPC_RECV: proc_info() has exactly one caller in this
+		// whole tree (procd.c3) and it's updated in this same
+		// change, not a real ABI with independent callers to keep
+		// working unmodified.
+		int query_pid = (int)f.a0;
+		Process* queried = proc_by_pid(query_pid);
+		if (queried == null)
+		{
+			f.a0 = (ulong)(-1);
+			return;
+		}
+		uint* state_out = (uint*)(uptr)f.a1;
+		uint* generation_out = (uint*)(uptr)f.a2;
+		int* uid_out = (int*)(uptr)f.a4;
+		if ((state_out != null && !user_range_valid(current_proc.page_table, (uptr)state_out, 4, true))
+			|| (generation_out != null && !user_range_valid(current_proc.page_table, (uptr)generation_out, 4, true))
+			|| (uid_out != null && !user_range_valid(current_proc.page_table, (uptr)uid_out, 4, true)))
+		{
+			f.a0 = (ulong)(-1);
+			return;
+		}
+		if (state_out != null) *state_out = (uint)queried.state;
+		if (generation_out != null) *generation_out = queried.generation;
+		if (uid_out != null) *uid_out = queried.uid;
+		f.a0 = 0;
+}
+
+// srv post: bind current_proc under a short name in the global srv_table (Plan 9 post half of post+mount).
+// (was inline in handle_syscall; extracted 2026-08-29.)
+fn void sys_srv_post(Trap_frame* f) @noinline
+{
+		// Posts current_proc (always self — no pid argument; there's
+		// no reason to let one process post another's pid even in a
+		// kernel with no general permission model, since "post"
+		// fundamentally means "here is my own connection") under a
+		// short name in the global srv_table (src/process.c3) — the
+		// "srv" half of the real Plan 9 post+mount two-step
+		// SYS_NS_MOUNT (below) is the other half of. Idempotent by
+		// name, same "already exists is fine" shape as
+		// fat32_mkdir/ext2_mkdir's own /tmp auto-create: an existing
+		// entry with this exact name is rebound in place (e.g. after
+		// a server restart) rather than refused.
+		char* post_name = (char*)(uptr)f.a0;
+		if (!user_range_valid(current_proc.page_table, (uptr)post_name, SRV_NAME_MAX, false))
+		{
+			f.a0 = (ulong)(-1);
+			return;
+		}
+		int post_free_slot = -1;
+		int post_result = -1;
+		bool post_denied = false;
+		for (int ps = 0; ps < SRV_MAX; ps++)
+		{
+			if (srv_table[ps].pid == 0)
+			{
+				if (post_free_slot == -1) post_free_slot = ps;
+				continue;
+			}
+			if (str_eq(&srv_table[ps].name[0], post_name))
+			{
+				// Reclaiming a name still held by a genuinely live
+				// process (a dead holder's slot is the "server
+				// restart" case, still unrestricted) needs root or
+				// the same uid as that live holder (Process.uid,
+				// process.c3) — otherwise any process could
+				// silently hijack another's posted service name.
+				Process* post_existing = proc_by_pid(srv_table[ps].pid);
+				if (post_existing != null && current_proc.uid != 0 && current_proc.uid != post_existing.uid)
+				{
+					post_denied = true;
+					break;
+				}
+				srv_table[ps].pid = current_proc.pid;
+				srv_table[ps].generation = current_proc.generation;
+				post_result = 0;
+				break;
+			}
+		}
+		if (!post_denied && post_result != 0 && post_free_slot != -1)
+		{
+			str_copy(&srv_table[post_free_slot].name[0], post_name, SRV_NAME_MAX);
+			srv_table[post_free_slot].pid = current_proc.pid;
+			srv_table[post_free_slot].generation = current_proc.generation;
+			post_result = 0;
+		}
+		f.a0 = (ulong)(iptr)post_result;
+}
+
+// ns mount+wait: like ns_mount but retries for a bounded window if the named server hasn't posted yet.
+// (was inline in handle_syscall; extracted 2026-08-29.)
+fn void sys_ns_mount_wait(Trap_frame* f) @noinline
+{
+		// Same as SYS_NS_MOUNT, but blocks — retrying ns_mount_try()
+		// in a loop — until either it succeeds or max_attempts retries
+		// have all failed. Closes a real gap SYS_NS_MOUNT alone has no
+		// answer for: a dynamically-spawned server (an unpredictable
+		// pid, no fixed boot-time slot — see SYS_RFORK above) posts
+		// itself at some unpredictable time after its own init
+		// finishes, and a client that tries to mount it too early
+		// would otherwise just fail outright with no way to wait for
+		// "not yet, but soon."
+		//
+		// Bounded by a plain retry count, not a wall-clock deadline —
+		// found the hard way, real hardware/QEMU testing this session:
+		// an earlier version computed a time-CSR deadline via
+		// read_reg("time") (see arm_timer's own, much simpler,
+		// single-call use of it above) and re-read it on every loop
+		// iteration, alongside mw_prefix/mw_srv_name kept live across
+		// each read — read_reg's own comment already documents that
+		// its asm() block's real register effects aren't visible to
+		// the compiler ("the previous version... silently clobbered");
+		// combining it with other locals surviving across repeated
+		// calls inside a loop reproduced exactly that class of
+		// corruption, crashing with a garbage pointer dereference
+		// inside ns_mount_try itself. A plain iteration count
+		// sidesteps read_reg entirely — less precise than a real
+		// wall-clock timeout, but correctness beats precision here,
+		// and every call site fully controls its own patience via how
+		// large a count it passes.
+		//
+		// Same PROC_RUNNABLE-throughout polling shape as SYS_JOIN
+		// above, not PROC_BLOCKED: nothing would ever explicitly clear
+		// that state for this condition (the poster doesn't know or
+		// care who might be waiting), so setting it would hang this
+		// process forever even once the target actually posts.
+		// yield() between checks is the same cooperative context-
+		// switch SYS_JOIN's own loop already uses, safe to call
+		// repeatedly from inside a syscall handler.
+		//
+		// blocking_depth (process.c3) tracking below is what actually
+		// found and fixes a real, separate kernel bug this syscall
+		// exposed: a freshly-rfork()'d child getting its first
+		// scheduling turn while this loop is still open could
+		// incorrectly re-enable global interrupts early (fork_entry's
+		// own synthetic first sret never touched sstatus at all
+		// before this fix) — see blocking_depth's own comment for the
+		// full mechanism.
+		char* mw_prefix = (char*)(uptr)f.a0;
+		char* mw_srv_name = (char*)(uptr)f.a1;
+		ulong mw_max_attempts = f.a2;
+		if (!user_range_valid(current_proc.page_table, (uptr)mw_prefix, NS_PREFIX_MAX, false)
+			|| !user_range_valid(current_proc.page_table, (uptr)mw_srv_name, SRV_NAME_MAX, false))
+		{
+			f.a0 = (ulong)(-1);
+			return;
+		}
+		// A caller-controlled ulong with no cap would let one process
+		// tie up its own blocking_depth-tracked slot for up to
+		// 2^64-1 cooperative retries — each one harmless on its own
+		// (a bounded ns_mount_try() + yield()), but there's no reason
+		// to trust an unbounded request at all when every legitimate
+		// caller in this tree already asks for a few million at most
+		// (see e.g. user/shell.c3's own MOUNTUSB_WAIT_ATTEMPTS).
+		if (mw_max_attempts > NS_MOUNT_WAIT_MAX_ATTEMPTS) mw_max_attempts = NS_MOUNT_WAIT_MAX_ATTEMPTS;
+		bool mw_ok = false;
+		current_proc.in_blocking_wait = true;
+		blocking_depth++;
+		for (ulong mw_i = 0; mw_i < mw_max_attempts; mw_i++)
+		{
+			mw_ok = ns_mount_try(mw_prefix, mw_srv_name);
+			if (mw_ok) break;
+			yield();
+		}
+		current_proc.in_blocking_wait = false;
+		blocking_depth--;
+		f.a0 = (ulong)(iptr)(mw_ok ? 0 : -1);
+}
+
 fn void handle_syscall(Trap_frame* f) @noinline
 {
 	switch (f.a3)
@@ -1221,374 +1910,17 @@ fn void handle_syscall(Trap_frame* f) @noinline
 		case SYS_EXIT:
 			sys_exit();
 		case SYS_IPC_SEND:
-			// Inline for the same reason as SYS_EXIT above — this is the
-			// pattern proven not to trigger the unexplained c3c reboot
-			// bug in this switch. dest_pid/type/data are a0-a2 as usual;
-			// len is a4, since a3 is always the syscall number (see
-			// syscall4 in user/user.c3 — this is the one syscall that
-			// needs a 4th argument).
-			int ipc_dest_pid = (int)f.a0;
-			uint ipc_type    = (uint)f.a1;
-			char* ipc_data   = (char*)(uptr)f.a2;
-			int ipc_len      = (int)f.a4;
-			int ipc_copy_len = ipc_len > MSG_MAX ? MSG_MAX : ipc_len;
-			if (ipc_copy_len < 0) ipc_copy_len = 0;
-			if (!user_range_valid(current_proc.page_table, (uptr)ipc_data, (ulong)ipc_copy_len, false))
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			// proc_by_pid here only ever guards against a plain dead/
-			// never-existed pid (e.g. a stale hardcoded pid like echod's
-			// or diskd's, if one of those ever exited). The stale-
-			// namespace-pid hazard this comment used to describe — a
-			// Mount entry silently resolving to an unrelated process that
-			// reused a dead target's slot, found while building the
-			// second, simultaneously-mounted fsd (docs/devlog.md) — is
-			// now closed one layer up, in SYS_NS_RESOLVE's own generation
-			// check (see Mount.server_generation's comment, process.c3):
-			// a caller can never obtain a hijacked pid through namespace
-			// resolution in the first place, so this check doesn't need
-			// to re-derive that distinction itself.
-			Process* ipc_target = proc_by_pid(ipc_dest_pid);
-			if (!ipc_target)
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-
-			// Wait for the target's inbox to actually be free — a
-			// previous sender's message that hasn't been consumed yet
-			// must never be silently overwritten. Busy-poll like
-			// SYS_GETCHAR: nothing specifically wakes a queued sender
-			// when the slot frees up, it's whoever notices next.
-			while (ipc_target.has_message)
-			{
-				yield();
-			}
-
-			mem::copy(&ipc_target.msg_data, ipc_data, (sz)ipc_copy_len);
-			ipc_target.msg_from = current_proc.pid;
-			ipc_target.msg_from_generation = current_proc.generation;
-			ipc_target.msg_type = ipc_type;
-			current_proc.msg_acked = false;
-			ipc_target.has_message = true;
-			if (ipc_target.state == PROC_BLOCKED)
-			{
-				ipc_target.state = PROC_RUNNABLE;
-			}
-
-			// True rendezvous: don't return to the caller until the
-			// receiver has actually consumed *this* message — SYS_IPC_RECV
-			// and SYS_IPC_POLL both wake us explicitly via msg_acked once
-			// they do (targeted at us specifically via msg_from, not just
-			// "the inbox looks empty again", which could just as easily
-			// mean a different sender's message arrived and got consumed
-			// instead).
-			while (!current_proc.msg_acked)
-			{
-				current_proc.state = PROC_BLOCKED;
-				yield();
-			}
-			f.a0 = 0;
+			sys_ipc_send(f);
 		case SYS_IPC_REPLY:
-			// Same shape as SYS_IPC_SEND above (kept as a full,
-			// separate copy rather than factored out — same
-			// inlining reason as SYS_EXIT/SYS_KILL), plus one
-			// addition: an optional expected_generation (a5) check
-			// on the target, mirroring SYS_KILL's own wildcard
-			// convention (0 = don't care). This is the piece that
-			// actually closes the reply-side stale-pid window —
-			// SYS_IPC_SEND's own proc_by_pid check only ever
-			// guarded against a dead/never-existed pid, never
-			// against "this pid, but a different process now"; a
-			// server built to reply safely calls SYS_IPC_RECV_GEN
-			// (below) to capture the requester's generation right
-			// when the request arrives, then passes it straight
-			// back in here. Without that captured generation, a
-			// server whose reply lands after the original requester
-			// has already exited and had its pid slot reused would
-			// otherwise silently misdeliver the reply to the new,
-			// unrelated occupant.
-			int reply_dest_pid = (int)f.a0;
-			uint reply_type    = (uint)f.a1;
-			char* reply_data   = (char*)(uptr)f.a2;
-			int reply_len      = (int)f.a4;
-			uint reply_expected_generation = (uint)f.a5;
-			int reply_copy_len = reply_len > MSG_MAX ? MSG_MAX : reply_len;
-			if (reply_copy_len < 0) reply_copy_len = 0;
-			if (!user_range_valid(current_proc.page_table, (uptr)reply_data, (ulong)reply_copy_len, false))
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			Process* reply_target = proc_by_pid(reply_dest_pid);
-			if (!reply_target || (reply_expected_generation != 0 && reply_target.generation != reply_expected_generation))
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-
-			while (reply_target.has_message)
-			{
-				yield();
-			}
-
-			mem::copy(&reply_target.msg_data, reply_data, (sz)reply_copy_len);
-			reply_target.msg_from = current_proc.pid;
-			reply_target.msg_from_generation = current_proc.generation;
-			reply_target.msg_type = reply_type;
-			current_proc.msg_acked = false;
-			reply_target.has_message = true;
-			if (reply_target.state == PROC_BLOCKED)
-			{
-				reply_target.state = PROC_RUNNABLE;
-			}
-
-			while (!current_proc.msg_acked)
-			{
-				current_proc.state = PROC_BLOCKED;
-				yield();
-			}
-			f.a0 = 0;
+			sys_ipc_reply(f);
 		case SYS_IPC_RECV:
-			// a2 (previously always 0 from user.c3's original ipc_recv) is
-			// now an optional out-pointer for the message's type/verb —
-			// null means "don't care", same as every existing call site
-			// still passes.
-			char* recv_buf       = (char*)(uptr)f.a0;
-			int recv_len         = (int)f.a1;
-			uint* recv_type_out  = (uint*)(uptr)f.a2;
-			int recv_valid_len = recv_len > MSG_MAX ? MSG_MAX : recv_len;
-			if (recv_valid_len < 0) recv_valid_len = 0;
-			if (!user_range_valid(current_proc.page_table, (uptr)recv_buf, (ulong)recv_valid_len, true)
-				|| (recv_type_out != null && !user_range_valid(current_proc.page_table, (uptr)recv_type_out, 4, true)))
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			current_proc.in_blocking_wait = true;
-			blocking_depth++;
-			for (;;)
-			{
-				if (current_proc.has_message)
-				{
-					int recv_copy_len = recv_len > MSG_MAX ? MSG_MAX : recv_len;
-					if (recv_copy_len < 0) recv_copy_len = 0;
-					mem::copy(recv_buf, &current_proc.msg_data, (sz)recv_copy_len);
-					if (recv_type_out != null)
-					{
-						*recv_type_out = current_proc.msg_type;
-					}
-					f.a0 = (ulong)current_proc.msg_from;
-					current_proc.has_message = false;
-
-					// Wake the sender: it's genuinely blocked (see
-					// SYS_IPC_SEND) waiting specifically for this ack,
-					// not just for the inbox to look empty from the
-					// outside.
-					Process* recv_acked_sender = proc_by_pid(current_proc.msg_from);
-					if (recv_acked_sender != null)
-					{
-						recv_acked_sender.msg_acked = true;
-						if (recv_acked_sender.state == PROC_BLOCKED)
-						{
-							recv_acked_sender.state = PROC_RUNNABLE;
-						}
-					}
-					break;
-				}
-				current_proc.state = PROC_BLOCKED;
-				yield();
-			}
-			current_proc.in_blocking_wait = false;
-			blocking_depth--;
+			sys_ipc_recv(f);
 		case SYS_IPC_RECV_GEN:
-			// Same shape as SYS_IPC_RECV above (kept as a full,
-			// separate copy, same reasoning as SYS_IPC_REPLY's own
-			// comment), plus one addition: also writes the sender's
-			// captured Process.generation (a3) out through a new
-			// optional out-pointer (a4) — the piece a server needs
-			// to later reply safely via SYS_IPC_REPLY instead of
-			// plain SYS_IPC_SEND. A distinct syscall number, not a
-			// widened SYS_IPC_RECV, on purpose: every existing
-			// SYS_IPC_RECV caller only ever sets a0-a2 (see
-			// user.c3's plain 3-arg syscall() wrapper), leaving a4
-			// holding whatever garbage was there before — reading it
-			// as a live out-pointer on the *same* syscall number
-			// would risk writing through that garbage for every
-			// caller that hasn't been updated to know about this.
-			char* recv_gen_buf       = (char*)(uptr)f.a0;
-			int recv_gen_len         = (int)f.a1;
-			uint* recv_gen_type_out  = (uint*)(uptr)f.a2;
-			uint* recv_gen_from_generation_out = (uint*)(uptr)f.a4;
-			int recv_gen_valid_len = recv_gen_len > MSG_MAX ? MSG_MAX : recv_gen_len;
-			if (recv_gen_valid_len < 0) recv_gen_valid_len = 0;
-			if (!user_range_valid(current_proc.page_table, (uptr)recv_gen_buf, (ulong)recv_gen_valid_len, true)
-				|| (recv_gen_type_out != null && !user_range_valid(current_proc.page_table, (uptr)recv_gen_type_out, 4, true))
-				|| (recv_gen_from_generation_out != null && !user_range_valid(current_proc.page_table, (uptr)recv_gen_from_generation_out, 4, true)))
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			current_proc.in_blocking_wait = true;
-			blocking_depth++;
-			for (;;)
-			{
-				if (current_proc.has_message)
-				{
-					int recv_gen_copy_len = recv_gen_len > MSG_MAX ? MSG_MAX : recv_gen_len;
-					if (recv_gen_copy_len < 0) recv_gen_copy_len = 0;
-					mem::copy(recv_gen_buf, &current_proc.msg_data, (sz)recv_gen_copy_len);
-					if (recv_gen_type_out != null)
-					{
-						*recv_gen_type_out = current_proc.msg_type;
-					}
-					if (recv_gen_from_generation_out != null)
-					{
-						*recv_gen_from_generation_out = current_proc.msg_from_generation;
-					}
-					f.a0 = (ulong)current_proc.msg_from;
-					current_proc.has_message = false;
-
-					Process* recv_gen_acked_sender = proc_by_pid(current_proc.msg_from);
-					if (recv_gen_acked_sender != null)
-					{
-						recv_gen_acked_sender.msg_acked = true;
-						if (recv_gen_acked_sender.state == PROC_BLOCKED)
-						{
-							recv_gen_acked_sender.state = PROC_RUNNABLE;
-						}
-					}
-					break;
-				}
-				current_proc.state = PROC_BLOCKED;
-				yield();
-			}
-			current_proc.in_blocking_wait = false;
-			blocking_depth--;
+			sys_ipc_recv_gen(f);
 		case SYS_IPC_POLL:
-			// Non-blocking counterpart to SYS_IPC_RECV: checks once,
-			// never sets PROC_BLOCKED, never yields. Exists for diskd's
-			// completion-wait (user/diskd.c3), which genuinely needs an
-			// interrupt to fire to make progress — and a *blocking*
-			// ipc_recv there is unsafe: sstatus.SIE has no per-process
-			// save/restore (kernel_entry only saves GPRs), and
-			// switch_context unconditionally resets sscratch to a fixed
-			// "top of this process's stack" value on every switch,
-			// including when *resuming* a process that's paused mid-trap
-			// (not freshly entering one). That reset is only correct for
-			// a fresh trap entry; enabling interrupts while blocked mid-
-			// trap risks a nested trap building its frame at that fixed
-			// address, colliding with — and corrupting — the still-in-
-			// progress outer frame lower on the same stack. Confirmed
-			// empirically: doing exactly that (enable_interrupts() right
-			// before yield() in SYS_IPC_RECV's loop) turned an
-			// intermittent hang into an intermittent page-fault panic
-			// instead of fixing it. Polling from genuine user-mode code
-			// sidesteps the whole problem: this process is never parked
-			// mid-trap between polls, so sstatus.SIE's natural value
-			// (on, from user_entry) is safe to leave alone, and the
-			// interrupt can fire and get routed normally in between.
-			char* poll_buf      = (char*)(uptr)f.a0;
-			int poll_len        = (int)f.a1;
-			uint* poll_type_out = (uint*)(uptr)f.a2;
-			if (!current_proc.has_message)
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			int poll_copy_len = poll_len > MSG_MAX ? MSG_MAX : poll_len;
-			if (poll_copy_len < 0) poll_copy_len = 0;
-			if (!user_range_valid(current_proc.page_table, (uptr)poll_buf, (ulong)poll_copy_len, true)
-				|| (poll_type_out != null && !user_range_valid(current_proc.page_table, (uptr)poll_type_out, 4, true)))
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			mem::copy(poll_buf, &current_proc.msg_data, (sz)poll_copy_len);
-			if (poll_type_out != null)
-			{
-				*poll_type_out = current_proc.msg_type;
-			}
-			f.a0 = (ulong)current_proc.msg_from;
-			current_proc.has_message = false;
-
-			// Same "wake the real sender" step as SYS_IPC_RECV — normally
-			// a no-op here, since diskd's only use of this is for the
-			// synthetic interrupt notify (msg_from=0, which proc_by_pid
-			// always rejects, so there's no real sender to wake), but
-			// correct regardless if that ever changes.
-			Process* poll_acked_sender = proc_by_pid(current_proc.msg_from);
-			if (poll_acked_sender != null)
-			{
-				poll_acked_sender.msg_acked = true;
-				if (poll_acked_sender.state == PROC_BLOCKED)
-				{
-					poll_acked_sender.state = PROC_RUNNABLE;
-				}
-			}
+			sys_ipc_poll(f);
 		case SYS_NS_RESOLVE:
-			// Inline for the same reason as every other case in this
-			// switch — see SYS_EXIT's comment. Walks the caller's own
-			// namespace (never a different process's — resolution is
-			// always relative to whoever's asking) for the first mount
-			// whose prefix matches the given path, longest-prefix-first so
-			// a more specific mount always wins over a broader one that
-			// also matches. Returns -1 (in f.a0, read as signed by the
-			// caller) if nothing matches.
-			char* ns_path = (char*)(uptr)f.a0;
-			uint* ns_prefix_len_out_check = (uint*)(uptr)f.a1;
-			if (!user_range_valid(current_proc.page_table, (uptr)ns_path, NS_PREFIX_MAX, false)
-				|| (ns_prefix_len_out_check != null && !user_range_valid(current_proc.page_table, (uptr)ns_prefix_len_out_check, 4, true)))
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			int ns_result = -1;
-			int ns_best_len = -1;
-			for (int m = 0; m < NS_MOUNTS_MAX; m++)
-			{
-				if (current_proc.namespace[m].server_pid == 0) continue;
-				// Generation check closes the stale-pid hazard documented
-				// on Mount.server_generation (process.c3): if the process
-				// that originally held this pid has since exited and the
-				// slot was reused (or never got this far at all), either
-				// proc_by_pid returns null or its live generation won't
-				// match what was recorded when this entry was bound —
-				// either way, treat it exactly like server_pid == 0 rather
-				// than resolve to the wrong, unrelated process.
-				Process* ns_target = proc_by_pid(current_proc.namespace[m].server_pid);
-				if (!ns_target || ns_target.generation != current_proc.namespace[m].server_generation) continue;
-				char* ns_prefix = &current_proc.namespace[m].prefix[0];
-				if (!str_starts_with(ns_path, ns_prefix)) continue;
-
-				int ns_len = 0;
-				while (ns_prefix[ns_len] != 0) ns_len++;
-				if (ns_len > ns_best_len)
-				{
-					ns_best_len = ns_len;
-					ns_result = current_proc.namespace[m].server_pid;
-				}
-			}
-			f.a0 = (ulong)(iptr)ns_result;
-
-			// Optional out-pointer (a1), same "null means don't care"
-			// convention as SYS_RFORK's generation out-pointer above —
-			// lets the caller strip the matched prefix itself (see
-			// user/user.c3's fs_read/fs_write) before building a wire-
-			// format request, so a server mounted under a non-empty
-			// prefix (e.g. the second fsd, under "/2/") still only ever
-			// sees the bare remainder, exactly like the "" catch-all
-			// mount already did by construction (its own prefix length
-			// is always 0). 0 when nothing matched — the caller already
-			// has -1 in f.a0 to detect that case, this just avoids
-			// leaving the out-pointer's target uninitialized.
-			uint* ns_prefix_len_out = (uint*)(uptr)f.a1;
-			if (ns_prefix_len_out != null)
-			{
-				*ns_prefix_len_out = (uint)(ns_best_len < 0 ? 0 : ns_best_len);
-			}
+			sys_ns_resolve(f);
 		case SYS_DISKD_INFO:
 			// diskd-only, called once at its own startup — see
 			// setup_diskd_mappings in process.c3 for why these addresses
@@ -1662,93 +1994,9 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			f.a0 = (ulong)(iptr)unmount_result;
 		case SYS_JOIN:
-			// Blocks until the joined process is actually gone — plain
-			// polling (check, yield(), recheck), the same proven shape
-			// as SYS_GETCHAR's own retry loop, not an event-driven wake.
-			//
-			// "Actually gone" means either the slot is empty
-			// (proc_by_pid returns null) *or* it's been reused by an
-			// unrelated process — detected via the join_generation the
-			// caller captured when it created this pid (rfork's or
-			// threadcreate's optional generation_out), compared against
-			// Process.generation (src/process.c3), which increments on
-			// every reuse of a slot and never resets. Without this
-			// check, a pid recycled into a new process (always possible,
-			// since a slot's next occupant gets the exact same pid —
-			// pid = slot index + 1) would look identical to the
-			// original process still running, and join would wait for
-			// the wrong thing.
-			int join_pid = (int)f.a0;
-			uint join_generation = (uint)f.a1;
-			if (join_pid == current_proc.pid)
-			{
-				// Can't wait for yourself to disappear while you're the
-				// one running — always self-deadlock. Reject rather than
-				// hang.
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			// Stays PROC_RUNNABLE throughout, same as SYS_GETCHAR's own
-			// loop above — deliberately not PROC_BLOCKED: that state
-			// only ever gets cleared by something *else* explicitly
-			// flipping it back (SYS_IPC_SEND does this for a receiver).
-			// Nothing does that for a join — SYS_EXIT only ever touches
-			// its own process's state — so setting PROC_BLOCKED here
-			// would make this process permanently unschedulable the
-			// moment it's set, even after the joined pid actually exits.
-			current_proc.in_blocking_wait = true;
-			blocking_depth++;
-			for (;;)
-			{
-				Process* join_target = proc_by_pid(join_pid);
-				if (join_target == null) break;
-				if (join_target.generation != join_generation) break;
-				yield();
-			}
-			current_proc.in_blocking_wait = false;
-			blocking_depth--;
-			f.a0 = 0;
+			sys_join(f);
 		case SYS_FUTEX_WAIT:
-			// Blocks while the user-space word at addr still equals
-			// expected. The check-then-block sequence below is atomic
-			// with respect to any concurrent SYS_FUTEX_WAKE precisely
-			// because kernel-mode code is never preempted (see
-			// enable_timer_interrupts()'s own comment above arm_timer)
-			// — no other process's SYS_FUTEX_WAKE can run between this
-			// read and setting PROC_BLOCKED, so a wake can never be
-			// lost in that window. Returns immediately (no block, no
-			// yield) if the value already differs — same as any real
-			// futex, the caller (user/user.c3's Mutex.lock) always
-			// re-checks its own condition either way, spuriously or
-			// not.
-			int* futex_addr     = (int*)(uptr)f.a0;
-			int futex_expected  = (int)f.a1;
-			if (!user_range_valid(current_proc.page_table, (uptr)futex_addr, 4, false))
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			if (*futex_addr != futex_expected)
-			{
-				f.a0 = 0;
-				break;
-			}
-			current_proc.futex_addr = (uptr)futex_addr;
-			current_proc.in_blocking_wait = true;
-			blocking_depth++;
-			for (;;)
-			{
-				// PROC_BLOCKED, not PROC_RUNNABLE the way SYS_JOIN
-				// stays above: unlike a join, something always does
-				// explicitly clear this — SYS_FUTEX_WAKE below, the
-				// only other place futex_addr is ever touched.
-				current_proc.state = PROC_BLOCKED;
-				yield();
-				if (current_proc.futex_addr == 0) break;
-			}
-			current_proc.in_blocking_wait = false;
-			blocking_depth--;
-			f.a0 = 0;
+			sys_futex_wait(f);
 		case SYS_FUTEX_WAKE:
 			// Wakes every process currently blocked on this exact
 			// address *within the same address space* — page_table
@@ -1771,51 +2019,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			f.a0 = 0;
 		case SYS_PROC_INFO:
-			// Read-only, no permission check — process existence/state
-			// isn't sensitive in this kernel's threat model (no
-			// user/permission concept at all), the same way an
-			// unprivileged `ps` is fine on a real Unix. Built for
-			// procd (user/procd.c3), the "/proc/" server, but open to
-			// any caller — there's no reason to restrict it further
-			// than that. uid (a4, optional out-pointer, null means
-			// don't care — same convention as state_out/generation_out)
-			// is the same "not sensitive, an identity not a secret"
-			// reasoning — real Unix `ps` shows everyone's uid too. Added
-			// alongside the new Process.uid field specifically so
-			// procd's own ctl handler can look up the *real* requester's
-			// uid (not its own, always root) before calling kill() —
-			// see that case's own comment. a4, not a3: a3 is always the
-			// syscall number (see syscall4's own comment, user.c3) —
-			// this is why proc_info()'s wrapper now uses syscall4
-			// instead of the plain 3-arg syscall(), same shape
-			// fs_read_at already uses for its own 4th argument. Safe to
-			// widen this specific wrapper directly rather than adding a
-			// new syscall number the way SYS_IPC_RECV_GEN did over
-			// SYS_IPC_RECV: proc_info() has exactly one caller in this
-			// whole tree (procd.c3) and it's updated in this same
-			// change, not a real ABI with independent callers to keep
-			// working unmodified.
-			int query_pid = (int)f.a0;
-			Process* queried = proc_by_pid(query_pid);
-			if (queried == null)
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			uint* state_out = (uint*)(uptr)f.a1;
-			uint* generation_out = (uint*)(uptr)f.a2;
-			int* uid_out = (int*)(uptr)f.a4;
-			if ((state_out != null && !user_range_valid(current_proc.page_table, (uptr)state_out, 4, true))
-				|| (generation_out != null && !user_range_valid(current_proc.page_table, (uptr)generation_out, 4, true))
-				|| (uid_out != null && !user_range_valid(current_proc.page_table, (uptr)uid_out, 4, true)))
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			if (state_out != null) *state_out = (uint)queried.state;
-			if (generation_out != null) *generation_out = queried.generation;
-			if (uid_out != null) *uid_out = queried.uid;
-			f.a0 = 0;
+			sys_proc_info(f);
 		case SYS_KILL:
 			// PROBE (2026-08-28): extracted to sys_kill() to test whether
 			// c3c 0.8.3 fixed the "call a moderately-complex function from
@@ -1825,61 +2029,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// is safe; reboot loop => revert, landmine still live.
 			sys_kill(f);
 		case SYS_SRV_POST:
-			// Posts current_proc (always self — no pid argument; there's
-			// no reason to let one process post another's pid even in a
-			// kernel with no general permission model, since "post"
-			// fundamentally means "here is my own connection") under a
-			// short name in the global srv_table (src/process.c3) — the
-			// "srv" half of the real Plan 9 post+mount two-step
-			// SYS_NS_MOUNT (below) is the other half of. Idempotent by
-			// name, same "already exists is fine" shape as
-			// fat32_mkdir/ext2_mkdir's own /tmp auto-create: an existing
-			// entry with this exact name is rebound in place (e.g. after
-			// a server restart) rather than refused.
-			char* post_name = (char*)(uptr)f.a0;
-			if (!user_range_valid(current_proc.page_table, (uptr)post_name, SRV_NAME_MAX, false))
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			int post_free_slot = -1;
-			int post_result = -1;
-			bool post_denied = false;
-			for (int ps = 0; ps < SRV_MAX; ps++)
-			{
-				if (srv_table[ps].pid == 0)
-				{
-					if (post_free_slot == -1) post_free_slot = ps;
-					continue;
-				}
-				if (str_eq(&srv_table[ps].name[0], post_name))
-				{
-					// Reclaiming a name still held by a genuinely live
-					// process (a dead holder's slot is the "server
-					// restart" case, still unrestricted) needs root or
-					// the same uid as that live holder (Process.uid,
-					// process.c3) — otherwise any process could
-					// silently hijack another's posted service name.
-					Process* post_existing = proc_by_pid(srv_table[ps].pid);
-					if (post_existing != null && current_proc.uid != 0 && current_proc.uid != post_existing.uid)
-					{
-						post_denied = true;
-						break;
-					}
-					srv_table[ps].pid = current_proc.pid;
-					srv_table[ps].generation = current_proc.generation;
-					post_result = 0;
-					break;
-				}
-			}
-			if (!post_denied && post_result != 0 && post_free_slot != -1)
-			{
-				str_copy(&srv_table[post_free_slot].name[0], post_name, SRV_NAME_MAX);
-				srv_table[post_free_slot].pid = current_proc.pid;
-				srv_table[post_free_slot].generation = current_proc.generation;
-				post_result = 0;
-			}
-			f.a0 = (ulong)(iptr)post_result;
+			sys_srv_post(f);
 		case SYS_NS_MOUNT:
 			// Looks srv_name up in srv_table and, if it names a still-live
 			// server, adds prefix -> (pid, generation) into the *calling*
@@ -1897,80 +2047,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			f.a0 = (ulong)(iptr)(ns_mount_try(mount_prefix, mount_srv_name) ? 0 : -1);
 		case SYS_NS_MOUNT_WAIT:
-			// Same as SYS_NS_MOUNT, but blocks — retrying ns_mount_try()
-			// in a loop — until either it succeeds or max_attempts retries
-			// have all failed. Closes a real gap SYS_NS_MOUNT alone has no
-			// answer for: a dynamically-spawned server (an unpredictable
-			// pid, no fixed boot-time slot — see SYS_RFORK above) posts
-			// itself at some unpredictable time after its own init
-			// finishes, and a client that tries to mount it too early
-			// would otherwise just fail outright with no way to wait for
-			// "not yet, but soon."
-			//
-			// Bounded by a plain retry count, not a wall-clock deadline —
-			// found the hard way, real hardware/QEMU testing this session:
-			// an earlier version computed a time-CSR deadline via
-			// read_reg("time") (see arm_timer's own, much simpler,
-			// single-call use of it above) and re-read it on every loop
-			// iteration, alongside mw_prefix/mw_srv_name kept live across
-			// each read — read_reg's own comment already documents that
-			// its asm() block's real register effects aren't visible to
-			// the compiler ("the previous version... silently clobbered");
-			// combining it with other locals surviving across repeated
-			// calls inside a loop reproduced exactly that class of
-			// corruption, crashing with a garbage pointer dereference
-			// inside ns_mount_try itself. A plain iteration count
-			// sidesteps read_reg entirely — less precise than a real
-			// wall-clock timeout, but correctness beats precision here,
-			// and every call site fully controls its own patience via how
-			// large a count it passes.
-			//
-			// Same PROC_RUNNABLE-throughout polling shape as SYS_JOIN
-			// above, not PROC_BLOCKED: nothing would ever explicitly clear
-			// that state for this condition (the poster doesn't know or
-			// care who might be waiting), so setting it would hang this
-			// process forever even once the target actually posts.
-			// yield() between checks is the same cooperative context-
-			// switch SYS_JOIN's own loop already uses, safe to call
-			// repeatedly from inside a syscall handler.
-			//
-			// blocking_depth (process.c3) tracking below is what actually
-			// found and fixes a real, separate kernel bug this syscall
-			// exposed: a freshly-rfork()'d child getting its first
-			// scheduling turn while this loop is still open could
-			// incorrectly re-enable global interrupts early (fork_entry's
-			// own synthetic first sret never touched sstatus at all
-			// before this fix) — see blocking_depth's own comment for the
-			// full mechanism.
-			char* mw_prefix = (char*)(uptr)f.a0;
-			char* mw_srv_name = (char*)(uptr)f.a1;
-			ulong mw_max_attempts = f.a2;
-			if (!user_range_valid(current_proc.page_table, (uptr)mw_prefix, NS_PREFIX_MAX, false)
-				|| !user_range_valid(current_proc.page_table, (uptr)mw_srv_name, SRV_NAME_MAX, false))
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			// A caller-controlled ulong with no cap would let one process
-			// tie up its own blocking_depth-tracked slot for up to
-			// 2^64-1 cooperative retries — each one harmless on its own
-			// (a bounded ns_mount_try() + yield()), but there's no reason
-			// to trust an unbounded request at all when every legitimate
-			// caller in this tree already asks for a few million at most
-			// (see e.g. user/shell.c3's own MOUNTUSB_WAIT_ATTEMPTS).
-			if (mw_max_attempts > NS_MOUNT_WAIT_MAX_ATTEMPTS) mw_max_attempts = NS_MOUNT_WAIT_MAX_ATTEMPTS;
-			bool mw_ok = false;
-			current_proc.in_blocking_wait = true;
-			blocking_depth++;
-			for (ulong mw_i = 0; mw_i < mw_max_attempts; mw_i++)
-			{
-				mw_ok = ns_mount_try(mw_prefix, mw_srv_name);
-				if (mw_ok) break;
-				yield();
-			}
-			current_proc.in_blocking_wait = false;
-			blocking_depth--;
-			f.a0 = (ulong)(iptr)(mw_ok ? 0 : -1);
+			sys_ns_mount_wait(f);
 		case SYS_YIELD:
 			// Plain, single, unconditional yield() — for a process that
 			// needs to busy-wait on something with no syscall of its
