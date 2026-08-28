@@ -250,17 +250,143 @@ one, is ~10k.)
 
 ---
 
+## 5. Resiliency — what happens when a server crashes
+
+### Where we are
+
+A driver "panic" is **not** a kernel panic — `panic()` in a user driver
+is `print` + `exit()` (a deliberate hardening pass; `panic::panic()` is
+kernel-only now). So a buggy `fsd`/`diskd`/`usbd` tears down cleanly as
+an ordinary process and the kernel stays up.
+
+Generation counters back most of the stale-reference handling:
+
+- `proc_by_pid` validates pid **and** generation — a reused slot is
+  never mistaken for the original process.
+- `SYS_NS_RESOLVE` re-checks the mounted server's pid+generation are
+  live before handing the pid back — a stale mount resolves to failure
+  (or the `""` catch-all), never to whatever reused the slot.
+- `SYS_IPC_SEND` / `SYS_IPC_REPLY` check the peer exists (+ generation
+  on reply) **at the start** — sending to an already-dead server returns
+  −1 immediately.
+- Kernel idle loop respawns the **shell** if nothing is `PROC_RUNNABLE`
+  (prevents a total-idle lockup when the shell exits).
+
+### The gaps
+
+1. **No supervision / respawn for servers.** If `fsd`, `diskd`, `usbd`,
+   `envd`, … exit, nothing restarts them. The system limps on without
+   that capability.
+2. **Clients block forever if a server dies mid-request.**
+   `SYS_IPC_SEND` blocks on `while (!msg_acked) yield()` with no
+   timeout. If the server crashes after `has_message = true` but before
+   `SYS_IPC_REPLY`, the sender is stuck permanently. Symmetric: a server
+   mid-reply-rendezvous to a client that dies hangs the same way. This
+   is `SYS_KILL`'s own documented "left blocked forever" gap.
+3. **`sys_exit` doesn't unblock IPC partners** — it frees pages, marks
+   the slot `PROC_UNUSED`, and yields. Anyone waiting on it stays
+   waiting.
+4. **Inbox wedge** — `while (target.has_message) yield()` spins forever
+   if the target died with `has_message` still set.
+5. **A hung (not exited) server is invisible.** An infinite loop looks
+   alive; clients wait forever with no signal.
+6. **In-flight hardware / FS state.** A driver that crashes mid-DMA or
+   mid-write leaves the device (and possibly the filesystem) in an
+   indeterminate state. `fsd`'s write path is ordering-careful but this
+   isn't characterised.
+7. **Live namespaces don't self-heal** — even after a respawn, a
+   process that already resolved the old pid keeps using it until its
+   next `ns_resolve`, and any fid it held is dead.
+
+### Work (roughly in order)
+
+1. **IPC failure propagation.** `sys_exit` walks the process table and,
+   for every process blocked with `msg_from == dying.pid` (or waiting on
+   a reply from it), sets `msg_acked = true` + a "peer died" flag and
+   marks it `PROC_RUNNABLE`; `SYS_IPC_SEND`/`_REPLY`/`p9_call` then
+   return −1 instead of hanging. Same sweep clears a wedged
+   `has_message`. This alone turns "hang forever" into "get an error"
+   for the crash-during-request case.
+2. **A `svc` / `init` supervisor.** A userspace process (or the kernel's
+   respawn loop generalised) holding a table of
+   `{binary, name, restart-policy}`; `SYS_JOIN` on each server, re-`exec`
+   on exit. Plan 9-flavoured: a small `/bin/init` that owns the tree.
+3. **Client re-attach contract.** Document that a `p9_*` op returning −1
+   means "re-`attach` and re-`walk`"; the shell / libraries do this
+   transparently. `ns_resolve` already returns the *new* pid after a
+   supervised respawn, so this is a client-library change, not a kernel
+   one.
+4. **State policy per server.** Respawned servers come up empty.
+   `fsd`: fine, re-reads from disk. `envd`: holds per-process env —
+   either persist it to a file under `/usr/$user/lib` or accept the
+   loss. Classify each server stateless-rebuildable vs
+   persist-on-write.
+5. **Device reset on driver respawn.** A respawned `usbd`/`sdd`/`ethd`
+   must assume the hardware is in an unknown state and do a full
+   re-init (most already do their bring-up unconditionally — verify).
+6. **Watchdog for hangs** (later). A supervisor ping, or the kernel
+   noticing a process hasn't yielded in N ticks and killing it.
+
+### Not doing
+
+Full transactional / journalled recovery, process checkpointing,
+live migration. This is "the system keeps working when a server dies,"
+not "no request is ever lost."
+
+---
+
+## 6. Real 9P (later)
+
+Deferred — do it once §1–§5 are solid.
+
+Today's protocol is 9P-**inspired**, not wire-compatible: the fid model
+(`attach`/`walk`/`open`/`read`/`write`/`clunk`) and the "everything is a
+mounted file server" architecture are faithful, but the transport is
+racccoon's own `SYS_IPC_*` message rendezvous with fixed-offset request
+structs and hand-assigned verb numbers — no `size[4] type[1] tag[2]`
+framing, no `qid`s, no `Tversion`/`msize`, no `tag`-based pipelining, no
+multi-element `Twalk`, no `Tauth`. A Linux `v9fs` client can't mount
+racccoon's `fsd`, and racccoon can't mount a remote 9P export.
+
+**The work:** a `/bin/9p` (or a `9p` server) translator — speaks real
+9P2000 on one side (over the network stack, or a pipe/serial for a
+host mount) and racccoon's `P9_*` IPC verbs on the other. Needs:
+
+- the 9P2000 wire codec (little-endian, `s[2]` strings, `qid` synthesis
+  — racccoon's `fsd` fids would need a stable `path`/`version` to map to
+  a qid),
+- `Tversion`/`Rversion`, `Rerror`, tag tracking (even if replies stay
+  in-order internally),
+- multi-element `Twalk` fan-out onto the one-name-per-call `P9_WALK`,
+- a transport binding (9P over the TCP/UDP the net stack will have by
+  then, or over a serial line for `mount` from a dev host).
+
+**Payoff:** mount racccoon's namespace from Linux (`mount -t 9p`), mount
+remote 9P services into racccoon, and — the interesting one — expose
+individual racccoon servers (`/proc`, a driver) to other machines the
+way Plan 9 does.
+
+---
+
 ## Sequencing
 
 ```
-§3 FPU  ─────────────────────────────┐ (any time; ~1 day)
-                                     │
-§1 file structure ──► §2 user model ──► shell work ──► §4 wasm
-   (tree + seed)        (login, /adm/users,   (rc-style:      (needs §3
-                         none, read perms)    $var, pipes,     for float)
-                                              redirection,
-                                              path, cd)
+§3 FPU ──────────────────────────────────────────┐ (any time; ~1 day)
+                                                 │
+§5 resiliency ─┐ (IPC failure propagation first — small, high value;
+               │  supervisor + the rest can follow interleaved)
+               ▼
+§1 file structure ──► §2 user model ──► shell work ──► §4 wasm ──► §6 real 9P
+   (tree + seed)       (login, /adm/users,  (rc-style:     (needs §3   (needs the
+                        none, read perms)    $var, pipes,   for float)  net stack)
+                                             redirection,
+                                             path, cd)
 ```
+
+**Do the §5.1 IPC-failure-propagation piece early** — it's a contained
+`sys_exit` change that turns "hang forever" into "get an error," and
+everything built after it is more pleasant to develop against. The
+supervisor and the rest of §5 can land interleaved with §1/§2.
 
 The shell is the through-line — it's where the file structure, the user
 model, and eventually wasm all become visible to someone sitting at the
