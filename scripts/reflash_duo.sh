@@ -15,6 +15,12 @@
 # — not a `build_fsbl` run, not the vendor Docker image. See
 # docs/devlog.md's 2026-08-28 real-hardware entry.
 #
+# PATCH_OPENSBI=1 additionally rebuilds OpenSBI with the T-HEAD C900 PLIC
+# S-mode delegate fix (scripts/build_opensbi_duo.sh) and swaps it in as
+# the MONITOR — needed for any interrupt-driven driver on this board (the
+# stock OpenSBI wedges S-mode PLIC access; see docs/devlog.md's
+# "PLIC storm SOLVED" entry). Needs a riscv64-unknown-elf- toolchain.
+#
 # This flashes the PRODUCTION shell (user/shell.c3). For a throwaway test
 # kernel with user/shell_test.c3's dev builtins, see build.sh's own
 # shell-swap trick and the devlog.
@@ -80,10 +86,19 @@ echo "==> DUOBOOT mounted at $MNT"
 
 # --- repackage via --OLD_FIP ----------------------------------------
 cp "$MNT/fip.bin" build/fip_old_from_sd.bin
-echo "==> Repackaging fip.bin (reusing BL2/MONITOR/DDR_PARAM/CHIP_CONF from the card)..."
+
+MONITOR_ARGS=()
+if [ "${PATCH_OPENSBI:-0}" = "1" ]; then
+  echo "==> PATCH_OPENSBI=1 — rebuilding OpenSBI with the T-HEAD PLIC delegate fix..."
+  FIP="$ROOT/build/fip_old_from_sd.bin" bash scripts/build_opensbi_duo.sh
+  MONITOR_ARGS=(--MONITOR "$ROOT/build/fw_dynamic_patched.bin")
+fi
+
+echo "==> Repackaging fip.bin (reusing BL2/DDR_PARAM/CHIP_CONF from the card${PATCH_OPENSBI:+, patched OpenSBI})..."
 python3 "$FIPTOOL" genfip \
   "$ROOT/build/fip_duo.bin" \
   --OLD_FIP "$ROOT/build/fip_old_from_sd.bin" \
+  "${MONITOR_ARGS[@]}" \
   --MONITOR_RUNADDR=0x80000000 \
   --BLCP_2ND_RUNADDR=0 \
   --LOADER_2ND="$ROOT/build/loader2nd_duo.bin" >/dev/null
@@ -100,7 +115,12 @@ magic = bytes(f.ldr_2nd_hdr["MAGIC"].content)
 mon = f.param2["MONITOR_RUNADDR"].toint()
 rest = len(getattr(f, "rest_fip", b""))
 ok = runaddr == 0x80200000 and magic == b"BL33" and mon == 0x80000000 and rest == 0
-print(f"    LOADER_2ND magic={magic!r} runaddr={runaddr:#x}  MONITOR runaddr={mon:#x}  trailing={rest}")
+monitor = bytes(f.body2["MONITOR"].content)
+has_fdt = monitor.find(bytes.fromhex("d00dfeed")) >= 0
+print(f"    LOADER_2ND magic={magic!r} runaddr={runaddr:#x}  MONITOR runaddr={mon:#x} ({len(monitor)} B, embedded-FDT={has_fdt})  trailing={rest}")
+if os.environ.get("PATCH_OPENSBI") == "1" and not has_fdt:
+    print("    ERROR: PATCH_OPENSBI=1 but MONITOR has no embedded FDT — OpenSBI build did not take", file=sys.stderr)
+    sys.exit(1)
 l2 = open("build/loader2nd_duo.bin", "rb").read()
 sec = bytes(f.body2["LOADER_2ND"].content)
 if l2[32:] != sec[32:32 + len(l2) - 32]:

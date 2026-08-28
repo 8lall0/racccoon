@@ -1,0 +1,46 @@
+diff --git a/opensbi/Makefile b/opensbi/Makefile
+index eeffe6bad..97dd78a02 100644
+--- a/opensbi/Makefile
++++ b/opensbi/Makefile
+@@ -203,7 +203,7 @@ GENFLAGS	+=	$(libsbiutils-genflags-y)
+ GENFLAGS	+=	$(platform-genflags-y)
+ GENFLAGS	+=	$(firmware-genflags-y)
+ 
+-CFLAGS		=	-g -Wall -Werror -ffreestanding -nostdlib -fno-strict-aliasing -O2
++CFLAGS		=	-g -Wall -std=gnu11 -Wno-error -ffreestanding -nostdlib -fno-strict-aliasing -O2
+ CFLAGS		+=	-fno-omit-frame-pointer -fno-optimize-sibling-calls
+ CFLAGS		+=	-mno-save-restore -mstrict-align
+ CFLAGS		+=	-mabi=$(PLATFORM_RISCV_ABI) -march=$(PLATFORM_RISCV_ISA)
+diff --git a/opensbi/lib/utils/irqchip/plic.c b/opensbi/lib/utils/irqchip/plic.c
+index 70e89a643..daa1583f6 100644
+--- a/opensbi/lib/utils/irqchip/plic.c
++++ b/opensbi/lib/utils/irqchip/plic.c
+@@ -85,6 +85,19 @@ int plic_warm_irqchip_init(struct plic_data *plic,
+ 	return 0;
+ }
+ 
++/*
++ * T-HEAD C900 PLIC (as used on the Sophgo CV1800B / Milk-V Duo): S-mode
++ * access to the per-context enable/threshold/claim registers is gated
++ * behind bit 0 of the control register at offset 0x1FFFFC, and it comes
++ * up 0 (M-mode only) out of reset. This MUST be set from M-mode; the
++ * stock Milk-V firmware never does (its devicetree has no
++ * thead,reset-sample / plic-delegate node). Without it an S-mode
++ * supervisor gets a permanent external-interrupt storm with claim()==0
++ * the moment it enables any PLIC source. Set it unconditionally here —
++ * on a plain SiFive PLIC this offset is unused and the write is inert.
++ */
++#define PLIC_THEAD_S_PERMISSION 0x1FFFFC
++
+ int plic_cold_irqchip_init(struct plic_data *plic)
+ {
+ 	int i;
+@@ -92,6 +105,8 @@ int plic_cold_irqchip_init(struct plic_data *plic)
+ 	if (!plic)
+ 		return SBI_EINVAL;
+ 
++	writel(1, (void *)plic->addr + PLIC_THEAD_S_PERMISSION);
++
+ 	/* Configure default priorities of all IRQs */
+ 	for (i = 1; i <= plic->num_src; i++)
+ 		plic_set_priority(plic, i, 1);

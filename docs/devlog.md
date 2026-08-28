@@ -4,6 +4,47 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 (continued) — PLIC storm FIXED and verified on real hardware
+
+Built the patched OpenSBI, repacked the fip, flashed, booted. **The
+storm is gone.**
+
+**The patch** (`scripts/opensbi-thead-plic-delegate.patch`): one line in
+`opensbi/lib/utils/irqchip/plic.c` `plic_cold_irqchip_init()` —
+`writel(1, (void *)plic->addr + 0x1FFFFC)` (the T-HEAD C900 PLIC S-mode
+delegate). Plus a Makefile tweak so OpenSBI 0.9 (2021) builds under
+GCC 16 (`-std=gnu11 -Wno-error`).
+
+**Build** (`scripts/build_opensbi_duo.sh`): `make PLATFORM=generic
+CROSS_COMPILE=riscv64-unknown-elf- PLATFORM_RISCV_ISA=rv64imafdc_zicsr_zifencei
+FW_PIC=n FW_FDT_PATH=<dtb>`. The `_zifencei` and `FW_PIC=n` are needed
+for the modern toolchain; the DTB is lifted **verbatim from the stock
+MONITOR's embedded FDT** (offset 0xd00dfeed, 23 KB) so the rebuild sees
+exactly the DT the working firmware did. First attempt without
+`FW_FDT_PATH` booted to a UART-garble + reset loop — the stock Milk-V
+OpenSBI carries its FDT embedded and does not rely on FSBL passing one.
+
+**Reflash** (`scripts/reflash_duo.sh PATCH_OPENSBI=1`): builds the
+patched OpenSBI and passes `--MONITOR build/fw_dynamic_patched.bin` to
+`fiptool genfip` alongside the usual `--OLD_FIP` / `--LOADER_2ND`. Once
+flashed it sticks — a later plain reflash carries it forward via
+`--OLD_FIP`. Keeps `fip.bin.goodbak-stock-opensbi` as the rollback.
+
+**Verified:** flashed patched OpenSBI + a racccoon kernel that arms
+PLIC source `IRQ_USB` (30) in `plic_init()` — a silent source (DWC2
+GINTMSK masked). Every prior time *any* PLIC enable bit was set, the
+board wedged in a permanent storm needing a reflash. This time it
+**booted straight to the shell** — sdd, fsd, usbd, ethd, gpiod all up,
+no storm. Root cause confirmed, fix confirmed.
+
+The `IRQ_USB` probe was reverted (it was the test). Interrupt-driven
+sdd / USB (`docs/usb-interrupt-plan.md`) / ethernet-RX are now
+unblocked — the next step is wiring one of them up for real, which
+also needs the kernel IRQ path to ack the device source (level-
+triggered) before returning, not just complete at the PLIC.
+
+---
+
 ## 2026-08-28 (continued) — PLIC storm SOLVED (root cause): missing M-mode `writel(1, 0x701FFFFC)`
 
 Confirmed, from an independent working port. The

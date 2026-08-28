@@ -81,12 +81,17 @@ cannot be verified on hardware until then**, and there is no QEMU DWC2
 Recommended: solve the SDHCI PLIC storm first (it already has a driver
 and a test rig). USB then reuses the now-trusted path.
 
-**Update 2026-08-28 — the storm is root-caused** (see
-`docs/devlog.md` and memory `racccoon-plic-storm`): it is the missing
-T-HEAD C900 PLIC M-mode delegate write `writel(1, 0x701FFFFC)`, which
-the Duo's stock OpenSBI never does. Fix is a ~1-line OpenSBI patch +
-a `fip.bin` MONITOR repack. Once that lands and `IRQ_SDHCI` is
-re-armed without storming, this whole plan is unblocked.
+**Update 2026-08-28 — the storm is FIXED and hardware-verified** (see
+`docs/devlog.md` and memory `racccoon-plic-storm`): it was the missing
+T-HEAD C900 PLIC M-mode delegate write `writel(1, 0x701FFFFC)`. Patched
+OpenSBI (`scripts/opensbi-thead-plic-delegate.patch`, flashed via
+`PATCH_OPENSBI=1 scripts/reflash_duo.sh`) now does it; arming a PLIC
+source from S-mode no longer storms. **This plan is unblocked.** One
+addition to Stage 1 below: `handle_trap`'s USB branch must also ack the
+DWC2 core interrupt (clear `GINTSTS.HCHINT` / `HAINT`) — for USB that's
+done in `hc_wait_chhltd` on the next poll, but a level-triggered source
+left unacked at trap-return re-fires; the plan's Stage 3 already reads
+`HCINT` each pass so this is covered for USB specifically.
 
 ---
 
