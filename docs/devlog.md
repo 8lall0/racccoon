@@ -57,17 +57,23 @@ every loop break in the already-extracted `sys_kill`/`sys_rfork`/
 `sys_exec`. A clean compile then rules out the *other* direction (a
 switch-break wrongly kept → "break outside loop").
 
-Verified QEMU: `srvtest` / `nstest` / `threadjointest` (99) /
-`mutextest` (16/16) / `racetest` (a=1 b=1) / `argvtest` / `killtest` /
-`runtest` / `envtest` / `sandboxtest`. Real Duo: clean boot, `ls` +
-`cat`. `p9fstest` / `mounttest` / `hardentest` fail — identically on
-pre-change `38d619a`, so pre-existing (unrelated).
+Verified QEMU (`launch64_dual` — two partitions, ext2 backend):
+`p9fstest` / `p9fswritetest` / `mounttest` / `srvtest` / `nstest` /
+`threadjointest` (99) / `mutextest` (16/16) / `racetest` (a=1 b=1) /
+`argvtest` / `killtest` / `runtest` / `envtest` / `sandboxtest` / and
+`hardentest` — all ok. Real Duo: clean boot, `ls` + `cat`
+(shell↔fsd is IPC + ns_resolve per command).
 
-**`hardentest` fixed** (`20d88ab`) — it wasn't a kernel bug. The test
-called `syscall(31, …)` as its "unrecognized number," but 31/32/33
-(`SYS_KBD_PUSH` etc.) were added since, so that was a valid
-`SYS_KBD_PUSH` (push a NUL keystroke) returning 0. The `default:` case
-denied unknown syscalls correctly all along. Now uses `999`.
+The p9/mount tests had looked like failures earlier only because they
+were run against the plain FAT32-only `disk.img` (`launch64.sh`) —
+`p9fstest` needs ext2, `mounttest` needs `/mnt/fs2/`. Not bugs, not
+regressions: wrong disk image.
+
+**`hardentest` was a genuinely rotted test**, fixed (`20d88ab`): it
+called `syscall(31, …)` as its "unrecognized number" (picked when 30
+was the max), but 31/32/33 (`SYS_KBD_PUSH` etc.) were added since — so
+that was a valid `SYS_KBD_PUSH` (push a NUL keystroke) returning 0. The
+`default:` case denied unknown syscalls correctly all along. Now `999`.
 
 ---
 
