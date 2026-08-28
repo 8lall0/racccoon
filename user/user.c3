@@ -43,6 +43,7 @@ const int SYS_USBD_INFO     = 28; // usbd-only: returns its DMA buffer physical 
 const int SYS_NETD_INFO     = 29; // netd-only: returns its RX/TX virtqueue physical addresses, plus its packet-buffer page — see src/entry.c3's case
 const int SYS_ETHD_INFO     = 30; // ethd-only: returns its DMA region's physical address — see src/entry.c3's case
 const int SYS_KBD_PUSH      = 31; // usbd-only: pushes one decoded USB-keyboard byte into the kernel keystroke queue SYS_GETCHAR drains — see src/entry.c3's case
+const int SYS_USB_IRQ_ARM   = 32; // usbd-only: re-enable PLIC source board::IRQ_USB (handle_trap disables it on each USB IRQ — level-triggered) — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process

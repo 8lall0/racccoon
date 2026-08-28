@@ -32,6 +32,10 @@ const uptr PLIC_BASE = 0x0c000000;
 // why it exists at all.
 const ulong PTE_EXTRA_BITS = 0;
 
+// No MAEE on QEMU's generic core — device MMIO just works with plain
+// PTEs. See boards/duo/board.c3's PTE_DEVICE_BITS.
+const ulong PTE_DEVICE_BITS = 0;
+
 // virtio-mmio devices on QEMU's virt board get IRQ N for slot N; we only
 // ever attach one device (bus=virtio-mmio-bus.0, slot 0), so IRQ 1.
 const uint IRQ_VIRTIO_BLK = 1;
@@ -210,6 +214,17 @@ fn void plic_complete(uint irq)
 {
 	uint* complete = (uint*)PLIC_CLAIM;
 	mem::store(complete, irq, 4, true);
+}
+
+// See boards/duo/board.c3's plic_set_enabled — kept here for symbol
+// parity (shared kernel code calls it). Never exercised on QEMU
+// (HAS_USB false, usbd never spawned).
+fn void plic_set_enabled(uint irq, bool on)
+{
+	uint* word = (uint*)(PLIC_ENABLE_BASE + (uptr)((irq / 32) * 4));
+	uint cur = mem::load(word, 4, true);
+	uint bit = 1u << (irq % 32);
+	mem::store(word, on ? (cur | bit) : (cur & ~bit), 4, true);
 }
 
 // QEMU's OpenSBI wires its console extension straight to the virt

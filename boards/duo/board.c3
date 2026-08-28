@@ -42,6 +42,18 @@ const uptr PLIC_BASE = 0x70000000;
 // coherency even though it wasn't the hang's root cause.
 const ulong PTE_EXTRA_BITS = (1UL << 60) | (1UL << 61) | (1UL << 62);
 
+// MAEE device-MMIO memory type: SO (bit 63, Strong Order) | SH (bit 60,
+// Shareable), C/B clear (non-cacheable, non-bufferable). This is what a
+// hardware register block needs on the C906 — leaving bits 63:59 zero
+// (as map_device_page did before) is NOT "strong order" as an old
+// comment claimed, it's *weakly-ordered* non-cacheable, which lets the
+// core reorder / merge / speculate register reads. The PLIC claim
+// register (read has a side effect; its value tracks live PLIC state)
+// returns a stale 0 under weak ordering while sip.SEIP stays asserted —
+// a hard interrupt storm. Matches the working RVSPOC xv6 CV1800B port's
+// PTE_THEAD_DEVICE ((1<<63)|(1<<60)). See docs/devlog.md.
+const ulong PTE_DEVICE_BITS = (1UL << 63) | (1UL << 60);
+
 // No virtio-mmio (or any confirmed IRQ source) wired up for this
 // platform yet — 0 rather than a real vendor IRQ number, matching
 // plic_claim()'s own "0 = nothing pending" sentinel, so the
@@ -159,8 +171,16 @@ const uptr USB_CLK_PAGE      = 0x03002000;
 // already being set — this driver had never touched pinmux at all
 // until now.
 const uptr USB_PINMUX_PAGE   = 0x03001000;
-const uint IRQ_USB           = 30; // declared, deliberately NOT wired into plic_init() yet — see IRQ_SDHCI's own claim-storm lesson above; Phase 1 polls HPRT0 instead
+const uint IRQ_USB           = 30; // CV1800B USB PLIC source (cv180x dtsi SOC_PERIPHERAL_IRQ(14)=30; confirmed via milkv-duos-rs)
 const bool HAS_USB           = true;
+
+// Interrupt-driven USB transfer completion (docs/usb-interrupt-plan.md).
+// Depends on the map_device_page SO fix (PTE_DEVICE_BITS) — before that
+// S-mode plic_claim() returned 0 and any armed PLIC source stormed.
+// Must stay in sync with user/usb/dwc2.c3's USBD_INTERRUPT_DRIVEN (user
+// code can't see board::); a mismatch is safe (falls back to HCINT
+// polling). Flip false for the pure-polled path.
+const bool INTERRUPT_DRIVEN_USB = true;
 
 // Ethernet MAC (Synopsys DesignWare/"stmmac" core, wrapped by the
 // vendor's own "cvitek,ethernet" devicetree compatible string — the
@@ -314,29 +334,36 @@ fn void plic_init()
 	uint* priority_sdhci = (uint*)(PLIC_PRIORITY_BASE + 4 * IRQ_SDHCI);
 	mem::store(priority_sdhci, 1u, 4, true);
 
-	// ISOLATION EXPERIMENT, temporary: every real-hardware test so far
-	// has changed this enable-bit write and user/sdd.c3's own
-	// SIGNAL_ENABLE/INT_ENABLE writes together, every single time — so
-	// every failure so far is equally consistent with "the PLIC enable
-	// bit itself is the problem" and "the device's own interrupt
-	// generation is the problem." Two targeted fixes at the device-status
-	// level (widening what gets cleared, and unconditionally completing
-	// at the PLIC level) both left the storm's exact signature
-	// unchanged (claim()=0 AND the raw pending bitmap=0 on every single
-	// sample, forever), which argues against a device-status-clearing
-	// explanation and toward something at the PLIC/enable level instead
-	// — this line is the one thing that's never been isolated. Leaving
-	// priority_sdhci's write in place (harmless alone: priority without
-	// an enable bit can never deliver anything per PLIC semantics) and
-	// skipping ONLY the enable-bit write, to see whether the storm
-	// requires this bit being set at all, independent of whether the
-	// device ever actually asserts. See docs/devlog.md for the full
-	// elimination trail this session before this test.
-	// uint* enable_word1 = (uint*)(PLIC_ENABLE_BASE + 4);
-	// mem::store(enable_word1, (1u << (IRQ_SDHCI % 32)), 4, true);
+	// IRQ_SDHCI's enable bit stays off — re-arming it needs the kernel
+	// IRQ path to ack the SDHCI controller's own level-triggered
+	// INT_STATUS (sdd turns on SD_SIGNAL_ENABLE), a separate to-do.
+	// USB is armed first: the DWC2 core interrupt (GINTMSK) is only
+	// unmasked by the driver mid-transfer and it re-reads HCINT as the
+	// source of truth, so no unacked-device-line hazard.
+	if (INTERRUPT_DRIVEN_USB && HAS_USB)
+	{
+		uint* priority_usb = (uint*)(PLIC_PRIORITY_BASE + 4 * IRQ_USB);
+		mem::store(priority_usb, 1u, 4, true);
+		uint* enable_word0 = (uint*)PLIC_ENABLE_BASE;
+		uint cur = mem::load(enable_word0, 4, true);
+		mem::store(enable_word0, cur | (1u << IRQ_USB), 4, true); // IRQ_USB (30) < 32 → word 0
+	}
 
 	uint* threshold = (uint*)PLIC_THRESHOLD;
 	mem::store(threshold, 0u, 4, true);
+}
+
+// Toggle a single S-context enable bit. handle_trap disables a
+// level-triggered source (USB) the instant it fires — the device line
+// stays asserted until the driver clears it and this SoC re-traps
+// before the returned-to context runs an instruction, so leaving it
+// enabled is a hard hang. The driver re-arms via SYS_USB_IRQ_ARM.
+fn void plic_set_enabled(uint irq, bool on)
+{
+	uint* word = (uint*)(PLIC_ENABLE_BASE + (uptr)((irq / 32) * 4));
+	uint cur = mem::load(word, 4, true);
+	uint bit = 1u << (irq % 32);
+	mem::store(word, on ? (cur | bit) : (cur & ~bit), 4, true);
 }
 
 fn uint plic_claim()

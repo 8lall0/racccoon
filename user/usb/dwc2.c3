@@ -46,6 +46,17 @@ import std::nolibc::mem;
 // port status, real errors) always prints regardless.
 const bool USBD_VERBOSE = false;
 
+// Interrupt-driven transfer-completion wait (docs/usb-interrupt-plan.md).
+// When true, hc_wait_chhltd() spins on ipc_poll_type() for the kernel's
+// synthetic IRQ notify instead of yield()-polling HCINT; usbd_init
+// unmasks GINTMSK.HCHINT so a channel halt raises the PLIC line and
+// handle_trap wakes usbd. HCINT stays the source of truth (re-read
+// every pass). MUST match boards/duo/board.c3's INTERRUPT_DRIVEN_USB
+// (user code can't see board::); a mismatch is safe. Depends on the
+// map_device_page strong-order fix — without it S-mode plic_claim()
+// returns 0 and any armed PLIC source storms.
+const bool USBD_INTERRUPT_DRIVEN = true;
+
 // --- DWC2 core registers (relative to board::USB_MMIO_BASE) — all fit
 // in the first 4KB page, nothing here needs the other 15 pages of the
 // core's own 64KB window.
@@ -55,6 +66,10 @@ const uint USB_GAHBCFG_GLBL_INTR_EN = 1 << 0; // real DWC2 silicon gates interna
 const uint USB_GUSBCFG  = 0x00C;
 const uint USB_GRSTCTL  = 0x010;
 const uint USB_GINTSTS  = 0x014;
+const uint USB_GINTMSK  = 0x018;
+const uint USB_GINTSTS_HCHINT = 1 << 25; // "Host Channels Interrupt" — read-only OR of every unmasked per-channel HCINT (via HAINT)
+const uint USB_HAINT    = 0x414; // Host All-channels Interrupt (read-only)
+const uint USB_HAINTMSK = 0x418;
 const uint USB_GRXFSIZ   = 0x024;
 const uint USB_GNPTXFSIZ = 0x028;
 const uint USB_GSNPSID  = 0x040;
@@ -631,6 +646,19 @@ fn void usbd_init()
     usb_reg_write(USB_GAHBCFG, ahbcfg);
     usbd_vprint("GAHBCFG programmed (DMA enabled, GLBL_INTR_EN set)\n");
 
+    // Interrupt-driven: let a channel-0 halt raise the DWC2 external IRQ
+    // line. Only these three bits — GINTMSK is otherwise clear, so no
+    // SOF / port-change / RXFLVL interrupt. Channel 0 only, one transfer
+    // at a time, so HAINT[0] + HCINTMSK.CHHLTD + GINTMSK.HCHINT is the
+    // whole path. hc_wait_chhltd() clears HCINT (which drops HAINT and
+    // GINTSTS.HCHINT with it) and treats HCINT as the source of truth.
+    if (USBD_INTERRUPT_DRIVEN)
+    {
+        usb_reg_write(USB_HC0_HCINTMSK, USB_HCINT_CHHLTD);
+        usb_reg_write(USB_HAINTMSK, 1); // channel 0
+        usb_reg_write(USB_GINTMSK, USB_GINTSTS_HCHINT);
+    }
+
     // Restart the PHY clock — see USB_PCGCCTL's own comment. This is
     // dwc_otg_core_host_init()'s own first step in the reference
     // driver, right after forcing host mode and before HCFG/HPRT0.
@@ -746,17 +774,37 @@ fn void usbd_init()
 // Waits for CHHLTD (channel halted — the transfer attempt is over, one
 // way or another). Shared by every transfer path below (plain, split
 // start, split complete). Returns 0 with *hcint_out set on success, -1
-// on a real timeout (2s budget — generous, real transfers complete in
-// microseconds to low milliseconds; only ever fires on a genuinely
-// wedged channel).
+// on a real timeout (2s budget — generous; only ever fires on a
+// genuinely wedged channel).
+//
+// USBD_INTERRUPT_DRIVEN: instead of yield()-polling HCINT, spin on
+// ipc_poll_type() draining the kernel's IRQ notify (handle_trap, woken
+// by GINTMSK.HCHINT). HCINT is still read every pass and is the source
+// of truth. On CHHLTD we clear HCINT here — the DWC2 line is level-high
+// and stays asserted until HCINT is cleared, so clearing it before
+// returning is what drops the PLIC line; the caller's own later clear
+// becomes a redundant no-op (callers inspect the *captured* value).
 fn int hc_wait_chhltd(uint* hcint_out)
 {
     ulong start = rdtime();
     ulong budget = usb_us_to_ticks(2000000);
+    char[8] notify_scratch @noinit;
+    uint notify_verb;
+    if (USBD_INTERRUPT_DRIVEN)
+    {
+        // handle_trap disables PLIC source IRQ_USB the instant the DWC2
+        // line fires; re-arm before every wait (idempotent).
+        syscall(SYS_USB_IRQ_ARM, 0, 0, 0);
+    }
     for (;;)
     {
         uint hcint = usb_reg_read(USB_HC0_HCINT);
-        if (hcint & USB_HCINT_CHHLTD) { *hcint_out = hcint; return 0; }
+        if (hcint & USB_HCINT_CHHLTD)
+        {
+            *hcint_out = hcint;
+            if (USBD_INTERRUPT_DRIVEN) { usb_reg_write(USB_HC0_HCINT, USB_HCINT_ALL_MASK); }
+            return 0;
+        }
         if (rdtime() - start > budget)
         {
             print("usbd: hc_transfer_once timed out waiting for CHHLTD, HCINT=0x");
@@ -764,7 +812,14 @@ fn int hc_wait_chhltd(uint* hcint_out)
             print("\n");
             return -1;
         }
-        yield();
+        if (USBD_INTERRUPT_DRIVEN)
+        {
+            ipc_poll_type(&notify_scratch[0], 0, &notify_verb); // drain notify; value irrelevant
+        }
+        else
+        {
+            yield();
+        }
     }
 }
 

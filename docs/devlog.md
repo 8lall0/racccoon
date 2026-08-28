@@ -4,7 +4,84 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
-## 2026-08-28 (continued) — PLIC storm FIXED and verified on real hardware
+## 2026-08-28 (continued) — interrupt-driven USB WORKS. Root cause: MMIO was weakly-ordered, not strong-ordered.
+
+**Solved, hardware-verified.** The whole "PLIC storm" saga — every
+attempt to arm a PLIC source ending in a permanent storm with
+`plic_claim()` returning 0 while `sip.SEIP` stayed asserted (2026-08-17
+SDHCI, and all of this session) — was **`map_device_page()` mapping
+device MMIO as weakly-ordered non-cacheable instead of strong-ordered.**
+
+On the MAEE-enabled T-HEAD C906, PTE bits [63:59] encode the memory
+type. `map_device_page` set them all to 0 → SO=0 (weak order), C=0, B=0
+= "Normal Non-cacheable, weakly ordered". An old comment here claimed
+that was "Strong-Order/non-cacheable" — **wrong**. Strong Order is bit
+63. Under weak ordering the C906 reorders / merges / speculates MMIO
+reads, and the PLIC claim register — whose value tracks live PLIC state
+and whose *read has a side effect* — comes back as a stale 0.
+
+**The fix** (`boards/duo/board.c3` + `src/page.c3`):
+`const ulong PTE_DEVICE_BITS = (1UL << 63) | (1UL << 60)` (SO | SH) on
+the Duo, `0` on QEMU; `map_device_page` ORs it at the leaf. Matches the
+working **RVSPOC xv6 CV1800B port**
+(`xhackerustc/rvspoc-p2308-xv6-riscv`), whose `PTE_THEAD_DEVICE` is
+exactly `(1<<63)|(1<<60)` — that port runs S-mode under OpenSBI (loads
+at 0x80200000 via FIP, no `CONFIG_RISCV_M_MODE`) with working UART /
+GPIO / I2C / SPI interrupts, i.e. proof S-mode PLIC claim *does* work
+on this SoC — racccoon was just corrupting the read.
+
+Everything else that was "ruled out" this session (delegate bit,
+priority quirk, register addresses, stuck-claim drain) genuinely
+wasn't the cause — the addresses etc. were right all along. The
+priority "25-31 only" thing (Opus, community.milkv.io/t/cv1800b-baremetal)
+is real (write 31, read back 7) but priority 1 works fine once ordering
+is correct — RVSPOC uses 1.
+
+**Interrupt-driven USB, now live** (docs/usb-interrupt-plan.md):
+- `boards/duo/board.c3`: `INTERRUPT_DRIVEN_USB`; `plic_init` arms PLIC
+  source 30 (priority 1, threshold 0); `plic_set_enabled()` helper.
+- `src/entry.c3` `handle_trap`: on `IRQ_USB` wake usbd via
+  `DISKD_IRQ_NOTIFY` (mirrors diskd/sdd), then `plic_complete`, THEN
+  `plic_set_enabled(IRQ_USB, false)` — the DWC2 line is level-high and
+  can't be cleared from the trap handler, and this SoC re-traps before
+  the returned-to context runs an instruction, so the source must be
+  disabled on the way out. Also disables any unrecognized non-zero
+  source (storm insurance). New syscall `SYS_USB_IRQ_ARM` (32) re-enables
+  it, called from `hc_wait_chhltd`.
+- `user/usb/dwc2.c3`: `USBD_INTERRUPT_DRIVEN`; `usbd_init` unmasks
+  `GINTMSK.HCHINT` + `HAINTMSK[0]` + `HCINTMSK.CHHLTD`; `hc_wait_chhltd`
+  spins on `ipc_poll_type` (no `yield()`) instead of polling, clears
+  HCINT on CHHLTD (drops the line). HCINT stays the source of truth so
+  a missed/late notify only costs latency.
+- `create_process` already maps the PLIC pages; `usb_msc_ipc_poll`
+  already drains-and-ignores non-MSC verbs, so a stray notify in usbd's
+  inbox is harmless. No process.c3 change.
+
+**Verified:** `ext-irq claim=30` on every USB transfer, hub enumerates
+fully (device + config descriptors, `SET_ADDRESS`, hub descriptor,
+multi-TT, 4-port scan) via interrupts, no storm, sdd/fsd/ethd all still
+come up (the strong-order change touches every device mapping — no
+regression). The port-4 STALL is the pre-existing 8BitDo split quirk,
+unrelated.
+
+**Known limitation:** `hc_wait_chhltd` pure-spins in interrupt mode
+(matches diskd) — a large multi-packet MSC transfer holds the CPU
+longer than the old yield-per-packet path. Fine for now; revisit if MSC
+latency bites.
+
+**Now also unblocked:** interrupt-driven sdd and ethernet RX — same
+strong-order fix, same `handle_trap` pattern. sdd additionally needs
+its level-triggered `SD_INT_STATUS` acked before trap return.
+
+**The OpenSBI patch** (`scripts/opensbi-thead-plic-delegate.patch`,
+`build_opensbi_duo.sh`, `reflash_duo.sh PATCH_OPENSBI=1`) turned out
+**not** to be needed — FSBL already sets the delegate bit. Kept as
+inert infrastructure; the card carries the patched OpenSBI harmlessly.
+A plain reflash works.
+
+---
+
+## 2026-08-28 (continued) — PLIC storm "FIXED" via OpenSBI delegate *(WRONG — real fix is the strong-order MMIO change, entry above)*
 
 Built the patched OpenSBI, repacked the fip, flashed, booted. **The
 storm is gone.**

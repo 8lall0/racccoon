@@ -206,26 +206,22 @@ fn void map_page(ulong* table2, uptr vaddr, uptr paddr, uint flags)
 
 // Same as map_page(), for genuine device MMIO (PLIC, virtio-blk,
 // user/sdd.c3's SDHCI/pad-mux/clock registers, and any future real
-// hardware register block) rather than ordinary RAM. The one difference:
-// no board::PTE_EXTRA_BITS at the leaf.
+// hardware register block) rather than ordinary RAM.
 //
-// This isn't a style choice — board::PTE_EXTRA_BITS's SHARE|CACHE|BUF
-// combination (see map_page()'s own comment) marks a mapping cacheable,
-// which is correct for RAM but wrong for a hardware register: a cached
-// write can sit in the CPU's own cache line and never actually reach the
-// device at all until that line happens to get evicted, and a cached
-// read can just as easily return a stale value instead of the device's
-// live state, instead of silently doing the right thing the way it
-// would for RAM. docs/devlog.md already noted this in passing during
-// the original Sv39 bring-up ("leaving them zero reads as
-// Strong-Order/non-cacheable") but every map_page() call site at the time
-// happened to be RAM, so it never mattered in practice until this: every
-// map_page() call for real device MMIO on this board (PLIC included) was
-// silently marking those registers cacheable the whole time — found only
-// once user/sdd.c3's PIO-polling SD driver made the effect impossible to
-// miss (register writes reading back correctly — cache hit on the same
-// line — while the actual hardware never showed any sign of having
-// received them at all).
+// board::PTE_DEVICE_BITS at the leaf, NOT board::PTE_EXTRA_BITS. On the
+// Duo (MAEE C906) that's SO|SH — strong-ordered, non-cacheable,
+// non-bufferable: what a hardware register needs. board::PTE_EXTRA_BITS's
+// SHARE|CACHE|BUF would mark the register *cacheable* (a cached write
+// never reaches the device; a cached read returns stale state). And
+// leaving bits 63:59 zero — as this function did before — is NOT strong
+// order despite an old comment here: it's *weakly-ordered*
+// non-cacheable, which still lets the core reorder / merge / speculate
+// register reads. That was the (long-hidden) cause of the S-mode PLIC
+// `claim()` always returning 0 while sip.SEIP stayed asserted: the
+// claim register's value tracks live PLIC state and its read has a side
+// effect, both of which weak ordering breaks. Found via the working
+// RVSPOC xv6 CV1800B port, whose PTE_THEAD_DEVICE is exactly
+// (1<<63)|(1<<60). On QEMU PTE_DEVICE_BITS is 0 (plain PTE, no MAEE).
 fn void map_device_page(ulong* table2, uptr vaddr, uptr paddr, uint flags)
 {
 	if (!mem::ptr_is_aligned((void*)vaddr, PAGE_SIZE))
@@ -240,5 +236,5 @@ fn void map_device_page(ulong* table2, uptr vaddr, uptr paddr, uint flags)
 	ulong* table0 = walk_to_leaf_table(table2, vaddr);
 
 	uint vpn0 = (uint)((vaddr >> 12) & 0x1ff);
-	table0[vpn0] = paddr_to_ppn_field(paddr) | (ulong)flags | PAGE_V | PAGE_A | PAGE_D;
+	table0[vpn0] = paddr_to_ppn_field(paddr) | (ulong)flags | PAGE_V | PAGE_A | PAGE_D | board::PTE_DEVICE_BITS;
 }

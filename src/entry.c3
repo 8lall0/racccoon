@@ -80,6 +80,7 @@ const SYS_USBD_INFO     = 28; // usbd-only: returns its DMA buffer's physical ad
 const SYS_NETD_INFO     = 29; // netd-only: returns its RX/TX virtqueue physical addresses, plus (Ethernet Phase 2) its packet-buffer page — see its case below
 const SYS_ETHD_INFO     = 30; // ethd-only: returns its DMA region's physical address (Ethernet Phase 2) — same shape/reasoning as SYS_USBD_INFO above
 const SYS_KBD_PUSH      = 31; // usbd-only in practice: pushes one decoded USB-keyboard byte into the kernel keystroke queue SYS_GETCHAR drains (src/kbd.c3) — see its case below
+const SYS_USB_IRQ_ARM   = 32; // usbd-only: re-enable PLIC source board::IRQ_USB, disabled by handle_trap on each USB IRQ (level-triggered) — see its case below
 
 // Generous cap on the image SYS_EXEC will install — real racccoon
 // binaries (build/user/*.bin) run 70-105KB; this leaves real headroom
@@ -1648,6 +1649,17 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			{
 				f.a0 = (ulong)(-1);
 			}
+		case SYS_USB_IRQ_ARM:
+			// usbd re-enables its own PLIC source after servicing a
+			// completion — handle_trap disabled it on the way in (the
+			// DWC2 line is level-high, can't be cleared from the trap
+			// handler). pid-gated to usbd; idempotent (first transfer /
+			// timeout path harmlessly re-set an already-set bit).
+			if (current_proc.pid == usbd_pid && usbd_pid != 0)
+			{
+				board::plic_set_enabled(board::IRQ_USB, true);
+			}
+			f.a0 = 0;
 		case SYS_PARENT_INFO:
 			// Read-only, no permission check — same reasoning as
 			// SYS_PROC_INFO above. Returns the given pid's parent_pid
@@ -2200,9 +2212,43 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 					}
 				}
 			}
+			// usbd (user/usb/dwc2.c3) — its interrupt-driven
+			// transfer-completion wait spins on ipc_poll_type for this
+			// notify. HCINT stays the source of truth, so a missed/late
+			// notify only costs latency.
+			if (irq == board::IRQ_USB && usbd_pid != 0)
+			{
+				Process* usbd_proc = proc_by_pid(usbd_pid);
+				if (usbd_proc != null)
+				{
+					usbd_proc.msg_from    = 0;
+					usbd_proc.msg_type    = DISKD_IRQ_NOTIFY;
+					usbd_proc.has_message = true;
+					if (usbd_proc.state == PROC_BLOCKED)
+					{
+						usbd_proc.state = PROC_RUNNABLE;
+					}
+				}
+			}
 			if (irq != 0)
 			{
 				board::plic_complete(irq);
+			}
+			// The DWC2 IRQ is level-high and its GINTSTS/HCINT stay
+			// asserted until usbd clears them; on this SoC a still-
+			// pending external interrupt at sret re-traps before the
+			// returned-to context runs an instruction, so leaving the
+			// source enabled hangs usbd out of ever reaching that clear.
+			// Disable it AFTER plic_complete (the PLIC ignores a
+			// completion for a disabled source). usbd re-arms IRQ_USB
+			// via SYS_USB_IRQ_ARM before its next wait. Also disable any
+			// unrecognized non-zero source — a misrouted level IRQ left
+			// enabled is a guaranteed storm.
+			bool handled_irq = (irq == board::IRQ_VIRTIO_BLK && diskd_pid != 0)
+				|| (irq == board::IRQ_SDHCI && sdd_pid != 0);
+			if (irq == board::IRQ_USB || (irq != 0 && !handled_irq))
+			{
+				board::plic_set_enabled(irq, false);
 			}
 		}
 		else if (code == SCAUSE_SUPERVISOR_TIMER)

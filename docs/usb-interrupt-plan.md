@@ -78,20 +78,18 @@ untrusted PLIC path and would need the storm solved first. **This plan
 cannot be verified on hardware until then**, and there is no QEMU DWC2
 (`board::HAS_USB` is Duo-only) so there is no QEMU leg either.
 
-Recommended: solve the SDHCI PLIC storm first (it already has a driver
-and a test rig). USB then reuses the now-trusted path.
-
-**Update 2026-08-28 — the storm is FIXED and hardware-verified** (see
-`docs/devlog.md` and memory `racccoon-plic-storm`): it was the missing
-T-HEAD C900 PLIC M-mode delegate write `writel(1, 0x701FFFFC)`. Patched
-OpenSBI (`scripts/opensbi-thead-plic-delegate.patch`, flashed via
-`PATCH_OPENSBI=1 scripts/reflash_duo.sh`) now does it; arming a PLIC
-source from S-mode no longer storms. **This plan is unblocked.** One
-addition to Stage 1 below: `handle_trap`'s USB branch must also ack the
-DWC2 core interrupt (clear `GINTSTS.HCHINT` / `HAINT`) — for USB that's
-done in `hc_wait_chhltd` on the next poll, but a level-triggered source
-left unacked at trap-return re-fires; the plan's Stage 3 already reads
-`HCINT` each pass so this is covered for USB specifically.
+**Update 2026-08-28 — DONE and hardware-verified.** The "storm" was
+never a delegate / OpenSBI problem — it was `map_device_page()` mapping
+device MMIO *weakly-ordered* on the T-HEAD C906, so S-mode
+`plic_claim()` returned a stale 0. Fixed with
+`board::PTE_DEVICE_BITS = (1<<63)|(1<<60)` (SO|SH), applied in
+`map_device_page`. See `docs/devlog.md` ("interrupt-driven USB WORKS")
+and memory `racccoon-plic-storm`. Implementation matches the stages
+below; `create_process` already maps the PLIC pages and
+`usb_msc_ipc_poll` already drains unknown verbs, so Stages 1 (process.c3)
+and 4 needed nothing. `handle_trap` does `plic_complete` then disables
+IRQ_USB (level-triggered), re-armed by `SYS_USB_IRQ_ARM` from
+`hc_wait_chhltd`.
 
 ---
 
