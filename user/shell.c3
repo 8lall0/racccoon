@@ -11,7 +11,7 @@ import std::nolibc::main_stub;
 // this split exists (shell.c3 used to carry both).
 fn void main() {
     for (;;) {
-        print("> ");
+        shell_prompt();
 
         char[128] cmdline @noinit;
         int i = 0;

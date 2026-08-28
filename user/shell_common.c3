@@ -43,15 +43,56 @@ fn void usbfs_teardown()
     }
 }
 
+// The current user, cached — refreshed lazily on the first prompt and
+// again after every `su`, rather than an fs_read of /adm/users per
+// keystroke line.
+char[32] g_shell_user @noinit;
+int      g_shell_uid = -1;
+
+fn void shell_refresh_user()
+{
+    g_shell_uid = getuid();
+    user_name_by_uid(g_shell_uid, &g_shell_user[0], 32);
+}
+
+// The prompt — "<user># " for root, "<user>% " otherwise (Plan 9's `%`).
+// Both shells call this instead of a bare "> ".
+fn void shell_prompt()
+{
+    if (g_shell_uid < 0) { shell_refresh_user(); }
+    print(&g_shell_user[0]);
+    print(g_shell_uid == 0 ? "# " : "% ");
+}
+
 // Dispatches the small set of real, end-user shell builtins shared by
 // both the production shell (shell.c3) and the test shell
-// (shell_test.c3) — hello/exit/mountusb. Returns true if cmd was one of
-// these (and therefore handled); false means the caller should fall
+// (shell_test.c3) — hello/exit/mountusb/su. Returns true if cmd was one
+// of these (and therefore handled); false means the caller should fall
 // back to shell_exec_external() below.
 fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
 {
         if (strcmp(cmd, "hello") == 0) {
             print("Hello world from shell!\n");
+            return true;
+        } else if (strcmp(cmd, "su") == 0) {
+            // Become another user. One-way (setuid only drops, never
+            // elevates — Plan 9's "become none, never come back"); to
+            // get root back, `exit` and let the kernel respawn a fresh
+            // root shell.
+            if (cmd_argc < 1) {
+                print("usage: su <user>\n");
+                return true;
+            }
+            int su_uid = user_uid_by_name(cmd_argv[0]);
+            if (su_uid < 0) {
+                print("su: no such user in /adm/users\n");
+                return true;
+            }
+            if (setuid(su_uid) < 0) {
+                print("su: denied (this shell already dropped privilege — exit and start over)\n");
+                return true;
+            }
+            shell_refresh_user();
             return true;
         } else if (strcmp(cmd, "exit") == 0) {
             exit();

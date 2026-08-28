@@ -135,7 +135,7 @@ fn void mutex_thread_body(void* arg) {
 
 fn void main() {
     for (;;) {
-        print("> ");
+        shell_prompt();
 
         char[128] cmdline @noinit;
         int i = 0;

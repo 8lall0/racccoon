@@ -46,6 +46,7 @@ const int SYS_KBD_PUSH      = 31; // usbd-only: pushes one decoded USB-keyboard 
 const int SYS_DRIVER_IRQ_ARM = 32; // usbd/sdd: re-enable this driver's PLIC source (handle_trap disables it on each fire — level-triggered); dispatched by caller pid — see src/entry.c3's case
 const int SYS_SDD_INFO      = 33; // sdd-only: returns its SDMA staging buffer's physical address — same shape as SYS_USBD_INFO
 const int SYS_IPC_CALL      = 34; // one-shot RPC: deliver a request and block for the reply, all in the kernel — reply can't be pre-empted by a stray sender, aborts -1 if the server dies at any point — see src/entry.c3's case
+const int SYS_GETUID        = 35; // the caller's own uid — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -759,6 +760,80 @@ fn int proc_info(int pid, uint* state_out, uint* generation_out, int* uid_out) @
 // — see both their own comments, src/entry.c3.
 fn int setuid(int new_uid) @export("setuid") {
     return syscall(SYS_SETUID, new_uid, 0, 0);
+}
+
+fn int getuid() @export("getuid") {
+    return syscall(SYS_GETUID, 0, 0, 0);
+}
+
+// --- /adm/users, the user database (docs/filesystem-layout.md, §2) ---
+// One "uid:name" line per user. Tiny (a handful of lines), so both
+// lookups just read the whole file each call — the shell caches its own
+// name rather than calling these per prompt.
+
+// name -> uid, or -1 if not found / no /adm/users.
+fn int user_uid_by_name(char* name) @export("user_uid_by_name") {
+    char[512] ub @noinit;
+    int n = fs_read("/adm/users", &ub, 512);
+    if (n < 0) return -1;
+    int i = 0;
+    while (i < n) {
+        // parse "uid:name\n"
+        int uid = 0;
+        bool have_digit = false;
+        while (i < n && ub[i] >= '0' && ub[i] <= '9') { uid = uid * 10 + (ub[i] - '0'); i++; have_digit = true; }
+        if (i < n && ub[i] == ':' && have_digit) {
+            i++;
+            int j = 0;
+            while (i < n && ub[i] != '\n' && ub[i] != 0) {
+                if (name[j] != ub[i]) { j = -1; }
+                if (j >= 0) j++;
+                i++;
+            }
+            if (j >= 0 && name[j] == 0) return uid;
+        }
+        while (i < n && ub[i] != '\n') i++; // skip to end of line
+        if (i < n) i++;                     // skip the newline
+    }
+    return -1;
+}
+
+// uid -> name into out (out_cap includes the null). Falls back to the
+// decimal uid if there's no matching line. Returns the name length.
+fn int user_name_by_uid(int uid, char* out, int out_cap) @export("user_name_by_uid") {
+    char[512] ub @noinit;
+    int n = fs_read("/adm/users", &ub, 512);
+    if (n >= 0) {
+        int i = 0;
+        while (i < n) {
+            int row = 0;
+            bool have_digit = false;
+            while (i < n && ub[i] >= '0' && ub[i] <= '9') { row = row * 10 + (ub[i] - '0'); i++; have_digit = true; }
+            if (i < n && ub[i] == ':' && have_digit && row == uid) {
+                i++;
+                int k = 0;
+                while (i < n && ub[i] != '\n' && ub[i] != 0 && k < out_cap - 1) { out[k] = ub[i]; k++; i++; }
+                out[k] = 0;
+                return k;
+            }
+            while (i < n && ub[i] != '\n') i++;
+            if (i < n) i++;
+        }
+    }
+    // fallback: "root" for uid 0 (always, by convention — even with no
+    // /adm/users yet), else the decimal uid.
+    if (uid == 0) {
+        if (out_cap >= 5) { out[0] = 'r'; out[1] = 'o'; out[2] = 'o'; out[3] = 't'; out[4] = 0; return 4; }
+    }
+    char[12] tmp @noinit;
+    int t = 0;
+    int v = uid;
+    if (v == 0) { tmp[t] = '0'; t++; }
+    while (v > 0) { tmp[t] = (char)('0' + (v % 10)); t++; v /= 10; }
+    int k = 0;
+    while (t > 0 && k < out_cap - 1) { t--; out[k] = tmp[t]; k++; }
+    out[k] = 0;
+    return k;
 }
 
 // Returns pid's parent pid, filling *parent_generation_out (may be null

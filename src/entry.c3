@@ -83,6 +83,7 @@ const SYS_KBD_PUSH      = 31; // usbd-only in practice: pushes one decoded USB-k
 const SYS_DRIVER_IRQ_ARM = 32; // interrupt-driven driver: re-enable this driver's PLIC source, disabled by handle_trap on each fire (level source); the source is the one the caller registered in the Irq_route table (process.c3) — see its case below
 const SYS_SDD_INFO      = 33; // sdd-only: returns its SDMA staging buffer's physical address — see its case below
 const SYS_IPC_CALL      = 34; // one-shot RPC: deliver a request to a server and block for its reply, all in the kernel — the reply can't be pre-empted by a stray sender, and the whole thing aborts with -1 if the server dies at any point (see its case below); user-space p9_call is now just this
+const SYS_GETUID        = 35; // the caller's own uid — see its case below
 
 // Generous cap on the image SYS_EXEC will install — real racccoon
 // binaries (build/user/*.bin) run 70-105KB; this leaves real headroom
@@ -2443,6 +2444,12 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			current_proc.uid = (int)f.a0;
 			f.a0 = 0;
+		case SYS_GETUID:
+			// The caller's own uid. Always succeeds — uid is a small
+			// non-negative int, so no error value collides. Lets a
+			// process (the shell's prompt, /bin/whoami) know who it is
+			// without a getpid()+proc_info(self) round trip.
+			f.a0 = (ulong)(uint)current_proc.uid;
 		default:
 			// An unrecognized syscall number from any process — a
 			// genuine bug in that process, or a deliberately hostile

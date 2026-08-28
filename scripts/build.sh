@@ -80,7 +80,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # bin/{cat,ls,write,rm,mkdir,mv} — the real, argv-taking utilities
   # shell.c3's own /bin/ fallback branch execs (see docs/devlog.md),
   # replacing what used to be hardcoded shell builtins.
-  for u in cat ls write rm mkdir mv usbrw fsd gpio; do
+  for u in cat ls whoami write rm mkdir mv usbrw fsd gpio; do
     mcopy -i build/disk.img "build/user/$u.bin" "::bin/$u"
   done
 
@@ -133,14 +133,14 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # they're absent here. Kept in sync by hand with the same list in
   # scripts/populate_duo_bin.sh (real Duo) — same convention as the
   # binary list below.
-  for d in bin lib usr usr/root adm tmp mnt; do
+  for d in bin lib usr usr/root usr/glenda adm tmp mnt; do
     debugfs -w -R "mkdir $d" build/disk_ext2.img > /dev/null
   done
-  printf '0:root\n' > build/adm_users_fixture
+  printf '0:root\n1000:glenda\n' > build/adm_users_fixture
   debugfs -w -R "write build/adm_users_fixture adm/users" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_ext2.img > /dev/null
-  for u in cat ls write rm mkdir mv usbrw fsd gpio; do
+  for u in cat ls whoami write rm mkdir mv usbrw fsd gpio; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_ext2.img > /dev/null
   done
   debugfs -w -R "write build/bigfile_fixture.bin bigfile.bin" build/disk_ext2.img > /dev/null
@@ -190,13 +190,13 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # mnt` behaves sensibly, not because anything reads its contents.
   # Canonical root tree — same set as disk_ext2.img above / the real
   # Duo (docs/filesystem-layout.md).
-  for d in bin lib usr usr/root adm tmp mnt; do
+  for d in bin lib usr usr/root usr/glenda adm tmp mnt; do
     debugfs -w -R "mkdir $d" build/disk_dual_root_part.img > /dev/null
   done
   debugfs -w -R "write build/adm_users_fixture adm/users" build/disk_dual_root_part.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_root_part.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_root_part.img > /dev/null
-  for u in cat ls write rm mkdir mv usbrw fsd gpio; do
+  for u in cat ls whoami write rm mkdir mv usbrw fsd gpio; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_root_part.img > /dev/null
   done
   dd if=build/disk_dual_root_part.img of=build/disk_dual.img bs=512 seek=0 conv=notrunc status=none
@@ -217,7 +217,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "mkdir bin" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_ext2_part.img > /dev/null
-  for u in cat ls write rm mkdir mv usbrw fsd gpio; do
+  for u in cat ls whoami write rm mkdir mv usbrw fsd gpio; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_ext2_part.img > /dev/null
   done
   # bigfile.bin — same double-indirect-block fixture as the single-mount

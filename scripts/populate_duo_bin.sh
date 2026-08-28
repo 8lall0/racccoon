@@ -42,7 +42,7 @@ fi
 # image's own bin/ — kept in sync by hand, same convention this
 # project already uses for the small protocol constants duplicated
 # across diskd.c3/fsd.c3.
-BINARIES="echod cat ls write rm mkdir mv usbrw fsd gpio"
+BINARIES="echod cat ls whoami write rm mkdir mv usbrw fsd gpio"
 
 for b in $BINARIES; do
   if [ ! -f "build/user/$b.bin" ]; then
@@ -59,11 +59,11 @@ echo "==> Ensuring the canonical root tree exists..."
 # docs/filesystem-layout.md / roadmap §1 — kept in sync by hand with the
 # same list in scripts/build.sh (the QEMU images). /proc /srv /env are
 # namespace mounts, not real dirs.
-for d in bin lib usr usr/root adm tmp mnt; do
+for d in bin lib usr usr/root usr/glenda adm tmp mnt; do
   mkdir -p "$MNT/$d"
 done
 if [ ! -e "$MNT/adm/users" ]; then
-  printf '0:root\n' > "$MNT/adm/users"
+  printf '0:root\n1000:glenda\n' > "$MNT/adm/users"
 fi
 
 for b in $BINARIES; do
