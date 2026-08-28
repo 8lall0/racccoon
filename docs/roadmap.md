@@ -300,13 +300,21 @@ Generation counters back most of the stale-reference handling:
 
 ### Work (roughly in order)
 
-1. **IPC failure propagation.** `sys_exit` walks the process table and,
-   for every process blocked with `msg_from == dying.pid` (or waiting on
-   a reply from it), sets `msg_acked = true` + a "peer died" flag and
-   marks it `PROC_RUNNABLE`; `SYS_IPC_SEND`/`_REPLY`/`p9_call` then
-   return −1 instead of hanging. Same sweep clears a wedged
-   `has_message`. This alone turns "hang forever" into "get an error"
-   for the crash-during-request case.
+1. **IPC failure propagation.**
+   - **1a — rendezvous hangs. DONE** (commit `262d45b`). `sys_exit` /
+     `sys_kill` sweep the table (`ipc_wake_waiters_on`) and wake anyone
+     blocked in `sys_ipc_send` / `sys_ipc_reply` toward the dying
+     process; those calls return −1. New `Process.ipc_wait_pid` /
+     `ipc_wait_generation` / `ipc_peer_died` track the wait. Covers:
+     send to a server that dies before consuming the request, reply to
+     a client that died. `ipcdeathtest` in `shell_test.c3`.
+   - **1b — reply-wait hang.** A client blocked in `ipc_recv` *waiting
+     for a reply* from a server that crashes after receiving the
+     request is still stuck — `ipc_recv` isn't peer-specific so the
+     sweep doesn't reach it. Fix: a single `ipc_call` syscall that owns
+     the whole send → recv-reply round-trip in the kernel and aborts
+     cleanly if the target dies at any point (also retires `p9_call`'s
+     `P9_STRAY` bounce dance). Touches every 9P client wrapper.
 2. **A `svc` / `init` supervisor.** A userspace process (or the kernel's
    respawn loop generalised) holding a table of
    `{binary, name, restart-policy}`; `SYS_JOIN` on each server, re-`exec`

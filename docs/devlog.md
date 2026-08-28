@@ -4,6 +4,45 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-29 (continued) — resiliency: IPC rendezvous no longer hangs on peer death
+
+First slice of `docs/roadmap.md` §5. The IPC rendezvous had no failure
+path — a process blocked in `sys_ipc_send` (waiting for its message to
+be acked) or `sys_ipc_reply` (waiting for the client to consume the
+reply) hung forever if the peer exited or was killed. `SYS_KILL`'s own
+comment already admitted it: *"left blocked forever — nothing forcibly
+unblocks a waiter."*
+
+**Fix** (`262d45b`):
+- `Process.ipc_wait_pid` / `ipc_wait_generation` / `ipc_peer_died` —
+  set while a process is blocked in send/reply toward a specific peer,
+  reset in `create_process` + the rfork child path (the slot isn't
+  zeroed on reuse).
+- `sys_exit` / `sys_kill` → `ipc_wake_waiters_on(victim)`: sweeps the
+  table before the victim's pid is zeroed, sets `ipc_peer_died` +
+  marks `PROC_RUNNABLE` anyone parked toward it.
+- both wait loops poll `ipc_peer_gone()` (the flag, plus a direct
+  `proc_by_pid` + generation check for the phase-A case where the
+  waiter is still `RUNNABLE`) and return −1.
+- `p9_call` already bailed on `ipc_send() < 0`, so it propagates to 9P
+  clients for free.
+
+New `ipcdeathtest` (`shell_test.c3`): child never `recv`s and
+`exit()`s; parent's `ipc_send` returns −1 instead of hanging.
+Deterministic. Full p9/ipc regression suite (`p9realtest` /
+`p9fstest` / `p9fswritetest` / `p9mkdirtest` / `srvtest` / `nstest` /
+`mounttest` / `hotplugtest` / `killtest` / `threadjointest` /
+`mutextest` / `racetest` / `envtest` / `runtest`) unchanged. Real Duo:
+clean boot, `ls` + `cat`.
+
+**Still hangs** (roadmap §5.1b): a client blocked in `ipc_recv`
+*awaiting a reply* from a server that crashes after receiving the
+request — `ipc_recv` isn't peer-specific. Wants a kernel `ipc_call`
+round-trip primitive (which would also retire `p9_call`'s `P9_STRAY`
+dance).
+
+---
+
 ## 2026-08-29 — session summary: xpad STALL fixed, then a long cleanup pass
 
 One session (spanning 2026-08-28 into the 29th). Started on a reported
