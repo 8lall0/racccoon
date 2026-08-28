@@ -37,26 +37,22 @@ const MSG_MAX = 1128;
                      // PROC_BLOCKED is automatically skipped without any
                      // scheduler change.
 
-// The disk driver process (see user/diskd.c3) — 0 until it's created and
-// registered by setup_diskd_mappings, checked by handle_trap before
-// routing a virtio-blk PLIC interrupt to it. diskd_vq_paddr/diskd_req_paddr
-// are the physical addresses of its virtqueue and request buffer,
-// allocated once at diskd's creation time (see setup_diskd_mappings) and
-// handed back to diskd itself via the SYS_DISKD_INFO syscall — diskd's own
-// user-mode code has no other way to learn them, since it can't call
-// alloc_pages() directly and its own per-page image mapping can't
-// guarantee the physical contiguity DMA needs.
-int  diskd_pid = 0;
+// The disk driver process (see user/diskd.c3). diskd_vq_paddr/
+// diskd_req_paddr are the physical addresses of its virtqueue and
+// request buffer, allocated once at diskd's creation time (see
+// setup_diskd_mappings) and handed back to diskd itself via the
+// SYS_DISKD_INFO syscall — diskd's own user-mode code has no other way
+// to learn them, since it can't call alloc_pages() directly and its own
+// per-page image mapping can't guarantee the physical contiguity DMA
+// needs. Its PLIC interrupt is routed to it via the Irq_route table
+// below (registered by setup_diskd_mappings).
 uptr diskd_vq_paddr;
 uptr diskd_req_paddr;
 
-// The SD driver process (see user/sdd.c3) — Duo's real-hardware
-// counterpart to diskd above, mutually exclusive with it at runtime (see
-// board::HAS_SD_BLOCK/HAS_VIRTIO_BLOCK, kernel.c3). No vq/req physical
-// addresses to track here: sdd talks to its SDHCI controller in PIO mode,
-// not DMA, so it needs no physically-contiguous buffer handed back the
-// way diskd does — see setup_sdd_mappings below.
-int sdd_pid = 0;
+// sdd (see user/sdd.c3) is Duo's real-hardware counterpart to diskd,
+// mutually exclusive with it at runtime (board::HAS_SD_BLOCK/
+// HAS_VIRTIO_BLOCK, kernel.c3). Its PLIC source is routed via the
+// Irq_route table below.
 // sdd's SDMA staging buffer — one identity-mapped, uncached page,
 // allocated at spawn (setup_sdd_mappings) and handed back via
 // SYS_SDD_INFO. Same pattern/reasoning as usbd_dma_paddr: the SDHCI
@@ -65,12 +61,6 @@ int sdd_pid = 0;
 // only ever moves one 512-byte block per request, so one page is
 // plenty. 0 until sdd is spawned (Duo only — HAS_SD_BLOCK).
 uptr sdd_dma_paddr;
-
-// The USB host-controller driver process (see user/usbd.c3) — Duo
-// only (board::HAS_USB), unused this phase (no interrupt routing, no
-// IPC clients yet — Phase 1 is bring-up + HPRT polling only), kept for
-// whenever a later phase needs it, same as diskd_pid/sdd_pid above.
-int usbd_pid = 0;
 
 // usbd's own single-page DMA buffer (Phase 2: control transfers over
 // the DWC2 host channels) — same pattern as diskd_vq_paddr/
@@ -81,15 +71,6 @@ int usbd_pid = 0;
 // packet, an 18-byte device descriptor, a handful-of-bytes hub
 // descriptor, a 4-byte port status) — nothing here approaches 4KB.
 uptr usbd_dma_paddr;
-
-// The Ethernet MAC driver process (see user/net/ethd.c3) — Duo only
-// (board::HAS_ETH_MAC), mutually exclusive with netd_pid below
-// (board::HAS_ETH_MAC/HAS_VIRTIO_NET, kernel.c3), same shape as
-// diskd_pid/sdd_pid. Phase 1 was MAC+embedded-PHY bring-up and MDIO
-// link-status polling only (no DMA descriptor rings — MDIO
-// transactions are plain register reads/writes through the MAC's own
-// miiaddr/miidata registers, entirely independent of its DMA engine).
-int ethd_pid = 0;
 
 // ethd's own single-page DMA region (Ethernet Phase 2: real packet
 // TX/RX) — one TX descriptor, one RX descriptor, one TX buffer, one RX
@@ -103,11 +84,10 @@ int ethd_pid = 0;
 uptr ethd_dma_paddr;
 
 // The virtio-net driver process (see user/net/netd.c3) — QEMU only
-// (board::HAS_VIRTIO_NET), same shape as diskd_pid above (a real
-// virtqueue, unlike ethd — virtio-net's own spec requires at least an
-// RX and TX queue configured before DRIVER_OK, even though Phase 1
-// doesn't push anything through them yet).
-int netd_pid = 0;
+// (board::HAS_VIRTIO_NET). A real pair of virtqueues, unlike ethd —
+// virtio-net's spec requires an RX and TX queue configured before
+// DRIVER_OK. Fully poll-driven (netd busy-polls used.index), so no
+// Irq_route entry.
 uptr netd_rxq_paddr;
 uptr netd_txq_paddr;
 // netd's own packet-buffer page (Ethernet Phase 2) — RX buffer at
@@ -117,6 +97,86 @@ uptr netd_txq_paddr;
 // virtqueues above and for the same reason — QEMU-only, no real
 // cache-incoherency to hit.
 uptr netd_pktbuf_paddr;
+
+// --- Interrupt-driven driver IRQ routing -----------------------------
+// Replaces the per-device `if (irq == board::IRQ_X && X_pid != 0)`
+// branches that used to accumulate in handle_trap, and the pid-switch
+// in SYS_DRIVER_IRQ_ARM. Each driver that services a device PLIC source
+// registers ONE route from its setup_*_mappings below — it knows its
+// own pid and its board::IRQ_* constant right there. Adding another
+// interrupt-driven driver (ethd RX, gpiod) is then a one-line
+// irq_route_register() call plus arming the source in board::plic_init;
+// no handle_trap or syscall edit.
+//
+// handle_trap looks the claimed IRQ up here, wakes the owning process
+// with the DISKD_IRQ_NOTIFY sentinel — reusing that driver's single-
+// slot IPC inbox, which is safe because a driver only ever waits for
+// this notify right after kicking its device, never with an unconsumed
+// client request sitting in the inbox (see user/diskd.c3's loop) — and
+// then, for a `level` source (device status line stays asserted until
+// the driver clears its own status register, and this SoC re-traps at
+// sret while a source is still pending), disables it; the driver
+// re-arms via SYS_DRIVER_IRQ_ARM before its next wait. Edge/latched
+// sources (virtio-mmio, acked through the virtio ISR register) register
+// level=false and are left enabled.
+const int IRQ_ROUTE_MAX = 8;
+struct Irq_route
+{
+	uint irq;
+	int  pid;
+	bool level;
+	bool used;
+}
+Irq_route[IRQ_ROUTE_MAX] irq_routes;
+
+// irq 0 is the "device not present on this board" sentinel (board::
+// IRQ_USB etc. are 0 on QEMU) and also plic_claim()'s spurious return —
+// never a real route. A repeat register for the same IRQ (driver
+// respawn) overwrites in place.
+fn void irq_route_register(uint irq, int pid, bool level)
+{
+	if (irq == 0 || pid == 0) { return; }
+	for (int i = 0; i < IRQ_ROUTE_MAX; i++)
+	{
+		if (irq_routes[i].used && irq_routes[i].irq == irq)
+		{
+			irq_routes[i].pid   = pid;
+			irq_routes[i].level = level;
+			return;
+		}
+	}
+	for (int i = 0; i < IRQ_ROUTE_MAX; i++)
+	{
+		if (!irq_routes[i].used)
+		{
+			irq_routes[i].irq   = irq;
+			irq_routes[i].pid   = pid;
+			irq_routes[i].level = level;
+			irq_routes[i].used  = true;
+			return;
+		}
+	}
+}
+
+fn Irq_route* irq_route_by_irq(uint irq)
+{
+	if (irq == 0) { return null; }
+	for (int i = 0; i < IRQ_ROUTE_MAX; i++)
+	{
+		if (irq_routes[i].used && irq_routes[i].irq == irq) { return &irq_routes[i]; }
+	}
+	return null;
+}
+
+fn Irq_route* irq_route_by_pid(int pid)
+{
+	if (pid == 0) { return null; }
+	for (int i = 0; i < IRQ_ROUTE_MAX; i++)
+	{
+		if (irq_routes[i].used && irq_routes[i].pid == pid) { return &irq_routes[i]; }
+	}
+	return null;
+}
 
 // The filesystem server (see user/fsd.c3) — 0 until created, consulted
 // only by create_process below to populate every new process's default
@@ -898,7 +958,10 @@ fn void setup_diskd_mappings(Process* proc)
 		map_page(proc.page_table, req_paddr + off, req_paddr + off, PAGE_U | PAGE_R | PAGE_W);
 	}
 
-	diskd_pid       = proc.pid;
+	// virtio-mmio interrupt: edge/latched, acked via the virtio ISR
+	// register in diskd itself — level=false, handle_trap leaves the
+	// PLIC source enabled.
+	irq_route_register(board::IRQ_VIRTIO_BLK, proc.pid, false);
 	diskd_vq_paddr  = vq_paddr;
 	diskd_req_paddr = req_paddr;
 }
@@ -929,7 +992,11 @@ fn void setup_sdd_mappings(Process* proc)
 	map_device_page(proc.page_table, dma_paddr, dma_paddr, PAGE_U | PAGE_R | PAGE_W);
 	sdd_dma_paddr = dma_paddr;
 
-	sdd_pid = proc.pid;
+	// SDHCI interrupt: level-high, cleared by sdd writing SD_INT_STATUS
+	// — same handle_trap disable / SYS_DRIVER_IRQ_ARM re-arm dance as
+	// usbd. Inert unless board::plic_init armed IRQ_SDHCI
+	// (INTERRUPT_DRIVEN_SD) and sdd unmasked the controller interrupt.
+	irq_route_register(board::IRQ_SDHCI, proc.pid, true);
 }
 
 fn void setup_usbd_mappings(Process* proc)
@@ -973,7 +1040,12 @@ fn void setup_usbd_mappings(Process* proc)
 	map_device_page(proc.page_table, dma_paddr, dma_paddr, PAGE_U | PAGE_R | PAGE_W);
 	usbd_dma_paddr = dma_paddr;
 
-	usbd_pid = proc.pid;
+	// DWC2 core interrupt (GINTMSK.HCHINT etc., see user/usb/dwc2.c3):
+	// level-high, cleared only by usbd writing HCINT — handle_trap
+	// disables the source on each fire, usbd re-arms via
+	// SYS_DRIVER_IRQ_ARM. Inert unless board::plic_init armed IRQ_USB
+	// (INTERRUPT_DRIVEN_USB) and dwc2.c3 unmasked the core interrupt.
+	irq_route_register(board::IRQ_USB, proc.pid, true);
 }
 
 // Called once, right after create_process() spawns gpiod (see
@@ -1024,7 +1096,12 @@ fn void setup_ethd_mappings(Process* proc)
 	map_device_page(proc.page_table, dma_paddr, dma_paddr, PAGE_U | PAGE_R | PAGE_W);
 	ethd_dma_paddr = dma_paddr;
 
-	ethd_pid = proc.pid;
+	// dwmac RX/TX-done interrupt: level, cleared by ethd writing the DMA
+	// status register. Registered now so interrupt-driven RX only needs
+	// board::plic_init to arm IRQ_ETH + ethd to unmask + wait on the
+	// notify — no kernel routing edit. Inert until then (source never
+	// fires).
+	irq_route_register(board::IRQ_ETH, proc.pid, true);
 }
 
 // Called once, right after create_process() spawns netd (see
@@ -1061,7 +1138,6 @@ fn void setup_netd_mappings(Process* proc)
 	uptr pktbuf_paddr = alloc_pages(1);
 	map_page(proc.page_table, pktbuf_paddr, pktbuf_paddr, PAGE_U | PAGE_R | PAGE_W);
 
-	netd_pid          = proc.pid;
 	netd_rxq_paddr    = rxq_paddr;
 	netd_txq_paddr    = txq_paddr;
 	netd_pktbuf_paddr = pktbuf_paddr;

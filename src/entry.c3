@@ -80,7 +80,7 @@ const SYS_USBD_INFO     = 28; // usbd-only: returns its DMA buffer's physical ad
 const SYS_NETD_INFO     = 29; // netd-only: returns its RX/TX virtqueue physical addresses, plus (Ethernet Phase 2) its packet-buffer page — see its case below
 const SYS_ETHD_INFO     = 30; // ethd-only: returns its DMA region's physical address (Ethernet Phase 2) — same shape/reasoning as SYS_USBD_INFO above
 const SYS_KBD_PUSH      = 31; // usbd-only in practice: pushes one decoded USB-keyboard byte into the kernel keystroke queue SYS_GETCHAR drains (src/kbd.c3) — see its case below
-const SYS_DRIVER_IRQ_ARM = 32; // usbd/sdd: re-enable this driver's PLIC source, disabled by handle_trap on each fire (level-triggered); which source is picked by the caller's pid — see its case below
+const SYS_DRIVER_IRQ_ARM = 32; // interrupt-driven driver: re-enable this driver's PLIC source, disabled by handle_trap on each fire (level source); the source is the one the caller registered in the Irq_route table (process.c3) — see its case below
 const SYS_SDD_INFO      = 33; // sdd-only: returns its SDMA staging buffer's physical address — see its case below
 
 // Generous cap on the image SYS_EXEC will install — real racccoon
@@ -118,10 +118,13 @@ const EXEC_MAX_ELF_SEGMENTS = 8;
 const int RFPROC = 1 << 0;
 const int RFMEM  = 1 << 1;
 
-// Sentinel msg_type handle_trap uses to wake diskd on a virtio-blk PLIC
-// interrupt (see handle_trap's interrupt branch below) — distinguishes
-// "the device finished, go check the used ring" from an actual client
-// request in diskd's single inbox slot. Must match user/diskd.c3's copy.
+// Sentinel msg_type handle_trap posts to wake an interrupt-driven
+// driver when its PLIC source fires (see handle_trap's interrupt branch
+// and the Irq_route table in process.c3) — distinguishes "your device
+// fired, go check its status register" from an actual client request in
+// the driver's single inbox slot. Opaque to the driver: diskd, sdd,
+// usbd all treat it the same way. Named for its first user; must match
+// user/diskd.c3's copy (and user/sdd.c3, user/usb/dwc2.c3).
 const uint DISKD_IRQ_NOTIFY = 0xFFFFFFFF;
 
 // RV64 port: these bridge globals carry full CSR values now (sepc/satp
@@ -1654,17 +1657,15 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// A driver re-enables its own PLIC source after servicing a
 			// completion — handle_trap disabled it on the way in (the
 			// device line is level-high and can't be cleared from the
-			// trap handler). Which source is chosen by the caller's pid:
-			// usbd -> IRQ_USB, sdd -> IRQ_SDHCI. Idempotent (first
-			// transfer / timeout path harmlessly re-sets an already-set
-			// bit).
-			if (current_proc.pid == usbd_pid && usbd_pid != 0)
+			// trap handler). The source is whichever one the caller
+			// registered in the Irq_route table (setup_*_mappings,
+			// process.c3). A non-driver caller finds no route -> no-op.
+			// Idempotent (first transfer / timeout path harmlessly
+			// re-sets an already-set enable bit).
+			Irq_route* arm_route = irq_route_by_pid(current_proc.pid);
+			if (arm_route != null)
 			{
-				board::plic_set_enabled(board::IRQ_USB, true);
-			}
-			else if (current_proc.pid == sdd_pid && sdd_pid != 0)
-			{
-				board::plic_set_enabled(board::IRQ_SDHCI, true);
+				board::plic_set_enabled(arm_route.irq, true);
 			}
 			f.a0 = 0;
 		case SYS_SDD_INFO:
@@ -2180,71 +2181,31 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 			// that wasn't actually claimed.
 			uint irq = board::plic_claim();
 
-			if (irq == board::IRQ_VIRTIO_BLK && diskd_pid != 0)
+			// Route it to the driver that registered it (Irq_route
+			// table, process.c3). Wake that process specifically rather
+			// than relying on "whatever happened to be running/wfi-
+			// waiting" — a device interrupt can land while any process
+			// (or the kernel's own boot code) is active, and only the
+			// owning driver cares. Uses the driver's single-slot IPC
+			// inbox: safe because a driver only waits for this notify
+			// right after kicking its device, never with an unconsumed
+			// client request sitting there (see user/diskd.c3's loop).
+			// DISKD_IRQ_NOTIFY is an opaque "your IRQ fired" marker to
+			// whichever driver gets it — the driver responds by re-
+			// reading its own device's status register, not by
+			// inspecting the notify.
+			Irq_route* route = irq_route_by_irq(irq);
+			if (route != null)
 			{
-				// Wake diskd specifically, rather than relying on
-				// "whatever happened to be running/wfi-waiting" like the
-				// old kernel-resident driver did — this interrupt can
-				// land while any process (or the kernel's own boot code)
-				// is active, and diskd is the only one that cares. Uses
-				// the same single-slot inbox as ordinary client requests:
-				// safe because diskd only ever waits here (its second
-				// ipc_recv, inbox already drained by the first) right
-				// after kicking the virtqueue, never while a client
-				// request is still sitting unconsumed — see
-				// user/diskd.c3's main loop and setup_diskd_mappings'
-				// comment in process.c3.
-				Process* diskd_proc = proc_by_pid(diskd_pid);
-				if (diskd_proc != null)
+				Process* driver = proc_by_pid(route.pid);
+				if (driver != null)
 				{
-					diskd_proc.msg_from    = 0;
-					diskd_proc.msg_type    = DISKD_IRQ_NOTIFY;
-					diskd_proc.has_message = true;
-					if (diskd_proc.state == PROC_BLOCKED)
+					driver.msg_from    = 0;
+					driver.msg_type    = DISKD_IRQ_NOTIFY;
+					driver.has_message = true;
+					if (driver.state == PROC_BLOCKED)
 					{
-						diskd_proc.state = PROC_RUNNABLE;
-					}
-				}
-			}
-			// Same pattern as diskd above, for sdd (see user/sdd.c3) —
-			// the two are mutually exclusive per board (see
-			// board::HAS_SD_BLOCK/HAS_VIRTIO_BLOCK), so this only ever
-			// matches on the Duo, where diskd_pid stays 0. Reuses
-			// DISKD_IRQ_NOTIFY's sentinel value rather than defining a
-			// second constant: it's an opaque "your IRQ fired" marker to
-			// whichever driver receives it, not a DISKD-specific verb —
-			// sdd interprets it exactly the same way diskd does, by
-			// re-reading its own device's status register, not by
-			// inspecting the notify itself.
-			if (irq == board::IRQ_SDHCI && sdd_pid != 0)
-			{
-				Process* sdd_proc = proc_by_pid(sdd_pid);
-				if (sdd_proc != null)
-				{
-					sdd_proc.msg_from    = 0;
-					sdd_proc.msg_type    = DISKD_IRQ_NOTIFY;
-					sdd_proc.has_message = true;
-					if (sdd_proc.state == PROC_BLOCKED)
-					{
-						sdd_proc.state = PROC_RUNNABLE;
-					}
-				}
-			}
-			// usbd (user/usb/dwc2.c3) — its interrupt-driven
-			// transfer-completion wait spins on ipc_poll_type for this
-			// notify. HCINT stays the source of truth, so a missed/late
-			// notify only costs latency.
-			if (irq == board::IRQ_USB && usbd_pid != 0)
-			{
-				Process* usbd_proc = proc_by_pid(usbd_pid);
-				if (usbd_proc != null)
-				{
-					usbd_proc.msg_from    = 0;
-					usbd_proc.msg_type    = DISKD_IRQ_NOTIFY;
-					usbd_proc.has_message = true;
-					if (usbd_proc.state == PROC_BLOCKED)
-					{
-						usbd_proc.state = PROC_RUNNABLE;
+						driver.state = PROC_RUNNABLE;
 					}
 				}
 			}
@@ -2252,18 +2213,18 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 			{
 				board::plic_complete(irq);
 			}
-			// The DWC2 / SDHCI IRQs are level-high and their device status stays
-			// asserted until the driver clears it; on this SoC a still-
-			// pending external interrupt at sret re-traps before the
-			// returned-to context runs an instruction, so leaving the
-			// source enabled hangs the driver out of ever reaching that clear.
-			// Disable it AFTER plic_complete (the PLIC ignores a
-			// completion for a disabled source). the driver re-arms
-			// via SYS_DRIVER_IRQ_ARM before its next wait. Also disable any
+			// A `level` source (DWC2, SDHCI, dwmac) keeps its device
+			// status line asserted until the driver clears it; on this
+			// SoC a still-pending external interrupt at sret re-traps
+			// before the returned-to context runs an instruction, so
+			// leaving it enabled hangs the driver out of ever reaching
+			// that clear. Disable AFTER plic_complete (the PLIC ignores a
+			// completion for a disabled source); the driver re-arms via
+			// SYS_DRIVER_IRQ_ARM before its next wait. Also disable any
 			// unrecognized non-zero source — a misrouted level IRQ left
-			// enabled is a guaranteed storm.
-			bool handled_irq = (irq == board::IRQ_VIRTIO_BLK && diskd_pid != 0);
-			if (irq == board::IRQ_USB || irq == board::IRQ_SDHCI || (irq != 0 && !handled_irq))
+			// enabled is a guaranteed storm. An edge/latched route
+			// (virtio-mmio, level=false) is the only case left enabled.
+			if (irq != 0 && (route == null || route.level))
 			{
 				board::plic_set_enabled(irq, false);
 			}
