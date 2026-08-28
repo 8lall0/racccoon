@@ -36,10 +36,15 @@ teardown + `yield()`) and `sys_rfork(f)`. `handle_syscall`: 1700 →
 `exit`. Real Duo — clean boot, USB enumerates, ext2 mounts via SDMA,
 `ls` + `cat` (each fork→exec→exit).
 
-**`SYS_EXEC` (416 lines, dozens of bailout paths) deliberately left
-inline** — mechanical extraction there is exactly where a
-break-vs-return slip would hide. Own focused pass. Update
-[[racccoon-refactor-backlog]] when done.
+**`SYS_EXEC` — done too** (commit `5c9525d`, later the same run):
+`sys_exec(f)`, 416 lines out. 8 case-level `f.a0=-1; break;` → `return`,
+5 loop breaks (PT_LOAD scan, per-page alloc, argv pages) kept, each
+discriminated by its preceding line. `handle_syscall`: **1700 → 952
+lines**. QEMU `argvtest` ok + the usual set; Duo clean boot, ls/cat.
+
+That's all four big cases. The medium ones (`IPC_SEND` 71,
+`IPC_RECV_GEN` 64, `NS_MOUNT_WAIT` 75, `NS_RESOLVE` 61, `SRV_POST` 56)
+are optional polish, not tracked.
 
 ---
 
