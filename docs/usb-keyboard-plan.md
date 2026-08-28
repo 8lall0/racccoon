@@ -168,13 +168,16 @@ buffer, `SYS_KBD_PUSH` (=31), `SYS_GETCHAR` drains the queue then the
 serial console, `kbd_emit()` pushes. `kbdpush` shell_test builtin.
 Typing at the `>` prompt works, `ls` runs.
 
-### Stage 4 — polish
-- Caps Lock: track state from the keyboard's Caps usage (`0x39`), XOR
-  with Shift for letters. Optionally drive the Caps Lock LED via
-  `SET_REPORT` (`bmRequestType 0x21`, `bRequest 0x09`, 1 data byte).
-- Software auto-repeat: if a key is still held N ms later (tracked
-  against the last report + a timestamp), re-emit it, then every M ms.
-- Devlog entry, memory note, commit.
+### Stage 4 — polish — **BUILT, hardware-verify pending**
+- Caps Lock: press of usage `0x39` toggles `g_kbd_caps_lock`, XOR'd with
+  Shift for letters only; LED driven via `usb_hid_set_report_leds`
+  (`SET_REPORT`, Output report). `Hid_session` gained `ctrl_max_packet`
+  + `iface_num`.
+- Software auto-repeat: `kbd_tick()` (every keyboard poll) re-emits the
+  last held mapped key — ~500 ms initial delay, ~40 ms interval,
+  modifiers kept fresh.
+- Devlog entry done. Hardware check: hold a key → repeats; Caps toggles
+  case + LED; Caps+Shift = lowercase.
 
 ---
 

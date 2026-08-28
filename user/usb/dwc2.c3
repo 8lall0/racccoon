@@ -1590,6 +1590,27 @@ fn bool usb_hid_set_idle(uint dev_addr, uint max_packet0, uint iface_num, uint d
     return usb_control_transfer(dev_addr, max_packet0, &setup[0], null, 0, true);
 }
 
+// HID class request SET_REPORT (HID 1.11 section 7.2.2), used here only
+// to push the keyboard's LED state (an Output report). bmRequestType
+// 0x21, bRequest 0x09; wValue hi = report type 2 (Output), lo = report
+// ID 0; wIndex = interface; one data byte = the LED bitmap (bit0
+// NumLock, bit1 CapsLock, bit2 ScrollLock).
+fn bool usb_hid_set_report_leds(uint dev_addr, uint max_packet0, uint iface_num, char leds)
+{
+    char[8] setup;
+    setup[0] = (char)0x21;
+    setup[1] = (char)0x09; // SET_REPORT
+    setup[2] = (char)0;    // wValue lo = report ID 0
+    setup[3] = (char)0x02; // wValue hi = report type Output
+    setup[4] = (char)(iface_num & 0xFF);
+    setup[5] = (char)0;
+    setup[6] = (char)1;    // wLength = 1
+    setup[7] = (char)0;
+    char[1] data;
+    data[0] = leds;
+    return usb_control_transfer(dev_addr, max_packet0, &setup[0], &data[0], 1, false);
+}
+
 fn bool usb_get_hub_descriptor(uint dev_addr, uint max_packet0, void* buf, uint len)
 {
     char[8] setup;

@@ -3,7 +3,7 @@ module user;
 // kbd: USB HID boot-protocol keyboard — the "what the 8 report bytes
 // mean" layer for user/usb/usbd.c3, same device/class split as
 // user/usb/xpad.c3 (gamepad) and user/usb/msc.c3 (mass storage). All
-// wire-level work (control/interrupt transfers, the g_hid_* session and
+// wire-level work (control/interrupt transfers, the g_hid session and
 // its cooperative poll) stays in dwc2.c3/usbd.c3.
 //
 // Boot protocol (USB HID 1.11, Appendix B.1): a FIXED 8-byte input
@@ -18,11 +18,14 @@ module user;
 //          report) — the whole report is meaningless, skip it.
 //
 // A key is "held" for as long as its usage ID stays in [2..7]; the
-// press *event* this layer cares about is the transition into that set
-// (diff against the previous report). Releases are not surfaced — a
-// console has no use for them. No hardware auto-repeat: usbd.c3 also
-// issues SET_IDLE(0) ("report only on change"); software repeat is a
-// later stage.
+// press *event* is the transition into that set (diff against the
+// previous report). Releases aren't surfaced — a console has no use for
+// them.
+//
+// SET_IDLE(0) turns off the keyboard's own hardware key-repeat (so a
+// held key produces no new reports at all), so kbd_tick() below does
+// repeat in software: usbd.c3 calls it on every keyboard poll, held-key
+// or not.
 //
 // US QWERTY layout only. Non-US keys produce the US symbol at that
 // scancode — a layout-table swap is future work, not a bug.
@@ -34,6 +37,7 @@ module user;
 const uint KBD_REPORT_LEN = 8;
 const uint KBD_KEY_SLOTS  = 6; // [2..7]
 const uint KBD_USAGE_ERR_ROLLOVER = 0x01;
+const uint KBD_USAGE_CAPS_LOCK    = 0x39;
 
 // Modifier bitmap ([0]) bits.
 const uint KBD_MOD_LSHIFT = 0x02;
@@ -46,13 +50,41 @@ const uint KBD_MOD_RCTRL  = 0x10;
 const char[10] KBD_DIGITS  = "1234567890";
 const char[10] KBD_SYMBOLS = "!@#$%^&*()";
 
+// Output-report LED bitmap (boot keyboard): bit0 NumLock, bit1
+// CapsLock, bit2 ScrollLock. usbd.c3 SET_REPORTs g_kbd_led_state to the
+// keyboard whenever g_kbd_led_dirty is set.
+const char KBD_LED_CAPS = 0x02;
+
+// USB_TIMEBASE_HZ (dwc2.c3) is 25 MHz on the Duo -> 25000 ticks/ms.
+const ulong KBD_REPEAT_DELAY_TICKS    = 500 * (ulong)(USB_TIMEBASE_HZ / 1000); // ~500 ms before repeat starts
+const ulong KBD_REPEAT_INTERVAL_TICKS = 40  * (ulong)(USB_TIMEBASE_HZ / 1000); // ~40 ms between repeats (~25/s)
+
 // Previous report, for press-edge detection. Zeroed by kbd_reset_state()
 // at the start of each session (usbd.c3's keyboard-dispatch branch).
 char[8] g_kbd_prev;
 
+// Caps Lock: a sticky toggle, flipped on each press of usage 0x39.
+// Affects letter case only (XORs with Shift), never digits/symbols.
+bool g_kbd_caps_lock;
+char g_kbd_led_state;   // current LED bitmap
+bool g_kbd_led_dirty;   // usbd.c3 clears this after pushing g_kbd_led_state to the device
+
+// Software auto-repeat: the one held key currently eligible to repeat
+// (0 = none), the modifiers to repeat it with, and when the next repeat
+// is due.
+uint  g_kbd_repeat_usage;
+uint  g_kbd_repeat_mods;
+ulong g_kbd_repeat_at;
+
 fn void kbd_reset_state()
 {
     for (uint i = 0; i < KBD_REPORT_LEN; i++) { g_kbd_prev[i] = (char)0; }
+    g_kbd_caps_lock     = false;
+    g_kbd_led_state     = (char)0;
+    g_kbd_led_dirty     = false; // most keyboards power up with LEDs off; first Caps toggle syncs it
+    g_kbd_repeat_usage  = 0;
+    g_kbd_repeat_mods   = 0;
+    g_kbd_repeat_at     = 0;
 }
 
 // Was `usage` present in the six key slots of `slots` (a pointer at
@@ -86,7 +118,9 @@ fn uint kbd_usage_to_bytes(uint usage, uint mods, char* out)
             out[0] = (char)(0x01 + letter);
             return 1;
         }
-        out[0] = (char)((shift ? 0x41 : 0x61) + letter); // 'A' / 'a'
+        // Caps Lock inverts Shift for letters only.
+        bool upper = shift != g_kbd_caps_lock;
+        out[0] = (char)((upper ? 0x41 : 0x61) + letter); // 'A' / 'a'
         return 1;
     }
 
@@ -141,8 +175,33 @@ fn void kbd_emit(char c)
     }
 }
 
-// One 8-byte boot report from usb_hid_poll(). Emits a keystroke for
-// every key that's newly held vs. the previous report, then stores it.
+fn void kbd_emit_usage(uint usage, uint mods)
+{
+    char[3] bytes @noinit;
+    uint n = kbd_usage_to_bytes(usage, mods, &bytes[0]);
+    for (uint k = 0; k < n; k++) { kbd_emit(bytes[k]); }
+}
+
+// The held key (last non-empty slot that maps to real bytes) that
+// auto-repeat should track — 0 if none. Last-slot heuristic: for the
+// common 1-2 key case it's the most recently pressed, which is the
+// key a user expects to repeat.
+fn uint kbd_repeat_candidate(char* report, uint mods)
+{
+    uint cand = 0;
+    for (uint i = 2; i < KBD_REPORT_LEN; i++)
+    {
+        uint usage = (uint)report[i] & 0xFF;
+        if (usage == 0 || usage == KBD_USAGE_ERR_ROLLOVER) { continue; }
+        char[3] scratch @noinit;
+        if (kbd_usage_to_bytes(usage, mods, &scratch[0]) > 0) { cand = usage; }
+    }
+    return cand;
+}
+
+// One 8-byte boot report from usb_hid_poll_slot(). Emits a keystroke
+// for every key newly held vs. the previous report, toggles Caps Lock,
+// updates the auto-repeat target, then stores the report.
 fn void kbd_handle_report(char* report, uint len)
 {
     if (len < KBD_REPORT_LEN) { return; } // not a boot-protocol report
@@ -159,10 +218,43 @@ fn void kbd_handle_report(char* report, uint len)
         if (usage == 0 || usage == KBD_USAGE_ERR_ROLLOVER) { continue; }
         if (kbd_usage_held(&g_kbd_prev[2], usage)) { continue; } // already down last time
 
-        char[3] bytes @noinit;
-        uint n = kbd_usage_to_bytes(usage, mods, &bytes[0]);
-        for (uint k = 0; k < n; k++) { kbd_emit(bytes[k]); }
+        if (usage == KBD_USAGE_CAPS_LOCK)
+        {
+            g_kbd_caps_lock = !g_kbd_caps_lock;
+            g_kbd_led_state = g_kbd_caps_lock ? KBD_LED_CAPS : (char)0;
+            g_kbd_led_dirty = true;
+            continue;
+        }
+
+        kbd_emit_usage(usage, mods);
+    }
+
+    // Auto-repeat target: whichever mapped key is held now. A change of
+    // target (new key, or the old one released) restarts the initial
+    // delay; the same key held just keeps its modifiers fresh (so
+    // adding/removing Shift mid-hold is honoured).
+    uint cand = kbd_repeat_candidate(report, mods);
+    if (cand != g_kbd_repeat_usage)
+    {
+        g_kbd_repeat_usage = cand;
+        g_kbd_repeat_mods  = mods;
+        if (cand != 0) { g_kbd_repeat_at = rdtime() + KBD_REPEAT_DELAY_TICKS; }
+    }
+    else if (cand != 0)
+    {
+        g_kbd_repeat_mods = mods;
     }
 
     for (uint i = 0; i < KBD_REPORT_LEN; i++) { g_kbd_prev[i] = report[i]; }
+}
+
+// Called on every keyboard poll (usbd.c3), report or not — drives
+// software auto-repeat for a held key.
+fn void kbd_tick()
+{
+    if (g_kbd_repeat_usage == 0) { return; }
+    ulong now = rdtime();
+    if (now < g_kbd_repeat_at) { return; }
+    kbd_emit_usage(g_kbd_repeat_usage, g_kbd_repeat_mods);
+    g_kbd_repeat_at = now + KBD_REPEAT_INTERVAL_TICKS;
 }

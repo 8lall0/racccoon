@@ -72,6 +72,8 @@ struct Hid_session
     ulong interval_ticks;
     ulong next_due;      // rdtime() value the next poll is due at
     uint report_count;
+    uint ctrl_max_packet; // EP0 max packet — keyboard-only, for SET_REPORT (Caps Lock LED)
+    uint iface_num;       // keyboard-only, wIndex for its HID class requests
     bool split_active;
     uint split_hub_addr;
     uint split_hub_port;
@@ -772,6 +774,11 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         // the generic branch below.
         kbd_reset_state();
         usb_hid_begin_session(USB_DOWNSTREAM_ADDR, kbd_ep_addr & 0x0F, kbd_ep_max_packet, kbd_ep_interval, port, true);
+        // Extra bits kbd.c3 needs for its Caps Lock LED SET_REPORT —
+        // not worth widening usb_hid_begin_session's signature for a
+        // keyboard-only detail.
+        g_hid[HID_SLOT_KEYBOARD].ctrl_max_packet = max_packet0;
+        g_hid[HID_SLOT_KEYBOARD].iface_num       = iface_num;
         return;
     }
 
@@ -883,16 +890,27 @@ fn void usb_hid_poll_slot(uint slot)
 
     char[16] report @noinit;
     uint report_len;
-    if (!usb_interrupt_poll(s.dev_addr, s.ep_num, s.max_packet, &s.pid_toggle, &report[0], 16, &report_len))
-    {
-        return;
-    }
+    bool got = usb_interrupt_poll(s.dev_addr, s.ep_num, s.max_packet, &s.pid_toggle, &report[0], 16, &report_len);
 
     if (s.is_keyboard)
     {
-        kbd_handle_report(&report[0], report_len);
+        if (got) { kbd_handle_report(&report[0], report_len); }
+        // kbd_tick() drives software auto-repeat, so it must run every
+        // poll (a held key produces no new reports under SET_IDLE(0)).
+        kbd_tick();
+        // Flush a pending Caps Lock LED change (g_kbd_led_dirty is set
+        // by kbd.c3 on each Caps toggle). The split context is still
+        // this keyboard's (set above), so the control transfer routes
+        // correctly.
+        if (g_kbd_led_dirty)
+        {
+            usb_hid_set_report_leds(s.dev_addr, s.ctrl_max_packet, s.iface_num, g_kbd_led_state);
+            g_kbd_led_dirty = false;
+        }
         return;
     }
+
+    if (!got) { return; }
 
     // Non-keyboard HID (a mouse, or an unknown interrupt-IN device):
     // just dump the raw report, exactly what the old

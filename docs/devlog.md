@@ -4,6 +4,37 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 (continued) — USB keyboard stage 4: Caps Lock + software auto-repeat
+
+Built, not yet hardware-verified — `user/usb/{kbd,dwc2,usbd}.c3`. No
+QEMU path (no DWC2), so "builds" is the pre-hardware bar.
+
+- **Caps Lock**: press of usage `0x39` toggles `g_kbd_caps_lock`;
+  `kbd_usage_to_bytes` XORs it with Shift for letters only (digits /
+  symbols untouched). The LED follows: `kbd.c3` sets `g_kbd_led_dirty`
+  on each toggle, `usb_hid_poll_slot` then SET_REPORTs the 1-byte LED
+  bitmap (`usb_hid_set_report_leds`, new in `dwc2.c3` — `bmRequestType
+  0x21`, `bRequest 0x09`, Output report). `Hid_session` gained
+  `ctrl_max_packet` + `iface_num` (keyboard-only) for that request.
+- **Software auto-repeat**: `SET_IDLE(0)` means a held key sends no new
+  reports, so `kbd_tick()` (called every keyboard poll, report or not)
+  drives it. `kbd_handle_report` picks the repeat target — the last
+  held key that maps to real bytes — restarting a ~500 ms delay when
+  the target changes; `kbd_tick()` then re-emits it every ~40 ms
+  (~25/s). Modifiers stay live: adding Shift mid-hold makes the repeat
+  switch to the uppercase byte. Ticks derived from `USB_TIMEBASE_HZ`
+  (25 MHz).
+
+`usb_hid_poll_slot` restructured so the keyboard branch runs
+`kbd_tick()` + the LED flush on every poll including a NAK (the mouse /
+generic branch still early-returns on NAK).
+
+**To verify on hardware:** hold a key → it repeats after a moment; Caps
+Lock toggles letter case and lights its LED; Shift still works;
+Caps+Shift = lowercase.
+
+---
+
 ## 2026-08-28 (continued) — USB keyboard stage 3: keystrokes reach the shell
 
 Committed stages 1-2 on branch `usb-keyboard` (bfccd6f) first, then
