@@ -308,13 +308,15 @@ Generation counters back most of the stale-reference handling:
      `ipc_wait_generation` / `ipc_peer_died` track the wait. Covers:
      send to a server that dies before consuming the request, reply to
      a client that died. `ipcdeathtest` in `shell_test.c3`.
-   - **1b — reply-wait hang.** A client blocked in `ipc_recv` *waiting
-     for a reply* from a server that crashes after receiving the
-     request is still stuck — `ipc_recv` isn't peer-specific so the
-     sweep doesn't reach it. Fix: a single `ipc_call` syscall that owns
-     the whole send → recv-reply round-trip in the kernel and aborts
-     cleanly if the target dies at any point (also retires `p9_call`'s
-     `P9_STRAY` bounce dance). Touches every 9P client wrapper.
+   - **1b — reply-wait hang. DONE** (commit `6879b89`). `SYS_IPC_CALL`
+     owns the whole send → wait-consume → wait-reply round-trip in the
+     kernel; `ipc_peer_gone()` is checked in all three phases so it
+     returns −1 if the target dies at any point.
+     `Process.in_call_reply_wait` reserves the caller's inbox for the
+     target's reply — a stray `ipc_send` from a third party waits in
+     its phase-A loop, so `p9_call`'s `P9_STRAY` bounce is gone and
+     `p9_call` is a 5-line shim. `exec()`'s `notify_pid` is no longer
+     load-bearing for correctness.
 2. **A supervisor. DONE (first pass)** — commit `7b5b97c`.
    `src/supervisor.c3`: a `Service` table registered from `kernel_main`,
    `supervisor_tick()` from the timer trap (~1/s) respawns any exited

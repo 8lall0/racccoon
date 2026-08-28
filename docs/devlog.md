@@ -4,6 +4,46 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-29 (continued) — resiliency: SYS_IPC_CALL, the client RPC round-trip as one syscall
+
+Roadmap §5.1b — closes the last "hang forever" IPC path and retires
+`p9_call`'s `P9_STRAY` bounce.
+
+A client's request+reply used to be three user-space steps: `ipc_send`,
+then an `ipc_recv` loop that bounced any non-reply sender back as
+`P9_STRAY`. Problems: a server that crashed *after* consuming the
+request left the client stuck in `ipc_recv` (the §5.1a fix only reached
+the send rendezvous), and the bounce could starve the real reply if the
+server's own round-trip ran long (`exec`'s `runtest`, historically).
+
+**`SYS_IPC_CALL`** (`6879b89`) does the whole thing in the kernel:
+- `Process.in_call_reply_wait` reserves the caller's inbox for the
+  target's reply for the call's whole duration. `ipc_inbox_available()`
+  makes a stray `ipc_send`/`ipc_reply` from a third party wait in its
+  phase-A loop instead of landing — nothing to mistake for the reply,
+  no bounce.
+- `ipc_peer_gone()` checked in all three phases (deliver / wait-consume
+  / wait-reply) → returns −1 if the target dies at any point.
+- in-place buffer: `a4` packs `(req_len<<16)|buf_cap`, `a5` = optional
+  reply-verb out. `p9_call` is now a 5-line shim (copies
+  `data`→`reply_buf` only for `p9_read`, the one caller with separate
+  buffers).
+
+`exec()`'s `notify_pid` is no longer load-bearing for correctness — the
+reservation closes the too-early-message race at the source. Kept for
+ordering.
+
+**Verified QEMU:** full p9 / ipc / fs / exec regression green —
+`p9fstest` / `p9fswritetest` / `p9mkdirtest` / `p9realtest` / `srvtest`
+/ `nstest` / `mounttest` / `hotplugtest` / **`runtest` + `runtest2`**
+(the exec-does-`p9_call`-while-pinged case `P9_STRAY` existed for) /
+`argvtest` / `bigreadtest` / `fsdkilltest` / `ipcdeathtest` /
+`killtest` / `threadjointest` / `mutextest` / `racetest` / `envtest` /
+`hardentest` / `sandboxtest`. Real Duo: clean boot, `ls` + `cat` +
+exec.
+
+---
+
 ## 2026-08-29 (continued) — resiliency: boot-server supervisor
 
 `docs/roadmap.md` §5.2. A crashed server used to stay dead — the kernel
