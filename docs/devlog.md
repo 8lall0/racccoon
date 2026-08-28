@@ -4,6 +4,55 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-29 — session summary: xpad STALL fixed, then a long cleanup pass
+
+One session (spanning 2026-08-28 into the 29th). Started on a reported
+bug, then turned into structural cleanup once that was closed. Per-topic
+entries below; the arc:
+
+1. **xpad SETUP STALL** (`581954e`) — the 8BitDo pad had stopped
+   enumerating (`GET_DESCRIPTOR(18)` → `HCINT=0x0a` STALL) ever since
+   interrupt-driven USB landed. Two wrong turns first (strong-order MMIO
+   on the DWC2 regs; a `USBD_VERBOSE` build that "fixed" it purely
+   through print latency), then the real cause: `hc_transfer_once_split`
+   issued the non-periodic complete-split in the *same microframe* as
+   the start-split. Fine while `hc_wait_chhltd` `yield()`-polled; the
+   interrupt-driven wait tight-spins. Fix: a 150µs gap. The pad's
+   interrupt-IN is still silent — that's the separate, long-standing
+   8BitDo-specific issue.
+
+2. **Irq_route table** (`f2f7270`) — `handle_trap`'s three hand-written
+   per-device IRQ branches + the pid-switch in `SYS_DRIVER_IRQ_ARM`
+   collapsed to one `{irq,pid,level}` lookup. Five write-only `*_pid`
+   globals deleted; ethd's route pre-registered so interrupt-driven RX
+   is now an arm-the-source change, no kernel routing edit.
+
+3. **Shared user helpers** (`55de499`) — `mmio_read32`/`write32`,
+   `print_hex8`/`32`, `panic()` had byte-identical copies in 5–6 driver
+   files each; hoisted into `user/user.c3`. −150 lines.
+
+4. **`handle_syscall` split, 1700 → 340 lines**
+   (`79e0e68` / `5c9525d` / `23bd80a`) — every case ≥40 lines
+   (`SYS_EXEC` 416, `SYS_RFORK`, `SYS_KILL`, `SYS_EXIT`, + 11 medium)
+   extracted to `sys_*(f)` functions; the switch is now a dispatch
+   table. This had been blocked for a year by an undiagnosed c3c 0.8.2
+   codegen bug (factoring a function out of that switch reboot-looped
+   the kernel from the first syscall, hit 3×). **Probed on 0.8.3 with
+   `SYS_KILL` — the bug is gone.** Verified the whole way on QEMU
+   (`launch64_dual`) + real Duo.
+
+5. **`hardentest` fixed** (`20d88ab`) — a rotted test, not a kernel
+   bug: it called `syscall(31)` as its "unrecognized number", but 31 is
+   `SYS_KBD_PUSH` now. `p9fstest`/`mounttest` "failures" were just the
+   wrong disk image (FAT32-only vs `disk_dual`).
+
+**Deferred:** timebase dedup (5 identical `*_TIMEBASE_HZ` Duo consts) —
+the clean fix is a `timebase_info()` syscall but `kbd.c3` bakes the
+value into a compile-time `const`; poor ratio. Interrupt-driven
+ethernet RX still waits on a test peer.
+
+---
+
 ## 2026-08-28 (continued) — entry: the handle_syscall extraction landmine is gone on c3c 0.8.3
 
 `handle_syscall` was a 1700-line function; its biggest cases (`SYS_EXEC`
