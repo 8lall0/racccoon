@@ -155,12 +155,17 @@ a split-context leak the same session (`usb_set_split_context(false,…)`
 now asserted before every hub-directed transfer — was causing a
 GET_PORT_STATUS STALL right after keyboard enum). See devlog.
 
-### Stage 3 — kernel keystroke queue, real shell input
+### Stage 3 — kernel keystroke queue, real shell input — **DONE, QEMU-verified; Duo check pending**
 Add `SYS_KBD_PUSH` + the ring buffer + the `SYS_GETCHAR` drain. usbd
 pushes instead of printing.
 **Verify (Duo):** at the `>` prompt, type `ls` on the USB keyboard, press
 Enter — it runs. Backspace edits the line. Ctrl-C interrupts. Serial
 console still works at the same time (type half a command on each).
+
+Done (devlog 2026-08-28): `src/kbd.c3` ring buffer, `SYS_KBD_PUSH` (=31),
+`SYS_GETCHAR` drains the queue then the serial console, `kbd_emit()`
+pushes. `kbdpush` shell_test builtin. QEMU: pushed bytes appear at the
+next prompt untyped. Real-Duo typing-at-the-prompt check still pending.
 
 ### Stage 4 — polish
 - Caps Lock: track state from the keyboard's Caps usage (`0x39`), XOR

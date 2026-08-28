@@ -127,23 +127,17 @@ fn uint kbd_usage_to_bytes(uint usage, uint mods, char* out)
     }
 }
 
-// Stage 2: a decoded keystroke just gets printed to the serial console
-// as a diagnostic. Stage 3 replaces this body with the kernel
-// keystroke-queue push (SYS_KBD_PUSH) that actually feeds the shell.
+// A decoded keystroke byte goes into the kernel keystroke queue
+// (SYS_KBD_PUSH, src/kbd.c3), which SYS_GETCHAR drains alongside the
+// serial console — so it reaches the shell exactly as a typed serial
+// byte would, and the shell's own echo puts it on screen. A full queue
+// (only under an extreme backlog) drops the byte; log that, since a
+// silently-swallowed keystroke is otherwise a mystery.
 fn void kbd_emit(char c)
 {
-    uint b = (uint)c & 0xFF;
-    if (b >= 0x20 && b <= 0x7E)
+    if (syscall(SYS_KBD_PUSH, (long)((uint)c & 0xFF), 0, 0) != 0)
     {
-        print("usbd: kbd: '");
-        putchar(c);
-        print("'\n");
-    }
-    else
-    {
-        print("usbd: kbd: <0x");
-        print_hex8(b);
-        print(">\n");
+        print("usbd: kbd: keystroke queue full, byte dropped\n");
     }
 }
 

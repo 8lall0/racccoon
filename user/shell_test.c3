@@ -2029,6 +2029,21 @@ fn void main() {
                 putchar((char)('0' + race_ok_b));
                 print(" (1=correct reply, 0=corrupted or lost)\n");
             }
+        } else if (strcmp(cmd, "kbdpush") == 0) {
+            // Stage-3 smoke test for the kernel keystroke queue
+            // (src/kbd.c3): push a few bytes through SYS_KBD_PUSH and
+            // watch them turn up at the next prompt exactly as if typed.
+            // No USB needed — this is the QEMU-side proof of the
+            // SYS_KBD_PUSH -> SYS_GETCHAR path that user/usb/kbd.c3
+            // feeds on real hardware.
+            char* kbdpush_str = "kbd-queue-works";
+            int kbdpush_n = 0;
+            for (int k = 0; kbdpush_str[k] != 0; k++) {
+                if (syscall(SYS_KBD_PUSH, (long)kbdpush_str[k], 0, 0) == 0) { kbdpush_n++; }
+            }
+            print("kbdpush: queued ");
+            print_uint((uint)kbdpush_n);
+            print(" bytes — they should appear on the next prompt line\n");
         } else if (strcmp(cmd, "mutextest") == 0) {
             mutex_test_counter = 0;
             mutex_test_lock.locked.store(0);

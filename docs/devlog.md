@@ -4,6 +4,40 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 (continued) — USB keyboard stage 3: keystrokes reach the shell
+
+Committed stages 1-2 on branch `usb-keyboard` (bfccd6f) first, then
+stage 3.
+
+The last gap: `kbd_emit()` only printed decoded keys to serial — they
+never reached `getchar()`. Now there's a kernel keystroke queue.
+
+- **`src/kbd.c3`** (new, `module kernel`): a 64-byte ring buffer,
+  `kbd_queue_push()` / `kbd_queue_pop()`. Single producer (usbd),
+  single consumer (the shell) — no locking needed on a single-hart
+  cooperative kernel where a syscall runs to completion. A full queue
+  drops the newest byte.
+- **`SYS_KBD_PUSH` (= 31)** in `src/entry.c3` / `user/user.c3`: a0 = one
+  byte, appended to the queue. Not pid-gated (same as the `*_INFO`
+  syscalls — a byte in the input stream is low-stakes, usbd is the only
+  caller).
+- **`SYS_GETCHAR`** now drains the keystroke queue first, then falls
+  back to `board::console_getchar()`. The shell and every other
+  `getchar()` caller are untouched — a USB-keyboard byte and a
+  serial byte are indistinguishable, and both stay live at once.
+- **`user/usb/kbd.c3`**: `kbd_emit()` now `syscall(SYS_KBD_PUSH, …)`
+  instead of printing; logs only on a full-queue drop.
+- **`user/shell_test.c3`**: `kbdpush` builtin — pushes
+  `"kbd-queue-works"` through `SYS_KBD_PUSH` so the QEMU test shell can
+  prove the queue → `getchar` → shell path with no USB hardware.
+
+Verified in QEMU: `> kbdpush` → `kbdpush: queued 15 bytes` →
+`> kbd-queue-works` appears on the next prompt line untyped →
+`kbd-queue-works: command not found`. The kernel path works; real-Duo
+check is a keyboard typing at the `>` prompt.
+
+---
+
 ## 2026-08-28 (continued) — USB keyboard stage 2: boot-report decode — WORKING ON REAL HARDWARE
 
 **Confirmed on the real Milk-V Duo** (low-speed keyboard vid=0x1a2c

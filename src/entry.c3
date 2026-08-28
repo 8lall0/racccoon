@@ -79,6 +79,7 @@ const SYS_YIELD         = 27; // voluntarily gives up the rest of this process's
 const SYS_USBD_INFO     = 28; // usbd-only: returns its DMA buffer's physical address — same shape/reasoning as SYS_DISKD_INFO above
 const SYS_NETD_INFO     = 29; // netd-only: returns its RX/TX virtqueue physical addresses, plus (Ethernet Phase 2) its packet-buffer page — see its case below
 const SYS_ETHD_INFO     = 30; // ethd-only: returns its DMA region's physical address (Ethernet Phase 2) — same shape/reasoning as SYS_USBD_INFO above
+const SYS_KBD_PUSH      = 31; // usbd-only in practice: pushes one decoded USB-keyboard byte into the kernel keystroke queue SYS_GETCHAR drains (src/kbd.c3) — see its case below
 
 // Generous cap on the image SYS_EXEC will install — real racccoon
 // binaries (build/user/*.bin) run 70-105KB; this leaves real headroom
@@ -438,7 +439,11 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			blocking_depth++;
 			for (;;)
 			{
-				int ch = board::console_getchar();
+				// USB keyboard first (src/kbd.c3, fed by usbd through
+				// SYS_KBD_PUSH), then the serial console — a caller can't
+				// tell which a byte came from, and both stay live at once.
+				int ch = kbd_queue_pop();
+				if (ch < 0) { ch = board::console_getchar(); }
 				if (ch >= 0)
 				{
 					f.a0 = (ulong)ch;
@@ -1627,6 +1632,22 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				break;
 			}
 			*ethd_dma_out = ethd_dma_paddr;
+		case SYS_KBD_PUSH:
+			// usbd-only in practice (user/usb/kbd.c3's kbd_emit): one
+			// decoded keyboard byte in a0, appended to the kernel
+			// keystroke queue SYS_GETCHAR drains (src/kbd.c3). Returns 0,
+			// or -1 if the queue was full (byte dropped). Not pid-gated,
+			// same as every other "*_INFO" syscall here — a byte in the
+			// input stream is low-stakes, and usbd is the only thing that
+			// ever calls this.
+			if (kbd_queue_push((char)(f.a0 & 0xFF)))
+			{
+				f.a0 = 0;
+			}
+			else
+			{
+				f.a0 = (ulong)(-1);
+			}
 		case SYS_PARENT_INFO:
 			// Read-only, no permission check — same reasoning as
 			// SYS_PROC_INFO above. Returns the given pid's parent_pid
