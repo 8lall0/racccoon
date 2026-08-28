@@ -4,6 +4,47 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 (continued) — interrupt-driven USB: investigated, planned, deferred
+
+Autonomous session ("go full auto on #3" — moving USB off transfer-
+completion polling onto the DWC2 core interrupt). Outcome: full
+implementation plan in `docs/usb-interrupt-plan.md`, no code.
+
+What the investigation turned up:
+
+- **CV1800B USB IRQ = 30** (level-high, plic0), from duo-buildroot-sdk
+  `cv180x_base_riscv.dtsi`. IRQ 30 < 32 → first PLIC enable word (the
+  simple case; `IRQ_SDHCI` 36 needs the second word).
+- The racccoon "interrupt-driven" pattern is **user-mode-poll for a
+  synthetic notify**, not park-and-wake: `handle_trap` posts
+  `DISKD_IRQ_NOTIFY` into the driver's inbox and marks it runnable; the
+  driver spins on `ipc_poll_type` (diskd/sdd template). A blocking
+  `ipc_recv` mid-trap corrupts the trap frame (sscratch/SIE have no
+  per-process save) — confirmed empirically per `SYS_IPC_POLL`'s
+  comment.
+- So the benefit vs. today is **modest**: `hc_wait_chhltd()` already
+  `yield()`s between `HCINT` reads. The wins are less AHB traffic, less
+  scheduler churn with several idle HID devices polling, and the idle
+  `wfi` actually parking. Polish, not a correctness fix.
+- **Blocker: the Duo PLIC path is unproven.** `PLIC_BASE`/context
+  formulas are UNVERIFIED (carried from QEMU), and `plic_init()` has a
+  live isolation experiment — the `IRQ_SDHCI` enable-bit write is
+  commented out over an unsolved interrupt storm whose own comment says
+  "the PLIC enable bit itself" is still a suspect. sdd runs polled PIO
+  because of this. Interrupt-driven USB rides the same untrusted path.
+- No QEMU DWC2 (`HAS_USB` is Duo-only), so nothing is verifiable
+  without hardware — and the change touches `handle_trap` + `plic_init`,
+  exactly the files the "verify on hardware, confirm before commit"
+  rule protects.
+
+Stopped at planning by design. The plan is fully specified (5 stages,
+all flag-gated behind `INTERRUPT_DRIVEN_USB` / `USBD_INTERRUPT_DRIVEN`,
+defaulting off) — a short session once the SDHCI PLIC storm is solved
+and that path is trusted. Recommend doing the storm + the ethernet
+real-hardware carrier work first; both are higher value.
+
+---
+
 ## 2026-08-28 (continued) — xpad input: the Linux capture didn't unlock it either; all reverted
 
 Got a `usbmon` capture of the 8BitDo SN30 Pro (X-input mode, clones
