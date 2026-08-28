@@ -62,6 +62,40 @@ side-effect-free registers — but it is NOT what fixed the STALL
 (verbose-off + weak-NC still STALLed), so it's left for a separate
 change if ever wanted.
 
+### Session arc (the dead-ends, so a future session doesn't re-walk them)
+
+1. **Timeline analysis first.** The devlog's own earlier entries proved
+   the pad enumerated + took EP0 vendor requests + drove rumble before
+   `aa86a49` and STALLed `GET_DESC(18)` after — so a regression in that
+   commit, which bundled *two* changes: strong-order MMIO and
+   interrupt-driven USB.
+2. **Wrong hypothesis: strong-order MMIO.** Reasoned that SO's
+   per-access round-trip cost slowed split-channel arming enough to
+   race the TT. Two flashes chasing it:
+   - `map_dma_page` (weak-NC) for the USB DMA buffer only → no change,
+     still STALL. (Correctly predicted neutral — kept as a candidate
+     cleanup, later dropped.)
+   - weak-NC for the DWC2 register pages too, **with `USBD_VERBOSE=on`**
+     → pad enumerated. Looked like the fix.
+3. **The verbose build was lying.** Verbose-off with the same weak-NC
+   mapping → STALL again. The variable was `USBD_VERBOSE`, not the
+   mapping: each control transfer prints a ~2.6ms UART line right before
+   its SETUP stage, and port 4 emitted no `np-split` lines (counter
+   already spent on the keyboard), so that pre-SETUP print was the only
+   added delay.
+4. **Right hypothesis: CSPLIT timing.** The pre-SETUP delay pointed at
+   the interrupt-driven `hc_wait_chhltd` (tight-spin vs the old
+   `yield()`) firing the non-periodic complete-split in the
+   start-split's own microframe. Added a 150µs gap + bumped
+   `addr_settle` 10→50ms in one flash → worked.
+5. **Bisected to the minimum.** `addr_settle` back to 10ms, keep only
+   the 150µs gap → still works. Dropped the weak-NC mapping (not the
+   cause) and the `addr_settle` bump. Committed just the gap.
+
+Lesson: `USBD_VERBOSE` changes timing enough to mask/unmask timing bugs
+— A/B with it fixed in one state, and prefer the `g_split_*_diag_count`
+counters (bounded, cheap) over blanket verbose for split work.
+
 ---
 
 ## 2026-08-28 (continued) — sdd: SDMA + interrupt-driven completion
