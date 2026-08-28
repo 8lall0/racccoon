@@ -42,9 +42,26 @@ teardown + `yield()`) and `sys_rfork(f)`. `handle_syscall`: 1700 →
 discriminated by its preceding line. `handle_syscall`: **1700 → 952
 lines**. QEMU `argvtest` ok + the usual set; Duo clean boot, ls/cat.
 
-That's all four big cases. The medium ones (`IPC_SEND` 71,
-`IPC_RECV_GEN` 64, `NS_MOUNT_WAIT` 75, `NS_RESOLVE` 61, `SRV_POST` 56)
-are optional polish, not tracked.
+**The 11 medium cases too** (commit `23bd80a`): `sys_ipc_send` /
+`_reply` / `_recv` / `_recv_gen` / `_poll` / `sys_ns_resolve` /
+`sys_join` / `sys_futex_wait` / `sys_proc_info` / `sys_srv_post` /
+`sys_ns_mount_wait`. **`handle_syscall`: 340 lines** — a dispatch table.
+Total for the run: **1700 → 340**.
+
+Break classification for this batch used a nesting-aware pass (a
+loop/switch stack, `//` comments stripped) instead of the
+preceding-line heuristic — the first crude version misclassified the
+`for`-loop breaks in `sys_join` / `sys_srv_post` / `sys_ns_mount_wait`
+/ `sys_futex_wait` as switch-level. The corrected pass agreed with
+every loop break in the already-extracted `sys_kill`/`sys_rfork`/
+`sys_exec`. A clean compile then rules out the *other* direction (a
+switch-break wrongly kept → "break outside loop").
+
+Verified QEMU: `srvtest` / `nstest` / `threadjointest` (99) /
+`mutextest` (16/16) / `racetest` (a=1 b=1) / `argvtest` / `killtest` /
+`runtest` / `envtest` / `sandboxtest`. Real Duo: clean boot, `ls` +
+`cat`. `p9fstest` / `mounttest` / `hardentest` fail — identically on
+pre-change `38d619a`, so pre-existing (unrelated).
 
 ---
 
