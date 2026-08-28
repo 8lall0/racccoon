@@ -41,7 +41,11 @@ source 36, the next transfer re-arms it. No storm in any ordering
 (confirmed: the card's SDHCI IRQ line drops when sdd clears
 `SD_INT_STATUS`, before or after `handle_trap` runs).
 
-Not done: interrupt-driven ethernet RX (same pattern, `IRQ_ETH` = 31).
+Not done, deferred: interrupt-driven ethernet RX (same pattern,
+`IRQ_ETH` = 31) — needs a live link + a peer to test against, which
+isn't available right now. The strong-order fix and the `handle_trap`
+disable-on-fire path already cover it; it's a short conversion when the
+test rig is back.
 
 ---
 
