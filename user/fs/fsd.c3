@@ -93,7 +93,10 @@ const uint SECTOR_SIZE   = 512;
 // mechanism usbrw.c3 already uses (usbd's own pid isn't fixed either).
 // diskd_rw() below is otherwise unchanged — it always just targets
 // whatever this holds, boot-time-fixed 3 or a dynamically resolved pid.
-int g_diskd_pid = 3;
+// Boot fsd/fsd2 overwrite this from SYS_FS_PARTITION_INFO's storage-pid
+// out-param in fs_mount(); the dynamic USB instance sets it from a
+// name resolution. The initial value is just a harmless placeholder.
+int g_diskd_pid = 0;
 
 // board::FS_PARTITION_START_SECTOR, learned via syscall — board is a
 // kernel-only module (see user/sdd.c3's own header comment for why),
@@ -450,9 +453,18 @@ fn void fs_reserve_protection_summary()
 fn void fs_mount(bool dynamic_mode, char* dynamic_self_name)
 {
 	bool is_secondary = false;
-	if (!dynamic_mode && fs_partition_info(&fs_partition_start, &is_secondary) < 0)
+	if (!dynamic_mode)
 	{
-		panic("fsd: ", "failed to get partition info");
+		int resolved_storage = 0;
+		if (fs_partition_info(&fs_partition_start, &is_secondary, &resolved_storage) < 0)
+		{
+			panic("fsd: ", "failed to get partition info");
+		}
+		// Boot fsd/fsd2 target whichever pid the kernel spawned the
+		// block driver at — no longer a hardcoded 3. (The dynamic USB
+		// instance resolves its own backend by name instead — see
+		// g_diskd_pid's comment and the srv_post path below.)
+		if (resolved_storage > 0) { g_diskd_pid = resolved_storage; }
 	}
 
 	// ext2 first: its magic is a specific 16-bit value at a fixed byte

@@ -2172,20 +2172,28 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// constant can't answer this the same way for both.
 			uint* fs_partition_out = (uint*)(uptr)f.a0;
 			bool* fs_is_secondary_out = (bool*)(uptr)f.a1;
+			int*  fs_storage_pid_out = (int*)(uptr)f.a2;
 			if (!user_range_valid(current_proc.page_table, (uptr)fs_partition_out, 4, true)
-				|| (fs_is_secondary_out != null && !user_range_valid(current_proc.page_table, (uptr)fs_is_secondary_out, 1, true)))
+				|| (fs_is_secondary_out != null && !user_range_valid(current_proc.page_table, (uptr)fs_is_secondary_out, 1, true))
+				|| (fs_storage_pid_out != null && !user_range_valid(current_proc.page_table, (uptr)fs_storage_pid_out, 4, true)))
 			{
 				f.a0 = (ulong)(-1);
 				break;
 			}
 			*fs_partition_out = current_proc.fs_partition_start;
-			// a1 is a second, optional out-pointer (same "null means
-			// the caller doesn't care" convention SYS_NS_RESOLVE/
-			// SYS_RFORK already use) — see is_secondary_fs's own
-			// comment (process.c3) for why fsd.c3 needs this at all.
+			// a1/a2 are optional out-pointers (same "null means the
+			// caller doesn't care" convention SYS_NS_RESOLVE/SYS_RFORK
+			// use). a1 -> is_secondary_fs (see its comment, process.c3).
+			// a2 -> storage_pid: which pid runs the block-storage driver
+			// (diskd/sdd), so fsd doesn't hardcode it. 0 = no block
+			// device on this board.
 			if (fs_is_secondary_out != null)
 			{
 				*fs_is_secondary_out = current_proc.is_secondary_fs;
+			}
+			if (fs_storage_pid_out != null)
+			{
+				*fs_storage_pid_out = storage_pid;
 			}
 		case SYS_RFORK:
 			sys_rfork(f);

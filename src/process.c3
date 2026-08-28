@@ -185,6 +185,19 @@ fn Irq_route* irq_route_by_pid(int pid)
 // not a hardcoded pid — see the "" catch-all mount below.
 int fsd_pid = 0;
 
+// The IPC test/demo server (user/echod.c3) — spawned first of all, so it
+// used to be guaranteed pid 2 and the default namespace hardcoded that.
+// Captured here now (kernel.c3 sets it) and read into namespace[0] like
+// every other server, so echod can move slots / be respawned by the
+// supervisor without anything breaking.
+int echod_pid = 0;
+
+// The block-storage driver (diskd on QEMU, sdd on the Duo — mutually
+// exclusive). fsd's only client; fsd used to hardcode its pid as 3.
+// Handed to fsd via SYS_FS_PARTITION_INFO now (kernel.c3 sets it at
+// spawn). 0 on a board with no block device.
+int storage_pid = 0;
+
 // A second, simultaneously-mounted fsd instance (see kernel.c3's own
 // spawn code, gated on board::HAS_SECOND_FS_PARTITION) — reachable under
 // the "/2/" prefix instead of fsd_pid's "" catch-all. Exactly two static
@@ -854,8 +867,8 @@ fn Process* create_process(void* image, uint image_size)
 	// own convention below, so a future "/srv/echo2" can't accidentally
 	// prefix-match too.
 	str_copy(&proc.namespace[0].prefix[0], "/srv/echo/", NS_PREFIX_MAX);
-	proc.namespace[0].server_pid = 2;
-	proc.namespace[0].server_generation = mount_generation(2);
+	proc.namespace[0].server_pid = echod_pid;
+	proc.namespace[0].server_generation = mount_generation(echod_pid);
 
 	// "" is a catch-all — str_starts_with treats an empty prefix as
 	// matching everything, and its zero length always loses a longest-

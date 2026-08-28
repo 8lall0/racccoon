@@ -110,7 +110,10 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	// pid 2 — user/shell.c3's "ping" command hardcodes that. Good enough
 	// for proving IPC works; a real name -> pid lookup is namespace work,
 	// not part of this first slice.
-	create_process((void*)&_binary_echod_bin_start, (uint)((uptr)&_binary_echod_bin_end - (uptr)&_binary_echod_bin_start));
+	Process* echod_proc = create_process((void*)&_binary_echod_bin_start, (uint)((uptr)&_binary_echod_bin_end - (uptr)&_binary_echod_bin_start));
+	echod_pid = echod_proc.pid;
+	supervisor_register("echod", (char*)&_binary_echod_bin_start, (char*)&_binary_echod_bin_end,
+		false, 0, false, &echod_pid, echod_proc);
 	io::print("Idle process started\n");
 
 	// diskd/fsd (see user/diskd.c3 and user/fsd.c3, microkernel plan
@@ -135,12 +138,14 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		{
 			Process* sdd_proc = create_process((void*)&_binary_sdd_bin_start, (uint)((uptr)&_binary_sdd_bin_end - (uptr)&_binary_sdd_bin_start));
 			setup_sdd_mappings(sdd_proc);
+			storage_pid = sdd_proc.pid;
 			io::print("sdd created\n");
 		}
 		else if (board::HAS_VIRTIO_BLOCK)
 		{
 			Process* diskd_proc = create_process((void*)&_binary_diskd_bin_start, (uint)((uptr)&_binary_diskd_bin_end - (uptr)&_binary_diskd_bin_start));
 			setup_diskd_mappings(diskd_proc);
+			storage_pid = diskd_proc.pid;
 			io::print("diskd created\n");
 		}
 
