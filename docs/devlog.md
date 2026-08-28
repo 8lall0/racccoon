@@ -4,13 +4,82 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 (continued) — PLIC storm SOLVED (root cause): missing M-mode `writel(1, 0x701FFFFC)`
+
+Confirmed, from an independent working port. The
+`community.milkv.io/t/cv1800b-baremetal/2445` thread led to
+**`StealthBadger747/xv6-riscv`** — a working xv6 port to the Milk-V Duo.
+Its `kernel/board/milkv-duo/entry.S` does, in its **M-mode** `_entry`:
+
+```asm
+        # Set up mxstatus for T-Head
+        li t0, 0xc0638000
+        csrw CSR_MXSTATUS, t0          # CSR 0xbe9
+
+        # Enable PLIC
+        li t0, PLIC_BASE
+        addi t0, t0, 0x1FFFFC          # 0x701FFFFC
+        li t1, 1
+        sw t1, 0(t0)                   # T-HEAD C900 PLIC: enable S-mode access
+```
+
+And its `config.h` PLIC addresses match racccoon's **exactly**:
+`PLIC_SENABLE(0)=0x70002080`, `PLIC_SPRIORITY/threshold(0)=0x70201000`,
+`PLIC_SCLAIM(0)=0x70201004`. So racccoon's PLIC register math was
+right all along (as the 2026-08-17 entry concluded).
+
+**The storm is 100% the missing delegate write.** The T-HEAD C900 PLIC
+gates S-mode access to the per-context enable/threshold/claim registers
+behind bit 0 of the control register at `PLIC_BASE + 0x1FFFFC`. Out of
+reset it's 0 → S-mode enable writes half-take / claim reads return 0,
+but the interrupt still reaches S-mode → permanent storm,
+`claim()==0`. Exactly racccoon's signature.
+
+**It must be written from M-mode.** racccoon (S-mode, under OpenSBI)
+tried it directly earlier this session and hard-hung the CV1800B — the
+SoC faults/hangs on an S-mode access to that address. xv6-duo gets away
+with it because it **replaces OpenSBI** and runs `_entry` in M-mode
+(also writes the T-HEAD `mxstatus` CSR 0xbe9 = `0xc0638000` there,
+M-mode-only). Same as the "CV1800B PLIC exception" thread
+(`community.milkv.io/t/cv1800b-plic-exception/3295`): its fix was
+"removed OpenSBI, let the 2nd-stage bootloader boot my program
+directly."
+
+The Duo's stock **Milk-V OpenSBI v0.9** does not do this write (no
+`thead,reset-sample` / `plic-delegate` FDT node — grep across the whole
+SDK: only the T-HEAD `light_mpw`/`ice` reference boards have one), and
+neither does its Linux DTS. So on this board nobody ever sets it — which
+is why the 2026-08-17 investigation, reading DT + OpenSBI + Linux
+driver, found "no hidden extra init step": there genuinely isn't one in
+*this board's* software, but there should be.
+
+**The fix (not yet done — a boot-chain change):**
+- `opensbi/lib/utils/irqchip/plic.c` already has `fdt_reset_thead.c`
+  compiled in; it does `writel(BIT(0), <plic-delegate addr>)` gated on a
+  `thead,reset-sample` FDT node with a `plic-delegate` prop. Either
+  add that node to the FDT OpenSBI parses, **or** just add an
+  unconditional `writel(1, PLIC_BASE + 0x1FFFFC)` to
+  `plic_cold_irqchip_init()` (~1 line, runs once from M-mode).
+- Then rebuild OpenSBI and repack `fip.bin` with the new MONITOR
+  section (`fiptool.py genfip --MONITOR opensbi.bin ...`).
+  `scripts/reflash_duo.sh` currently reuses the on-card OpenSBI via
+  `--OLD_FIP` and would need extending, **or** a one-off manual repack.
+- After that: re-arm `IRQ_SDHCI` in `plic_init()`, verify no storm,
+  then interrupt-driven sdd / USB (`docs/usb-interrupt-plan.md`) all
+  become reachable.
+
+This turns "deferred forever, needs a logic analyzer" into "needs a
+one-line OpenSBI patch + a fip repack." Big.
+
+---
+
 ## 2026-08-28 (continued) — PLIC storm: T-HEAD S-mode delegate-bit theory — tried, hung, dead end from S-mode
 
 The 2026-08-17 investigation closed the SDHCI PLIC storm as "undocumented
 silicon erratum." Re-opened it. Found a concrete, previously-missed
 init step.
 
-**The lead.** The CV1800B's PLIC is a T-HEAD **`thead,c900-plic`** (same
+**The lead.** The [CV1800B](https://community.milkv.io/t/cv1800b-baremetal/2445/3)'s PLIC is a T-HEAD **`thead,c900-plic`** (same
 C906 core as the Allwinner D1). The T-HEAD variant gates S-mode access
 to the per-context enable / threshold / claim registers behind **bit 0
 of a control register at PLIC offset `0x1FFFFC`** (`0x701FFFFC` here),

@@ -79,10 +79,14 @@ cannot be verified on hardware until then**, and there is no QEMU DWC2
 (`board::HAS_USB` is Duo-only) so there is no QEMU leg either.
 
 Recommended: solve the SDHCI PLIC storm first (it already has a driver
-and a test rig). USB then reuses the now-trusted path. If USB IRQ 30
-happens to behave when SDHCI 36 doesn't, that is itself a strong clue
-for the storm investigation (30 is in the first enable word, 36 in the
-second — see §3).
+and a test rig). USB then reuses the now-trusted path.
+
+**Update 2026-08-28 — the storm is root-caused** (see
+`docs/devlog.md` and memory `racccoon-plic-storm`): it is the missing
+T-HEAD C900 PLIC M-mode delegate write `writel(1, 0x701FFFFC)`, which
+the Duo's stock OpenSBI never does. Fix is a ~1-line OpenSBI patch +
+a `fip.bin` MONITOR repack. Once that lands and `IRQ_SDHCI` is
+re-armed without storming, this whole plan is unblocked.
 
 ---
 
