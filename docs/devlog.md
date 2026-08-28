@@ -33,12 +33,21 @@ Net −9 lines. Builds clean (Duo + QEMU); no QEMU path for USB.
 (0x045e:0x028e, p2) and a mouse (p3) all enumerated, the hub walk ran
 to completion past the pad (on the old build it dead-ended right after
 `LED command sent`), `ethd` came up afterward, and keyboard + mouse
-both stream while the pad is plugged. The pad still produces **no input
-reports** — but that's the pre-existing issue from 2026-08-25 (points
-at power: a real 360 pad buzzes / lights its LED ring on power-up and
-never has under racccoon), now confirmed with a real controller, not
-just the clone. The coexistence fix this entry is about is done and
-working.
+both stream while the pad is plugged. The pad still produces **no input reports** — pre-existing issue from
+2026-08-25, now with a sharper picture. The pad is an **8BitDo SN30 Pro
+(USB) in XInput mode** (clones 0x045e:0x028e). Under Linux it buzzes on
+plug-in; under racccoon it does not. Its player-1 LED is lit from the
+moment it's powered (the pad's own default, not racccoon's LED
+command), it enumerates fully, and the LED command returns success —
+but it never reaches active state (no rumble, no reports), and its
+mode-switch button combos are unresponsive too. So it has power for the
+LED + control transfers but never completes the XInput host handshake:
+either racccoon's LED/init bytes aren't actually landing over the split
+interrupt-OUT (the "confirmed working" note from 2026-08-25 may have
+been a false positive — that was against the clone's own logo LED), or
+the rumble motor browns it out through the bus-powered hub. Separate
+multi-round investigation, not part of this refactor. The coexistence
+fix this entry is about is done and working.
 
 ---
 
