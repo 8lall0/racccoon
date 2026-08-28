@@ -6,8 +6,22 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ## 2026-08-28 (continued) — USB keyboard stage 4: Caps Lock + software auto-repeat
 
-Built, not yet hardware-verified — `user/usb/{kbd,dwc2,usbd}.c3`. No
-QEMU path (no DWC2), so "builds" is the pre-hardware bar.
+`user/usb/{kbd,dwc2,usbd}.c3`. No QEMU path (no DWC2).
+
+**Hardware result:** auto-repeat works (hold a key → repeats), Caps Lock
+letter-case toggle works, Shift + Caps+Shift correct. The one gap: the
+physical Caps Lock **LED** doesn't light. `SET_REPORT` has an OUT data
+stage, and this driver has never done an OUT-data control transfer over
+a USB 2.0 split transaction — every prior one (GET_DESCRIPTOR,
+SET_CONFIGURATION, …) was no-data or IN-data. The user's keyboard is
+low-speed behind the hi-speed hub, so it splits. Likely fix if wanted:
+`dwc2.c3`'s control/bulk complete-split path (~line 1152) should force
+HCTSIZ size 0 for a CSPLIT OUT, the way its interrupt path already
+does (see the comment there). Not chased — the LED is cosmetic and the
+Caps function doesn't depend on it. `usb_hid_poll_slot` now **skips the
+SET_REPORT entirely when `s.split_active`** so it doesn't burn the 3 s
+NAK budget + print an error per toggle; a directly-attached full-speed
+keyboard still gets its LED.
 
 - **Caps Lock**: press of usage `0x39` toggles `g_kbd_caps_lock`;
   `kbd_usage_to_bytes` XORs it with Shift for letters only (digits /
@@ -29,9 +43,9 @@ QEMU path (no DWC2), so "builds" is the pre-hardware bar.
 `kbd_tick()` + the LED flush on every poll including a NAK (the mouse /
 generic branch still early-returns on NAK).
 
-**To verify on hardware:** hold a key → it repeats after a moment; Caps
-Lock toggles letter case and lights its LED; Shift still works;
-Caps+Shift = lowercase.
+**Hardware-verified:** held key repeats; Caps Lock toggles letter case;
+Shift and Caps+Shift correct. LED is a known gap over split transactions
+(see above).
 
 ---
 

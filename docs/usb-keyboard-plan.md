@@ -168,16 +168,18 @@ buffer, `SYS_KBD_PUSH` (=31), `SYS_GETCHAR` drains the queue then the
 serial console, `kbd_emit()` pushes. `kbdpush` shell_test builtin.
 Typing at the `>` prompt works, `ls` runs.
 
-### Stage 4 — polish — **BUILT, hardware-verify pending**
+### Stage 4 — polish — **DONE, verified on real Duo** (LED is a known gap)
 - Caps Lock: press of usage `0x39` toggles `g_kbd_caps_lock`, XOR'd with
-  Shift for letters only; LED driven via `usb_hid_set_report_leds`
-  (`SET_REPORT`, Output report). `Hid_session` gained `ctrl_max_packet`
-  + `iface_num`.
+  Shift for letters only. **Works.**
 - Software auto-repeat: `kbd_tick()` (every keyboard poll) re-emits the
-  last held mapped key — ~500 ms initial delay, ~40 ms interval,
-  modifiers kept fresh.
-- Devlog entry done. Hardware check: hold a key → repeats; Caps toggles
-  case + LED; Caps+Shift = lowercase.
+  last held mapped key — ~500 ms delay, ~40 ms interval. **Works.**
+- Caps Lock **LED**: `usb_hid_set_report_leds` (`SET_REPORT`, Output
+  report) — doesn't light on a low-speed keyboard behind the hi-speed
+  hub, because this driver has never done an OUT-data control transfer
+  over a split transaction. Skipped when `s.split_active` (no error
+  spam); a directly-attached full-speed keyboard would get it. Cosmetic;
+  fix noted in `dwc2.c3` (~line 1152, CSPLIT OUT size 0). `Hid_session`
+  gained `ctrl_max_packet` + `iface_num` for it.
 
 ---
 
@@ -191,6 +193,7 @@ Typing at the `>` prompt works, `ls` runs.
 | Real-Duo-only | QEMU `virt` has no DWC2 (`board::HAS_USB` is Duo-only) — no QEMU leg to this, same as the rest of the USB stack |
 | One keyboard + one mouse | two session slots (`Hid_session[2]`); a 2nd device of the *same* kind overwrites its slot |
 | Combo receiver (kbd+mouse in one device) | matches the mouse branch → its keyboard interface goes unpolled; real fix is binding both interfaces of one device to their own slots |
+| Caps Lock LED over a split transaction | not lit — OUT-data control transfer unproven on this driver's split path (`dwc2.c3` ~line 1152); Caps *function* is unaffected |
 
 ---
 

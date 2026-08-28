@@ -898,13 +898,28 @@ fn void usb_hid_poll_slot(uint slot)
         // kbd_tick() drives software auto-repeat, so it must run every
         // poll (a held key produces no new reports under SET_IDLE(0)).
         kbd_tick();
-        // Flush a pending Caps Lock LED change (g_kbd_led_dirty is set
-        // by kbd.c3 on each Caps toggle). The split context is still
-        // this keyboard's (set above), so the control transfer routes
-        // correctly.
+        // Flush a pending Caps Lock LED change (g_kbd_led_dirty, set by
+        // kbd.c3 on each Caps toggle) — best-effort, cosmetic. The Caps
+        // Lock *function* (letter case) lives entirely in kbd.c3 and
+        // doesn't need this.
+        //
+        // Skipped over a split transaction: SET_REPORT has an OUT data
+        // stage, and this driver has never done an OUT-data control
+        // transfer over a USB 2.0 split before (every prior one was
+        // no-data or IN-data) — on a low-speed keyboard behind the
+        // hi-speed hub it doesn't light the LED, and attempting it just
+        // burns the 3s NAK budget and prints an error per toggle.
+        // Likely fix if it's ever wanted: dwc2.c3's control/bulk
+        // complete-split path (~line 1152) should force HCTSIZ size 0
+        // for a CSPLIT OUT, the way its interrupt path already does. A
+        // directly-attached full-speed keyboard (no split) still gets
+        // its LED.
         if (g_kbd_led_dirty)
         {
-            usb_hid_set_report_leds(s.dev_addr, s.ctrl_max_packet, s.iface_num, g_kbd_led_state);
+            if (!s.split_active)
+            {
+                usb_hid_set_report_leds(s.dev_addr, s.ctrl_max_packet, s.iface_num, g_kbd_led_state);
+            }
             g_kbd_led_dirty = false;
         }
         return;
