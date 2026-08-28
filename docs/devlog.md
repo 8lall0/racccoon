@@ -4,6 +4,65 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 (continued) — xpad input: the Linux capture didn't unlock it either; all reverted
+
+Got a `usbmon` capture of the 8BitDo SN30 Pro (X-input mode, clones
+`045e:028e`) on a working Linux host. The device-side sequence right
+before its interrupt-IN starts streaming:
+
+1. `SET_CONFIGURATION(1)`
+2. interrupt-OUT (ep2): LED command `{01 03 02}` — racccoon already does this
+3. **vendor "magic message" on EP0**: `bmRequestType=0xC1, bRequest=0x01,
+   wValue=0x0100, wIndex=0x0000, wLength=20` → pad replies 2 bytes
+   `00 00`.
+4. Linux also reads the manufacturer/product/serial **string
+   descriptors** (langid 0x0409) before `SET_CONFIGURATION`.
+5. submit interrupt-IN on ep1 (0x81) → first report `00 14 00 00…`
+   arrives on the next 4ms poll.
+
+**Checked mainline `drivers/input/joystick/xpad.c`** (vendor 5.10 is
+too old to have this): `xpad_start_input()` for `XTYPE_XBOX360` does
+`usb_submit_urb(irq_in)` **first**, *then* sends exactly that magic
+message —
+`usb_control_msg_recv(udev, 0, 0x01, USB_TYPE_VENDOR|USB_DIR_IN|USB_RECIP_INTERFACE, 0x100, 0x00, dummy, 20, 25)`
+— with the comment "Some third-party Xbox 360-style controllers
+require this message to finish initialization." A short/failed reply
+is expected (kernel just `dev_warn`s). So the magic message is
+legit-from-the-driver, and the IN endpoint is already being polled
+when it lands.
+
+**Tried on real hardware, all reverted:**
+- Magic message *after* starting the session: completes cleanly
+  (`c1 01 00 01 00 00 14 00`, no STALL), IN endpoint still clean
+  complete-split NAK on every poll (verified to poll #2750). No change.
+- Magic message *mid-poll-burst*, matching mainline's submit-IN-first
+  order — 48 tight IN polls with the magic message fired at poll 2:
+  `IN still silent after magic message + 48 polls`. No change.
+- String-descriptor reads before `SET_CONFIGURATION`. **Regression:**
+  langid (idx 0) succeeds but `GET_DESCRIPTOR(STRING, idx 1, langid
+  0x0409)` throws `XACTERR` (HCINT 0x82) on the start-split, wedges the
+  hub TT → endless `CLEAR_TT_BUFFER` / re-enumerate storm, all USB dies.
+  Reading string descriptors over racccoon's split/TT path is itself
+  broken (latent, nothing else needs it — do NOT re-add here).
+
+Also observed: after the TT wedged, the pad re-enumerated as
+`057e:2009` (Switch Pro Controller IDs) — the SN30 Pro mode-switching,
+or garbage from the wedged TT.
+
+**State: still open. Software guessing is genuinely exhausted now** —
+we've faithfully replicated both the mainline `xpad_start_input()`
+sequence and the working usbmon capture's bytes, and the IN endpoint
+still returns a clean complete-split NAK forever. That points at a
+racccoon split-interrupt-IN bug specific to this endpoint geometry
+(vendor class, 32-byte MPS, 4ms interval) rather than a missing init
+step. Real next step: a hardware USB analyzer on racccoon's own bus, a
+dwc2 split-IN trace mode, or — cheapest discriminator — retest a
+**genuine** Xbox 360 pad's input (not just enumeration) to confirm
+whether this NAK is 8BitDo-specific or affects all xpads. Nothing
+kept; tree clean.
+
+---
+
 ## 2026-08-28 (continued) — xpad input: exhausted the guesses, needs a bus capture
 
 Long session on the 8BitDo SN30 Pro (USB, X-input mode, clones
