@@ -4,6 +4,41 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 (continued) — xpad input: exhausted the guesses, needs a bus capture
+
+Long session on the 8BitDo SN30 Pro (USB, X-input mode, clones
+0x045e:0x028e). All on a throwaway branch, reverted — nothing kept.
+Findings, so a future session doesn't repeat them:
+
+- **OUT works end to end.** A rumble command `{00 08 00 FF FF 00 00 00}`
+  on the interrupt-OUT endpoint physically spins the motors. Multi-packet
+  OUT works too once `usb_interrupt_transfer_out()` carries the DATA
+  toggle (it hardcoded DATA0 before — a real latent bug for any
+  >1-packet OUT, but nothing needs it yet, so not kept).
+- **The IN endpoint returns a clean NAK forever.** HCINT `0x12`
+  (CHHLTD|NAK), no error bits, on every one of 90+ polls — including 80
+  polled in a tight 4ms burst *immediately* after SET_CONFIGURATION,
+  and including with buttons held. So: not a timing / continuity issue,
+  not a transaction error, not the split mechanism (keyboard + mouse
+  stream IN through the identical code). The pad's firmware simply
+  never enters reporting mode.
+- **This pad ignores LED commands.** `{01 03 xx}` for xx ∈ {01, 02, 06}
+  — all complete (XFERCOMP) but produce zero visible LED change, while
+  the same-endpoint rumble works. So the popular "the LED / player-ID
+  assignment unlocks the IN stream" theory can't apply here.
+- Also tried, no effect: 100ms post-SET_CONFIGURATION settle, 32-byte
+  zero-padded packets, `{05 20 00 01 00}`, a 300ms settle between a
+  "blink" LED and a "solid" LED.
+
+Linux drives this exact pad (buzz on connect + working input). The
+difference is something the generic web advice doesn't name. **Next
+step is a `usbmon` capture of the working Linux exchange** — the bytes
+between enumeration and the first IN report. Everything short of that
+is guessing, and the guessing is done. See `racccoon-xpad-input`
+memory.
+
+---
+
 ## 2026-08-28 (continued) — xpad folded into the cooperative HID session model
 
 Cleanup, not a feature. `usbd_xpad_read_loop()` was the last `for(;;)`
