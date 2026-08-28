@@ -4,6 +4,63 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 (continued) — PLIC storm: T-HEAD S-mode delegate-bit theory — tried, hung, dead end from S-mode
+
+The 2026-08-17 investigation closed the SDHCI PLIC storm as "undocumented
+silicon erratum." Re-opened it. Found a concrete, previously-missed
+init step.
+
+**The lead.** The CV1800B's PLIC is a T-HEAD **`thead,c900-plic`** (same
+C906 core as the Allwinner D1). The T-HEAD variant gates S-mode access
+to the per-context enable / threshold / claim registers behind **bit 0
+of a control register at PLIC offset `0x1FFFFC`** (`0x701FFFFC` here),
+and it comes up **0 = M-mode-only** out of reset. On the D1 that bit is
+set by OpenSBI's own `thead_reset_init`
+(`opensbi/lib/utils/reset/fdt_reset_thead.c`:
+`writel(BIT(0), <plic-delegate addr>)`), gated on a `thead,reset-sample`
+devicetree node carrying a `plic-delegate` property — the D1's SBI doc
+example literally shows `plic-delegate = <0x0 0x101ffffc>`.
+
+**The Duo's OpenSBI FDT has no `thead,reset-sample` node** (grep across
+the whole SDK: only the T-HEAD `light_mpw` / `ice` reference boards
+have one). So on this board that bit is **never set** — every S-mode
+PLIC enable/claim access this project has ever made has gone to an
+un-delegated PLIC. That is a textbook match for the storm signature:
+`sip.SEIP` asserted, S-mode `claim()` returns 0 forever, permanent,
+reflash to escape. The earliest mainline `irq-thead-c900-plic.c` wrote
+this bit **from S-mode** directly and it worked, so S-mode is (at least
+historically) allowed to.
+
+**Tried on real hardware — hung, all reverted.**
+- `plic_init()` did a read / `|= 1` / read-back on `PLIC_BASE + 0x1FFFFC`
+  before any other PLIC register, plus re-armed the `IRQ_SDHCI` enable
+  bit, with a boot-log print of the before/after value.
+- **Result: hard hang.** `1: BSS cleared` was the last line — the
+  machine died inside `plic_init()`, before the `PLIC T-HEAD ctrl:`
+  print. So the **S-mode read of `0x701FFFFC` itself wedges the
+  CV1800B** — no trap, just a dead bus access. That register is either
+  not implemented in Sophgo's PLIC integration or is M-mode-only, and
+  this SoC hangs rather than faulting on it (consistent with its
+  known behaviour elsewhere). racccoon cannot poke it from S-mode.
+
+**Also learned from the boot banner:** the flashed firmware is
+**Milk-V's own OpenSBI v0.9** (`Platform Name: Milk-V Duo`), *not* the
+generic OpenSBI + `fdt_reset_thead` in the SDK's newer checkout that
+the `plic-delegate` theory came from. So that mechanism may not even be
+present in what runs on this board, and the "patch the FDT" fallback is
+now murkier — it would need Milk-V's OpenSBI 0.9 to honour a
+`thead,reset-sample` node, and there's no evidence it does.
+
+**Where this leaves it:** the delegate-register angle is a dead end
+from S-mode. If revisited: needs either (a) a different (newer)
+OpenSBI on the board that does the delegation in M-mode, or (b) real
+hardware debug tooling (logic analyzer on the IRQ line / vendor
+support) — the same conclusion the 2026-08-17 entry reached. Nothing
+kept; tree clean. Backup to restore if a bad flash sticks:
+`fip.bin.bak-*` on DUOBOOT.
+
+---
+
 ## 2026-08-28 (continued) — interrupt-driven USB: investigated, planned, deferred
 
 Autonomous session ("go full auto on #3" — moving USB off transfer-
