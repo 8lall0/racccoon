@@ -815,6 +815,16 @@ fn int hc_wait_chhltd(uint* hcint_out)
         if (USBD_INTERRUPT_DRIVEN)
         {
             ipc_poll_type(&notify_scratch[0], 0, &notify_verb); // drain notify; value irrelevant
+            // Tight-spin only while the transfer could plausibly be
+            // about to finish (a control/interrupt transfer or a NAK
+            // cycle is well under 300us). Past that it's a slow one — a
+            // big multi-packet MSC read, or a stalling device — so drop
+            // to yield()-pacing and let other processes run. The IRQ
+            // notify still lands and re-runs us promptly.
+            if (rdtime() - start > usb_us_to_ticks(300))
+            {
+                yield();
+            }
         }
         else
         {

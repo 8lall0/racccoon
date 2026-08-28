@@ -109,10 +109,11 @@ come up (the strong-order change touches every device mapping — no
 regression). The port-4 STALL is the pre-existing 8BitDo split quirk,
 unrelated.
 
-**Known limitation:** `hc_wait_chhltd` pure-spins in interrupt mode
-(matches diskd) — a large multi-packet MSC transfer holds the CPU
-longer than the old yield-per-packet path. Fine for now; revisit if MSC
-latency bites.
+**Latency:** `hc_wait_chhltd` tight-spins on `ipc_poll_type` only for
+the first ~300us of a wait (a control/interrupt transfer or NAK cycle
+finishes well under that); past that it `yield()`-paces so a slow
+transfer — a big multi-packet MSC read, a stalling device — doesn't
+hold the CPU. The IRQ notify still lands and re-runs usbd promptly.
 
 **Now also unblocked:** interrupt-driven sdd and ethernet RX — same
 strong-order fix, same `handle_trap` pattern. sdd additionally needs
@@ -126,170 +127,35 @@ A plain reflash works.
 
 ---
 
-## 2026-08-28 (continued) — PLIC storm "FIXED" via OpenSBI delegate *(WRONG — real fix is the strong-order MMIO change, entry above)*
+## 2026-08-28 (continued) — PLIC storm: the T-HEAD delegate rabbit-hole *(all wrong — see the strong-order MMIO entry above)*
 
-Built the patched OpenSBI, repacked the fip, flashed, booted. **The
-storm is gone.**
+Before finding the real cause (weak-ordered MMIO, entry above), a long
+detour chasing the T-HEAD C900 PLIC's S-mode-access "delegate" bit at
+`PLIC_BASE + 0x1FFFFC`. Collapsed here from three entries; the useful
+facts, since they're still true:
 
-**The patch** (`scripts/opensbi-thead-plic-delegate.patch`): one line in
-`opensbi/lib/utils/irqchip/plic.c` `plic_cold_irqchip_init()` —
-`writel(1, (void *)plic->addr + 0x1FFFFC)` (the T-HEAD C900 PLIC S-mode
-delegate). Plus a Makefile tweak so OpenSBI 0.9 (2021) builds under
-GCC 16 (`-std=gnu11 -Wno-error`).
+- **Register addresses were right all along.** Confirmed against
+  `StealthBadger747/xv6-riscv` and `ParkerTenBroeck/milkv-duos-rs`:
+  S-enable `0x70002080`, S-threshold `0x70201000`, S-claim `0x70201004`,
+  delegate/perms `0x701FFFFC`. `PLIC_S_CONTEXT = 1` is correct.
+- **The FSBL already writes `[0x701FFFFC] = 1`** (`fsbl/lib/cpu/riscv/
+  bl2_entrypoint.S`). So the delegate was never missing. The OpenSBI
+  patch that re-asserts it (`scripts/opensbi-thead-plic-delegate.patch`
+  + `build_opensbi_duo.sh` + `reflash_duo.sh PATCH_OPENSBI=1`) is inert
+  — kept only for the GCC-16 build fixes / FDT-extraction tooling, in
+  case a future M-mode change ever needs it. A plain reflash works.
+- **S-mode access to `0x701FFFFC` hard-hangs the CV1800B** (no trap) —
+  so racccoon can't poke it directly anyway.
+- The priority "only 25-31 works, wraps mod-8" quirk (Opus,
+  community.milkv.io/t/cv1800b-baremetal) is real — write 31, read
+  back 7 — but priority 1 is fine once ordering is correct.
+- Threads that helped narrow it: `community.milkv.io/t/cv1800b-baremetal/2445`,
+  `.../cv1800b-plic-exception/3295`.
 
-**Build** (`scripts/build_opensbi_duo.sh`): `make PLATFORM=generic
-CROSS_COMPILE=riscv64-unknown-elf- PLATFORM_RISCV_ISA=rv64imafdc_zicsr_zifencei
-FW_PIC=n FW_FDT_PATH=<dtb>`. The `_zifencei` and `FW_PIC=n` are needed
-for the modern toolchain; the DTB is lifted **verbatim from the stock
-MONITOR's embedded FDT** (offset 0xd00dfeed, 23 KB) so the rebuild sees
-exactly the DT the working firmware did. First attempt without
-`FW_FDT_PATH` booted to a UART-garble + reset loop — the stock Milk-V
-OpenSBI carries its FDT embedded and does not rely on FSBL passing one.
-
-**Reflash** (`scripts/reflash_duo.sh PATCH_OPENSBI=1`): builds the
-patched OpenSBI and passes `--MONITOR build/fw_dynamic_patched.bin` to
-`fiptool genfip` alongside the usual `--OLD_FIP` / `--LOADER_2ND`. Once
-flashed it sticks — a later plain reflash carries it forward via
-`--OLD_FIP`. Keeps `fip.bin.goodbak-stock-opensbi` as the rollback.
-
-**Verified:** flashed patched OpenSBI + a racccoon kernel that arms
-PLIC source `IRQ_USB` (30) in `plic_init()` — a silent source (DWC2
-GINTMSK masked). Every prior time *any* PLIC enable bit was set, the
-board wedged in a permanent storm needing a reflash. This time it
-**booted straight to the shell** — sdd, fsd, usbd, ethd, gpiod all up,
-no storm. Root cause confirmed, fix confirmed.
-
-The `IRQ_USB` probe was reverted (it was the test). Interrupt-driven
-sdd / USB (`docs/usb-interrupt-plan.md`) / ethernet-RX are now
-unblocked — the next step is wiring one of them up for real, which
-also needs the kernel IRQ path to ack the device source (level-
-triggered) before returning, not just complete at the PLIC.
-
----
-
-## 2026-08-28 (continued) — PLIC storm SOLVED (root cause): missing M-mode `writel(1, 0x701FFFFC)`
-
-Confirmed, from an independent working port. The
-`community.milkv.io/t/cv1800b-baremetal/2445` thread led to
-**`StealthBadger747/xv6-riscv`** — a working xv6 port to the Milk-V Duo.
-Its `kernel/board/milkv-duo/entry.S` does, in its **M-mode** `_entry`:
-
-```asm
-        # Set up mxstatus for T-Head
-        li t0, 0xc0638000
-        csrw CSR_MXSTATUS, t0          # CSR 0xbe9
-
-        # Enable PLIC
-        li t0, PLIC_BASE
-        addi t0, t0, 0x1FFFFC          # 0x701FFFFC
-        li t1, 1
-        sw t1, 0(t0)                   # T-HEAD C900 PLIC: enable S-mode access
-```
-
-And its `config.h` PLIC addresses match racccoon's **exactly**:
-`PLIC_SENABLE(0)=0x70002080`, `PLIC_SPRIORITY/threshold(0)=0x70201000`,
-`PLIC_SCLAIM(0)=0x70201004`. So racccoon's PLIC register math was
-right all along (as the 2026-08-17 entry concluded).
-
-**The storm is 100% the missing delegate write.** The T-HEAD C900 PLIC
-gates S-mode access to the per-context enable/threshold/claim registers
-behind bit 0 of the control register at `PLIC_BASE + 0x1FFFFC`. Out of
-reset it's 0 → S-mode enable writes half-take / claim reads return 0,
-but the interrupt still reaches S-mode → permanent storm,
-`claim()==0`. Exactly racccoon's signature.
-
-**It must be written from M-mode.** racccoon (S-mode, under OpenSBI)
-tried it directly earlier this session and hard-hung the CV1800B — the
-SoC faults/hangs on an S-mode access to that address. xv6-duo gets away
-with it because it **replaces OpenSBI** and runs `_entry` in M-mode
-(also writes the T-HEAD `mxstatus` CSR 0xbe9 = `0xc0638000` there,
-M-mode-only). Same as the "CV1800B PLIC exception" thread
-(`community.milkv.io/t/cv1800b-plic-exception/3295`): its fix was
-"removed OpenSBI, let the 2nd-stage bootloader boot my program
-directly."
-
-The Duo's stock **Milk-V OpenSBI v0.9** does not do this write (no
-`thead,reset-sample` / `plic-delegate` FDT node — grep across the whole
-SDK: only the T-HEAD `light_mpw`/`ice` reference boards have one), and
-neither does its Linux DTS. So on this board nobody ever sets it — which
-is why the 2026-08-17 investigation, reading DT + OpenSBI + Linux
-driver, found "no hidden extra init step": there genuinely isn't one in
-*this board's* software, but there should be.
-
-**The fix (not yet done — a boot-chain change):**
-- `opensbi/lib/utils/irqchip/plic.c` already has `fdt_reset_thead.c`
-  compiled in; it does `writel(BIT(0), <plic-delegate addr>)` gated on a
-  `thead,reset-sample` FDT node with a `plic-delegate` prop. Either
-  add that node to the FDT OpenSBI parses, **or** just add an
-  unconditional `writel(1, PLIC_BASE + 0x1FFFFC)` to
-  `plic_cold_irqchip_init()` (~1 line, runs once from M-mode).
-- Then rebuild OpenSBI and repack `fip.bin` with the new MONITOR
-  section (`fiptool.py genfip --MONITOR opensbi.bin ...`).
-  `scripts/reflash_duo.sh` currently reuses the on-card OpenSBI via
-  `--OLD_FIP` and would need extending, **or** a one-off manual repack.
-- After that: re-arm `IRQ_SDHCI` in `plic_init()`, verify no storm,
-  then interrupt-driven sdd / USB (`docs/usb-interrupt-plan.md`) all
-  become reachable.
-
-This turns "deferred forever, needs a logic analyzer" into "needs a
-one-line OpenSBI patch + a fip repack." Big.
-
----
-
-## 2026-08-28 (continued) — PLIC storm: T-HEAD S-mode delegate-bit theory — tried, hung, dead end from S-mode
-
-The 2026-08-17 investigation closed the SDHCI PLIC storm as "undocumented
-silicon erratum." Re-opened it. Found a concrete, previously-missed
-init step.
-
-**The lead.** The [CV1800B](https://community.milkv.io/t/cv1800b-baremetal/2445/3)'s PLIC is a T-HEAD **`thead,c900-plic`** (same
-C906 core as the Allwinner D1). The T-HEAD variant gates S-mode access
-to the per-context enable / threshold / claim registers behind **bit 0
-of a control register at PLIC offset `0x1FFFFC`** (`0x701FFFFC` here),
-and it comes up **0 = M-mode-only** out of reset. On the D1 that bit is
-set by OpenSBI's own `thead_reset_init`
-(`opensbi/lib/utils/reset/fdt_reset_thead.c`:
-`writel(BIT(0), <plic-delegate addr>)`), gated on a `thead,reset-sample`
-devicetree node carrying a `plic-delegate` property — the D1's SBI doc
-example literally shows `plic-delegate = <0x0 0x101ffffc>`.
-
-**The Duo's OpenSBI FDT has no `thead,reset-sample` node** (grep across
-the whole SDK: only the T-HEAD `light_mpw` / `ice` reference boards
-have one). So on this board that bit is **never set** — every S-mode
-PLIC enable/claim access this project has ever made has gone to an
-un-delegated PLIC. That is a textbook match for the storm signature:
-`sip.SEIP` asserted, S-mode `claim()` returns 0 forever, permanent,
-reflash to escape. The earliest mainline `irq-thead-c900-plic.c` wrote
-this bit **from S-mode** directly and it worked, so S-mode is (at least
-historically) allowed to.
-
-**Tried on real hardware — hung, all reverted.**
-- `plic_init()` did a read / `|= 1` / read-back on `PLIC_BASE + 0x1FFFFC`
-  before any other PLIC register, plus re-armed the `IRQ_SDHCI` enable
-  bit, with a boot-log print of the before/after value.
-- **Result: hard hang.** `1: BSS cleared` was the last line — the
-  machine died inside `plic_init()`, before the `PLIC T-HEAD ctrl:`
-  print. So the **S-mode read of `0x701FFFFC` itself wedges the
-  CV1800B** — no trap, just a dead bus access. That register is either
-  not implemented in Sophgo's PLIC integration or is M-mode-only, and
-  this SoC hangs rather than faulting on it (consistent with its
-  known behaviour elsewhere). racccoon cannot poke it from S-mode.
-
-**Also learned from the boot banner:** the flashed firmware is
-**Milk-V's own OpenSBI v0.9** (`Platform Name: Milk-V Duo`), *not* the
-generic OpenSBI + `fdt_reset_thead` in the SDK's newer checkout that
-the `plic-delegate` theory came from. So that mechanism may not even be
-present in what runs on this board, and the "patch the FDT" fallback is
-now murkier — it would need Milk-V's OpenSBI 0.9 to honour a
-`thead,reset-sample` node, and there's no evidence it does.
-
-**Where this leaves it:** the delegate-register angle is a dead end
-from S-mode. If revisited: needs either (a) a different (newer)
-OpenSBI on the board that does the delegation in M-mode, or (b) real
-hardware debug tooling (logic analyzer on the IRQ line / vendor
-support) — the same conclusion the 2026-08-17 entry reached. Nothing
-kept; tree clean. Backup to restore if a bad flash sticks:
-`fip.bin.bak-*` on DUOBOOT.
+The "SOLVED via OpenSBI delegate, hardware-verified" claim that briefly
+lived here (and in commit `21485d0`'s message) was a false positive —
+it "worked" only because that test armed a *silent* PLIC source
+(GINTMSK masked), so `claim()` was never actually exercised.
 
 ---
 
