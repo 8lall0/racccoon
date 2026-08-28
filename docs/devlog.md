@@ -29,7 +29,7 @@ is_in ? xfer_len : 0`), and vendor Linux 5.10's own
 comes out right (remaining stays 0 → `xfer_len - 0`). Also corrects
 split *bulk* OUT (MSC writes) for free, though nothing exercises that
 over this hub yet. `usb_hid_poll_slot` attempts the SET_REPORT
-unconditionally again.
+unconditionally again. **Confirmed on hardware: the LED lights.**
 
 - **Caps Lock**: press of usage `0x39` toggles `g_kbd_caps_lock`;
   `kbd_usage_to_bytes` XORs it with Shift for letters only (digits /
@@ -52,8 +52,9 @@ unconditionally again.
 generic branch still early-returns on NAK).
 
 **Hardware-verified:** held key repeats; Caps Lock toggles letter case;
-Shift and Caps+Shift correct. Caps LED fixed via the CSPLIT-OUT-size-0
-change above (pending the re-flash confirmation).
+Shift and Caps+Shift correct; and after the CSPLIT-OUT-size-0 fix the
+physical Caps Lock **LED lights** on toggle. USB keyboard is done —
+all four stages confirmed on the real Milk-V Duo.
 
 ---
 
