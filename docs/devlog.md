@@ -4,6 +4,54 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 (continued) — real Milk-V Duo confirmation: FS_WRITE_AT / FS_STAT / hardening / dispatch table
+
+The whole arc from this session — `FS_WRITE_AT` + `FS_STAT`, the
+empty-leaf / null-termination hardening, and the `Fs_ops` dispatch
+table — booted and passed on the real CV1800B, against its ext2 root
+(`HAS_SECOND_FS_PARTITION = false`, so ext2 is the only backend the Duo
+mounts; the exFAT multi-cluster path stays QEMU + `fsck`-only, no Duo
+role).
+
+Packaging note for the future: the `$DUO_SDK` checkout had lost its
+built FSBL/OpenSBI binaries, but `fiptool.py genfip --OLD_FIP <the
+fip.bin already on the card> --LOADER_2ND <new kernel>` rebuilds the
+image reusing every non-kernel section (BL2, MONITOR, DDR_PARAM,
+CHIP_CONF) from the existing fip — no SDK rebuild, no Docker. Parsed
+back clean (`RUNADDR 0x80200000`, param1 byte-identical, zero trailing
+bytes). This kernel embeds `shell_test` (swapped in for the run, same
+trick `build.sh` uses for QEMU) so the board had the test builtins.
+`DUOBOOT/fip.bin.bak-preFSWRITEAT` is the pre-flash image.
+
+Serial, at the `>` prompt:
+
+```
+> cycletest
+cycletest: ok
+> p9fswritetest
+p9fswritetest: ok
+> fsneg
+fsneg: ok
+> fswriteat
+fswriteat: ok
+> fswriteatfrag
+fswriteatfrag: ok
+```
+
+`cycletest` / `p9fswritetest` first to prove fsd + the ext2 write path
+were alive; then the three new builtins — `fsneg` (17 negative-case
+assertions: empty path, wrong node type, past-EOF, name collisions),
+`fswriteat` (9 KB chunked write + read-back byte-compare, `fs_stat`
+size/type, non-aligned mid-file overwrite, append via
+`FS_OFFSET_APPEND`, no-holes rejection, write-to-directory rejection),
+`fswriteatfrag` (two files grown interleaved, read back verified). All
+`ok` on real silicon.
+
+Still to do: reflash the production-shell kernel for normal use (same
+`--OLD_FIP` recipe, `shell.bin.o` instead of `shell_test`).
+
+---
+
 ## 2026-08-28 — fsd: FS_* verb dispatch table
 
 The nine path-based `FS_*` verbs (`FS_READ` / `FS_READ_AT` / `FS_WRITE` /
