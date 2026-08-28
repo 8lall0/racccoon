@@ -80,7 +80,8 @@ const SYS_USBD_INFO     = 28; // usbd-only: returns its DMA buffer's physical ad
 const SYS_NETD_INFO     = 29; // netd-only: returns its RX/TX virtqueue physical addresses, plus (Ethernet Phase 2) its packet-buffer page — see its case below
 const SYS_ETHD_INFO     = 30; // ethd-only: returns its DMA region's physical address (Ethernet Phase 2) — same shape/reasoning as SYS_USBD_INFO above
 const SYS_KBD_PUSH      = 31; // usbd-only in practice: pushes one decoded USB-keyboard byte into the kernel keystroke queue SYS_GETCHAR drains (src/kbd.c3) — see its case below
-const SYS_USB_IRQ_ARM   = 32; // usbd-only: re-enable PLIC source board::IRQ_USB, disabled by handle_trap on each USB IRQ (level-triggered) — see its case below
+const SYS_DRIVER_IRQ_ARM = 32; // usbd/sdd: re-enable this driver's PLIC source, disabled by handle_trap on each fire (level-triggered); which source is picked by the caller's pid — see its case below
+const SYS_SDD_INFO      = 33; // sdd-only: returns its SDMA staging buffer's physical address — see its case below
 
 // Generous cap on the image SYS_EXEC will install — real racccoon
 // binaries (build/user/*.bin) run 70-105KB; this leaves real headroom
@@ -1649,17 +1650,34 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			{
 				f.a0 = (ulong)(-1);
 			}
-		case SYS_USB_IRQ_ARM:
-			// usbd re-enables its own PLIC source after servicing a
+		case SYS_DRIVER_IRQ_ARM:
+			// A driver re-enables its own PLIC source after servicing a
 			// completion — handle_trap disabled it on the way in (the
-			// DWC2 line is level-high, can't be cleared from the trap
-			// handler). pid-gated to usbd; idempotent (first transfer /
-			// timeout path harmlessly re-set an already-set bit).
+			// device line is level-high and can't be cleared from the
+			// trap handler). Which source is chosen by the caller's pid:
+			// usbd -> IRQ_USB, sdd -> IRQ_SDHCI. Idempotent (first
+			// transfer / timeout path harmlessly re-sets an already-set
+			// bit).
 			if (current_proc.pid == usbd_pid && usbd_pid != 0)
 			{
 				board::plic_set_enabled(board::IRQ_USB, true);
 			}
+			else if (current_proc.pid == sdd_pid && sdd_pid != 0)
+			{
+				board::plic_set_enabled(board::IRQ_SDHCI, true);
+			}
 			f.a0 = 0;
+		case SYS_SDD_INFO:
+			// sdd-only, called once at startup — see setup_sdd_mappings
+			// in process.c3. a0 is an out-pointer, same convention as
+			// SYS_USBD_INFO.
+			uptr* sdd_dma_out = (uptr*)(uptr)f.a0;
+			if (!user_range_valid(current_proc.page_table, (uptr)sdd_dma_out, 8, true))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			*sdd_dma_out = sdd_dma_paddr;
 		case SYS_PARENT_INFO:
 			// Read-only, no permission check — same reasoning as
 			// SYS_PROC_INFO above. Returns the given pid's parent_pid
@@ -2234,19 +2252,18 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 			{
 				board::plic_complete(irq);
 			}
-			// The DWC2 IRQ is level-high and its GINTSTS/HCINT stay
-			// asserted until usbd clears them; on this SoC a still-
+			// The DWC2 / SDHCI IRQs are level-high and their device status stays
+			// asserted until the driver clears it; on this SoC a still-
 			// pending external interrupt at sret re-traps before the
 			// returned-to context runs an instruction, so leaving the
-			// source enabled hangs usbd out of ever reaching that clear.
+			// source enabled hangs the driver out of ever reaching that clear.
 			// Disable it AFTER plic_complete (the PLIC ignores a
-			// completion for a disabled source). usbd re-arms IRQ_USB
-			// via SYS_USB_IRQ_ARM before its next wait. Also disable any
+			// completion for a disabled source). the driver re-arms
+			// via SYS_DRIVER_IRQ_ARM before its next wait. Also disable any
 			// unrecognized non-zero source — a misrouted level IRQ left
 			// enabled is a guaranteed storm.
-			bool handled_irq = (irq == board::IRQ_VIRTIO_BLK && diskd_pid != 0)
-				|| (irq == board::IRQ_SDHCI && sdd_pid != 0);
-			if (irq == board::IRQ_USB || (irq != 0 && !handled_irq))
+			bool handled_irq = (irq == board::IRQ_VIRTIO_BLK && diskd_pid != 0);
+			if (irq == board::IRQ_USB || irq == board::IRQ_SDHCI || (irq != 0 && !handled_irq))
 			{
 				board::plic_set_enabled(irq, false);
 			}

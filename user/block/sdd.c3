@@ -47,6 +47,20 @@ fn void sdd_init()
 		sdd_panic("card enumeration failed");
 	}
 	print("sdd: card ready\n");
+
+	// SDMA staging buffer (identity-mapped, uncached — SYS_SDD_INFO,
+	// same pattern as usbd/ethd) + the controller's own SDMA capability
+	// bit. Both must be present for sdd_block_rw to take the DMA path;
+	// otherwise it stays PIO. See sdhci.c3's SDD_USE_DMA.
+	if (SDD_USE_DMA)
+	{
+		uptr dma_paddr = 0;
+		syscall(SYS_SDD_INFO, (long)&dma_paddr, 0, 0);
+		g_sdd_dma_paddr = dma_paddr;
+		uint caps = sd_reg_read(SD_CAPABILITIES);
+		g_sdd_dma_ok = dma_paddr != 0 && (caps & SD_CAP_SDMA) != 0;
+		print(g_sdd_dma_ok ? "sdd: SDMA enabled\n" : "sdd: SDMA unavailable, PIO\n");
+	}
 }
 
 fn void main()

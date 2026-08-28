@@ -4,6 +4,47 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-28 (continued) — sdd: SDMA + interrupt-driven completion
+
+With the strong-order MMIO fix (entry below) the PLIC is usable, so
+sdd's block I/O moved off PIO onto the SDHCI SDMA engine + an
+interrupt-driven completion wait.
+
+- **`sdhci.c3`**: new `sdd_block_rw_dma()` — writes the physical
+  staging-buffer address to `SD_DMA_ADDRESS` (0x00), sets
+  `SD_TRNS_DMA` in the transfer mode (`sd_send_cmd` does this when
+  `g_sd_dma_addr_pending` is set), clears HOST_CONTROL's DMA-select
+  field to SDMA and forces HC2 "Host Version 4 Enable" off (both were
+  needed — without the HOST_CONTROL clear the transfer stalled with
+  `int=0x1`, command-complete but no `DATA_END`), then waits for
+  `SD_INT_DATA_END`. No PIO FIFO, so the shallow-FIFO timing discipline
+  the old path lives under doesn't apply — `ipc_poll_type` + `yield()`
+  during the wait are fine, and the CPU is genuinely free while the
+  DMA runs. `SDD_USE_DMA` gates it (checks `SD_CAPABILITIES` bit 22 at
+  init); PIO stays as the fallback. `SDD_DMA_INTERRUPT` gates the
+  interrupt wait vs a tight poll.
+- **`board::IRQ_SDHCI`** (36) is now armed in `plic_init` (second
+  enable word, `INTERRUPT_DRIVEN_SD`). `handle_trap`'s existing
+  `IRQ_SDHCI` branch wakes sdd; the disable-on-fire logic (shared with
+  USB) now covers it too.
+- **New kernel plumbing**: `sdd_dma_paddr` (one identity-mapped
+  uncached page, `setup_sdd_mappings`) handed back via `SYS_SDD_INFO`
+  (33). `SYS_USB_IRQ_ARM` generalized to `SYS_DRIVER_IRQ_ARM` (still
+  32) — re-arms `IRQ_USB` or `IRQ_SDHCI` by caller pid.
+
+**Verified on real Duo:** `sdd: SDMA enabled`, `fsd: ext2 mounted`,
+`ls` / `ls bin` (full binary list) / `cat bin/cat` all read via SDMA
+under load, no storm, responsive shell. For a fast 512-byte transfer
+`DATA_END` is already set by the time the wait loop first checks, so it
+short-circuits — the IRQ still fires async, `handle_trap` disables
+source 36, the next transfer re-arms it. No storm in any ordering
+(confirmed: the card's SDHCI IRQ line drops when sdd clears
+`SD_INT_STATUS`, before or after `handle_trap` runs).
+
+Not done: interrupt-driven ethernet RX (same pattern, `IRQ_ETH` = 31).
+
+---
+
 ## 2026-08-28 (continued) — interrupt-driven USB WORKS. Root cause: MMIO was weakly-ordered, not strong-ordered.
 
 **Solved, hardware-verified.** The whole "PLIC storm" saga — every

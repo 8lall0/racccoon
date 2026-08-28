@@ -794,7 +794,7 @@ fn int hc_wait_chhltd(uint* hcint_out)
     {
         // handle_trap disables PLIC source IRQ_USB the instant the DWC2
         // line fires; re-arm before every wait (idempotent).
-        syscall(SYS_USB_IRQ_ARM, 0, 0, 0);
+        syscall(SYS_DRIVER_IRQ_ARM, 0, 0, 0);
     }
     for (;;)
     {

@@ -51,6 +51,7 @@ const uint SECTOR_SIZE = 512; // shared with sdd.c3's own wire-protocol message 
 // instead of narrower loads/stores — same reasoning user/block/diskd.c3's
 // mmio_read32 comment gives for why this codebase avoids relying on
 // anything but `lw`/`sw` in asm blocks.
+const uint SD_DMA_ADDRESS      = 0x00; // SDMA system address (32-bit) — physical buffer for a DMA transfer
 const uint SD_BLKSIZE_BLKCNT   = 0x04; // [15:0]=block size, [31:16]=block count
 const uint SD_ARGUMENT         = 0x08;
 const uint SD_XFERMODE_CMD     = 0x0C; // [15:0]=transfer mode, [31:16]=command
@@ -66,6 +67,8 @@ const uint SD_INT_STATUS       = 0x30;
 const uint SD_INT_ENABLE       = 0x34;
 const uint SD_SIGNAL_ENABLE    = 0x38;
 const uint SD_ACMD12ERR_HOSTCTRL2 = 0x3C; // [15:0]=ACMD12 err status, [31:16]=Host Control 2
+const uint SD_CAPABILITIES     = 0x40; // synthesis-time capability bits
+const uint SD_CAP_SDMA         = 1 << 22; // SDHCI_CAN_DO_SDMA
 
 const uint SD_PRESENT_CMD_INHIBIT    = 0x00000001;
 const uint SD_PRESENT_DATA_INHIBIT   = 0x00000002;
@@ -74,6 +77,7 @@ const uint SD_PRESENT_DATA_AVAIL     = 0x00000800; // buffer read-ready
 
 const uint SD_INT_RESPONSE    = 0x00000001; // command complete
 const uint SD_INT_DATA_END    = 0x00000002; // transfer complete
+const uint SD_INT_DMA_END     = 0x00000008; // SDMA crossed a buffer boundary — re-write SD_DMA_ADDRESS to continue (never happens for a single 512-byte block against the 512KB default boundary)
 const uint SD_INT_SPACE_AVAIL = 0x00000010; // buffer write-ready — NOT
                                              // the same bit position as
                                              // SD_PRESENT_SPACE_AVAIL
@@ -150,8 +154,22 @@ const uint SD_CMD_INDEX_CHECK     = 0x10;
 const uint SD_CMD_DATA_PRESENT    = 0x20;
 
 // Transfer mode (lower 16 bits of SD_XFERMODE_CMD).
+const uint SD_TRNS_DMA        = 0x0001; // use the SDMA engine, not PIO through SD_BUFFER
 const uint SD_TRNS_BLK_CNT_EN = 0x0002;
 const uint SD_TRNS_READ       = 0x0010; // 1 = card-to-host (read)
+
+// Block I/O via the SDMA engine instead of PIO through SD_BUFFER. The
+// controller moves the data itself (Capabilities bit 22 set on this
+// SDHCI; the vendor U-Boot builds CONFIG_MMC_SDHCI_SDMA=y), so the CPU
+// is free during the transfer and the completion wait can be
+// interrupt-driven (PLIC source board::IRQ_SDHCI). Also sidesteps the
+// PIO path's shallow-FIFO timing hazard entirely — no mid-transfer
+// register access at all. Confirmed at init against SD_CAPABILITIES;
+// falls back to PIO if the controller can't do SDMA.
+const bool SDD_USE_DMA = true;
+bool g_sdd_dma_ok = false;      // set by sdd_init once SD_CAPABILITIES is read
+uptr g_sdd_dma_paddr = 0;       // the DMA staging buffer (SYS_SDD_INFO), 0 until sdd.c3 sets it
+uint g_sd_dma_addr_pending = 0; // sd_send_cmd writes this to SD_DMA_ADDRESS + sets SD_TRNS_DMA for the next data command, then clears it
 
 fn uint mmio_read32(uptr addr)
 {
@@ -454,6 +472,15 @@ fn bool sd_send_cmd(uint index, uint arg, uint resp_flags, bool data)
 	{
 		xfer = SD_TRNS_BLK_CNT_EN;
 		if (index == 17) xfer |= SD_TRNS_READ;
+		// SDMA: the caller (sdd_block_rw) stashed the physical buffer
+		// address in g_sd_dma_addr_pending; program it and flip the DMA
+		// bit so the controller moves the data itself.
+		if (g_sd_dma_addr_pending != 0)
+		{
+			sd_reg_write(SD_DMA_ADDRESS, g_sd_dma_addr_pending);
+			xfer |= SD_TRNS_DMA;
+			g_sd_dma_addr_pending = 0;
+		}
 	}
 	uint cmd_word = ((index & 0x3F) << 24) | ((flags & 0xFF) << 16) | xfer;
 	sd_reg_write(SD_XFERMODE_CMD, cmd_word);
@@ -661,33 +688,135 @@ fn bool sdd_enumerate()
 	return true;
 }
 
+// SDMA block transfer — the controller moves the 512 bytes to/from
+// g_sdd_dma_paddr itself (an identity-mapped, uncached staging page,
+// SYS_SDD_INFO). No PIO FIFO, so the shallow-FIFO timing discipline the
+// function above lives under doesn't apply here — syscalls / yield()
+// during the completion wait are fine. Completion is interrupt-driven
+// (PLIC source board::IRQ_SDHCI; SYS_DRIVER_IRQ_ARM re-arms it after
+// handle_trap disables it, same pattern as usbd) unless SDD_DMA_INTERRUPT
+// is flipped off for an A/B against DMA-but-polled.
+const bool SDD_DMA_INTERRUPT = true;
+
+fn bool sdd_block_rw_dma(char* data, uint sector, bool is_write)
+{
+	uint* dma_words = (uint*)g_sdd_dma_paddr; // identity-mapped: vaddr == paddr
+	uint* io_words  = (uint*)data;
+
+	if (is_write)
+	{
+		for (uint i = 0; i < SECTOR_SIZE / 4; i++) { dma_words[i] = io_words[i]; }
+	}
+
+	// HOST_CONTROL byte 0, DMA-select field [4:3] = 00 = SDMA (not
+	// ADMA). sdhci_prepare_dma clears this first; racccoon never
+	// otherwise touches this byte, and can't assume the boot ROM / FSBL
+	// left it 0.
+	mmio_clrset8_in32(SD_HOSTCTRL_PWRCTRL, 0, 0x18, 0x00);
+
+	// Host Control 2 "Host Version 4 Enable" (bit 12 of HC2 = bit 28 of
+	// the 32-bit word at 0x3C). If set, SDMA uses a completely
+	// different register layout (address in ADMA_ADDRESS, block count
+	// in DMA_ADDRESS). racccoon's SDMA code below is the classic
+	// non-v4 layout, so force v4 off.
+	uint hc2w = sd_reg_read(SD_ACMD12ERR_HOSTCTRL2);
+	if ((hc2w & (1u << 28)) != 0)
+	{
+		sd_reg_write(SD_ACMD12ERR_HOSTCTRL2, hc2w & ~(1u << 28));
+	}
+
+	// 1 block, DMA buffer-boundary bits [14:12] = 7 (512KB — a single
+	// 512-byte block never reaches it), block size [11:0] = 512.
+	sd_reg_write(SD_BLKSIZE_BLKCNT, (1 << 16) | (7 << 12) | SECTOR_SIZE);
+
+	uint arg = sd_high_capacity ? sector : (sector * SECTOR_SIZE);
+	uint resp = SD_CMD_RESP_SHORT | SD_CMD_CRC_CHECK | SD_CMD_INDEX_CHECK;
+	uint cmd_index = is_write ? 24 : 17;
+
+	g_sd_dma_addr_pending = (uint)g_sdd_dma_paddr; // sd_send_cmd programs SD_DMA_ADDRESS + SD_TRNS_DMA
+	if (!sd_send_cmd(cmd_index, arg, resp, true))
+	{
+		g_sd_dma_addr_pending = 0;
+		print("sdd: DMA CMD");
+		print_hex32(cmd_index);
+		print(" TIMED OUT resp0=");
+		print_hex32(sd_response0);
+		print("\n");
+		return false;
+	}
+
+	ulong done_start = rdtime();
+	ulong done_budget = sd_us_to_ticks(SD_XFER_DONE_US);
+	uint status = 0;
+	if (SDD_DMA_INTERRUPT) { syscall(SYS_DRIVER_IRQ_ARM, 0, 0, 0); }
+	for (;;)
+	{
+		status = sd_reg_read(SD_INT_STATUS);
+		if ((status & (SD_INT_DATA_END | SD_INT_ERROR)) != 0) { break; }
+		if ((status & SD_INT_DMA_END) != 0)
+		{
+			// SDMA crossed a 512KB boundary — clear the bit and point at
+			// the next boundary. Shouldn't happen for one 512-byte block.
+			sd_reg_write(SD_INT_STATUS, SD_INT_DMA_END);
+			uint next = ((uint)g_sdd_dma_paddr + 0x80000u) & ~0x7FFFFu;
+			sd_reg_write(SD_DMA_ADDRESS, next);
+		}
+		if (rdtime() - done_start > done_budget) { break; }
+		if (SDD_DMA_INTERRUPT)
+		{
+			char[8] sc @noinit;
+			uint sv;
+			ipc_poll_type(&sc[0], 0, &sv); // drain the wake; SD_INT_STATUS is the truth
+			yield();                        // DMA runs CPU-free — let others work
+		}
+	}
+
+	sd_reg_write(SD_INT_STATUS, SD_INT_ALL_MASK); // drops the level-high device line
+
+	bool ok = (status & SD_INT_DATA_END) != 0 && (status & SD_INT_ERROR) == 0;
+	if (ok && !is_write)
+	{
+		for (uint i = 0; i < SECTOR_SIZE / 4; i++) { io_words[i] = dma_words[i]; }
+	}
+	if (!ok)
+	{
+		print("sdd: DMA xfer status=0x");
+		print_hex32(status);
+		print("\n");
+	}
+	if (SDD_VERBOSE)
+	{
+		uint done_us = (uint)((rdtime() - done_start) * 1000000 / SD_TIMEBASE_HZ);
+		print("sdd: DMA CMD");
+		print_hex32(cmd_index);
+		print(" ok in ");
+		print_uint(done_us);
+		print("us status=0x");
+		print_hex32(status);
+		print("\n");
+	}
+	return ok;
+}
+
 // PIO block transfer: CMD17 (read) or CMD24 (write), then 128 32-bit
 // words through the buffer-data-port register once the present-state
 // ready bit is set, then wait for transfer-complete. `data` is exactly
 // SECTOR_SIZE bytes, already positioned by the caller.
 //
-// Busy-polling, not interrupt-driven — a real attempt at interrupt-
-// driven completion (PLIC IRQ_SDHCI) was made and thoroughly isolated on
-// real hardware: enabling this PLIC's enable-bit for source 36 alone
-// (independent of anything the SDHCI device itself does — confirmed by
-// disabling only that one bit and leaving every device-side
-// interrupt-enable register untouched, which fixed it) reliably wedges
-// the CPU into a permanent external-interrupt storm — claim() and the
-// raw hardware pending bitmap both report nothing pending on every
-// single sample, yet the trap never stops. That's a genuine, real
-// hardware quirk in this exact PLIC for this exact source, not
-// something in this driver's own logic: two independent, correctly-
-// targeted device-level fixes (widening the status-register clear,
-// unconditionally completing at the PLIC level) left the storm's exact
-// signature completely unchanged, and the isolation test proved neither
-// of those was ever the actual cause. See docs/devlog.md's 2026-08-17
-// entry for the full elimination trail. board::IRQ_SDHCI's PLIC
-// enable-bit write is commented out in boards/duo/board.c3's plic_init()
-// to match — leave it that way unless this gets revisited with real
-// hardware debug tooling (logic analyzer on the IRQ line, or vendor
-// engineering support), not just source-reading.
+// The PIO fallback (sdd_block_rw_dma above is the normal path). This
+// half is timing-fragile — this SDHCI clone's FIFO is shallow enough
+// that a stray access or a print() mid-transfer costs real data (see
+// the "no print, no SD_INT_STATUS write" discipline below and
+// docs/devlog.md's FAT32 entry). Busy-polled, no yield(), for that
+// reason. SDMA has none of this hazard — the controller does the FIFO
+// work — which is why it's the default now.
 fn bool sdd_block_rw(char* data, uint sector, bool is_write)
 {
+	if (SDD_USE_DMA && g_sdd_dma_ok && g_sdd_dma_paddr != 0)
+	{
+		return sdd_block_rw_dma(data, sector, is_write);
+	}
+
 	// Write support: fsd's own reserved-cluster allowlist (see
 	// user/fs/fsd.c3's header comment) is the thing that decides WHICH
 	// sectors are safe to write — this layer just moves bytes for

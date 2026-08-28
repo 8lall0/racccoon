@@ -57,6 +57,14 @@ uptr diskd_req_paddr;
 // not DMA, so it needs no physically-contiguous buffer handed back the
 // way diskd does — see setup_sdd_mappings below.
 int sdd_pid = 0;
+// sdd's SDMA staging buffer — one identity-mapped, uncached page,
+// allocated at spawn (setup_sdd_mappings) and handed back via
+// SYS_SDD_INFO. Same pattern/reasoning as usbd_dma_paddr: the SDHCI
+// SDMA engine's own address register needs a real physical address and
+// sdd can't learn its virtual pages' physical backing otherwise. sdd
+// only ever moves one 512-byte block per request, so one page is
+// plenty. 0 until sdd is spawned (Duo only — HAS_SD_BLOCK).
+uptr sdd_dma_paddr;
 
 // The USB host-controller driver process (see user/usbd.c3) — Duo
 // only (board::HAS_USB), unused this phase (no interrupt routing, no
@@ -913,6 +921,13 @@ fn void setup_sdd_mappings(Process* proc)
 	// SD_MMIO_BASE and from each other.
 	uptr[4] sdd_pages = { board::SD_MMIO_BASE, board::SD_TOP_PAGE, board::SD_PINMUX_PAGE, board::SD_CLOCK_PAGE };
 	map_device_pages(proc, &sdd_pages[0], 4);
+
+	// SDMA staging buffer — identity-mapped, uncached (map_device_page,
+	// not map_page — same real-hardware DMA cache-incoherency reasoning
+	// as usbd_dma_paddr's own comment).
+	uptr dma_paddr = alloc_pages(1);
+	map_device_page(proc.page_table, dma_paddr, dma_paddr, PAGE_U | PAGE_R | PAGE_W);
+	sdd_dma_paddr = dma_paddr;
 
 	sdd_pid = proc.pid;
 }

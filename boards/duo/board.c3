@@ -86,11 +86,14 @@ const uptr PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uptr)~(kernel::PAGE_SIZE - 1);
 // that actually owns this (pad/power/clock bring-up, standard SD command
 // sequence, PIO block transfers — no DMA, no PLIC involvement in v1).
 const uptr SD_MMIO_BASE = 0x04310000;
-const uint IRQ_SDHCI    = 36; // routed through plic_init()/handle_trap
-                               // (entry.c3) the same way IRQ_VIRTIO_BLK
-                               // is on QEMU — sdd.c3 blocks on it for
-                               // block-transfer completion instead of
-                               // busy-polling INT_STATUS.
+const uint IRQ_SDHCI    = 36; // CV1800B SD0 PLIC source (cv180x dtsi SOC_PERIPHERAL_IRQ(20)=36) — armed in plic_init when INTERRUPT_DRIVEN_SD, routed via handle_trap like IRQ_USB
+
+// Interrupt-driven SD block-transfer completion — only meaningful with
+// the SDMA path (sdhci.c3 SDD_USE_DMA), where the controller moves the
+// data itself and the CPU is free to wait on the IRQ. Same
+// strong-order-MMIO prerequisite and handle_trap pattern as USB. Flip
+// false to keep IRQ_SDHCI unarmed (sdd then polls INT_STATUS).
+const bool INTERRUPT_DRIVEN_SD = true;
 
 // Real, confirmed timebase-frequency (rdtime()'s own tick rate), not
 // guessed — read directly from the real devicetree shipped in
@@ -334,12 +337,12 @@ fn void plic_init()
 	uint* priority_sdhci = (uint*)(PLIC_PRIORITY_BASE + 4 * IRQ_SDHCI);
 	mem::store(priority_sdhci, 1u, 4, true);
 
-	// IRQ_SDHCI's enable bit stays off — re-arming it needs the kernel
-	// IRQ path to ack the SDHCI controller's own level-triggered
-	// INT_STATUS (sdd turns on SD_SIGNAL_ENABLE), a separate to-do.
-	// USB is armed first: the DWC2 core interrupt (GINTMSK) is only
-	// unmasked by the driver mid-transfer and it re-reads HCINT as the
-	// source of truth, so no unacked-device-line hazard.
+	// Arm the driver PLIC sources. Both use the handle_trap
+	// disable-on-fire / SYS_DRIVER_IRQ_ARM re-arm pattern so the
+	// level-high device line is harmless between fire and the driver's
+	// own status clear. USB: DWC2 GINTMSK unmasked only mid-transfer.
+	// SD: only fires in the SDMA path (sdd clears SD_INT_STATUS right
+	// after the wait).
 	if (INTERRUPT_DRIVEN_USB && HAS_USB)
 	{
 		uint* priority_usb = (uint*)(PLIC_PRIORITY_BASE + 4 * IRQ_USB);
@@ -347,6 +350,14 @@ fn void plic_init()
 		uint* enable_word0 = (uint*)PLIC_ENABLE_BASE;
 		uint cur = mem::load(enable_word0, 4, true);
 		mem::store(enable_word0, cur | (1u << IRQ_USB), 4, true); // IRQ_USB (30) < 32 → word 0
+	}
+	if (INTERRUPT_DRIVEN_SD && HAS_BLOCK_DEVICE)
+	{
+		// priority_sdhci is already written above. IRQ_SDHCI (36) → the
+		// SECOND enable word (36/32 = 1), bit 36 % 32 = 4.
+		uint* enable_word1 = (uint*)(PLIC_ENABLE_BASE + 4);
+		uint cur = mem::load(enable_word1, 4, true);
+		mem::store(enable_word1, cur | (1u << (IRQ_SDHCI % 32)), 4, true);
 	}
 
 	uint* threshold = (uint*)PLIC_THRESHOLD;
