@@ -22,8 +22,8 @@ import std::nolibc::main_stub;
 
 // --- Shared with the kernel / fsd — kept in sync by hand, same wire
 // protocol as user/block/diskd.c3.
-const uint DISKD_READ    = 10;
-const uint DISKD_WRITE   = 11;
+const uint DISKD_READ    = 210;
+const uint DISKD_WRITE   = 211;
 const uint DISKD_MSG_MAX = 516;
 
 fn void sdd_init()

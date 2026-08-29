@@ -26,6 +26,8 @@ const uint VIRTIO_REG_QUEUE_SEL      = 0x30;
 const uint VIRTIO_REG_QUEUE_NUM      = 0x38;
 const uint VIRTIO_REG_QUEUE_PFN      = 0x40;
 const uint VIRTIO_REG_QUEUE_NOTIFY   = 0x50;
+const uint VIRTIO_REG_INTERRUPT_STATUS = 0x60; // read: which events the device is signalling (bit 0 = used ring)
+const uint VIRTIO_REG_INTERRUPT_ACK    = 0x64; // write the same bits back to clear them — and drop the IRQ line
 const uint VIRTIO_REG_DEVICE_STATUS  = 0x70;
 const uint VIRTIO_REG_DEVICE_CONFIG  = 0x100;
 

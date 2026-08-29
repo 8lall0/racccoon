@@ -22,8 +22,8 @@ import std::nolibc::mem;
 // --- Shared with the kernel — kept in sync by hand, same convention as
 // the SYS_* numbers above (see src/entry.c3, src/process.c3).
 const uint DISKD_IRQ_NOTIFY = 0xFFFFFFFF;
-const uint DISKD_READ  = 10; // request: read one sector
-const uint DISKD_WRITE = 11; // request: write one sector
+const uint DISKD_READ  = 210; // request: read one sector
+const uint DISKD_WRITE = 211; // request: write one sector
 
 // Message layout, both directions: byte 0..3 = sector number (uint),
 // byte 4..515 = one 512-byte sector's worth of data (the sector written,
@@ -176,6 +176,16 @@ fn void main()
 			int r = ipc_poll_type(&buf, 0, &notify_verb);
 			if (r != -1 && notify_verb == DISKD_IRQ_NOTIFY) break;
 		}
+
+		// Clear the device's interrupt-status bits so QEMU drops the
+		// (legacy virtio-mmio, level-triggered) IRQ line. Nothing else
+		// does it — and a permanently-asserted line re-traps on every
+		// sret, storming the PLIC and wedging the whole system. This was
+		// harmless while the only IRQ delivery was the trap path routing
+		// straight to diskd's inbox; it stopped being harmless once
+		// SYS_IPC_POLL started draining the PLIC itself (docs/devlog.md).
+		uint isr = reg_read32(VIRTIO_REG_INTERRUPT_STATUS);
+		if (isr != 0) { reg_write32(VIRTIO_REG_INTERRUPT_ACK, isr); }
 
 		buf[0] = req.status;
 		if (!is_write)

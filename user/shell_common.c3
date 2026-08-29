@@ -482,12 +482,13 @@ fn int shell_expand_q(char* in, char* out, char* qmask, int cap)
     return o;
 }
 
-// One pipeline — a simple command, optionally with a single `|` and
-// `<` / `>` / `>>` redirections (each operator its own space-separated
-// token; quoted, e.g. `echo '|'`, they're literal). `seg` is the raw
-// segment text (shell_exec_line has already split off `;` / `&&` /
-// `||`); it's `$var`-expanded quote-aware and tokenised here, right
-// before it runs. With no `|`/redirection it's the plain
+// One pipeline — a chain of commands joined by `|` (up to MAX_STAGES),
+// optionally with `<` on the first stage and `>` / `>>` on the last
+// (each operator its own space-separated token; quoted, e.g.
+// `echo '|'`, they're literal). `seg` is the raw segment text
+// (shell_exec_line has already split off `;` / `&&` / `||`); it's
+// `$var`-expanded quote-aware and tokenised here, right before it runs.
+// With no `|`/redirection it's the plain
 // `shell_dispatch_common() || shell_exec_external()` path, builtins and
 // all. A pipeline stage is always an external /bin binary — a builtin
 // like `echo` on the left of a `|` needs /bin/echo (user/bin/echo.c3).
@@ -532,55 +533,66 @@ fn int shell_run_pipeline(char* seg, int seg_len)
     }
     if (nt == 0) { return 0; }
 
-    // Split the tokens around the operators into up to two argv
-    // segments (seg 0 = left of `|`, seg 1 = right) plus in/out files.
-    char*[20] seg0 @noinit; int seg0n = 0;
-    char*[20] seg1 @noinit; int seg1n = 0;
-    int side = 0;   // 0 = left of `|`, 1 = right
-    bool has_pipe = false;
-    char* infile  = null;
-    char* outfile = null;
-    bool  append  = false;
-    bool  bad     = false;
+    // Split the tokens into pipeline stages on `|`, collecting each
+    // stage's argv plus the (first-stage-only) `<` and (last-stage-only)
+    // `>` / `>>` targets. `stage_words` is flat storage; stage s's argv
+    // is stage_words[stage_off[s] ..] with element 0 the command name.
+    const int MAX_STAGES = 6;
+    const int STAGE_WORDS_MAX = MAX_STAGES * 8;
+    char*[STAGE_WORDS_MAX] stage_words @noinit;
+    int[MAX_STAGES] stage_off @noinit;
+    int[MAX_STAGES] stage_n   @noinit;
+    int nstages = 1;
+    int sw = 0;
+    stage_off[0] = 0; stage_n[0] = 0;
+    char* infile   = null;
+    char* outfile  = null;
+    bool  append   = false;
+    int   gt_stage = -1;   // which stage carried `>` (must be the last one)
+    bool  bad      = false;
 
     for (int i = 0; i < nt; i++) {
         char* t = tokens[i];
         if (tok_op[i] && t[0] == '|') {
-            if (has_pipe) { bad = true; break; }
-            has_pipe = true; side = 1; continue;
+            if (nstages >= MAX_STAGES) { print("shell: pipeline too long\n"); return 2; }
+            stage_off[nstages] = sw;
+            stage_n[nstages] = 0;
+            nstages++;
+            continue;
         }
         if (tok_op[i]) {   // < > >>
             if (i + 1 >= nt || tok_op[i + 1]) { bad = true; break; }
             char* target = tokens[i + 1];
             i++;
-            if (t[0] == '<') { infile = target; }
-            else { outfile = target; append = t[1] == '>'; }
+            if (t[0] == '<') {
+                if (nstages != 1) { print("shell: `<` redirect only on the first pipeline stage\n"); return 2; }
+                infile = target;
+            } else {
+                outfile = target; append = t[1] == '>'; gt_stage = nstages - 1;
+            }
             continue;
         }
-        if (side == 0) { if (seg0n < 19) { seg0[seg0n++] = t; } }
-        else           { if (seg1n < 19) { seg1[seg1n++] = t; } }
+        if (sw < STAGE_WORDS_MAX) { stage_words[sw] = t; sw++; stage_n[nstages - 1]++; }
     }
 
-    if (bad || seg0n == 0 || (has_pipe && seg1n == 0)) {
-        print("shell: malformed pipeline\n");
+    for (int s = 0; s < nstages; s++) { if (stage_n[s] == 0) { bad = true; } }
+    if (bad) { print("shell: malformed pipeline\n"); return 2; }
+    if (outfile != null && gt_stage != nstages - 1) {
+        print("shell: `>` redirect only on the last pipeline stage\n");
         return 2;
     }
-    seg0[seg0n] = null;
-    seg1[seg1n] = null;
 
     // No pipe, no redirection: the plain path, builtins included.
-    if (!has_pipe && infile == null && outfile == null) {
-        char* c0 = seg0[0];
-        if (shell_dispatch_common(c0, &seg0[1], seg0n - 1)) {
+    if (nstages == 1 && infile == null && outfile == null) {
+        char* c0 = stage_words[0];
+        if (shell_dispatch_common(c0, &stage_words[1], stage_n[0] - 1)) {
             return g_shell_status;
         }
-        return shell_exec_external(c0, &seg0[1], seg0n - 1);
+        return shell_exec_external(c0, &stage_words[1], stage_n[0] - 1);
     }
 
-    // `< file`: read it now (bounded at the kernel pipe buffer) into a
-    // buffer that outlives the whole pipeline, and make the pipe that
-    // will carry it to the consumer's stdin.
-    int in_pipe = -1;
+    // `< file`: read it up front (bounded at one kernel pipe buffer)
+    // into a buffer that outlives the whole pipeline.
     char[PIPE_FILE_MAX] infbuf @noinit;
     int inflen = 0;
     if (infile != null) {
@@ -589,51 +601,63 @@ fn int shell_run_pipeline(char* seg, int seg_len)
             print("shell: "); print(infile); print(": cannot open\n");
             return 2;
         }
-        in_pipe = pipe_new();
-        if (in_pipe < 0) { print("shell: out of pipes\n"); return 2; }
-        pipe_hold(in_pipe, 1, 1);   // shell is the writer until it has fed the bytes in
     }
 
-    // Left stage of a `|` (its stdout -> a fresh pipe the right stage
-    // reads). Without a `|` there is only one command stage.
-    int mid_pipe = -1;
-    int left_pid = -1; uint left_gen = 0;
-    if (has_pipe) {
-        mid_pipe = pipe_new();
-        if (mid_pipe < 0) { print("shell: out of pipes\n"); return 2; }
-        left_pid = shell_spawn(seg0[0], &seg0[1], seg0n - 1, &left_gen);
-        if (left_pid < 0) { return 2; }
-        pipe_setout(left_pid, mid_pipe);
-        if (in_pipe >= 0) { pipe_setin(left_pid, in_pipe); }
-    }
-
-    // The final command stage.
-    char** last_argv = has_pipe ? &seg1[0] : &seg0[0];
-    int    last_argc = has_pipe ? seg1n    : seg0n;
+    // Allocate every pipe first: nstages-1 inter-stage pipes, plus
+    // in_pipe (`<`) and out_pipe (`>`). On exhaustion, free what we got
+    // (pipe_hold +1 then -1 — the -1 detach runs pipe_free_if_idle) and
+    // bail before spawning anything.
+    int[MAX_STAGES] mpipe @noinit;
+    int nmp = nstages - 1;
+    int in_pipe  = -1;
     int out_pipe = -1;
-    if (outfile != null) {
-        out_pipe = pipe_new();
-        if (out_pipe < 0) { print("shell: out of pipes\n"); return 2; }
-        pipe_hold(out_pipe, 0, 1);  // shell is the reader draining it to the file
+    bool pipe_fail = false;
+    for (int s = 0; s < nmp; s++) {
+        mpipe[s] = pipe_new();
+        if (mpipe[s] < 0) { pipe_fail = true; nmp = s; break; }
     }
-    uint last_gen = 0;
-    int last_pid = shell_spawn(last_argv[0], &last_argv[1], last_argc - 1, &last_gen);
-    if (last_pid < 0) {
-        if (left_pid > 0) { join(left_pid, left_gen); }
+    if (!pipe_fail && infile  != null) { in_pipe  = pipe_new(); if (in_pipe  < 0) { pipe_fail = true; } }
+    if (!pipe_fail && outfile != null) { out_pipe = pipe_new(); if (out_pipe < 0) { pipe_fail = true; } }
+    if (pipe_fail) {
+        for (int s = 0; s < nmp; s++) { pipe_hold(mpipe[s], 0, 1); pipe_hold(mpipe[s], 0, -1); }
+        if (in_pipe >= 0) { pipe_hold(in_pipe, 0, 1); pipe_hold(in_pipe, 0, -1); }
+        print("shell: out of pipes\n");
         return 2;
     }
-    if (has_pipe)          { pipe_setin(last_pid, mid_pipe); }
-    else if (in_pipe >= 0) { pipe_setin(last_pid, in_pipe); }
-    if (out_pipe >= 0)     { pipe_setout(last_pid, out_pipe); }
+    if (in_pipe  >= 0) { pipe_hold(in_pipe, 1, 1); }   // shell writes the file in
+    if (out_pipe >= 0) { pipe_hold(out_pipe, 0, 1); }  // shell drains it to the file
 
-    // Every end is attached. Feed `< file` in, then drop our writer so
-    // the consumer sees EOF once it has drained the buffer.
+    // Spawn every stage, then wire its ends — before any child runs
+    // (cooperative sched, the shell doesn't yield until the feed / pump
+    // / join below). On a spawn failure, kill what started and bail.
+    int[MAX_STAGES]  spid @noinit;
+    uint[MAX_STAGES] sgen @noinit;
+    int spawned = 0;
+    for (int s = 0; s < nstages; s++) {
+        char** argv = &stage_words[stage_off[s] + 1];
+        int    argc = stage_n[s] - 1;
+        spid[s] = shell_spawn(stage_words[stage_off[s]], argv, argc, &sgen[s]);
+        if (spid[s] < 0) {
+            for (int k = 0; k < spawned; k++) { kill(spid[k], sgen[k]); }
+            if (in_pipe  >= 0) { pipe_hold(in_pipe, 1, -1); }
+            if (out_pipe >= 0) { pipe_hold(out_pipe, 0, -1); }
+            return 2;
+        }
+        spawned++;
+        int stdin_p  = s == 0           ? in_pipe  : mpipe[s - 1];
+        int stdout_p = s == nstages - 1 ? out_pipe : mpipe[s];
+        if (stdin_p  >= 0) { pipe_setin(spid[s], stdin_p); }
+        if (stdout_p >= 0) { pipe_setout(spid[s], stdout_p); }
+    }
+
+    // Feed `< file`, then drop our writer so stage 0 sees EOF once it
+    // has drained the buffer.
     if (in_pipe >= 0) {
         if (inflen > 0) { pipe_write(in_pipe, &infbuf[0], inflen); }
         pipe_hold(in_pipe, 1, -1);
     }
 
-    // Pump `>` / `>>`: stream the final stage's stdout to the file.
+    // Pump `>` / `>>`: stream the last stage's stdout to the file.
     bool redir_failed = false;
     if (out_pipe >= 0) {
         uint off = 0;
@@ -655,9 +679,12 @@ fn int shell_run_pipeline(char* seg, int seg_len)
         pipe_hold(out_pipe, 0, -1);
     }
 
-    if (left_pid > 0) { join(left_pid, left_gen); }
-    int last_status = join(last_pid, last_gen);
-    // A redirection write failure outranks the command's own status.
+    // Join in order; the pipeline's status is the last stage's.
+    int last_status = 0;
+    for (int s = 0; s < nstages; s++) {
+        int st = join(spid[s], sgen[s]);
+        if (s == nstages - 1) { last_status = st; }
+    }
     return redir_failed ? 3 : last_status;
 }
 

@@ -393,6 +393,15 @@ struct Process
 	char[MSG_MAX] msg_data;
 	bool msg_acked; // set by the receiver once *this* process's own pending send has been consumed
 
+	// An interrupt-driven driver's pending device-completion notify —
+	// SEPARATE from the inbox above, so routing an IRQ can never clobber
+	// (or be clobbered by) a real client request. service_pending_external_irq()
+	// (entry.c3) sets it; the driver's SYS_IPC_POLL wait reports it as a
+	// DISKD_IRQ_NOTIFY and clears it. Was routed through has_message /
+	// msg_type; that collided once SYS_IPC_POLL started draining the PLIC
+	// itself (see docs/devlog.md).
+	bool driver_irq_pending;
+
 	// Per-process namespace: path prefix -> server pid. Every process gets
 	// an identical default namespace today (populated in create_process) —
 	// there's no fork()/namespace inheritance yet to make private ones

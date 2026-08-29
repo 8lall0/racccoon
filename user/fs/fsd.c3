@@ -72,9 +72,16 @@ import std::nolibc::mem;
 
 // --- diskd's own protocol (user/diskd.c3) — unrelated to FS_READ/WRITE
 // above, just the client side of it. Shared by every backend, via
-// fs_read_sector/fs_write_sector below.
-const uint DISKD_READ    = 10;
-const uint DISKD_WRITE   = 11;
+// fs_read_sector/fs_write_sector below. Deliberately >100, clear of both
+// the P9_* verb range (3..10) and the FS_* range (20..28): if a diskd
+// reply ever lands in fsd's inbox unconsumed (a completion-IRQ delivery
+// race — see docs/devlog.md), fsd's main-loop recv picks it up as a
+// bogus request. With a colliding number (DISKD_READ was 10 == P9_REMOVE)
+// fsd would dispatch it and reply straight back to diskd — a mutual
+// deadlock. Out of range, fsd just drops it (the recv still acks diskd,
+// so diskd unblocks) and recovers.
+const uint DISKD_READ    = 210;
+const uint DISKD_WRITE   = 211;
 const uint DISKD_MSG_MAX = 516;
 const uint SECTOR_SIZE   = 512;
 

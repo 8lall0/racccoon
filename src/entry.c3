@@ -775,6 +775,7 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		*(--child_sp) = (uptr)&fork_entry;
 
 		child.has_message = false;
+		child.driver_irq_pending = false; // reused-slot hygiene (a driver's slot never actually gets rfork'd, but keep it clean)
 		// Same reused-slot reasoning as has_message above — a
 		// previous occupant of this slot could have been killed
 		// while genuinely mid a blocking wait (SYS_KILL's own
@@ -1740,11 +1741,41 @@ fn void sys_ipc_poll(Trap_frame* f) @noinline
 		// instead of fixing it. Polling from genuine user-mode code
 		// sidesteps the whole problem: this process is never parked
 		// mid-trap between polls, so sstatus.SIE's natural value
-		// (on, from user_entry) is safe to leave alone, and the
-		// interrupt can fire and get routed normally in between.
+		// (on, from user_entry) is safe to leave alone.
+		//
+		// The interrupt still can't always fire on its own: a
+		// concurrent multi-stage shell pipeline keeps several processes
+		// parked in SYS_IPC_CALL's cooperative yield loops, so
+		// sstatus.SIE stays globally clear and the device completion
+		// this poll waits for is never taken as a trap. So this syscall
+		// drains the PLIC by hand (service_pending_external_irq) and
+		// reports the result through Process.driver_irq_pending — a flag
+		// distinct from the IPC inbox, so it can't clobber (or be
+		// clobbered by) a real client request. See docs/devlog.md.
 		char* poll_buf      = (char*)(uptr)f.a0;
 		int poll_len        = (int)f.a1;
 		uint* poll_type_out = (uint*)(uptr)f.a2;
+		if (poll_type_out != null && !user_range_valid(current_proc.page_table, (uptr)poll_type_out, 4, true))
+		{
+			f.a0 = (ulong)(-1);
+			return;
+		}
+
+		// Deliver a pending device IRQ that couldn't be taken as a trap
+		// (SIE globally off during a cooperative-blocking storm — see
+		// service_pending_external_irq). Reported as a DISKD_IRQ_NOTIFY
+		// with no payload and from == 0, exactly like the old
+		// trap-routed version; it lives in its own flag so it can never
+		// clobber a real client request in the inbox.
+		service_pending_external_irq();
+		if (current_proc.driver_irq_pending)
+		{
+			current_proc.driver_irq_pending = false;
+			if (poll_type_out != null) { *poll_type_out = DISKD_IRQ_NOTIFY; }
+			f.a0 = 0;
+			return;
+		}
+
 		if (!current_proc.has_message)
 		{
 			f.a0 = (ulong)(-1);
@@ -1752,8 +1783,7 @@ fn void sys_ipc_poll(Trap_frame* f) @noinline
 		}
 		int poll_copy_len = poll_len > MSG_MAX ? MSG_MAX : poll_len;
 		if (poll_copy_len < 0) poll_copy_len = 0;
-		if (!user_range_valid(current_proc.page_table, (uptr)poll_buf, (ulong)poll_copy_len, true)
-			|| (poll_type_out != null && !user_range_valid(current_proc.page_table, (uptr)poll_type_out, 4, true)))
+		if (!user_range_valid(current_proc.page_table, (uptr)poll_buf, (ulong)poll_copy_len, true))
 		{
 			f.a0 = (ulong)(-1);
 			return;
@@ -2665,6 +2695,59 @@ fn void handle_syscall(Trap_frame* f) @noinline
 	}
 }
 
+// Claim, route, and complete one pending PLIC external interrupt, or do
+// nothing when none is pending (plic_claim() returns 0). handle_trap's
+// SCAUSE_SUPERVISOR_EXTERNAL case calls it for a genuine hardware trap;
+// sys_ipc_poll also calls it, because an interrupt-driven driver
+// (user/block/diskd.c3, user/block/sdd.c3, user/usb/*, user/gpio/*)
+// waits for its device completion by spin-polling its inbox through
+// that syscall — and while a concurrent multi-stage shell pipeline
+// keeps several processes parked in SYS_IPC_CALL's cooperative yield
+// loops, none of those loops ever sret, so hardware-cleared
+// sstatus.SIE stays globally off and the completion IRQ is never
+// taken. Draining it here delivers the driver its notify regardless of
+// SIE, closing a real deadlock (diskd spins for an IRQ that can't fire
+// → fsd blocks on diskd → the pipeline stage blocks on fsd → the
+// shell's join() hangs). The notify lands in Process.driver_irq_pending,
+// NOT the IPC inbox, so it can't collide with a client request the
+// driver hasn't consumed yet. See docs/devlog.md.
+fn void service_pending_external_irq() @noinline
+{
+	uint irq = board::plic_claim();
+
+	Irq_route* route = irq_route_by_irq(irq);
+	if (route != null)
+	{
+		Process* driver = proc_by_pid(route.pid);
+		if (driver != null)
+		{
+			driver.driver_irq_pending = true;
+			if (driver.state == PROC_BLOCKED)
+			{
+				driver.state = PROC_RUNNABLE;
+			}
+		}
+	}
+	if (irq != 0)
+	{
+		board::plic_complete(irq);
+	}
+	// A `level` source (DWC2, SDHCI, dwmac) keeps its device status line
+	// asserted until the driver clears it; on this SoC a still-pending
+	// external interrupt at sret re-traps before the returned-to context
+	// runs an instruction, so leaving it enabled hangs the driver out of
+	// ever reaching that clear. Disable AFTER plic_complete (the PLIC
+	// ignores a completion for a disabled source); the driver re-arms
+	// via SYS_DRIVER_IRQ_ARM before its next wait. Also disable any
+	// unrecognized non-zero source — a misrouted level IRQ left enabled
+	// is a guaranteed storm. An edge/latched route (virtio-mmio,
+	// level=false) is the only case left enabled.
+	if (irq != 0 && (route == null || route.level))
+	{
+		board::plic_set_enabled(irq, false);
+	}
+}
+
 fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 {
 	ulong scause  = read_reg("scause");
@@ -2685,58 +2768,7 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 		ulong code = scause & ~SCAUSE_INTERRUPT_BIT;
 		if (code == SCAUSE_SUPERVISOR_EXTERNAL)
 		{
-			// Claiming acknowledges the IRQ to the PLIC. 0 means a
-			// spurious claim (nothing pending) — don't complete an IRQ
-			// that wasn't actually claimed.
-			uint irq = board::plic_claim();
-
-			// Route it to the driver that registered it (Irq_route
-			// table, process.c3). Wake that process specifically rather
-			// than relying on "whatever happened to be running/wfi-
-			// waiting" — a device interrupt can land while any process
-			// (or the kernel's own boot code) is active, and only the
-			// owning driver cares. Uses the driver's single-slot IPC
-			// inbox: safe because a driver only waits for this notify
-			// right after kicking its device, never with an unconsumed
-			// client request sitting there (see user/diskd.c3's loop).
-			// DISKD_IRQ_NOTIFY is an opaque "your IRQ fired" marker to
-			// whichever driver gets it — the driver responds by re-
-			// reading its own device's status register, not by
-			// inspecting the notify.
-			Irq_route* route = irq_route_by_irq(irq);
-			if (route != null)
-			{
-				Process* driver = proc_by_pid(route.pid);
-				if (driver != null)
-				{
-					driver.msg_from    = 0;
-					driver.msg_type    = DISKD_IRQ_NOTIFY;
-					driver.has_message = true;
-					if (driver.state == PROC_BLOCKED)
-					{
-						driver.state = PROC_RUNNABLE;
-					}
-				}
-			}
-			if (irq != 0)
-			{
-				board::plic_complete(irq);
-			}
-			// A `level` source (DWC2, SDHCI, dwmac) keeps its device
-			// status line asserted until the driver clears it; on this
-			// SoC a still-pending external interrupt at sret re-traps
-			// before the returned-to context runs an instruction, so
-			// leaving it enabled hangs the driver out of ever reaching
-			// that clear. Disable AFTER plic_complete (the PLIC ignores a
-			// completion for a disabled source); the driver re-arms via
-			// SYS_DRIVER_IRQ_ARM before its next wait. Also disable any
-			// unrecognized non-zero source — a misrouted level IRQ left
-			// enabled is a guaranteed storm. An edge/latched route
-			// (virtio-mmio, level=false) is the only case left enabled.
-			if (irq != 0 && (route == null || route.level))
-			{
-				board::plic_set_enabled(irq, false);
-			}
+			service_pending_external_irq();
 		}
 		else if (code == SCAUSE_SUPERVISOR_TIMER)
 		{
