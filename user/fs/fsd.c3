@@ -1049,6 +1049,17 @@ fn void main(String[] args)
 		// the terminator so every backend's own string walk stays inside
 		// this buffer no matter what arrived on the wire.
 		filename[99] = 0;
+		// Trailing-slash normalization, one place for every backend and
+		// verb: the mount prefix is already stripped on the wire, so
+		// what's left is a bare name that a real filesystem never spells
+		// with a trailing '/'. `ls /` arrives here as "/" and `ls /bin/`
+		// as "/bin/" — collapse both (the first all the way to "", which
+		// every backend's own name walk already reads as "the root").
+		{
+			int fn_end = 0;
+			while (filename[fn_end] != 0) fn_end++;
+			while (fn_end > 0 && filename[fn_end - 1] == '/') { fn_end--; filename[fn_end] = 0; }
+		}
 		// FS_RENAME-only (see user.c3's own wire-format comment) — every
 		// other verb's byte 100.. means something else entirely (a
 		// length, a recursive flag, listing output), captured unconditionally
@@ -1060,6 +1071,11 @@ fn void main(String[] args)
 			new_filename[i] = buf[100 + i];
 		}
 		new_filename[99] = 0; // same untrusted-length guard as filename above
+		{
+			int nfn_end = 0;
+			while (new_filename[nfn_end] != 0) nfn_end++;
+			while (nfn_end > 0 && new_filename[nfn_end - 1] == '/') { nfn_end--; new_filename[nfn_end] = 0; }
+		}
 		uint* len_field = (uint*)&buf[100];
 		int req_len = (int)*len_field;
 		// Untrusted input — clamp rather than trust the caller not to

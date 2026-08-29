@@ -4,6 +4,22 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-29 (continued) — fsd: trailing-slash path normalization
+
+Follow-up to the pipes work, which surfaced it: `ls /` reported "not
+found" (so did `ls /bin/`). `ext2_leaf_name("/")` is `""`, so
+`ext2_list` / `ext2_stat` looked up a directory entry literally named
+`""` and missed — `ls /bin` worked only because its leaf is a real
+name. Fix (`user/fs/fsd.c3`): strip trailing `/` from the request
+filename in the one place it's pulled off the wire (the mount prefix
+is already gone by then), collapsing a lone `/` to `""` — which every
+backend already reads as the root. Same for the FS_RENAME target.
+
+Verified QEMU (ext2 / fat32 / exfat: `ls /`, `ls /bin/` now list;
+`ls /mnt/fs2/` and the fs regression suite unchanged) + real Duo.
+
+---
+
 ## 2026-08-29 (continued) — shell: pipes and redirection
 
 Roadmap §2.5. A kernel pipe primitive + the shell wiring for `|` and
