@@ -85,6 +85,8 @@ const SYS_SDD_INFO      = 33; // sdd-only: returns its SDMA staging buffer's phy
 const SYS_IPC_CALL      = 34; // one-shot RPC: deliver a request to a server and block for its reply, all in the kernel — the reply can't be pre-empted by a stray sender, and the whole thing aborts with -1 if the server dies at any point (see its case below); user-space p9_call is now just this
 const SYS_GETUID        = 35; // the caller's own uid — see its case below
 const SYS_BOOT_QUIET    = 36; // shell-only, called once after boot settles: silences boot servers' console output — see SYS_PUTCHAR
+const SYS_CHDIR         = 37; // set the caller's cwd (a0 = absolute, normalised path, <100 bytes) — the shell's `cd`
+const SYS_GETCWD        = 38; // copy the caller's cwd out (a0 = buf, a1 = cap) — `pwd`, the prompt, the fs_* wrappers
 
 // Flipped by SYS_BOOT_QUIET (the shell, once, after a settle delay).
 // While true, SYS_PUTCHAR from a process with is_boot_server set is
@@ -727,6 +729,7 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		{
 			child.namespace[ns_i] = current_proc.namespace[ns_i];
 		}
+		for (int cw = 0; cw < 100; cw++) { child.cwd[cw] = current_proc.cwd[cw]; }
 
 		// Build the child's first-resume state: a copy of this
 		// trap's own Trap_frame (a0 zeroed — the child's return
@@ -2471,6 +2474,42 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// process (the shell's prompt, /bin/whoami) know who it is
 			// without a getpid()+proc_info(self) round trip.
 			f.a0 = (ulong)(uint)current_proc.uid;
+		case SYS_CHDIR:
+			// a0 = the new cwd, already made absolute + normalised by
+			// the caller (user.c3's cd path logic). The kernel just
+			// stores it — it doesn't stat the target (a cd into a
+			// non-existent dir just makes later relative paths fail,
+			// same as any shell). Truncated to fit.
+			char* chdir_path = (char*)(uptr)f.a0;
+			if (!user_range_valid(current_proc.page_table, (uptr)chdir_path, 1, false))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			int cdw = 0;
+			while (cdw < 99 && chdir_path[cdw] != 0)
+			{
+				current_proc.cwd[cdw] = chdir_path[cdw];
+				cdw++;
+			}
+			current_proc.cwd[cdw] = 0;
+			f.a0 = 0;
+		case SYS_GETCWD:
+			char* getcwd_buf = (char*)(uptr)f.a0;
+			int getcwd_cap = (int)f.a1;
+			if (getcwd_cap < 1 || !user_range_valid(current_proc.page_table, (uptr)getcwd_buf, (ulong)getcwd_cap, true))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			int gcw = 0;
+			while (gcw < getcwd_cap - 1 && current_proc.cwd[gcw] != 0)
+			{
+				getcwd_buf[gcw] = current_proc.cwd[gcw];
+				gcw++;
+			}
+			getcwd_buf[gcw] = 0;
+			f.a0 = (ulong)gcw;
 		default:
 			// An unrecognized syscall number from any process — a
 			// genuine bug in that process, or a deliberately hostile

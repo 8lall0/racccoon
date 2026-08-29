@@ -48,6 +48,8 @@ const int SYS_SDD_INFO      = 33; // sdd-only: returns its SDMA staging buffer's
 const int SYS_IPC_CALL      = 34; // one-shot RPC: deliver a request and block for the reply, all in the kernel — reply can't be pre-empted by a stray sender, aborts -1 if the server dies at any point — see src/entry.c3's case
 const int SYS_GETUID        = 35; // the caller's own uid — see src/entry.c3's case
 const int SYS_BOOT_QUIET    = 36; // shell-only: silences boot-server console output once boot settles — see src/entry.c3's case
+const int SYS_CHDIR         = 37; // set the caller's cwd (absolute, normalised) — see src/entry.c3's case
+const int SYS_GETCWD        = 38; // copy the caller's cwd out — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -194,7 +196,11 @@ fn int exec_path(char* name, char* buf, uint buf_max, int notify_pid, char** arg
     int path_len = fs_read("/env/PATH", &path_var, PATH_VAR_MAX - 1); // leave room for the NUL below
     char* search;
     if (path_len <= 0) {
-        search = "bin/";
+        // Absolute — candidates built below must not be reinterpreted
+        // relative to the caller's cwd (fs_read_at inside exec() now
+        // does that for relative paths). /env/PATH entries should be
+        // absolute too, for the same reason.
+        search = "/bin/";
     } else {
         path_var[path_len] = 0;
         search = &path_var;
@@ -774,6 +780,53 @@ fn void boot_quiet() @export("boot_quiet") {
     syscall(SYS_BOOT_QUIET, 0, 0, 0);
 }
 
+// --- Current working directory ---
+fn int chdir(char* abs_path) @export("chdir") {
+    return syscall(SYS_CHDIR, (long)abs_path, 0, 0);
+}
+fn int getcwd(char* buf, int cap) @export("getcwd") {
+    return syscall(SYS_GETCWD, (long)buf, cap, 0);
+}
+
+// Fill `out` (must be >= 100 bytes) with `rel` resolved against the
+// caller's cwd. Absolute paths (and the empty path = root) pass through
+// unchanged; a relative path from the root cwd also passes through
+// unchanged (it was already root-relative before cwd existed). No `.`
+// / `..` collapsing here — the shell's `cd` normalises those into the
+// stored cwd, and `cat ../x` from a non-root dir just won't resolve for
+// now.
+fn void fs_abspath(char* rel, char* out) @export("fs_abspath") {
+    // Absolute: pass through.
+    if (rel[0] == '/') {
+        int i = 0;
+        while (rel[i] != 0 && i < 99) { out[i] = rel[i]; i++; }
+        out[i] = 0;
+        return;
+    }
+    // Empty (e.g. `ls` with no arg) means "the cwd" — not root.
+    char[100] cw @noinit;
+    int n = getcwd(&cw[0], 100);
+    if (rel[0] == 0) {
+        int i = 0;
+        while (i < n && i < 99) { out[i] = cw[i]; i++; }
+        out[i] = 0;
+        return;
+    }
+    // Relative from root cwd: the bare name is already root-relative,
+    // unchanged from before cwd existed.
+    if (n <= 0) {
+        int i = 0;
+        while (rel[i] != 0 && i < 99) { out[i] = rel[i]; i++; }
+        out[i] = 0;
+        return;
+    }
+    int o = 0;
+    for (int i = 0; i < n && o < 99; i++) { out[o] = cw[i]; o++; }
+    if (o < 99) { out[o] = '/'; o++; }
+    for (int i = 0; rel[i] != 0 && o < 99; i++) { out[o] = rel[i]; o++; }
+    out[o] = 0;
+}
+
 // --- /adm/users, the user database (docs/filesystem-layout.md, §2) ---
 // One "uid:name" line per user. Tiny (a handful of lines), so both
 // lookups just read the whole file each call — the shell caches its own
@@ -1146,6 +1199,7 @@ const uint FS_LIST_NAME_MAX   = 32;
 const uint FS_LIST_ENTRY_SIZE = 36;
 
 fn int fs_read(char* filename, char* buf, int len) @export("fs_read") {
+    char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
     uint prefix_len = 0;
     int fsd_pid = ns_resolve(filename, &prefix_len);
     if (fsd_pid < 0) return -1;
@@ -1189,6 +1243,7 @@ fn int fs_read(char* filename, char* buf, int len) @export("fs_read") {
 // same as a plain fs_read() past the end would, not -1 — exec() below
 // relies on this to know when to stop looping.
 fn int fs_read_at(char* filename, char* buf, int len, uint offset) @export("fs_read_at") {
+    char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
     uint prefix_len = 0;
     int fsd_pid = ns_resolve(filename, &prefix_len);
     if (fsd_pid < 0) return -1;
@@ -1221,6 +1276,7 @@ fn int fs_read_at(char* filename, char* buf, int len, uint offset) @export("fs_r
 }
 
 fn int fs_write(char* filename, char* buf, int len) @export("fs_write") {
+    char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
     uint prefix_len = 0;
     int fsd_pid = ns_resolve(filename, &prefix_len);
     if (fsd_pid < 0) return -1;
@@ -1260,6 +1316,7 @@ fn int fs_write(char* filename, char* buf, int len) @export("fs_write") {
 // offset, a hole, a directory, permission). See FS_WRITE_AT's own
 // wire-format comment.
 fn int fs_write_at(char* filename, char* buf, int len, uint offset) @export("fs_write_at") {
+    char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
     uint prefix_len = 0;
     int fsd_pid = ns_resolve(filename, &prefix_len);
     if (fsd_pid < 0) return -1;
@@ -1297,6 +1354,7 @@ fn int fs_write_at(char* filename, char* buf, int len, uint offset) @export("fs_
 // (0 = file, 1 = directory), either of which may be null. Returns -1 if
 // nothing resolves there. See FS_STAT's own wire-format comment.
 fn int fs_stat(char* filename, uint* out_size, int* out_type) @export("fs_stat") {
+    char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
     uint prefix_len = 0;
     int fsd_pid = ns_resolve(filename, &prefix_len);
     if (fsd_pid < 0) return -1;
@@ -1323,6 +1381,7 @@ fn int fs_stat(char* filename, uint* out_size, int* out_type) @export("fs_stat")
 }
 
 fn int fs_delete_impl(char* filename, uint recursive) {
+    char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
     uint prefix_len = 0;
     int fsd_pid = ns_resolve(filename, &prefix_len);
     if (fsd_pid < 0) return -1;
@@ -1370,6 +1429,7 @@ fn int fs_delete_recursive(char* filename) @export("fs_delete_recursive") {
 // found, not a directory). See user.c3's own FS_LIST wire-format
 // comment for each record's layout.
 fn int fs_list(char* dirname, char* out_buf, int max_entries) @export("fs_list") {
+    char[100] _ap @noinit; fs_abspath(dirname, &_ap[0]); dirname = &_ap[0]; // cwd-relative -> absolute
     uint prefix_len = 0;
     int fsd_pid = ns_resolve(dirname, &prefix_len);
     if (fsd_pid < 0) return -1;
@@ -1404,6 +1464,7 @@ fn int fs_list(char* dirname, char* out_buf, int max_entries) @export("fs_list")
 // the same way fs_delete_recursive is: creates real, persistent
 // on-disk state, no undo besides a subsequent fs_delete.
 fn int fs_mkdir(char* dirname) @export("fs_mkdir") {
+    char[100] _ap @noinit; fs_abspath(dirname, &_ap[0]); dirname = &_ap[0]; // cwd-relative -> absolute
     uint prefix_len = 0;
     int fsd_pid = ns_resolve(dirname, &prefix_len);
     if (fsd_pid < 0) return -1;
@@ -1435,6 +1496,8 @@ fn int fs_mkdir(char* dirname) @export("fs_mkdir") {
 // here would turn an atomic-looking rename into a non-atomic one
 // without the caller ever being told.
 fn int fs_rename(char* old_path, char* new_path) @export("fs_rename") {
+    char[100] _apo @noinit; fs_abspath(old_path, &_apo[0]); old_path = &_apo[0];
+    char[100] _apn @noinit; fs_abspath(new_path, &_apn[0]); new_path = &_apn[0];
     uint old_prefix_len = 0;
     int old_fsd_pid = ns_resolve(old_path, &old_prefix_len);
     if (old_fsd_pid < 0) return -1;

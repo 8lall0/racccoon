@@ -401,6 +401,13 @@ struct Process
 	// restricted view later without a redesign.
 	Mount[NS_MOUNTS_MAX] namespace;
 
+	// Current working directory, absolute, no trailing slash. "" = the
+	// root. SYS_CHDIR sets it (the shell's `cd`), SYS_GETCWD reads it
+	// (`pwd`, the prompt). Inherited across rfork and unchanged by exec,
+	// same as uid/namespace. The fs_* user wrappers prepend it to any
+	// path that isn't already absolute.
+	char[100] cwd;
+
 	// fsd-only: which partition SYS_FS_PARTITION_INFO (entry.c3) hands
 	// back to *this specific* process. Per-process, not a plain kernel
 	// global the way diskd_vq_paddr etc. are — those stay globals because
@@ -862,6 +869,7 @@ fn Process* create_process(void* image, uint image_size)
 	proc.ipc_peer_died = false;
 	proc.in_call_reply_wait = false;
 	proc.is_boot_server = false; // kernel.c3 / supervisor_spawn set it for servers
+	proc.cwd[0] = 0; // root
 
 	// Default namespace: "/srv/echo/" resolves to echod, which is always
 	// pid 2 (see kernel.c3 — it's the first process spawned after idle,
