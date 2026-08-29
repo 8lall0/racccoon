@@ -4,6 +4,57 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-29 (continued) — multi-stage pipelines: blocked on a kernel race
+
+Roadmap §2.5. Attempted `a | b | c` (3+ stages). The shell side worked
+(N-stage parser in `shell_run_pipeline`, `MAX_STAGES` inter-stage
+pipes, spawn-all-then-wire-then-join), and a single 3+ stage pipeline
+runs cleanly every time. But a **second** 3+ stage pipeline in the
+same session hangs (~15-20%), or crashes (`scause=c` instruction
+fault at a stage's `main`). 2-stage stays rock-solid (18/18 hammered).
+Reverted the N-stage code; kept `/bin/head` (a genuinely useful
+2-stage filter — `ls | head -n 3`).
+
+**Root cause (found, not yet fixed).** Instrumented the hang: the
+shell's `join()` waits on the last stage; that stage is parked in
+`SYS_IPC_CALL` phase 3 (its `exec()` mid-`fs_read_at`); **fsd and
+diskd are deadlocked replying to each other** —
+`DBG fsd RECV_GEN from=3 verb=10` then `DBG fsd REPLY to pid=3`. The
+chain:
+
+1. A 3+ stage pipeline runs 3 `exec()`s concurrently. Each stage
+   parks in one of `SYS_IPC_CALL`'s cooperative yield loops, which
+   never `sret`, so hardware-cleared `sstatus.SIE` stays globally off
+   and **no interrupt is taken** for the duration.
+2. diskd's disk-completion wait (`user/block/diskd.c3`) is a
+   **busy-spin poll of its inbox** that relies on its virtio-blk IRQ
+   being delivered normally in between. Under (1) it can't fire.
+3. diskd spins; its `DISKD_READ` reply to fsd ends up delivered but
+   not consumed by fsd's `p9_call` (a duplicate, or a spin-poll that
+   ate fsd's next request). It lingers in fsd's inbox.
+4. fsd's next `ipc_recv_type_gen` picks the stale reply up as a
+   *request* `from=3 verb=10`. **`DISKD_READ == 10 == P9_REMOVE`**, so
+   fsd dispatches it as a P9_REMOVE and `ipc_reply`s to diskd — which
+   is itself still mid-`ipc_reply` to fsd. Mutual deadlock.
+
+**Fixes tried, none sufficient alone:** (a) draining the PLIC from
+`yield()` when `blocking_depth > 0` — the IRQ reaches diskd but the
+deadlock still forms (diskd doesn't ack the virtio-mmio ISR, so
+delivery timing stays fragile); (b) moving `DISKD_READ`/`_WRITE` off
+the P9/FS verb range (10/11 → 60/61) so a stray reply is dropped
+instead of mis-dispatched — removes the *mutual* deadlock but the
+pipeline still hangs (diskd still starved of its IRQ).
+
+**A real fix needs** the interrupt-driven driver's completion wait to
+survive "SIE globally off during a concurrent cooperative-blocking
+storm" — either a PLIC drain on the exact spin path plus a proper
+virtio-mmio ISR ack in diskd/sdd, or replacing the spin with a
+blocking primitive (which today's kernel forbids — the sscratch
+nested-trap hazard in `SYS_IPC_POLL`'s comment). Plus the verb-range
+fix as defence-in-depth. Filed in roadmap §2.5.
+
+---
+
 ## 2026-08-29 (continued) — shell: quoting
 
 Roadmap §2.5. Shell-only — `'...'` and `"..."`.

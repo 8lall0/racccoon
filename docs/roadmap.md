@@ -179,10 +179,23 @@ not bourne. Interleaved with §1/§2 rather than a phase of its own.
   expands. The tokeniser splits only on unquoted whitespace and treats
   `|` / `<` / `>` / `>>` / `;` / `&&` / `||` as operators only when
   unquoted. Unterminated quote → status 2. No backslash escapes.
+- **`/bin/head`** — first stdin filter (`ls | head -n 3`); `head [-n N]`,
+  reads stdin only, default 10 lines.
 
 **Still to do:**
 - globbing; backslash escapes.
-- multi-stage pipelines (`a | b | c`); builtins as pipeline stages.
+- builtins as pipeline stages.
+- **multi-stage pipelines (`a | b | c`) — BLOCKED on a kernel race.**
+  The shell side is written and works for a single pipeline, but a
+  second 3+ stage pipeline in a session hangs or crashes (see
+  docs/devlog.md 2026-08-29). Root cause: 3 concurrent `exec()`s keep
+  `sstatus.SIE` globally off (cooperative-blocking storm), so diskd's
+  busy-spin disk-completion wait never gets its IRQ → fsd blocks on
+  diskd → the stage blocks on fsd → the shell's `join()` hangs. Fix
+  needs the interrupt-driven driver completion path to work with SIE
+  off (PLIC drain on the spin path + virtio-mmio ISR ack, or a safe
+  blocking primitive) plus moving `DISKD_READ`/`_WRITE` (10/11) off the
+  P9/FS verb range so a stray reply can't be mis-dispatched.
 - `bind`/`mount`/`unmount` builtins + a `namespace` view (the §1
   leftover) — `SYS_NS_MOUNT`/`_UNMOUNT` exist.
 - a boot-time `login` — the console still comes up as a root shell.
