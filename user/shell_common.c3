@@ -117,6 +117,72 @@ fn void shell_resolve_path(char* arg, char* out)
     out[o] = 0;
 }
 
+fn bool sh_name_start(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
+fn bool sh_name_char(char c)  { return sh_name_start(c) || (c >= '0' && c <= '9'); }
+
+// Value of $<name>, into out (cap includes the NUL). "user"/"cwd"
+// (alias "PWD")/"home" are synthesised from the shell's own state;
+// everything else reads /env/<name> (empty if unset — Plan 9 rc
+// treats an unset variable as the empty list).
+fn int shell_var_value(char* name, char* out, int cap)
+{
+    if (strcmp(name, "user") == 0) {
+        int k = 0;
+        while (g_shell_user[k] != 0 && k < cap - 1) { out[k] = g_shell_user[k]; k++; }
+        out[k] = 0;
+        return k;
+    }
+    if (strcmp(name, "cwd") == 0 || strcmp(name, "PWD") == 0) {
+        int n = getcwd(out, cap);
+        if (n <= 0) { out[0] = '/'; out[1] = 0; return 1; }
+        return n;
+    }
+    if (strcmp(name, "home") == 0) {
+        int k = 0;
+        char* pfx = "/usr/";
+        while (pfx[k] != 0 && k < cap - 1) { out[k] = pfx[k]; k++; }
+        for (int j = 0; g_shell_user[j] != 0 && k < cap - 1; j++) { out[k] = g_shell_user[j]; k++; }
+        out[k] = 0;
+        return k;
+    }
+    char[80] path @noinit;
+    char* ep = "/env/";
+    int p = 0;
+    while (ep[p] != 0) { path[p] = ep[p]; p++; }
+    for (int j = 0; name[j] != 0 && p < 79; j++) { path[p] = name[j]; p++; }
+    path[p] = 0;
+    int n = fs_read(&path[0], out, cap - 1);
+    if (n < 0) n = 0;
+    out[n] = 0;
+    return n;
+}
+
+// Expand $<name> references in `in` into `out` (cap includes the NUL).
+// A `$` not followed by a name character is left literal. No braces,
+// no quotes yet.
+fn void shell_expand(char* in, char* out, int cap)
+{
+    int o = 0;
+    int i = 0;
+    while (in[i] != 0 && o < cap - 1) {
+        if (in[i] == '$' && sh_name_start(in[i + 1])) {
+            i++;
+            char[32] name @noinit;
+            int n = 0;
+            while (sh_name_char(in[i]) && n < 31) { name[n] = in[i]; n++; i++; }
+            name[n] = 0;
+            char[256] val @noinit;
+            int vl = shell_var_value(&name[0], &val[0], 256);
+            for (int k = 0; k < vl && o < cap - 1; k++) { out[o] = val[k]; o++; }
+        } else {
+            out[o] = in[i];
+            o++;
+            i++;
+        }
+    }
+    out[o] = 0;
+}
+
 // Dispatches the small set of real, end-user shell builtins shared by
 // both the production shell (shell.c3) and the test shell
 // (shell_test.c3) — hello/exit/mountusb/su. Returns true if cmd was one
@@ -126,6 +192,13 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
 {
         if (strcmp(cmd, "hello") == 0) {
             print("Hello world from shell!\n");
+            return true;
+        } else if (strcmp(cmd, "echo") == 0) {
+            for (int e = 0; e < cmd_argc; e++) {
+                if (e > 0) { putchar(' '); }
+                print(cmd_argv[e]);
+            }
+            putchar('\n');
             return true;
         } else if (strcmp(cmd, "su") == 0) {
             // Become another user. One-way (setuid only drops, never

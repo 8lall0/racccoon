@@ -56,25 +56,23 @@ fn void main() {
 
         if (too_long) continue;
 
-        // Tokenize on spaces, in place — each token is a pointer
-        // straight into cmdline, NUL-terminated where the next space
-        // was, same "no separate storage" approach exec()'s own
-        // NUL-separated argv blob already uses (user.c3). cmd_argv/
-        // cmd_argc (everything after the command name) only matter to
-        // the /bin/ fallback branch at the very end of this chain —
-        // every builtin below ignores them, unchanged from before this
-        // tokenization existed.
+        // $var expansion, then tokenize the result in place. Tokens
+        // point straight into `expanded`, NUL-terminated where the next
+        // space was.
+        char[512] expanded @noinit;
+        shell_expand(&cmdline[0], &expanded[0], 512);
+
         const int SHELL_MAX_TOKENS = 8;
         char*[SHELL_MAX_TOKENS] tokens @noinit;
         int token_count = 0;
         int ti = 0;
-        while (cmdline[ti] != 0 && token_count < SHELL_MAX_TOKENS) {
-            while (cmdline[ti] == ' ') ti++;
-            if (cmdline[ti] == 0) break;
-            tokens[token_count] = &cmdline[ti];
+        while (expanded[ti] != 0 && token_count < SHELL_MAX_TOKENS) {
+            while (expanded[ti] == ' ') ti++;
+            if (expanded[ti] == 0) break;
+            tokens[token_count] = &expanded[ti];
             token_count++;
-            while (cmdline[ti] != 0 && cmdline[ti] != ' ') ti++;
-            if (cmdline[ti] == ' ') { cmdline[ti] = 0; ti++; }
+            while (expanded[ti] != 0 && expanded[ti] != ' ') ti++;
+            if (expanded[ti] == ' ') { expanded[ti] = 0; ti++; }
         }
         if (token_count == 0) continue;
 
