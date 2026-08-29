@@ -110,19 +110,25 @@ More than you'd expect:
 
 ### Work
 
-1. `/adm/users` on the root fs + a tiny parser (shared lib, used by
-   `login` and by anything that maps uid ↔ name for display).
-2. `login` (`/bin/login`, or a `getty`-alike the kernel spawns on the
-   console instead of the shell): prompt for a name, look it up, set
-   uid via `SYS_SETUID`, `cd /usr/$name`, exec the shell. No password
-   at first (single-user-ish); a password check + an `auth` server is a
-   later step.
-3. A `none` entry + a `newns`/`sandbox` helper that drops to `none` and
-   trims the namespace (generalise `sandboxtest`).
-4. Thread `requester_uid` through the **read** path in `fsd` + the FAT32
-   and exFAT backends; decide the no-`i_uid` policy for those.
-5. `chmod`/`chown` verbs (ext2 only initially) + `/bin` front-ends.
-6. `$user` in `/env` so the shell prompt and `whoami` are cheap.
+1. **`/adm/users` + parser. DONE** (`d1de99d`) — `user_uid_by_name` /
+   `user_name_by_uid` in `user.c3`; `uid:name` lines; uid 0 always
+   resolves to `root`.
+2. **Become a named user. DONE** (`d1de99d`) — `SYS_GETUID`, `su <user>`
+   shell builtin (one-way, like `setuid`), `/bin/whoami`, and the
+   prompt shows the user (`root#` / `glenda%`). *Not* a boot-time
+   `login`/`getty` yet — the console still comes up as a root shell;
+   folding `login` into shell startup (or a real `/bin/login`) is a
+   follow-up, and needs a cwd/`$HOME` concept (deferred with the shell
+   work).
+3. **Read enforcement. DONE** (`05aa0bf`) — `ext2_read_allowed` /
+   `ext2_may_read`; `fsd`'s read/list/stat/`P9_OPEN` paths pass the
+   requester uid. ext2 only (FAT32/exFAT have no ownership); root
+   bypasses. `65534:none` is in `/adm/users`; a `newns`/`sandbox`
+   helper that does `su none` + a namespace trim (generalising
+   `sandboxtest`) is still to do.
+4. **Still to do:** `chmod`/`chown` verbs (ext2 only) + `/bin`
+   front-ends; a boot-time `login`; `$user` in `/env`; a password
+   check + `auth` server (much later).
 
 ### The Plan 9 stance to keep in mind
 

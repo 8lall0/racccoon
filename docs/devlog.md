@@ -4,6 +4,48 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-29 (continued) — §2: the Plan 9 user model (identity + read enforcement)
+
+Roadmap §2, two commits.
+
+**Identity** (`d1de99d`). The kernel already had `Process.uid` +
+`setuid` (drop-only) + write-side fs ownership; what was missing was
+*being* a named user.
+- `SYS_GETUID` (35) — a process learns its own uid.
+- `user_uid_by_name` / `user_name_by_uid` in `user.c3` parse
+  `/adm/users` (`uid:name` lines); uid 0 → `root` even with no file.
+- **`su <user>`** shell builtin — one-way (`setuid` never elevates —
+  Plan 9's "become none, never come back"); `exit` for a fresh root
+  shell.
+- **prompt** — `<user># ` for root, `<user>% ` otherwise; cached,
+  refreshed after `su`. `/bin/whoami`.
+- `/adm/users` seeded `0:root` + `1000:glenda`; `/usr/glenda`.
+
+  Not done: a boot-time `login`/`getty` — the console still comes up as
+  a root shell. Folding `login` into shell startup needs a cwd/`$HOME`
+  concept, deferred with the shell work.
+
+**Read enforcement** (`05aa0bf`). Reads were open to everyone.
+- `ext2_read_allowed` (`S_IRUSR`/`S_IROTH`, mirrors
+  `ext2_write_allowed`) + `ext2_may_read` (name → inode → check; an
+  unresolvable name stays "not found", not a denial).
+- `fsd`'s `FS_READ` / `FS_READ_AT` / `FS_LIST` / `FS_STAT` and the
+  `P9_OPEN` read path pass `fsd_requester_uid(from)`; the `ext2_op_*`
+  read adapters gate on it. **ext2 only** — FAT32/exFAT have no
+  ownership; root always passes.
+- `65534:none` added; a mode-0600 `/adm/secret` fixture makes denial
+  testable.
+
+**Verified QEMU:** `root#` → `su glenda` → `glenda%`; `whoami`; `su
+root` denied; `cat hello.txt` (0644) ok as glenda, `cat adm/secret`
+(0600) denied; `ls` ok. Full regression — `fspermtest` / `bigreadtest`
+/ `p9fstest` / `p9fswritetest` / `p9mkdirtest` / `fswriteat` /
+`fsdkilltest` / `runtest` / `mounttest` / `srvtest` / `sandboxtest` /
+`killtest` / `mutextest` — unchanged (the test shell runs as root).
+Real Duo: clean boot, `root#` prompt, `ls` + `cat`.
+
+---
+
 ## 2026-08-29 (continued) — §1: Plan 9 file structure + hardcoded server pids removed
 
 Roadmap §1, two commits.
