@@ -8,6 +8,12 @@ module user;
 const int RUN_EXEC_BUF_MAX = 262144;
 char[RUN_EXEC_BUF_MAX] run_exec_buf;
 
+// `< file` redirection is bounded at one kernel pipe buffer (PIPE_BUF,
+// src/pipe.c3) — the shell preloads the whole file before any child
+// runs, so it can't stream more than the buffer holds. Larger inputs
+// need a real streaming reader; nothing in this project has wanted one.
+const int PIPE_FILE_MAX = 4096;
+
 // mountusb builtin's own wait bound — see that command's own comment
 // below for why this is a plain retry count this generous, not a
 // wall-clock timeout.
@@ -339,9 +345,12 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
     return false;
 }
 
-// The /bin/<cmd> fallback — also shared by both shells (see
-// shell_dispatch_common's own comment above for why).
-fn void shell_exec_external(char* cmd, char** cmd_argv, int cmd_argc)
+// rfork + exec a /bin/<cmd>, returning the child pid (its generation in
+// *gen_out for a later join()) WITHOUT waiting. The child that fails to
+// exec prints "<cmd>: command not found" and exits. -1 = rfork failed.
+// Split out of shell_exec_external so shell_run_line can start several
+// children, wire their pipe ends, then join them all.
+fn int shell_spawn(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out)
 {
             char[100] bin_path @noinit;
             int bp_i = 0;
@@ -351,16 +360,158 @@ fn void shell_exec_external(char* cmd, char** cmd_argv, int cmd_argc)
             while (cmd[bp_j] != 0 && bp_i < 99) { bin_path[bp_i] = cmd[bp_j]; bp_i++; bp_j++; }
             bin_path[bp_i] = 0;
 
-            uint sh_gen = 0;
-            int sh_r = rfork(RFPROC, &sh_gen);
+            *gen_out = 0;
+            int sh_r = rfork(RFPROC, gen_out);
             if (sh_r < 0) {
                 print("rfork failed\n");
-            } else if (sh_r == 0) {
+                return -1;
+            }
+            if (sh_r == 0) {
                 exec(&bin_path, &run_exec_buf, RUN_EXEC_BUF_MAX, 0, cmd_argv, cmd_argc);
                 print(cmd);
                 print(": command not found\n");
                 exit();
-            } else {
-                join(sh_r, sh_gen);
             }
+            return sh_r;
+}
+
+// The /bin/<cmd> fallback — also shared by both shells (see
+// shell_dispatch_common's own comment above for why).
+fn void shell_exec_external(char* cmd, char** cmd_argv, int cmd_argc)
+{
+            uint sh_gen = 0;
+            int sh_r = shell_spawn(cmd, cmd_argv, cmd_argc, &sh_gen);
+            if (sh_r > 0) { join(sh_r, sh_gen); }
+}
+
+// One entered command line, already tokenised. Handles a single `|`
+// pipe and `<` / `>` / `>>` redirections (each operator must be its own
+// space-separated token); with none of those it is exactly the old
+// `shell_dispatch_common() || shell_exec_external()` path, builtins and
+// all. A pipeline segment is always an external /bin binary — a builtin
+// like `echo` on the left of a `|` needs /bin/echo (user/bin/echo.c3).
+// `< file` is capped at the kernel pipe buffer (PIPE_BUF, src/pipe.c3).
+fn void shell_run_line(char** tokens, int token_count)
+{
+    // Split the tokens around the operators into up to two argv
+    // segments (seg 0 = left of `|`, seg 1 = right) plus in/out files.
+    char*[16] seg0 @noinit; int seg0n = 0;
+    char*[16] seg1 @noinit; int seg1n = 0;
+    int seg = 0;
+    bool has_pipe = false;
+    char* infile  = null;
+    char* outfile = null;
+    bool  append  = false;
+    bool  bad     = false;
+
+    for (int i = 0; i < token_count; i++) {
+        char* t = tokens[i];
+        if (strcmp(t, "|") == 0) {
+            if (has_pipe) { bad = true; break; }
+            has_pipe = true; seg = 1; continue;
+        }
+        if (strcmp(t, "<") == 0 || strcmp(t, ">") == 0 || strcmp(t, ">>") == 0) {
+            if (i + 1 >= token_count) { bad = true; break; }
+            char* target = tokens[i + 1];
+            i++;
+            if (t[0] == '<') { infile = target; }
+            else { outfile = target; append = t[1] == '>'; }
+            continue;
+        }
+        if (seg == 0) { if (seg0n < 15) { seg0[seg0n++] = t; } }
+        else          { if (seg1n < 15) { seg1[seg1n++] = t; } }
+    }
+
+    if (bad || seg0n == 0 || (has_pipe && seg1n == 0)) {
+        print("shell: malformed pipeline\n");
+        return;
+    }
+    seg0[seg0n] = null;
+    seg1[seg1n] = null;
+
+    // No pipe, no redirection: the plain path, builtins included.
+    if (!has_pipe && infile == null && outfile == null) {
+        char* c0 = seg0[0];
+        if (!shell_dispatch_common(c0, &seg0[1], seg0n - 1)) {
+            shell_exec_external(c0, &seg0[1], seg0n - 1);
+        }
+        return;
+    }
+
+    // `< file`: read it now (bounded at the kernel pipe buffer) into a
+    // buffer that outlives the whole pipeline, and make the pipe that
+    // will carry it to the consumer's stdin.
+    int in_pipe = -1;
+    char[PIPE_FILE_MAX] infbuf @noinit;
+    int inflen = 0;
+    if (infile != null) {
+        inflen = fs_read(infile, &infbuf[0], PIPE_FILE_MAX);
+        if (inflen < 0) {
+            print("shell: "); print(infile); print(": cannot open\n");
+            return;
+        }
+        in_pipe = pipe_new();
+        if (in_pipe < 0) { print("shell: out of pipes\n"); return; }
+        pipe_hold(in_pipe, 1, 1);   // shell is the writer until it has fed the bytes in
+    }
+
+    // Left stage of a `|` (its stdout -> a fresh pipe the right stage
+    // reads). Without a `|` there is only one command stage.
+    int mid_pipe = -1;
+    int left_pid = -1; uint left_gen = 0;
+    if (has_pipe) {
+        mid_pipe = pipe_new();
+        if (mid_pipe < 0) { print("shell: out of pipes\n"); return; }
+        left_pid = shell_spawn(seg0[0], &seg0[1], seg0n - 1, &left_gen);
+        if (left_pid < 0) { return; }
+        pipe_setout(left_pid, mid_pipe);
+        if (in_pipe >= 0) { pipe_setin(left_pid, in_pipe); }
+    }
+
+    // The final command stage.
+    char** last_argv = has_pipe ? &seg1[0] : &seg0[0];
+    int    last_argc = has_pipe ? seg1n    : seg0n;
+    int out_pipe = -1;
+    if (outfile != null) {
+        out_pipe = pipe_new();
+        if (out_pipe < 0) { print("shell: out of pipes\n"); return; }
+        pipe_hold(out_pipe, 0, 1);  // shell is the reader draining it to the file
+    }
+    uint last_gen = 0;
+    int last_pid = shell_spawn(last_argv[0], &last_argv[1], last_argc - 1, &last_gen);
+    if (last_pid < 0) { return; }
+    if (has_pipe)          { pipe_setin(last_pid, mid_pipe); }
+    else if (in_pipe >= 0) { pipe_setin(last_pid, in_pipe); }
+    if (out_pipe >= 0)     { pipe_setout(last_pid, out_pipe); }
+
+    // Every end is attached. Feed `< file` in, then drop our writer so
+    // the consumer sees EOF once it has drained the buffer.
+    if (in_pipe >= 0) {
+        if (inflen > 0) { pipe_write(in_pipe, &infbuf[0], inflen); }
+        pipe_hold(in_pipe, 1, -1);
+    }
+
+    // Pump `>` / `>>`: stream the final stage's stdout to the file.
+    if (out_pipe >= 0) {
+        uint off = 0;
+        if (append) {
+            uint st_sz = 0; int st_ty = 0;
+            if (fs_stat(outfile, &st_sz, &st_ty) == 0) { off = st_sz; }
+        } else {
+            char[1] empty @noinit;
+            fs_write(outfile, &empty[0], 0);   // truncate / create
+        }
+        char[512] chunk @noinit;
+        for (;;) {
+            int got = pipe_read(out_pipe, &chunk[0], 512);
+            if (got <= 0) { break; }
+            int w = fs_write_at(outfile, &chunk[0], got, off);
+            if (w < 0) { print("shell: "); print(outfile); print(": write failed\n"); break; }
+            off += (uint)w;
+        }
+        pipe_hold(out_pipe, 0, -1);
+    }
+
+    if (left_pid > 0) { join(left_pid, left_gen); }
+    join(last_pid, last_gen);
 }

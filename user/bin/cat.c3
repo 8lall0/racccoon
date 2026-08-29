@@ -6,9 +6,21 @@ import std::nolibc::main_stub;
 // readfile2/readsubfile/readsubfile2 (all four hardcoded to a fixed
 // path) — one path argument, prints its content. Multi-file support
 // real cat has isn't added: nothing in this project ever needed it.
+//
+// With no argument it copies stdin to stdout a byte at a time until
+// EOF (getchar() == -1) — this is the `echo hi | cat` / `cat < file`
+// case, where the shell (shell_run_line, user/shell_common.c3) has
+// wired this process's stdin to a pipe.
 fn void main(String[] args) {
+    if (args.len == 0) {
+        for (;;) {
+            int c = getchar();
+            if (c < 0) { return; }
+            putchar((char)c);
+        }
+    }
     if (args.len != 1) {
-        print("usage: cat <path>\n");
+        print("usage: cat [path]\n");
         return;
     }
     char* path = args[0].ptr;

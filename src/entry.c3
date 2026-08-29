@@ -87,6 +87,12 @@ const SYS_GETUID        = 35; // the caller's own uid — see its case below
 const SYS_BOOT_QUIET    = 36; // shell-only, called once after boot settles: silences boot servers' console output — see SYS_PUTCHAR
 const SYS_CHDIR         = 37; // set the caller's cwd (a0 = absolute, normalised path, <100 bytes) — the shell's `cd`
 const SYS_GETCWD        = 38; // copy the caller's cwd out (a0 = buf, a1 = cap) — `pwd`, the prompt, the fs_* wrappers
+const SYS_PIPE          = 39; // allocate an anonymous pipe, returns its id or -1 — src/pipe.c3
+const SYS_PIPE_SETOUT   = 40; // point a child's stdout at a pipe: a0 = child pid, a1 = pipe id (or -1 to detach)
+const SYS_PIPE_SETIN    = 41; // point a child's stdin at a pipe: a0 = child pid, a1 = pipe id (or -1)
+const SYS_PIPE_READ     = 42; // drain a pipe into a buffer: a0 = id, a1 = buf, a2 = max; returns bytes (0 = EOF)
+const SYS_PIPE_WRITE    = 43; // feed a buffer into a pipe: a0 = id, a1 = buf, a2 = len; returns bytes written
+const SYS_PIPE_HOLD     = 44; // the shell claims/releases a pipe end it pumps itself (>/< redirection): a0 = id, a1 = as_writer, a2 = delta (+1/-1)
 
 // Flipped by SYS_BOOT_QUIET (the shell, once, after a settle delay).
 // While true, SYS_PUTCHAR from a process with is_boot_server set is
@@ -503,6 +509,8 @@ fn void sys_kill(Trap_frame* f) @noinline
 	// Same as sys_exit: unblock anyone parked in ipc_send/ipc_reply
 	// toward the process we're killing, before its pid is zeroed below.
 	ipc_wake_waiters_on(kill_target);
+	if (kill_target.stdout_pipe >= 0) { pipe_detach(kill_target.stdout_pipe, true); kill_target.stdout_pipe = -1; }
+	if (kill_target.stdin_pipe >= 0) { pipe_detach(kill_target.stdin_pipe, false); kill_target.stdin_pipe = -1; }
 
 	// Same page-table-teardown-if-not-shared logic as
 	// SYS_EXIT above, just targeting kill_target instead of
@@ -574,6 +582,11 @@ fn void sys_exit() @noinline
 		// with a failure. Before pid is cleared below (the sweep keys
 		// on pid+generation).
 		ipc_wake_waiters_on(current_proc);
+
+		// Drop our pipe ends — the other side needs writers/readers to
+		// fall to 0 to see EOF (and the pipe to be freed).
+		if (current_proc.stdout_pipe >= 0) { pipe_detach(current_proc.stdout_pipe, true); current_proc.stdout_pipe = -1; }
+		if (current_proc.stdin_pipe >= 0) { pipe_detach(current_proc.stdin_pipe, false); current_proc.stdin_pipe = -1; }
 
 		bool exit_table_shared = false;
 		for (int share_i = 0; share_i < PROCS_MAX; share_i++)
@@ -767,6 +780,8 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		child.ipc_peer_died = false;
 		child.in_call_reply_wait = false;
 		child.is_boot_server = false; // an rfork child is user work, not a boot server
+		child.stdout_pipe = -1; // console until the shell wires a pipe end
+		child.stdin_pipe = -1;
 		child.pid   = child_i + 1;
 		child.generation++;
 		child.sp    = (uptr)child_sp;
@@ -2120,13 +2135,22 @@ fn void handle_syscall(Trap_frame* f) @noinline
 	switch (f.a3)
 	{
 		case SYS_PUTCHAR:
+			if (current_proc.stdout_pipe >= 0)
+			{
+				// Redirected (a `|` or `>`): into the pipe, blocking
+				// while it's full.
+				while (!pipe_try_put(current_proc.stdout_pipe, (char)(f.a0 & 0xFF)))
+				{
+					yield();
+				}
+			}
 			// Boot servers go silent once the shell has settled (it
 			// calls SYS_BOOT_QUIET) — their init chatter otherwise keeps
 			// landing on the console after the prompt is up. The shell
 			// and everything it exec()s (is_boot_server == false) print
 			// normally. A dmesg-style recall of the dropped lines is a
 			// later add (docs/roadmap.md).
-			if (!(g_boot_quiet && current_proc.is_boot_server))
+			else if (!(g_boot_quiet && current_proc.is_boot_server))
 			{
 				board::console_putchar((int)f.a0);
 			}
@@ -2138,19 +2162,35 @@ fn void handle_syscall(Trap_frame* f) @noinline
 		case SYS_GETCHAR:
 			current_proc.in_blocking_wait = true;
 			blocking_depth++;
-			for (;;)
+			if (current_proc.stdin_pipe >= 0)
 			{
-				// USB keyboard first (src/kbd.c3, fed by usbd through
-				// SYS_KBD_PUSH), then the serial console — a caller can't
-				// tell which a byte came from, and both stay live at once.
-				int ch = kbd_queue_pop();
-				if (ch < 0) { ch = board::console_getchar(); }
-				if (ch >= 0)
+				// Redirected (a `|` or `<`): from the pipe. -1 on EOF
+				// (all writers gone and nothing buffered).
+				for (;;)
 				{
-					f.a0 = (ulong)ch;
-					break;
+					char pc;
+					int pr = pipe_try_get(current_proc.stdin_pipe, &pc);
+					if (pr == 0) { f.a0 = (ulong)(uint)pc; break; }
+					if (pr == 2) { f.a0 = (ulong)(-1); break; }
+					yield();
 				}
-				yield();
+			}
+			else
+			{
+				for (;;)
+				{
+					// USB keyboard first (src/kbd.c3, fed by usbd through
+					// SYS_KBD_PUSH), then the serial console — a caller can't
+					// tell which a byte came from, and both stay live at once.
+					int ch = kbd_queue_pop();
+					if (ch < 0) { ch = board::console_getchar(); }
+					if (ch >= 0)
+					{
+						f.a0 = (ulong)ch;
+						break;
+					}
+					yield();
+				}
 			}
 			current_proc.in_blocking_wait = false;
 			blocking_depth--;
@@ -2510,6 +2550,100 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			getcwd_buf[gcw] = 0;
 			f.a0 = (ulong)gcw;
+		case SYS_PIPE:
+			f.a0 = (ulong)(long)pipe_alloc();
+		case SYS_PIPE_SETOUT:
+		case SYS_PIPE_SETIN:
+		{
+			// a0 = target pid (self or a direct child), a1 = pipe id
+			// (-1 detaches). The shell calls this right after rfork,
+			// before the child runs, so there's no race on the child's
+			// first SYS_PUTCHAR.
+			int spid = (int)f.a0;
+			int spipe = (int)f.a1;
+			Process* starget = proc_by_pid(spid);
+			if (starget == null
+				|| (spid != current_proc.pid && starget.parent_pid != current_proc.pid)
+				|| (spipe >= 0 && !pipe_valid(spipe)))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			bool as_writer = f.a3 == SYS_PIPE_SETOUT;
+			int old = as_writer ? starget.stdout_pipe : starget.stdin_pipe;
+			if (old >= 0) { pipe_detach(old, as_writer); }
+			if (as_writer) { starget.stdout_pipe = spipe; } else { starget.stdin_pipe = spipe; }
+			if (spipe >= 0)
+			{
+				if (as_writer) { pipes[spipe].writers++; } else { pipes[spipe].readers++; }
+			}
+			f.a0 = 0;
+		}
+		case SYS_PIPE_READ:
+		{
+			int rid = (int)f.a0;
+			char* rbuf = (char*)(uptr)f.a1;
+			int rmax = (int)f.a2;
+			if (rmax < 0) { rmax = 0; }
+			if (!pipe_valid(rid) || !user_range_valid(current_proc.page_table, (uptr)rbuf, (ulong)rmax, true))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			// The shell reads a pipe end here to pump `>` to a file:
+			// grab whatever's buffered, block only if nothing's there
+			// yet and writers remain, stop at EOF.
+			int rn = 0;
+			for (;;)
+			{
+				char rc;
+				int rr = pipe_try_get(rid, &rc);
+				if (rr == 0) { rbuf[rn] = rc; rn++; if (rn >= rmax) { break; } continue; }
+				if (rr == 2) { break; }        // EOF
+				if (rn > 0) { break; }         // return what we have
+				yield();
+			}
+			f.a0 = (ulong)rn;
+		}
+		case SYS_PIPE_HOLD:
+		{
+			// The shell holds a pipe end it pumps itself: reader for
+			// `cmd > file` (so the child's writes aren't dropped as
+			// reader-less), writer for `cmd < file` (so the child
+			// doesn't see EOF before the shell has fed the bytes in).
+			// It releases the end (delta -1) once the pump is done.
+			int hid = (int)f.a0;
+			if (!pipe_valid(hid)) { f.a0 = (ulong)(-1); break; }
+			bool h_writer = f.a1 != 0;
+			if ((long)f.a2 >= 0)
+			{
+				if (h_writer) { pipes[hid].writers++; } else { pipes[hid].readers++; }
+			}
+			else
+			{
+				pipe_detach(hid, h_writer);
+			}
+			f.a0 = 0;
+		}
+		case SYS_PIPE_WRITE:
+		{
+			int wid = (int)f.a0;
+			char* wbuf = (char*)(uptr)f.a1;
+			int wlen = (int)f.a2;
+			if (wlen < 0) { wlen = 0; }
+			if (!pipe_valid(wid) || !user_range_valid(current_proc.page_table, (uptr)wbuf, (ulong)wlen, false))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			int wn = 0;
+			while (wn < wlen)
+			{
+				if (pipe_try_put(wid, wbuf[wn])) { wn++; }
+				else { yield(); }
+			}
+			f.a0 = (ulong)wn;
+		}
 		default:
 			// An unrecognized syscall number from any process — a
 			// genuine bug in that process, or a deliberately hostile

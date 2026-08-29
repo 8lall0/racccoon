@@ -154,13 +154,23 @@ not bourne. Interleaved with §1/§2 rather than a phase of its own.
 - **`$var` expansion** (`5fc3c69`) — `shell_expand()` before tokenising.
   `$user`/`$cwd`/`$home` synthesised; anything else is `/env/<name>`,
   empty if unset. `echo` builtin.
+- **`|` pipes** and **`>` / `<` / `>>` redirection** — kernel pipe
+  primitive (`src/pipe.c3`: a ring buffer with writer/reader refcounts;
+  `Process.stdout_pipe`/`stdin_pipe`, -1 = console). `SYS_PUTCHAR`/
+  `SYS_GETCHAR` route through it; `SYS_PIPE`/`_SETOUT`/`_SETIN`/`_READ`/
+  `_WRITE`/`_HOLD` (39–44) drive it. `shell_run_line()` parses one `|`
+  plus `<`/`>`/`>>` (each its own space-separated token), spawns the
+  stage(s) with `shell_spawn()`, wires the ends before any child runs
+  (cooperative sched — no race), then pumps the file end itself. A
+  pipeline stage is always an external `/bin` binary, so `echo` got a
+  real `/bin/echo` and `cat` learned to read stdin. `< file` is bounded
+  at one `PIPE_BUF` (4096). Builtins can't sit in a pipeline yet;
+  `SHELL_MAX_TOKENS` is 8 so a long pipeline overflows.
 
 **Still to do:**
-- **`|` pipes** and **`>` / `<` / `>>` redirection** — needs the
-  storage/IPC model to grow a byte-stream notion (today everything is
-  request/reply; a pipe is a different shape). Probably a small `pipe`
-  server or a kernel pipe primitive.
 - `;` / `&&` / `||` sequencing; quoting; globbing.
+- multi-stage pipelines (`a | b | c`); builtins as pipeline stages;
+  raise `SHELL_MAX_TOKENS`.
 - `bind`/`mount`/`unmount` builtins + a `namespace` view (the §1
   leftover) — `SYS_NS_MOUNT`/`_UNMOUNT` exist.
 - a boot-time `login` — the console still comes up as a root shell.

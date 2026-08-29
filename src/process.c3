@@ -408,6 +408,15 @@ struct Process
 	// path that isn't already absolute.
 	char[100] cwd;
 
+	// stdout / stdin redirection for `|` and `>`/`<` (src/pipe.c3):
+	// -1 = the console (the default). A pipe id otherwise — SYS_PUTCHAR
+	// / SYS_GETCHAR route through it. Reset to -1 in create_process and
+	// the rfork child (a fresh process gets the console); the shell
+	// sets a child's ends explicitly via SYS_PIPE_SETOUT/SETIN, and
+	// SYS_EXEC keeps them.
+	int stdout_pipe;
+	int stdin_pipe;
+
 	// fsd-only: which partition SYS_FS_PARTITION_INFO (entry.c3) hands
 	// back to *this specific* process. Per-process, not a plain kernel
 	// global the way diskd_vq_paddr etc. are — those stay globals because
@@ -870,6 +879,8 @@ fn Process* create_process(void* image, uint image_size)
 	proc.in_call_reply_wait = false;
 	proc.is_boot_server = false; // kernel.c3 / supervisor_spawn set it for servers
 	proc.cwd[0] = 0; // root
+	proc.stdout_pipe = -1;
+	proc.stdin_pipe = -1;
 
 	// Default namespace: "/srv/echo/" resolves to echod, which is always
 	// pid 2 (see kernel.c3 — it's the first process spawned after idle,

@@ -2119,9 +2119,10 @@ fn void main() {
                 print(")\n");
             }
         } else {
-            if (!shell_dispatch_common(cmd, cmd_argv, cmd_argc)) {
-                shell_exec_external(cmd, cmd_argv, cmd_argc);
-            }
+            // Pipes (`|`) and redirection (`<`, `>`, `>>`); with none
+            // of those it's still just shell_dispatch_common || the
+            // /bin fallback (see shell_run_line, user/shell_common.c3).
+            shell_run_line(&tokens[0], token_count);
         }
     }
 }

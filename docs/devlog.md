@@ -4,6 +4,57 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-29 (continued) — shell: pipes and redirection
+
+Roadmap §2.5. A kernel pipe primitive + the shell wiring for `|` and
+`<` / `>` / `>>`.
+
+**Kernel** (`src/pipe.c3`, new). A `Pipe` is a fixed `PIPE_BUF` (4096)
+ring buffer with `writers` / `readers` refcounts (`PIPES_MAX` = 6).
+`pipe_try_put` drops silently when `readers == 0` (SIGPIPE-style);
+`pipe_try_get` returns EOF once the buffer is empty *and* `writers ==
+0`. `Process` grew `stdout_pipe` / `stdin_pipe` (-1 = the console).
+`SYS_PUTCHAR` / `SYS_GETCHAR` route through them when set, so a piped
+child needs no code changes. New syscalls 39–44: `SYS_PIPE` (alloc),
+`SYS_PIPE_SETOUT` / `_SETIN` (point a child's end at a pipe, called
+right after rfork before the child runs — cooperative sched means no
+race), `SYS_PIPE_READ` / `_WRITE` (the shell pumps a file end), and
+`SYS_PIPE_HOLD` (the shell claims the reader end of a `>` pipe / the
+writer end of a `<` pipe so its own traffic isn't dropped / EOF'd
+early, then releases it). `sys_exit` / `sys_kill` detach both ends.
+
+**Shell** (`shell_common.c3`). `shell_exec_external` split into
+`shell_spawn` (rfork + exec, returns the child pid without waiting) +
+a join. New `shell_run_line(tokens, count)` replaces the
+`shell_dispatch_common || shell_exec_external` tail of both shell
+mains: it scans for one `|` and for `<` / `>` / `>>` (each must be its
+own space-separated token); with none it's the old path verbatim,
+builtins and all. A pipeline stage is always an external `/bin`
+binary — so `echo` gained a real `/bin/echo` (`user/bin/echo.c3`) and
+`cat` with no argument now copies stdin to stdout until EOF. `> file`
+truncates then streams `pipe_read` → `fs_write_at`; `>> file` starts
+at the current size; `< file` is read up front (bounded at one
+`PIPE_BUF`) and fed in before any child runs.
+
+**Limitations** (roadmap §2.5): builtins can't be a pipeline stage;
+only one `|`; `SHELL_MAX_TOKENS` is 8 so a long pipeline overflows;
+operators must be space-separated.
+
+**Verified QEMU** (`disk_dual`): `echo hi | cat` → `hi`; `echo foo >
+/tmp/t` + `cat /tmp/t` → `foo`; `echo bar >> /tmp/t` → `foo` / `bar`;
+`cat < /tmp/t` → same; `ls /bin | cat` lists every binary incl. the
+new `echo`. Regression (`hello` / `whoami` / `ls` / `readfile` /
+`p9test` / `nstest` / `ping`) unchanged. Pre-existing, unrelated:
+`ls /` (a lone-slash path) still reports "not found" — `ls` with no
+arg and `ls /bin` are fine.
+
+**Duo:** verified on hardware after a reflash + `populate_duo_bin.sh` —
+`echo hi | cat`, `ls /bin > /tmp/l` + `cat /tmp/l`, `cat < /tmp/l` all
+behave as in QEMU (`/bin/echo` and the stdin-aware `cat` live on the
+ext2 partition, so both flashing steps were needed).
+
+---
+
 ## 2026-08-29 (continued) — shell: boot-quiet, cwd, $var
 
 Roadmap §2.5. Three commits, making §1/§2 usable at the prompt.

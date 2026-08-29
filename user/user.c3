@@ -50,6 +50,12 @@ const int SYS_GETUID        = 35; // the caller's own uid — see src/entry.c3's
 const int SYS_BOOT_QUIET    = 36; // shell-only: silences boot-server console output once boot settles — see src/entry.c3's case
 const int SYS_CHDIR         = 37; // set the caller's cwd (absolute, normalised) — see src/entry.c3's case
 const int SYS_GETCWD        = 38; // copy the caller's cwd out — see src/entry.c3's case
+const int SYS_PIPE          = 39;
+const int SYS_PIPE_SETOUT   = 40;
+const int SYS_PIPE_SETIN    = 41;
+const int SYS_PIPE_READ     = 42;
+const int SYS_PIPE_WRITE    = 43;
+const int SYS_PIPE_HOLD     = 44;
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -787,6 +793,15 @@ fn int chdir(char* abs_path) @export("chdir") {
 fn int getcwd(char* buf, int cap) @export("getcwd") {
     return syscall(SYS_GETCWD, (long)buf, cap, 0);
 }
+
+// --- Anonymous pipes (src/pipe.c3) for the shell's | and > / < ---
+fn int pipe_new() @export("pipe_new") { return syscall(SYS_PIPE, 0, 0, 0); }
+fn int pipe_setout(int pid, int pipe_id) @export("pipe_setout") { return syscall(SYS_PIPE_SETOUT, pid, pipe_id, 0); }
+fn int pipe_setin(int pid, int pipe_id) @export("pipe_setin") { return syscall(SYS_PIPE_SETIN, pid, pipe_id, 0); }
+fn int pipe_read(int id, char* buf, int max) @export("pipe_read") { return syscall(SYS_PIPE_READ, id, (long)buf, max); }
+fn int pipe_write(int id, char* buf, int len) @export("pipe_write") { return syscall(SYS_PIPE_WRITE, id, (long)buf, len); }
+// delta > 0 claims a pipe end the shell pumps itself; delta < 0 releases it. See SYS_PIPE_HOLD.
+fn int pipe_hold(int id, int as_writer, int delta) @export("pipe_hold") { return syscall(SYS_PIPE_HOLD, id, as_writer, delta); }
 
 // Fill `out` (must be >= 100 bytes) with `rel` resolved against the
 // caller's cwd. Absolute paths (and the empty path = root) pass through
