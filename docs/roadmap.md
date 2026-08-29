@@ -174,9 +174,14 @@ not bourne. Interleaved with §1/§2 rather than a phase of its own.
   before it runs — so `$status` (rc's) mid-line is correct. One
   left-associative precedence level. `/bin/true`, `/bin/false`.
   `SHELL_MAX_TOKENS` 8 → 16.
+- **quoting** — `shell_expand_q()` + a parallel `qmask` byte array:
+  `'...'` fully literal (`''` → `'`), `"..."` literal but `$name`
+  expands. The tokeniser splits only on unquoted whitespace and treats
+  `|` / `<` / `>` / `>>` / `;` / `&&` / `||` as operators only when
+  unquoted. Unterminated quote → status 2. No backslash escapes.
 
 **Still to do:**
-- quoting; globbing.
+- globbing; backslash escapes.
 - multi-stage pipelines (`a | b | c`); builtins as pipeline stages.
 - `bind`/`mount`/`unmount` builtins + a `namespace` view (the §1
   leftover) — `SYS_NS_MOUNT`/`_UNMOUNT` exist.

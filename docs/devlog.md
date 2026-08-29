@@ -4,6 +4,42 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-29 (continued) — shell: quoting
+
+Roadmap §2.5. Shell-only — `'...'` and `"..."`.
+
+`shell_expand_q(in, out, qmask, cap)` replaces the plain `shell_expand`
+on the interactive path: it removes the quote characters and, in a
+parallel `qmask` byte array, marks every output byte that came from
+inside quotes. Single quotes are fully literal (`''` → a literal `'`,
+rc's rule); double quotes are literal but `$name` still expands; an
+unquoted `$name` expands and its bytes stay unquoted (so it still
+word-splits, unchanged). Unterminated quote → error, status 2.
+
+The tokeniser (now inside `shell_run_pipeline`, which takes the raw
+segment text and expands + splits it itself) splits only on `qmask`-0
+whitespace, and a token counts as a `|` / `<` / `>` / `>>` operator
+only when its bytes are unquoted — so `echo '|'` and `echo "a ; b"`
+are literal. `shell_exec_line`'s `;` / `&&` / `||` scan tracks quote
+state too. `sh_seq_op_at` unchanged (operators still space-surrounded).
+The old `shell_expand` stays for shell_test.c3's dev-command dispatch,
+which never quotes.
+
+**Verified QEMU** (`disk_dual` + `disk.img`): `echo "a b c"` → one
+arg; `'$user'` literal vs `"$user"` expanded; `"a | b ; c && d"` all
+literal; `echo '|' `/`"a ; b"` literal but bare `|` / `;` still work;
+`echo 'it''s'` → `it's`; `"hello world" > /tmp/q`; `cd "/tmp" && pwd`;
+unterminated quote caught. Full regression (`pathtest` / `fsneg` /
+`fspermtest` / `envtest` / `bigreadtest` / `runtest` / `killtest` /
+`ipcdeathtest` / `p9fstest` / `mounttest` / `argvtest` on FAT32)
+unchanged.
+
+**Duo:** verified on hardware after `reflash_duo.sh` (shell-only, no
+`/bin` repopulate) — `echo '$user'` literal, `echo "a b c"` one arg,
+`echo "x` caught.
+
+---
+
 ## 2026-08-29 (continued) — shell: `;` / `&&` / `||` sequencing + exit status
 
 Roadmap §2.5. `&&` / `||` need a real exit status, which the kernel

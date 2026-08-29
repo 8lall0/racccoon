@@ -414,44 +414,151 @@ fn int shell_exec_external(char* cmd, char** cmd_argv, int cmd_argc)
             return join(sh_r, sh_gen);
 }
 
+// Quote-aware expansion for one pipeline segment. Copies `in` to `out`
+// with the quote characters removed, expanding $name (via
+// shell_var_value) except inside '...'. qmask[k] is 1 for every out[k]
+// that came from inside quotes (or from a double-quoted expansion) —
+// the tokeniser treats those bytes as ordinary text: never a word
+// split, never an operator. Single quotes are fully literal, and '' is
+// a literal '. Double quotes are literal except $name still expands
+// (its bytes marked quoted, so "$x" stays one word). Returns the out
+// length, or -1 on an unterminated quote.
+fn int shell_expand_q(char* in, char* out, char* qmask, int cap)
+{
+    int o = 0;
+    int i = 0;
+    while (in[i] != 0 && o < cap - 1) {
+        char c = in[i];
+        if (c == '\'') {
+            i++;
+            for (;;) {
+                if (in[i] == 0) { return -1; }
+                if (in[i] == '\'') {
+                    if (in[i + 1] == '\'') {
+                        if (o < cap - 1) { out[o] = '\''; qmask[o] = 1; o++; }
+                        i += 2; continue;
+                    }
+                    i++; break;
+                }
+                if (o < cap - 1) { out[o] = in[i]; qmask[o] = 1; o++; }
+                i++;
+            }
+            continue;
+        }
+        if (c == '"') {
+            i++;
+            for (;;) {
+                if (in[i] == 0) { return -1; }
+                if (in[i] == '"') { i++; break; }
+                if (in[i] == '$' && sh_name_start(in[i + 1])) {
+                    i++;
+                    char[32] nm @noinit; int n = 0;
+                    while (sh_name_char(in[i]) && n < 31) { nm[n] = in[i]; n++; i++; }
+                    nm[n] = 0;
+                    char[256] val @noinit;
+                    int vl = shell_var_value(&nm[0], &val[0], 256);
+                    for (int k = 0; k < vl && o < cap - 1; k++) { out[o] = val[k]; qmask[o] = 1; o++; }
+                } else {
+                    if (o < cap - 1) { out[o] = in[i]; qmask[o] = 1; o++; }
+                    i++;
+                }
+            }
+            continue;
+        }
+        if (c == '$' && sh_name_start(in[i + 1])) {
+            i++;
+            char[32] nm @noinit; int n = 0;
+            while (sh_name_char(in[i]) && n < 31) { nm[n] = in[i]; n++; i++; }
+            nm[n] = 0;
+            char[256] val @noinit;
+            int vl = shell_var_value(&nm[0], &val[0], 256);
+            for (int k = 0; k < vl && o < cap - 1; k++) { out[o] = val[k]; qmask[o] = 0; o++; }
+            continue;
+        }
+        out[o] = c; qmask[o] = 0; o++;
+        i++;
+    }
+    out[o] = 0;
+    return o;
+}
+
 // One pipeline — a simple command, optionally with a single `|` and
 // `<` / `>` / `>>` redirections (each operator its own space-separated
-// token). With none of those it's the plain
+// token; quoted, e.g. `echo '|'`, they're literal). `seg` is the raw
+// segment text (shell_exec_line has already split off `;` / `&&` /
+// `||`); it's `$var`-expanded quote-aware and tokenised here, right
+// before it runs. With no `|`/redirection it's the plain
 // `shell_dispatch_common() || shell_exec_external()` path, builtins and
 // all. A pipeline stage is always an external /bin binary — a builtin
 // like `echo` on the left of a `|` needs /bin/echo (user/bin/echo.c3).
 // `< file` is capped at the kernel pipe buffer (PIPE_BUF, src/pipe.c3).
 // Returns the exit status of the last stage (0 = success); a shell-side
-// error (bad syntax, unopenable redirection) is status 2.
-fn int shell_run_pipeline(char** tokens, int token_count)
+// error (bad syntax, unterminated quote, unopenable redirection) is 2.
+fn int shell_run_pipeline(char* seg, int seg_len)
 {
+    char[256] raw @noinit;
+    int rn = seg_len < 255 ? seg_len : 255;
+    for (int k = 0; k < rn; k++) { raw[k] = seg[k]; }
+    raw[rn] = 0;
+
+    char[512] exp @noinit;
+    char[512] qm  @noinit;
+    if (shell_expand_q(&raw[0], &exp[0], &qm[0], 512) < 0) {
+        print("shell: unterminated quote\n");
+        return 2;
+    }
+
+    // Tokenise on unquoted whitespace. A token is an operator only if
+    // it's an unquoted, bare `|` / `<` / `>` / `>>`.
+    const int PL_MAX_TOKENS = 20;
+    char*[PL_MAX_TOKENS] tokens @noinit;
+    bool[PL_MAX_TOKENS]  tok_op @noinit;
+    int nt = 0;
+    int ti = 0;
+    while (exp[ti] != 0 && nt < PL_MAX_TOKENS) {
+        while (exp[ti] == ' ' && qm[ti] == 0) { ti++; }
+        if (exp[ti] == 0) { break; }
+        int ts = ti;
+        tokens[nt] = &exp[ti];
+        while (exp[ti] != 0 && !(exp[ti] == ' ' && qm[ti] == 0)) { ti++; }
+        if (exp[ti] == ' ') { exp[ti] = 0; ti++; }
+        char* t = tokens[nt];
+        tok_op[nt] = qm[ts] == 0 &&
+            ((t[0] == '|' && t[1] == 0) ||
+             (t[0] == '<' && t[1] == 0) ||
+             (t[0] == '>' && t[1] == 0) ||
+             (t[0] == '>' && t[1] == '>' && t[2] == 0));
+        nt++;
+    }
+    if (nt == 0) { return 0; }
+
     // Split the tokens around the operators into up to two argv
     // segments (seg 0 = left of `|`, seg 1 = right) plus in/out files.
     char*[20] seg0 @noinit; int seg0n = 0;
     char*[20] seg1 @noinit; int seg1n = 0;
-    int seg = 0;
+    int side = 0;   // 0 = left of `|`, 1 = right
     bool has_pipe = false;
     char* infile  = null;
     char* outfile = null;
     bool  append  = false;
     bool  bad     = false;
 
-    for (int i = 0; i < token_count; i++) {
+    for (int i = 0; i < nt; i++) {
         char* t = tokens[i];
-        if (strcmp(t, "|") == 0) {
+        if (tok_op[i] && t[0] == '|') {
             if (has_pipe) { bad = true; break; }
-            has_pipe = true; seg = 1; continue;
+            has_pipe = true; side = 1; continue;
         }
-        if (strcmp(t, "<") == 0 || strcmp(t, ">") == 0 || strcmp(t, ">>") == 0) {
-            if (i + 1 >= token_count) { bad = true; break; }
+        if (tok_op[i]) {   // < > >>
+            if (i + 1 >= nt || tok_op[i + 1]) { bad = true; break; }
             char* target = tokens[i + 1];
             i++;
             if (t[0] == '<') { infile = target; }
             else { outfile = target; append = t[1] == '>'; }
             continue;
         }
-        if (seg == 0) { if (seg0n < 19) { seg0[seg0n++] = t; } }
-        else          { if (seg1n < 19) { seg1[seg1n++] = t; } }
+        if (side == 0) { if (seg0n < 19) { seg0[seg0n++] = t; } }
+        else           { if (seg1n < 19) { seg1[seg1n++] = t; } }
     }
 
     if (bad || seg0n == 0 || (has_pipe && seg1n == 0)) {
@@ -576,25 +683,30 @@ fn int sh_seq_op_at(char* line, int p, int* op_len)
 }
 
 // A whole entered line: one or more pipelines joined by ` ; `, ` && `,
-// ` || ` (space-surrounded — `a;b` is not split). Left-associative, all
-// three at one precedence level (simpler than sh's split levels, and
-// predictable): `a && b || c` runs c only if the `a && b` result was
-// non-zero. `;` always runs the next pipeline; `&&` only after success
-// (status 0); `||` only after failure. Each pipeline is `$var`-expanded
-// and tokenised on its own, right before it runs — so `$status` inside
-// a sequenced line reflects the pipeline just before it. Returns the
-// last pipeline's status; also left in g_shell_status for `$status`.
+// ` || ` (space-surrounded — `a;b` is not split; a quoted `';'` is
+// literal). Left-associative, all three at one precedence level
+// (simpler than sh's split levels, and predictable): `a && b || c`
+// runs c only if the `a && b` result was non-zero. `;` always runs the
+// next pipeline; `&&` only after success (status 0); `||` only after
+// failure. Each pipeline is quote-aware `$var`-expanded and tokenised
+// on its own, right before it runs — so `$status` inside a sequenced
+// line reflects the pipeline just before it. Returns the last
+// pipeline's status; also left in g_shell_status for `$status`.
 fn int shell_exec_line(char* line)
 {
-    const int SEQ_MAX_TOKENS = 16;
     int status = 0;
     int conn = 0;       // 0 = first (always run), 1 = `;`, 2 = `&&`, 3 = `||`
     int seg_start = 0;
     int p = 0;
+    char quote = 0;     // 0, '\'' or '"' — a sequencing op inside a quote is literal
 
     for (;;) {
+        char c = line[p];
+        if (c != 0 && quote == 0 && (c == '\'' || c == '"')) { quote = c; p++; continue; }
+        if (c != 0 && quote != 0 && c == quote)              { quote = 0; p++; continue; }
+
         int op_len = 0;
-        int op = line[p] == 0 ? -1 : sh_seq_op_at(line, p, &op_len);
+        int op = c == 0 ? -1 : (quote != 0 ? 0 : sh_seq_op_at(line, p, &op_len));
         if (op == 0) { p++; continue; }   // ordinary char, keep scanning
 
         // op == -1 (end of line) or op >= 1 (a sequencing operator): the
@@ -610,29 +722,8 @@ fn int shell_exec_line(char* line)
         while (s < p && line[s] == ' ') { s++; }
 
         if (s < p && run) {
-            char[256] seg_raw @noinit;
-            int rn = 0;
-            for (int k = seg_start; k < p && rn < 255; k++) { seg_raw[rn] = line[k]; rn++; }
-            seg_raw[rn] = 0;
-
-            char[512] seg_exp @noinit;
-            shell_expand(&seg_raw[0], &seg_exp[0], 512);
-
-            char*[SEQ_MAX_TOKENS] toks @noinit;
-            int tn = 0;
-            int ti = 0;
-            while (seg_exp[ti] != 0 && tn < SEQ_MAX_TOKENS) {
-                while (seg_exp[ti] == ' ') ti++;
-                if (seg_exp[ti] == 0) break;
-                toks[tn] = &seg_exp[ti];
-                tn++;
-                while (seg_exp[ti] != 0 && seg_exp[ti] != ' ') ti++;
-                if (seg_exp[ti] == ' ') { seg_exp[ti] = 0; ti++; }
-            }
-            if (tn > 0) {
-                status = shell_run_pipeline(&toks[0], tn);
-                g_shell_status = status;   // visible to the next segment's $status
-            }
+            status = shell_run_pipeline(&line[seg_start], seg_len);
+            g_shell_status = status;   // visible to the next segment's $status
         } else if (s >= p && op >= 1) {
             print("shell: empty command near a ; && || operator\n");
             status = 2;
