@@ -55,6 +55,18 @@ fn void shell_refresh_user()
     user_name_by_uid(g_shell_uid, &g_shell_user[0], 32);
 }
 
+// Wait out the boot servers' init chatter, then tell the kernel to drop
+// their console output (SYS_BOOT_QUIET). settle_ticks is a raw rdtime()
+// delta — the caller picks it for its board's timebase (there's no
+// board-agnostic "seconds" in user mode yet). Called once, before the
+// first prompt.
+fn void shell_boot_settle(ulong settle_ticks)
+{
+    ulong start = rdtime();
+    while (rdtime() - start < settle_ticks) { yield(); }
+    boot_quiet();
+}
+
 // The prompt — "<user># " for root, "<user>% " otherwise (Plan 9's `%`).
 // Both shells call this instead of a bare "> ".
 fn void shell_prompt()

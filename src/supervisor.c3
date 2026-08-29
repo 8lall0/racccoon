@@ -123,6 +123,7 @@ fn void supervisor_spawn(Service* s)
 	uint img_size = (uint)((uptr)s.bin_end - (uptr)s.bin_start);
 	Process* p = create_process((void*)s.bin_start, img_size);
 
+	p.is_boot_server = true;
 	if (s.needs_fsd_setup)
 	{
 		setup_fsd_mappings(p, s.fsd_partition, s.fsd_secondary);

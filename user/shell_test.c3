@@ -134,6 +134,10 @@ fn void mutex_thread_body(void* arg) {
 }
 
 fn void main() {
+    // QEMU timebase is 10 MHz — ~3 s covers the (fast) virtio boot
+    // chatter; automated test runs wait much longer than this before
+    // sending anything anyway.
+    shell_boot_settle(30000000);
     for (;;) {
         shell_prompt();
 

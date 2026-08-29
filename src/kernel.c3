@@ -111,6 +111,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	// for proving IPC works; a real name -> pid lookup is namespace work,
 	// not part of this first slice.
 	Process* echod_proc = create_process((void*)&_binary_echod_bin_start, (uint)((uptr)&_binary_echod_bin_end - (uptr)&_binary_echod_bin_start));
+	echod_proc.is_boot_server = true;
 	echod_pid = echod_proc.pid;
 	supervisor_register("echod", (char*)&_binary_echod_bin_start, (char*)&_binary_echod_bin_end,
 		false, 0, false, &echod_pid, echod_proc);
@@ -137,6 +138,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		if (board::HAS_SD_BLOCK)
 		{
 			Process* sdd_proc = create_process((void*)&_binary_sdd_bin_start, (uint)((uptr)&_binary_sdd_bin_end - (uptr)&_binary_sdd_bin_start));
+			sdd_proc.is_boot_server = true;
 			setup_sdd_mappings(sdd_proc);
 			storage_pid = sdd_proc.pid;
 			io::print("sdd created\n");
@@ -144,6 +146,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		else if (board::HAS_VIRTIO_BLOCK)
 		{
 			Process* diskd_proc = create_process((void*)&_binary_diskd_bin_start, (uint)((uptr)&_binary_diskd_bin_end - (uptr)&_binary_diskd_bin_start));
+			diskd_proc.is_boot_server = true;
 			setup_diskd_mappings(diskd_proc);
 			storage_pid = diskd_proc.pid;
 			io::print("diskd created\n");
@@ -159,6 +162,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		// idle/echod/the storage driver, created before this line, don't
 		// and don't need to (see process.c3's create_process).
 		Process* fsd_proc = create_process((void*)&_binary_fsd_bin_start, (uint)((uptr)&_binary_fsd_bin_end - (uptr)&_binary_fsd_bin_start));
+		fsd_proc.is_boot_server = true;
 		setup_fsd_mappings(fsd_proc, board::FS_PARTITION_START_SECTOR, false);
 		fsd_pid = fsd_proc.pid;
 		supervisor_register("fsd", (char*)&_binary_fsd_bin_start, (char*)&_binary_fsd_bin_end,
@@ -178,6 +182,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		if (board::HAS_SECOND_FS_PARTITION)
 		{
 			Process* fsd2_proc = create_process((void*)&_binary_fsd_bin_start, (uint)((uptr)&_binary_fsd_bin_end - (uptr)&_binary_fsd_bin_start));
+			fsd2_proc.is_boot_server = true;
 			setup_fsd_mappings(fsd2_proc, board::FS_PARTITION_2_START_SECTOR, true);
 			fsd2_pid = fsd2_proc.pid;
 			supervisor_register("fsd2", (char*)&_binary_fsd_bin_start, (char*)&_binary_fsd_bin_end,
@@ -196,6 +201,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	// before any later create_process call populates a default
 	// namespace" ordering constraint as fsd_pid/fsd2_pid above.
 	Process* procd_proc = create_process((void*)&_binary_procd_bin_start, (uint)((uptr)&_binary_procd_bin_end - (uptr)&_binary_procd_bin_start));
+	procd_proc.is_boot_server = true;
 	procd_pid = procd_proc.pid;
 	supervisor_register("procd", (char*)&_binary_procd_bin_start, (char*)&_binary_procd_bin_end,
 		false, 0, false, &procd_pid, procd_proc);
@@ -208,6 +214,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	// board), and ordering still matters for the same reason
 	// (create_process's default namespace population, right below).
 	Process* envd_proc = create_process((void*)&_binary_envd_bin_start, (uint)((uptr)&_binary_envd_bin_end - (uptr)&_binary_envd_bin_start));
+	envd_proc.is_boot_server = true;
 	envd_pid = envd_proc.pid;
 	supervisor_register("envd", (char*)&_binary_envd_bin_start, (char*)&_binary_envd_bin_end,
 		false, 0, false, &envd_pid, envd_proc);
@@ -250,6 +257,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	if (board::HAS_USB)
 	{
 		Process* usbd_proc = create_process((void*)&_binary_usbd_bin_start, (uint)((uptr)&_binary_usbd_bin_end - (uptr)&_binary_usbd_bin_start));
+		usbd_proc.is_boot_server = true;
 		setup_usbd_mappings(usbd_proc);
 		io::print("usbd created\n");
 	}
@@ -263,12 +271,14 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	if (board::HAS_ETH_MAC)
 	{
 		Process* ethd_proc = create_process((void*)&_binary_ethd_bin_start, (uint)((uptr)&_binary_ethd_bin_end - (uptr)&_binary_ethd_bin_start));
+		ethd_proc.is_boot_server = true;
 		setup_ethd_mappings(ethd_proc);
 		io::print("ethd created\n");
 	}
 	if (board::HAS_VIRTIO_NET)
 	{
 		Process* netd_proc = create_process((void*)&_binary_netd_bin_start, (uint)((uptr)&_binary_netd_bin_end - (uptr)&_binary_netd_bin_start));
+		netd_proc.is_boot_server = true;
 		setup_netd_mappings(netd_proc);
 		io::print("netd created\n");
 	}
@@ -282,6 +292,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	if (board::HAS_GPIO)
 	{
 		Process* gpiod_proc = create_process((void*)&_binary_gpiod_bin_start, (uint)((uptr)&_binary_gpiod_bin_end - (uptr)&_binary_gpiod_bin_start));
+		gpiod_proc.is_boot_server = true;
 		setup_gpiod_mappings(gpiod_proc);
 		io::print("gpiod created\n");
 	}

@@ -47,6 +47,7 @@ const int SYS_DRIVER_IRQ_ARM = 32; // usbd/sdd: re-enable this driver's PLIC sou
 const int SYS_SDD_INFO      = 33; // sdd-only: returns its SDMA staging buffer's physical address — same shape as SYS_USBD_INFO
 const int SYS_IPC_CALL      = 34; // one-shot RPC: deliver a request and block for the reply, all in the kernel — reply can't be pre-empted by a stray sender, aborts -1 if the server dies at any point — see src/entry.c3's case
 const int SYS_GETUID        = 35; // the caller's own uid — see src/entry.c3's case
+const int SYS_BOOT_QUIET    = 36; // shell-only: silences boot-server console output once boot settles — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -764,6 +765,13 @@ fn int setuid(int new_uid) @export("setuid") {
 
 fn int getuid() @export("getuid") {
     return syscall(SYS_GETUID, 0, 0, 0);
+}
+
+// Shell-only: silences the boot servers' console chatter (fsd/sdd/usbd/
+// ethd/... init logs that otherwise keep landing after the prompt).
+// Called once, after a settle delay — see shell_boot_settle().
+fn void boot_quiet() @export("boot_quiet") {
+    syscall(SYS_BOOT_QUIET, 0, 0, 0);
 }
 
 // --- /adm/users, the user database (docs/filesystem-layout.md, §2) ---

@@ -84,6 +84,12 @@ const SYS_DRIVER_IRQ_ARM = 32; // interrupt-driven driver: re-enable this driver
 const SYS_SDD_INFO      = 33; // sdd-only: returns its SDMA staging buffer's physical address — see its case below
 const SYS_IPC_CALL      = 34; // one-shot RPC: deliver a request to a server and block for its reply, all in the kernel — the reply can't be pre-empted by a stray sender, and the whole thing aborts with -1 if the server dies at any point (see its case below); user-space p9_call is now just this
 const SYS_GETUID        = 35; // the caller's own uid — see its case below
+const SYS_BOOT_QUIET    = 36; // shell-only, called once after boot settles: silences boot servers' console output — see SYS_PUTCHAR
+
+// Flipped by SYS_BOOT_QUIET (the shell, once, after a settle delay).
+// While true, SYS_PUTCHAR from a process with is_boot_server set is
+// dropped — keeps late server init chatter off the prompt.
+bool g_boot_quiet = false;
 
 // Generous cap on the image SYS_EXEC will install — real racccoon
 // binaries (build/user/*.bin) run 70-105KB; this leaves real headroom
@@ -757,6 +763,7 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		child.ipc_wait_generation = 0;
 		child.ipc_peer_died = false;
 		child.in_call_reply_wait = false;
+		child.is_boot_server = false; // an rfork child is user work, not a boot server
 		child.pid   = child_i + 1;
 		child.generation++;
 		child.sp    = (uptr)child_sp;
@@ -2110,7 +2117,21 @@ fn void handle_syscall(Trap_frame* f) @noinline
 	switch (f.a3)
 	{
 		case SYS_PUTCHAR:
-			board::console_putchar((int)f.a0);
+			// Boot servers go silent once the shell has settled (it
+			// calls SYS_BOOT_QUIET) — their init chatter otherwise keeps
+			// landing on the console after the prompt is up. The shell
+			// and everything it exec()s (is_boot_server == false) print
+			// normally. A dmesg-style recall of the dropped lines is a
+			// later add (docs/roadmap.md).
+			if (!(g_boot_quiet && current_proc.is_boot_server))
+			{
+				board::console_putchar((int)f.a0);
+			}
+		case SYS_BOOT_QUIET:
+			// The shell calls this once, after a short settle delay, to
+			// stop boot-server console output. One-way for the boot.
+			g_boot_quiet = true;
+			f.a0 = 0;
 		case SYS_GETCHAR:
 			current_proc.in_blocking_wait = true;
 			blocking_depth++;

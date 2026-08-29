@@ -10,6 +10,10 @@ import std::nolibc::main_stub;
 // what scripts/build.sh embeds for QEMU. See docs/devlog.md for why
 // this split exists (shell.c3 used to carry both).
 fn void main() {
+    // Duo timebase is 25 MHz — ~6 s, long enough to cover sdd/usb/ethd
+    // bring-up (this shell is only ever built for the Duo; QEMU gets
+    // shell_test.c3).
+    shell_boot_settle(150000000);
     for (;;) {
         shell_prompt();
 

@@ -411,6 +411,14 @@ struct Process
 	// setup_diskd_mappings()/setup_sdd_mappings() below.
 	uint fs_partition_start;
 
+	// True for every kernel-spawned boot server (fsd, sdd/diskd, usbd,
+	// ethd, netd, gpiod, procd, envd, echod) — set right after
+	// create_process() in kernel.c3 / supervisor_spawn(). Once the shell
+	// calls SYS_BOOT_QUIET, SYS_PUTCHAR from these is dropped so their
+	// late init logs stop landing on the prompt. The shell and its
+	// exec()'d children leave this false and print normally.
+	bool is_boot_server;
+
 	// fsd-only, same "set by setup_fsd_mappings, handed back via a
 	// SYS_FS_PARTITION_INFO out-pointer" shape as fs_partition_start
 	// above — lets fsd.c3 (user-space, can't see the kernel-only board
@@ -853,6 +861,7 @@ fn Process* create_process(void* image, uint image_size)
 	proc.ipc_wait_generation = 0;
 	proc.ipc_peer_died = false;
 	proc.in_call_reply_wait = false;
+	proc.is_boot_server = false; // kernel.c3 / supervisor_spawn set it for servers
 
 	// Default namespace: "/srv/echo/" resolves to echod, which is always
 	// pid 2 (see kernel.c3 — it's the first process spawned after idle,
