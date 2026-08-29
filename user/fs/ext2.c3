@@ -1526,6 +1526,41 @@ fn bool ext2_write_allowed(Ext2_inode_info* inode, uint requester_uid)
 		: (inode.mode & EXT2_S_IWOTH) != 0;
 }
 
+const uint EXT2_S_IRUSR = 0x0100; // owner-read permission bit in i_mode
+const uint EXT2_S_IROTH = 0x0004; // other-read permission bit in i_mode
+
+// Read-permission counterpart of ext2_write_allowed. Same shape: root,
+// or the owner subject to S_IRUSR, or anyone else subject to S_IROTH.
+fn bool ext2_read_allowed(Ext2_inode_info* inode, uint requester_uid)
+{
+	if (requester_uid == 0) return true;
+	return (requester_uid == inode.uid)
+		? (inode.mode & EXT2_S_IRUSR) != 0
+		: (inode.mode & EXT2_S_IROTH) != 0;
+}
+
+// Resolve a bare name to its inode and check read permission for
+// requester_uid. Returns true (allow) if the name can't be resolved —
+// that's a "not found", not a permission problem, and the caller's real
+// op will surface it. Used by fsd.c3's ext2 read/read_at/stat/list
+// adapters.
+fn bool ext2_may_read(char* name, uint requester_uid)
+{
+	if (requester_uid == 0) return true;
+	uint dir_inode;
+	if (!ext2_resolve_dir(name, &dir_inode)) return true;
+	char* leaf = ext2_leaf_name(name);
+	if (leaf[0] == 0) return true; // listing/stat of a dir root — never a denial
+	uint inode_num;
+	uint ds;
+	uint doff;
+	uint mode;
+	if (!ext2_find_in_dir(dir_inode, leaf, &inode_num, &ds, &doff, &mode)) return true;
+	Ext2_inode_info inode;
+	if (!ext2_read_inode(inode_num, &inode)) return true;
+	return ext2_read_allowed(&inode, requester_uid);
+}
+
 // Entry point dispatched from fsd.c3's main() for FS_WRITE. Only ever
 // called once fsd.c3's own fs_is_protected_name() check has already
 // passed, so no protected-name check here — but fs_is_protected_entry()

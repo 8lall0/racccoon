@@ -178,13 +178,16 @@ fn int fat32_op_list(Fs_req* r)     { int c = -1; if (!fat32_list(r.name, &r.buf
 fn int fat32_op_mkdir(Fs_req* r)    { return fat32_mkdir(r.name); }
 fn int fat32_op_rename(Fs_req* r)   { return fat32_rename(r.name, r.name2); }
 
-fn int ext2_op_read(Fs_req* r)     { return ext2_read(r.name, &r.buf[4], r.len); }
-fn int ext2_op_read_at(Fs_req* r)  { return ext2_read_at(r.name, &r.buf[4], r.len, r.offset); }
+// r.uid is the requester's uid for reads too now (fsd's dispatch sets
+// it); ext2_may_read denies a non-root user a file it has no read bit
+// for. Root (uid 0) and every FAT32/exFAT path are unaffected.
+fn int ext2_op_read(Fs_req* r)     { return ext2_may_read(r.name, r.uid) ? ext2_read(r.name, &r.buf[4], r.len) : -1; }
+fn int ext2_op_read_at(Fs_req* r)  { return ext2_may_read(r.name, r.uid) ? ext2_read_at(r.name, &r.buf[4], r.len, r.offset) : -1; }
 fn int ext2_op_write(Fs_req* r)    { return ext2_write(r.name, r.data, r.len, r.uid); }
 fn int ext2_op_write_at(Fs_req* r) { return ext2_write_at(r.name, r.data, r.len, r.offset, r.uid); }
-fn int ext2_op_stat(Fs_req* r)     { return ext2_stat(r.name, &r.out_size, &r.out_type) ? 0 : -1; }
+fn int ext2_op_stat(Fs_req* r)     { return ext2_may_read(r.name, r.uid) && ext2_stat(r.name, &r.out_size, &r.out_type) ? 0 : -1; }
 fn int ext2_op_remove(Fs_req* r)   { return r.recursive ? ext2_delete_recursive(r.name, r.uid) : ext2_delete(r.name, r.uid); }
-fn int ext2_op_list(Fs_req* r)     { int c = -1; if (!ext2_list(r.name, &r.buf[4], fs_list_max(), &c)) c = -1; return c; }
+fn int ext2_op_list(Fs_req* r)     { if (!ext2_may_read(r.name, r.uid)) return -1; int c = -1; if (!ext2_list(r.name, &r.buf[4], fs_list_max(), &c)) c = -1; return c; }
 fn int ext2_op_mkdir(Fs_req* r)    { return ext2_mkdir(r.name, r.uid); }
 fn int ext2_op_rename(Fs_req* r)   { return ext2_rename(r.name, r.name2, r.uid); }
 
@@ -819,8 +822,18 @@ fn void main(String[] args)
 				int result = -1;
 				if (fid < (uint)FS9_FID_MAX && fs9_fids[fid].used && !fs9_fids[fid].is_dir)
 				{
-					fs9_fids[fid].opened = true;
-					result = 0;
+					// Read-permission check (ext2 only carries i_uid;
+					// FAT32/exFAT have no ownership, so ext2_read_allowed
+					// there just isn't consulted). Root always passes.
+					Ext2_inode_info oi;
+					bool may = fs_type != FS_TYPE_EXT2
+						|| (ext2_read_inode(fs9_fids[fid].inode_num, &oi)
+							&& ext2_read_allowed(&oi, fsd_requester_uid(from)));
+					if (may)
+					{
+						fs9_fids[fid].opened = true;
+						result = 0;
+					}
 				}
 				int* result_field = (int*)&buf[0];
 				*result_field = result;
@@ -1095,24 +1108,28 @@ fn void main(String[] args)
 			{
 				if (req_len > (int)(FS_MSG_MAX - 4)) req_len = (int)(FS_MSG_MAX - 4);
 				r.len = (uint)req_len;
+				r.uid = fsd_requester_uid(from);
 				result = fs_ops.read(&r);
 			}
 			case FS_READ_AT:
 			{
 				if (req_len > (int)(FS_MSG_MAX - 4)) req_len = (int)(FS_MSG_MAX - 4);
 				r.len = (uint)req_len;
+				r.uid = fsd_requester_uid(from);
 				result = fs_ops.read_at(&r);
 			}
 			case FS_LIST:
 			{
 				// max_entries / no-pagination is fs_list_max()'s and
 				// user.c3's concern — nothing to set up here.
+				r.uid = fsd_requester_uid(from);
 				result = fs_ops.list(&r);
 			}
 			case FS_STAT:
 			{
 				// Reply: 0..3 = 0/-1, 4..7 = size (uint), 8 = type
 				// (0 file, 1 dir). The adapter fills r.out_size/out_type.
+				r.uid = fsd_requester_uid(from);
 				result = fs_ops.stat(&r);
 				uint* stat_size_field = (uint*)&buf[4];
 				*stat_size_field = r.out_size;
@@ -1139,17 +1156,20 @@ fn void main(String[] args)
 				if (req_len > (int)(FS_MSG_MAX - 108)) req_len = (int)(FS_MSG_MAX - 108);
 				r.len = (uint)req_len;
 				r.data = &buf[108];
+				r.uid = fsd_requester_uid(from);
 				// FS_OFFSET_APPEND → the file's current size (0 if it
 				// doesn't exist yet), so a caller can append with no
 				// prior FS_STAT. The stat adapter only touches
-				// r.out_size/out_type, not the reply buffer.
+				// r.out_size/out_type, not the reply buffer. (r.uid is
+				// already the requester's, set above — so a user who
+				// can't read the file it's appending to gets offset 0,
+				// but the write_at below then denies it anyway.)
 				if (r.offset == FS_OFFSET_APPEND)
 				{
 					r.offset = (fs_ops.stat(&r) == 0) ? r.out_size : 0;
 				}
 				if (!fs_is_protected_name(&filename))
 				{
-					r.uid = fsd_requester_uid(from);
 					result = fs_ops.write_at(&r);
 				}
 			}

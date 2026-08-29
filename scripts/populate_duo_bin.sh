@@ -63,7 +63,7 @@ for d in bin lib usr usr/root usr/glenda adm tmp mnt; do
   mkdir -p "$MNT/$d"
 done
 if [ ! -e "$MNT/adm/users" ]; then
-  printf '0:root\n1000:glenda\n' > "$MNT/adm/users"
+  printf '0:root\n1000:glenda\n65534:none\n' > "$MNT/adm/users"
 fi
 
 for b in $BINARIES; do

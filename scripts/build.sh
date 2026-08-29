@@ -136,8 +136,14 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   for d in bin lib usr usr/root usr/glenda adm tmp mnt; do
     debugfs -w -R "mkdir $d" build/disk_ext2.img > /dev/null
   done
-  printf '0:root\n1000:glenda\n' > build/adm_users_fixture
+  printf '0:root\n1000:glenda\n65534:none\n' > build/adm_users_fixture
   debugfs -w -R "write build/adm_users_fixture adm/users" build/disk_ext2.img > /dev/null
+  # A deliberately root-only file (mode 0600) so §2's read-permission
+  # enforcement (ext2_read_allowed) is testable: `su glenda; cat
+  # adm/secret` must fail. debugfs's `sif` sets the raw i_mode.
+  printf 'top secret\n' > build/adm_secret_fixture
+  debugfs -w -R "write build/adm_secret_fixture adm/secret" build/disk_ext2.img > /dev/null
+  debugfs -w -R "sif adm/secret mode 0100600" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_ext2.img > /dev/null
   for u in cat ls whoami write rm mkdir mv usbrw fsd gpio; do
