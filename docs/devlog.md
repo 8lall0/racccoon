@@ -60,10 +60,19 @@ Heisenbug caveat from last session still holds: any debug print shifts
 timing enough to hide the original hang, so verification is by tight
 hammer loops (`sleep 0.9` between pipelines), not instrumented runs.
 
-Duo kernel + user binaries build clean; the 10/11→210/211 change is a
-wire-protocol change between fsd and sdd, so Duo needs both reflashed
-and the `/bin` binaries repopulated together. Duo hardware verification
-pending.
+Duo hardware verified (reflash only — `fsd`/`sdd`/`diskd` are all
+embedded in `kernel_duo.elf` and respawned from the embedded copies, so
+the 10/11→210/211 verb change is entirely inside the flashed image; the
+card's `/bin` needed no repopulate). 3-stage `echo hi | cat | cat`,
+`cat < f | cat | cat`, `cat < f | cat | head -n 1`,
+`ls /bin | cat | cat > f`, and disk-heavy `ls /` / `cat` regression all
+clean on the Duo console.
+
+One reflash snag worth noting: the SD card had been reprovisioned from
+scratch (empty DUOBOOT), so `reflash_duo.sh`'s `--OLD_FIP` section-reuse
+had nothing to build on. Restored `build/fip_old_from_sd.bin` (the FIP
+read off the card earlier, PLIC-patched OpenSBI intact) as the base
+first, then reflashed.
 
 `src/entry.c3`, `src/process.c3`, `user/block/diskd.c3`,
 `user/block/sdd.c3`, `user/fs/fsd.c3`, `user/virtio.c3`,
