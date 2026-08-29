@@ -56,6 +56,8 @@ const int SYS_PIPE_SETIN    = 41;
 const int SYS_PIPE_READ     = 42;
 const int SYS_PIPE_WRITE    = 43;
 const int SYS_PIPE_HOLD     = 44;
+const int SYS_NS_LIST       = 45; // copy the caller's namespace out — see src/entry.c3's case
+const int SYS_NS_BIND       = 46; // Plan 9 `bind` — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -699,6 +701,24 @@ fn int ns_mount(char* prefix, char* srv_name) @export("ns_mount") {
 // already uses.
 fn int ns_mount_wait(char* prefix, char* srv_name, ulong max_attempts) @export("ns_mount_wait") {
     return syscall(SYS_NS_MOUNT_WAIT, (long)prefix, (long)srv_name, (long)max_attempts);
+}
+
+// Copy this process's own namespace (mount table) out. Each 36-byte
+// record is a 32-byte null-padded path prefix followed by the server
+// pid as 4 little-endian bytes. Returns the record count, or -1 on a
+// bad buffer. Backs the shell's `namespace` builtin.
+fn int ns_list(char* out_buf, int max_records) @export("ns_list") {
+    return syscall(SYS_NS_LIST, (long)out_buf, (long)max_records, 0);
+}
+
+// Plan 9's `bind`: make `new_prefix` resolve to whatever server
+// currently serves `source_path` (itself resolved through this
+// process's own namespace). Like ns_mount(), but keyed off an existing
+// path instead of a posted srv name. Same per-process, exact-prefix,
+// idempotent semantics. -1 if `source_path` resolves nowhere or the
+// namespace is full. Backs the shell's `bind` builtin.
+fn int ns_bind(char* new_prefix, char* source_path) @export("ns_bind") {
+    return syscall(SYS_NS_BIND, (long)new_prefix, (long)source_path, 0);
 }
 
 // Voluntarily gives up the rest of this process's timeslice once —

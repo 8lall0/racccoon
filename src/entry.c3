@@ -93,6 +93,8 @@ const SYS_PIPE_SETIN    = 41; // point a child's stdin at a pipe: a0 = child pid
 const SYS_PIPE_READ     = 42; // drain a pipe into a buffer: a0 = id, a1 = buf, a2 = max; returns bytes (0 = EOF)
 const SYS_PIPE_WRITE    = 43; // feed a buffer into a pipe: a0 = id, a1 = buf, a2 = len; returns bytes written
 const SYS_PIPE_HOLD     = 44; // the shell claims/releases a pipe end it pumps itself (>/< redirection): a0 = id, a1 = as_writer, a2 = delta (+1/-1)
+const SYS_NS_LIST       = 45; // copy the caller's own namespace (mount table) out: a0 = buf, a1 = max records (36 bytes each: 32-byte prefix + 4-byte LE pid); returns the count — the shell's `namespace`
+const SYS_NS_BIND       = 46; // bind whatever currently serves a1 (a path resolved through the caller's namespace) at a0 (a new prefix) in that same namespace — Plan 9's `bind`, the source-is-a-path counterpart to SYS_NS_MOUNT
 
 // Flipped by SYS_BOOT_QUIET (the shell, once, after a settle delay).
 // While true, SYS_PUTCHAR from a process with is_boot_server set is
@@ -2330,6 +2332,103 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				}
 			}
 			f.a0 = (ulong)(iptr)unmount_result;
+		case SYS_NS_LIST:
+			// Copies the caller's own namespace out — one 36-byte record
+			// per live mount: the 32-byte null-padded path prefix, then
+			// the server pid as 4 little-endian bytes. Same per-process,
+			// "resolution is always relative to whoever's asking" scope as
+			// SYS_NS_RESOLVE, and the same generation check drops entries
+			// whose server has since exited. Returns the record count.
+			char* nl_buf = (char*)(uptr)f.a0;
+			int nl_max = (int)(iptr)f.a1;
+			if (nl_max < 0) nl_max = 0;
+			if (nl_max > NS_MOUNTS_MAX) nl_max = NS_MOUNTS_MAX;
+			if (!user_range_valid(current_proc.page_table, (uptr)nl_buf, (ulong)(nl_max * 36), true))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			int nl_count = 0;
+			for (int m = 0; m < NS_MOUNTS_MAX && nl_count < nl_max; m++)
+			{
+				if (current_proc.namespace[m].server_pid == 0) continue;
+				Process* nl_t = proc_by_pid(current_proc.namespace[m].server_pid);
+				if (!nl_t || nl_t.generation != current_proc.namespace[m].server_generation) continue;
+				char* nl_dst = &nl_buf[nl_count * 36];
+				char* nl_src = &current_proc.namespace[m].prefix[0];
+				int nl_k = 0;
+				while (nl_k < 31 && nl_src[nl_k] != 0) { nl_dst[nl_k] = nl_src[nl_k]; nl_k++; }
+				while (nl_k < 32) { nl_dst[nl_k] = 0; nl_k++; }
+				int nl_pid = current_proc.namespace[m].server_pid;
+				nl_dst[32] = (char)(nl_pid & 0xff);
+				nl_dst[33] = (char)((nl_pid >> 8) & 0xff);
+				nl_dst[34] = (char)((nl_pid >> 16) & 0xff);
+				nl_dst[35] = (char)((nl_pid >> 24) & 0xff);
+				nl_count++;
+			}
+			f.a0 = (ulong)(iptr)nl_count;
+		case SYS_NS_BIND:
+			// Plan 9's `bind`: resolve a1 (a path) through the caller's
+			// own namespace, longest-prefix-first exactly like
+			// SYS_NS_RESOLVE, then add/replace a mount at a0 (a new
+			// prefix) pointing at that same server. The difference from
+			// SYS_NS_MOUNT is only where the target comes from — an
+			// existing path here, a posted srv_table name there; the
+			// insert half (idempotent by exact prefix, needs a free slot)
+			// is identical.
+			char* nb_prefix = (char*)(uptr)f.a0;
+			char* nb_src    = (char*)(uptr)f.a1;
+			if (!user_range_valid(current_proc.page_table, (uptr)nb_prefix, NS_PREFIX_MAX, false)
+				|| !user_range_valid(current_proc.page_table, (uptr)nb_src, NS_PREFIX_MAX, false))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			int  nb_pid  = 0;
+			uint nb_gen  = 0;
+			int  nb_best = -1;
+			for (int m = 0; m < NS_MOUNTS_MAX; m++)
+			{
+				if (current_proc.namespace[m].server_pid == 0) continue;
+				Process* nb_t = proc_by_pid(current_proc.namespace[m].server_pid);
+				if (!nb_t || nb_t.generation != current_proc.namespace[m].server_generation) continue;
+				char* nb_pfx = &current_proc.namespace[m].prefix[0];
+				if (!str_starts_with(nb_src, nb_pfx)) continue;
+				int nb_len = 0;
+				while (nb_pfx[nb_len] != 0) nb_len++;
+				if (nb_len > nb_best)
+				{
+					nb_best = nb_len;
+					nb_pid  = current_proc.namespace[m].server_pid;
+					nb_gen  = current_proc.namespace[m].server_generation;
+				}
+			}
+			if (nb_pid == 0) { f.a0 = (ulong)(-1); break; }
+			int  nb_free = -1;
+			bool nb_done = false;
+			for (int m = 0; m < NS_MOUNTS_MAX; m++)
+			{
+				if (current_proc.namespace[m].server_pid == 0)
+				{
+					if (nb_free == -1) nb_free = m;
+					continue;
+				}
+				if (str_eq(&current_proc.namespace[m].prefix[0], nb_prefix))
+				{
+					current_proc.namespace[m].server_pid = nb_pid;
+					current_proc.namespace[m].server_generation = nb_gen;
+					nb_done = true;
+					break;
+				}
+			}
+			if (!nb_done)
+			{
+				if (nb_free == -1) { f.a0 = (ulong)(-1); break; }
+				str_copy(&current_proc.namespace[nb_free].prefix[0], nb_prefix, NS_PREFIX_MAX);
+				current_proc.namespace[nb_free].server_pid = nb_pid;
+				current_proc.namespace[nb_free].server_generation = nb_gen;
+			}
+			f.a0 = 0;
 		case SYS_JOIN:
 			sys_join(f);
 		case SYS_FUTEX_WAIT:

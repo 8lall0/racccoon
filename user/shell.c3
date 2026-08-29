@@ -14,52 +14,25 @@ fn void main() {
     // bring-up (this shell is only ever built for the Duo; QEMU gets
     // shell_test.c3).
     shell_boot_settle(150000000);
+
+    // The console comes up needing a login — `login: <name>`, matched
+    // against /adm/users, then setuid + cd $home. `root` is always
+    // valid, so there's no lockout. On `exit` the kernel respawns this
+    // shell fresh as root and the prompt returns. (shell_test.c3, the
+    // QEMU build, skips this — its automated runs expect a root shell
+    // immediately; the `login` builtin is still there to exercise it.)
+    shell_login();
+
     for (;;) {
         shell_prompt();
 
         char[128] cmdline @noinit;
-        int i = 0;
-        bool too_long = false;
-        for (;;) {
-            char ch = (char)getchar();
-            // 0x7F (DEL) and 0x08 (BS) — different terminal
-            // emulators/serial console tools send different bytes for
-            // Backspace, no way to know which in advance, so both are
-            // handled. Checked before the echo/full-buffer logic below
-            // (not gated behind i == 127) so a user can also backspace
-            // their way back from a genuinely full line instead of it
-            // being unconditionally abandoned — falls out of the
-            // ordering, not extra logic. The raw byte is never echoed
-            // via putchar() — "\b \b" (cursor back, blank, cursor back
-            // again) is what actually erases the character on-screen.
-            if (ch == 127 || ch == 8) {
-                if (i > 0) {
-                    i--;
-                    print("\b \b");
-                }
-                continue;
-            }
-            putchar(ch);
-            if (i == 127) {
-                print("\ncommand line too long\n");
-                too_long = true;
-                break;
-            }
-            if (ch == '\r') {
-                print("\n");
-                cmdline[i] = 0;
-                break;
-            }
-            cmdline[i] = ch;
-            i++;
-        }
-
-        if (too_long) continue;
+        if (shell_readline(&cmdline[0], 128) < 0) { continue; }
 
         // `;` / `&&` / `||` sequencing, then per-pipeline `$var`
-        // expansion + tokenising + `|` / `<` / `>` / `>>`; a plain line
-        // is still just shell_dispatch_common || the /bin fallback
-        // (see shell_exec_line, user/shell_common.c3).
+        // expansion + tokenising + `|` / `<` / `>` / `>>` + globbing;
+        // a plain line is still just shell_dispatch_common || the /bin
+        // fallback (see shell_exec_line, user/shell_common.c3).
         shell_exec_line(&cmdline[0]);
     }
 }

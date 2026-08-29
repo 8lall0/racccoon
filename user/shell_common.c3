@@ -211,11 +211,183 @@ fn void shell_expand(char* in, char* out, int cap)
     out[o] = 0;
 }
 
+// Read one console line into buf (cap includes the NUL). Both Backspace
+// bytes (0x7F / 0x08) erase with a "\b \b"; every other byte is echoed;
+// CR ends the line (a newline is printed). Returns the line length, or
+// -1 if it overran cap-1 (caller discards and reprompts). Shared by
+// shell.c3's command loop and shell_login() below — shell_test.c3 keeps
+// its own inline copy (it has extra dev-only line handling).
+fn int shell_readline(char* buf, int cap)
+{
+    int i = 0;
+    for (;;) {
+        char ch = (char)getchar();
+        if (ch == 127 || ch == 8) {
+            if (i > 0) { i--; print("\b \b"); }
+            continue;
+        }
+        putchar(ch);
+        if (i == cap - 1) {
+            print("\ncommand line too long\n");
+            return -1;
+        }
+        if (ch == '\r') {
+            print("\n");
+            buf[i] = 0;
+            return i;
+        }
+        buf[i] = ch;
+        i++;
+    }
+}
+
+// Absolutise `in` against the cwd and write it into `out` (>=
+// NS_PREFIX_MAX bytes) with exactly one trailing '/' — the namespace
+// prefix convention (src/process.c3's Mount). Bare `/` and the empty
+// string both come out as "/", which resolves as a catch-all the same
+// way the boot-time root mount's "" does. Used by the mount / bind /
+// unmount builtins.
+const int SH_NS_PREFIX_MAX = 32; // must match src/process.c3's NS_PREFIX_MAX
+const int NS_LIST_RECS     = 8;  // must match src/process.c3's NS_MOUNTS_MAX
+
+fn void shell_ns_prefix(char* in, char* out)
+{
+    char[100] abs @noinit;
+    shell_resolve_path(in, &abs[0]);   // "" for root, "/foo" otherwise, no trailing slash
+    int k = 0;
+    while (abs[k] != 0 && k < SH_NS_PREFIX_MAX - 2) { out[k] = abs[k]; k++; }
+    out[k] = '/'; k++;
+    out[k] = 0;
+}
+
+// One login attempt: look `name` up in /adm/users, drop to that uid, cd
+// to its /usr/<name> home, refresh the cached user. Returns false (with
+// a message) for an unknown name or a shell that already dropped
+// privilege — setuid is one-way, so `exit` for a fresh root shell.
+// Backs both the `login` builtin and shell.c3's startup prompt.
+fn bool shell_login_once(char* name)
+{
+    int uid = user_uid_by_name(name);
+    if (uid < 0) { print("login: no such user\n"); return false; }
+    if (setuid(uid) < 0) {
+        print("login: this shell already dropped privilege — exit and start over\n");
+        return false;
+    }
+    shell_refresh_user();
+    char[100] home @noinit;
+    char* pfx = "/usr/";
+    int h = 0;
+    while (pfx[h] != 0) { home[h] = pfx[h]; h++; }
+    for (int j = 0; name[j] != 0 && h < 99; j++) { home[h] = name[j]; h++; }
+    home[h] = 0;
+    char[100] dst @noinit;
+    shell_resolve_path(&home[0], &dst[0]);
+    uint lg_sz = 0;
+    int  lg_ty = 0;
+    if (dst[0] != 0 && fs_stat(&dst[0], &lg_sz, &lg_ty) == 0 && lg_ty != 0) { chdir(&dst[0]); }
+    else { chdir(""); }
+    return true;
+}
+
+// Startup login loop for shell.c3 — repeats until a valid /adm/users
+// name is entered. `root` is always in /adm/users, so there's no way to
+// lock yourself out.
+fn void shell_login()
+{
+    // No user database at all (an unprovisioned root partition) — come
+    // up as root rather than loop forever on a prompt nothing can
+    // satisfy.
+    char[8] probe @noinit;
+    if (fs_read("/adm/users", &probe[0], 8) < 0) { return; }
+
+    for (;;) {
+        print("login: ");
+        char[64] nm @noinit;
+        int n = shell_readline(&nm[0], 64);
+        if (n <= 0) { continue; }
+        if (shell_login_once(&nm[0])) { return; }
+    }
+}
+
+// Glob: does `name` match `pat`? `*` is any run (including empty), `?`
+// is exactly one character; everything else is literal. Standard
+// linear-time backtracking match. `pat` here is one path component —
+// shell_glob_into() splits a pattern on its last '/' first.
+fn bool glob_match(char* pat, char* name)
+{
+    int p = 0;
+    int n = 0;
+    int star_p = -1;
+    int star_n = 0;
+    while (name[n] != 0) {
+        if (pat[p] == '?' || (pat[p] != 0 && pat[p] == name[n])) {
+            p++; n++;
+        } else if (pat[p] == '*') {
+            star_p = p; star_n = n; p++;
+        } else if (star_p >= 0) {
+            p = star_p + 1; star_n++; n = star_n;
+        } else {
+            return false;
+        }
+    }
+    while (pat[p] == '*') { p++; }
+    return pat[p] == 0;
+}
+
+// Expand the glob pattern `pat` against the filesystem, appending each
+// matching path to `words[*sw..]` (bounded by sw_cap) with the string
+// bytes packed into `names[*nb..]` (bounded by nb_cap). Only the last
+// path component may hold `*` / `?`; earlier components are literal.
+// Returns the match count — 0 means "no match", and the caller keeps
+// the pattern literal (rc's behaviour, not sh's).
+fn int shell_glob_into(char* pat, char* names, int* nb, int nb_cap, char** words, int* sw, int sw_cap)
+{
+    int slash = -1;
+    for (int k = 0; pat[k] != 0; k++) { if (pat[k] == '/') { slash = k; } }
+
+    char[100] dir @noinit;
+    char* base;
+    if (slash < 0) {
+        dir[0] = '.'; dir[1] = 0;
+        base = pat;
+    } else {
+        int d = 0;
+        while (d <= slash && d < 99) { dir[d] = pat[d]; d++; }
+        dir[d] = 0;                 // keeps the trailing '/'
+        base = &pat[slash + 1];
+        if (base[0] == 0) { return 0; }
+    }
+
+    char[576] lb @noinit;           // FS_LIST_ENTRY_SIZE (36) * 16
+    int cnt = fs_list(&dir[0], &lb[0], 16);
+    if (cnt < 0) { return 0; }
+
+    int matched = 0;
+    for (int e = 0; e < cnt; e++) {
+        char* nm = &lb[e * 36];
+        if (!glob_match(base, nm)) { continue; }
+        if (*sw >= sw_cap) { break; }
+        int start = *nb;
+        int w = start;
+        if (slash >= 0) {
+            for (int k = 0; k <= slash && w < nb_cap - 1; k++) { names[w] = pat[k]; w++; }
+        }
+        for (int k = 0; nm[k] != 0 && w < nb_cap - 1; k++) { names[w] = nm[k]; w++; }
+        if (w >= nb_cap - 1) { break; }
+        names[w] = 0; w++;
+        words[*sw] = &names[start];
+        (*sw)++;
+        *nb = w;
+        matched++;
+    }
+    return matched;
+}
+
 // Dispatches the small set of real, end-user shell builtins shared by
 // both the production shell (shell.c3) and the test shell
-// (shell_test.c3) — hello/exit/mountusb/su. Returns true if cmd was one
-// of these (and therefore handled); false means the caller should fall
-// back to shell_exec_external() below.
+// (shell_test.c3) — hello/exit/mountusb/su/cd/login/mount/bind/…
+// Returns true if cmd was one of these (and therefore handled); false
+// means the caller should fall back to shell_exec_external() below.
 fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
 {
         g_shell_status = 0; // a builtin that fails overrides this below
@@ -368,6 +540,93 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
                 print("unmountusb: unmounted\n");
             }
             return true;
+        } else if (strcmp(cmd, "login") == 0) {
+            if (cmd_argc < 1) {
+                print("usage: login <user>\n");
+                g_shell_status = 1;
+                return true;
+            }
+            if (!shell_login_once(cmd_argv[0])) { g_shell_status = 1; }
+            return true;
+        } else if (strcmp(cmd, "namespace") == 0 || strcmp(cmd, "ns") == 0) {
+            // The current process's mount table — this shell's own, the
+            // one every command it spawns inherits a copy of.
+            char[NS_LIST_RECS * 36] nsb @noinit;
+            int nc = ns_list(&nsb[0], NS_LIST_RECS);
+            if (nc < 0) {
+                print("namespace: failed\n");
+                g_shell_status = 1;
+                return true;
+            }
+            for (int e = 0; e < nc; e++) {
+                char* rec = &nsb[e * 36];
+                uint pid = ((uint)rec[32] & 0xff)
+                         | (((uint)rec[33] & 0xff) << 8)
+                         | (((uint)rec[34] & 0xff) << 16)
+                         | (((uint)rec[35] & 0xff) << 24);
+                print(rec[0] != 0 ? rec : "/");
+                print("\t-> pid ");
+                print_uint(pid);
+                putchar('\n');
+            }
+            return true;
+        } else if (strcmp(cmd, "mount") == 0) {
+            // mount <srv> <dir> — bind a posted server (srv_post name,
+            // e.g. the ones from `srvtest` or a hand-spawned fsd) into
+            // this shell's namespace. Must be a builtin: a namespace
+            // change only ever flows parent -> child at spawn time, so a
+            // separate /bin/mount would bind the mount into its own
+            // throwaway process and take it right back on exit (the same
+            // reason mountusb is a builtin — see its comment above).
+            if (cmd_argc < 2) {
+                print("usage: mount <srv> <dir>\n");
+                g_shell_status = 1;
+                return true;
+            }
+            char[SH_NS_PREFIX_MAX] mp @noinit;
+            shell_ns_prefix(cmd_argv[1], &mp[0]);
+            if (ns_mount(&mp[0], cmd_argv[0]) < 0) {
+                print("mount: ");
+                print(cmd_argv[0]);
+                print(": no server posted under that name\n");
+                g_shell_status = 1;
+            }
+            return true;
+        } else if (strcmp(cmd, "bind") == 0) {
+            // bind <source> <dir> — make <dir> resolve to whatever
+            // currently serves <source>. Builtin for the same reason as
+            // mount above.
+            if (cmd_argc < 2) {
+                print("usage: bind <source> <dir>\n");
+                g_shell_status = 1;
+                return true;
+            }
+            char[SH_NS_PREFIX_MAX] bp @noinit;
+            shell_ns_prefix(cmd_argv[1], &bp[0]);
+            char[100] bsrc @noinit;
+            shell_resolve_path(cmd_argv[0], &bsrc[0]);
+            if (ns_bind(&bp[0], bsrc[0] != 0 ? &bsrc[0] : "/") < 0) {
+                print("bind: ");
+                print(cmd_argv[0]);
+                print(": resolves nowhere, or the namespace is full\n");
+                g_shell_status = 1;
+            }
+            return true;
+        } else if (strcmp(cmd, "unmount") == 0 || strcmp(cmd, "umount") == 0) {
+            if (cmd_argc < 1) {
+                print("usage: unmount <dir>\n");
+                g_shell_status = 1;
+                return true;
+            }
+            char[SH_NS_PREFIX_MAX] up @noinit;
+            shell_ns_prefix(cmd_argv[0], &up[0]);
+            if (ns_unmount(&up[0]) < 0) {
+                print("unmount: ");
+                print(&up[0]);
+                print(": not mounted\n");
+                g_shell_status = 1;
+            }
+            return true;
         }
     return false;
 }
@@ -493,6 +752,9 @@ fn int shell_expand_q(char* in, char* out, char* qmask, int cap)
 // all. A pipeline stage is always an external /bin binary — a builtin
 // like `echo` on the left of a `|` needs /bin/echo (user/bin/echo.c3).
 // `< file` is capped at the kernel pipe buffer (PIPE_BUF, src/pipe.c3).
+// Any word carrying an unquoted `*` / `?` is glob-expanded against the
+// filesystem before the stage runs (last path component only); a
+// pattern that matches nothing is left literal (rc's rule).
 // Returns the exit status of the last stage (0 = success); a shell-side
 // error (bad syntax, unterminated quote, unopenable redirection) is 2.
 fn int shell_run_pipeline(char* seg, int seg_len)
@@ -512,8 +774,9 @@ fn int shell_run_pipeline(char* seg, int seg_len)
     // Tokenise on unquoted whitespace. A token is an operator only if
     // it's an unquoted, bare `|` / `<` / `>` / `>>`.
     const int PL_MAX_TOKENS = 20;
-    char*[PL_MAX_TOKENS] tokens @noinit;
-    bool[PL_MAX_TOKENS]  tok_op @noinit;
+    char*[PL_MAX_TOKENS] tokens   @noinit;
+    bool[PL_MAX_TOKENS]  tok_op   @noinit;
+    bool[PL_MAX_TOKENS]  tok_glob @noinit;   // token has an unquoted * or ?
     int nt = 0;
     int ti = 0;
     while (exp[ti] != 0 && nt < PL_MAX_TOKENS) {
@@ -522,6 +785,7 @@ fn int shell_run_pipeline(char* seg, int seg_len)
         int ts = ti;
         tokens[nt] = &exp[ti];
         while (exp[ti] != 0 && !(exp[ti] == ' ' && qm[ti] == 0)) { ti++; }
+        int te = ti;
         if (exp[ti] == ' ') { exp[ti] = 0; ti++; }
         char* t = tokens[nt];
         tok_op[nt] = qm[ts] == 0 &&
@@ -529,6 +793,11 @@ fn int shell_run_pipeline(char* seg, int seg_len)
              (t[0] == '<' && t[1] == 0) ||
              (t[0] == '>' && t[1] == 0) ||
              (t[0] == '>' && t[1] == '>' && t[2] == 0));
+        bool tg = false;
+        for (int q = ts; q < te; q++) {
+            if (qm[q] == 0 && (exp[q] == '*' || exp[q] == '?')) { tg = true; }
+        }
+        tok_glob[nt] = tg && !tok_op[nt];
         nt++;
     }
     if (nt == 0) { return 0; }
@@ -538,10 +807,18 @@ fn int shell_run_pipeline(char* seg, int seg_len)
     // `>` / `>>` targets. `stage_words` is flat storage; stage s's argv
     // is stage_words[stage_off[s] ..] with element 0 the command name.
     const int MAX_STAGES = 6;
-    const int STAGE_WORDS_MAX = MAX_STAGES * 8;
+    const int STAGE_WORDS_MAX = MAX_STAGES * 12;   // headroom for glob expansion
     char*[STAGE_WORDS_MAX] stage_words @noinit;
     int[MAX_STAGES] stage_off @noinit;
     int[MAX_STAGES] stage_n   @noinit;
+
+    // Packed storage for glob-expanded path strings — stage_words[] holds
+    // pointers into here, so it has to outlive the spawn loop below (it
+    // does: same function scope).
+    const int GLOB_NAMES_BUF = 2048;
+    char[GLOB_NAMES_BUF] glob_names @noinit;
+    int gnb = 0;
+
     int nstages = 1;
     int sw = 0;
     stage_off[0] = 0; stage_n[0] = 0;
@@ -572,7 +849,15 @@ fn int shell_run_pipeline(char* seg, int seg_len)
             }
             continue;
         }
-        if (sw < STAGE_WORDS_MAX) { stage_words[sw] = t; sw++; stage_n[nstages - 1]++; }
+        if (tok_glob[i]) {
+            int gm = shell_glob_into(t, &glob_names[0], &gnb, GLOB_NAMES_BUF,
+                                     &stage_words[0], &sw, STAGE_WORDS_MAX);
+            stage_n[nstages - 1] += gm;
+            // rc: a pattern that matches nothing stands as a literal word.
+            if (gm == 0 && sw < STAGE_WORDS_MAX) { stage_words[sw] = t; sw++; stage_n[nstages - 1]++; }
+        } else if (sw < STAGE_WORDS_MAX) {
+            stage_words[sw] = t; sw++; stage_n[nstages - 1]++;
+        }
     }
 
     for (int s = 0; s < nstages; s++) { if (stage_n[s] == 0) { bad = true; } }
