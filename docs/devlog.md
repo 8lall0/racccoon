@@ -53,6 +53,39 @@ blocking primitive (which today's kernel forbids — the sscratch
 nested-trap hazard in `SYS_IPC_POLL`'s comment). Plus the verb-range
 fix as defence-in-depth. Filed in roadmap §2.5.
 
+### Second, deeper fix attempt (also filed, not landed)
+
+Tried three combinable pieces, none of which got a clean pass:
+
+1. **`yield()` drains the PLIC when `blocking_depth > 0`** (extracted
+   `service_pending_external_irq` from handle_trap). Delivers a pending
+   device IRQ cooperatively during the SIE-off window. On its own it
+   didn't break the deadlock — diskd's spin loop has no `yield()`, so
+   the scheduler never leaves diskd to let the drain run.
+2. **`yield()` in diskd's spin loop.** Now the drain runs — but this
+   alone *broke* `bigreadtest` (single-command, disk-heavy): the
+   virtio-blk IRQ line stays asserted (diskd never acks the ISR), so
+   `plic_claim` keeps re-delivering it and diskd breaks its spin
+   *early* for the next request with a garbage `req.status`.
+3. **diskd polls the used ring instead of the IRQ notify** (netd's
+   self-sufficient pattern: `while (used.index != last_used_index)` +
+   timeout + `yield()`), plus a virtio ISR ack (new
+   `VIRTIO_REG_INTERRUPT_STATUS`/`_ACK` in `virtio.c3`), plus moving
+   `DISKD_READ`/`_WRITE` (10/11) off the P9 verb range. Boot, `pathtest`
+   and 2-stage pipelines pass — but **`bigreadtest` still hangs**, and
+   it is *not* diskd hanging (its reads complete, no timeout fires).
+   Something downstream in the ~600-request path (fsd2 → diskd on the
+   `/mnt/fs2/` mount) stalls. Left unfinished here — the used-ring poll
+   is the right direction; the remaining stall wants a focused debug
+   pass (likely a QEMU virtio-blk sync-vs-async completion detail: the
+   poll loop has no VM exit, so an async aio can't complete while diskd
+   spins on guest memory).
+
+Net: root cause is solid, the fix is a genuine multi-front kernel /
+driver change (virtio-mmio interrupt model + the SIE-off blocking
+model) that needs its own session. `a3d3f04` state (2-stage +
+`/bin/head`) is unchanged.
+
 ---
 
 ## 2026-08-29 (continued) — shell: quoting
