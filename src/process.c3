@@ -553,6 +553,60 @@ fn Process* proc_by_pid(int pid)
 	return p;
 }
 
+// --- exit-status side table --------------------------------------------
+// sys_exit / sys_kill drop a (pid, generation, code) here as they tear a
+// process down; sys_join picks it up once it sees the slot is gone, so
+// the shell's `&&` / `||` can tell whether a command succeeded. Only
+// non-zero codes from a process that had a parent are recorded (a clean
+// exit is the absence of a record — join returns 0). Round-robin and
+// small: the shell joins its children promptly, so an unreaped entry
+// just gets overwritten. generation stops a recycled pid from matching a
+// stale record.
+const int EXIT_RECORDS = 8;
+
+struct Exit_record
+{
+	int  pid;
+	uint generation;
+	int  code;
+	bool used;
+}
+
+Exit_record[EXIT_RECORDS] exit_records;
+int exit_record_next;
+
+fn void proc_record_exit(int pid, uint generation, int parent_pid, int code)
+{
+	if (parent_pid == 0 || code == 0) return;
+	for (int i = 0; i < EXIT_RECORDS; i++)
+	{
+		if (exit_records[i].used && exit_records[i].pid == pid && exit_records[i].generation == generation)
+		{
+			exit_records[i].code = code;
+			return;
+		}
+	}
+	exit_records[exit_record_next].pid        = pid;
+	exit_records[exit_record_next].generation = generation;
+	exit_records[exit_record_next].code       = code;
+	exit_records[exit_record_next].used       = true;
+	exit_record_next = (exit_record_next + 1) % EXIT_RECORDS;
+}
+
+fn int proc_take_exit(int pid, uint generation)
+{
+	for (int i = 0; i < EXIT_RECORDS; i++)
+	{
+		if (exit_records[i].used && exit_records[i].pid == pid && exit_records[i].generation == generation)
+		{
+			int c = exit_records[i].code;
+			exit_records[i].used = false;
+			return c;
+		}
+	}
+	return 0;
+}
+
 // One attempt at "look srv_name up in srv_table and, if it names a
 // still-live server, bind it at prefix in current_proc's own
 // namespace" — the shared logic SYS_NS_MOUNT (entry.c3) and

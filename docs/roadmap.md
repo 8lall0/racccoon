@@ -158,19 +158,26 @@ not bourne. Interleaved with §1/§2 rather than a phase of its own.
   primitive (`src/pipe.c3`: a ring buffer with writer/reader refcounts;
   `Process.stdout_pipe`/`stdin_pipe`, -1 = console). `SYS_PUTCHAR`/
   `SYS_GETCHAR` route through it; `SYS_PIPE`/`_SETOUT`/`_SETIN`/`_READ`/
-  `_WRITE`/`_HOLD` (39–44) drive it. `shell_run_line()` parses one `|`
-  plus `<`/`>`/`>>` (each its own space-separated token), spawns the
+  `_WRITE`/`_HOLD` (39–44) drive it. `shell_run_pipeline()` parses one
+  `|` plus `<`/`>`/`>>` (each its own space-separated token), spawns the
   stage(s) with `shell_spawn()`, wires the ends before any child runs
   (cooperative sched — no race), then pumps the file end itself. A
   pipeline stage is always an external `/bin` binary, so `echo` got a
   real `/bin/echo` and `cat` learned to read stdin. `< file` is bounded
-  at one `PIPE_BUF` (4096). Builtins can't sit in a pipeline yet;
-  `SHELL_MAX_TOKENS` is 8 so a long pipeline overflows.
+  at one `PIPE_BUF` (4096). Builtins can't sit in a pipeline yet.
+- **`;` / `&&` / `||` sequencing + exit status** — kernel gained an
+  exit-status side table (`src/process.c3`: `sys_exit` / `sys_kill`
+  record `(pid, gen, code)`, `sys_join` returns it); `exit()` →
+  `exitcode(int)`; a failed `exec` is 127, a kill is -1.
+  `shell_exec_line()` splits the raw line on ` ; ` / ` && ` / ` || `
+  (space-surrounded), then expands + tokenises each pipeline right
+  before it runs — so `$status` (rc's) mid-line is correct. One
+  left-associative precedence level. `/bin/true`, `/bin/false`.
+  `SHELL_MAX_TOKENS` 8 → 16.
 
 **Still to do:**
-- `;` / `&&` / `||` sequencing; quoting; globbing.
-- multi-stage pipelines (`a | b | c`); builtins as pipeline stages;
-  raise `SHELL_MAX_TOKENS`.
+- quoting; globbing.
+- multi-stage pipelines (`a | b | c`); builtins as pipeline stages.
 - `bind`/`mount`/`unmount` builtins + a `namespace` view (the §1
   leftover) — `SYS_NS_MOUNT`/`_UNMOUNT` exist.
 - a boot-time `login` — the console still comes up as a root shell.

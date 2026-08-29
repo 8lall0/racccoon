@@ -55,6 +55,13 @@ fn void usbfs_teardown()
 char[32] g_shell_user @noinit;
 int      g_shell_uid = -1;
 
+// Status of the last simple command, for `&&` / `||` sequencing and the
+// `$status` / `$?` var. shell_dispatch_common resets it to 0 on entry;
+// a builtin that fails (bad `cd`, denied `su`) sets it non-zero.
+// External commands overwrite it with join()'s return in
+// shell_run_pipeline.
+int g_shell_status = 0;
+
 fn void shell_refresh_user()
 {
     g_shell_uid = getuid();
@@ -143,6 +150,21 @@ fn int shell_var_value(char* name, char* out, int cap)
         if (n <= 0) { out[0] = '/'; out[1] = 0; return 1; }
         return n;
     }
+    if (strcmp(name, "status") == 0) {
+        // Exit status of the last command (rc's $status). Decimal, and
+        // negative codes (e.g. -1 for a killed command) print with a
+        // leading '-'.
+        int v = g_shell_status;
+        int k = 0;
+        if (v < 0) { if (k < cap - 1) { out[k] = '-'; k++; } v = -v; }
+        char[12] digs @noinit;
+        int d = 0;
+        digs[d] = (char)('0' + v % 10); d++; v /= 10;
+        while (v > 0) { digs[d] = (char)('0' + v % 10); d++; v /= 10; }
+        while (d > 0 && k < cap - 1) { d--; out[k] = digs[d]; k++; }
+        out[k] = 0;
+        return k;
+    }
     if (strcmp(name, "home") == 0) {
         int k = 0;
         char* pfx = "/usr/";
@@ -196,6 +218,7 @@ fn void shell_expand(char* in, char* out, int cap)
 // back to shell_exec_external() below.
 fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
 {
+        g_shell_status = 0; // a builtin that fails overrides this below
         if (strcmp(cmd, "hello") == 0) {
             print("Hello world from shell!\n");
             return true;
@@ -218,10 +241,12 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
             int su_uid = user_uid_by_name(cmd_argv[0]);
             if (su_uid < 0) {
                 print("su: no such user in /adm/users\n");
+                g_shell_status = 1;
                 return true;
             }
             if (setuid(su_uid) < 0) {
                 print("su: denied (this shell already dropped privilege — exit and start over)\n");
+                g_shell_status = 1;
                 return true;
             }
             shell_refresh_user();
@@ -252,10 +277,12 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
                     print("cd: ");
                     print(&dst[0]);
                     print(": no such directory\n");
+                    g_shell_status = 1;
                     return true;
                 }
                 if (cd_ty == 0) {
                     print("cd: not a directory\n");
+                    g_shell_status = 1;
                     return true;
                 }
             }
@@ -347,9 +374,10 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
 
 // rfork + exec a /bin/<cmd>, returning the child pid (its generation in
 // *gen_out for a later join()) WITHOUT waiting. The child that fails to
-// exec prints "<cmd>: command not found" and exits. -1 = rfork failed.
-// Split out of shell_exec_external so shell_run_line can start several
-// children, wire their pipe ends, then join them all.
+// exec prints "<cmd>: command not found" and exits 127 (the shell reads
+// that back through join() for `&&` / `||`). -1 = rfork failed.
+// Split out of shell_exec_external so shell_run_pipeline can start
+// several children, wire their pipe ends, then join them all.
 fn int shell_spawn(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out)
 {
             char[100] bin_path @noinit;
@@ -370,33 +398,37 @@ fn int shell_spawn(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out)
                 exec(&bin_path, &run_exec_buf, RUN_EXEC_BUF_MAX, 0, cmd_argv, cmd_argc);
                 print(cmd);
                 print(": command not found\n");
-                exit();
+                exitcode(127);
             }
             return sh_r;
 }
 
 // The /bin/<cmd> fallback — also shared by both shells (see
-// shell_dispatch_common's own comment above for why).
-fn void shell_exec_external(char* cmd, char** cmd_argv, int cmd_argc)
+// shell_dispatch_common's own comment above for why). Returns the
+// command's exit status (127 if it couldn't be spawned).
+fn int shell_exec_external(char* cmd, char** cmd_argv, int cmd_argc)
 {
             uint sh_gen = 0;
             int sh_r = shell_spawn(cmd, cmd_argv, cmd_argc, &sh_gen);
-            if (sh_r > 0) { join(sh_r, sh_gen); }
+            if (sh_r <= 0) { return 127; }
+            return join(sh_r, sh_gen);
 }
 
-// One entered command line, already tokenised. Handles a single `|`
-// pipe and `<` / `>` / `>>` redirections (each operator must be its own
-// space-separated token); with none of those it is exactly the old
+// One pipeline — a simple command, optionally with a single `|` and
+// `<` / `>` / `>>` redirections (each operator its own space-separated
+// token). With none of those it's the plain
 // `shell_dispatch_common() || shell_exec_external()` path, builtins and
-// all. A pipeline segment is always an external /bin binary — a builtin
+// all. A pipeline stage is always an external /bin binary — a builtin
 // like `echo` on the left of a `|` needs /bin/echo (user/bin/echo.c3).
 // `< file` is capped at the kernel pipe buffer (PIPE_BUF, src/pipe.c3).
-fn void shell_run_line(char** tokens, int token_count)
+// Returns the exit status of the last stage (0 = success); a shell-side
+// error (bad syntax, unopenable redirection) is status 2.
+fn int shell_run_pipeline(char** tokens, int token_count)
 {
     // Split the tokens around the operators into up to two argv
     // segments (seg 0 = left of `|`, seg 1 = right) plus in/out files.
-    char*[16] seg0 @noinit; int seg0n = 0;
-    char*[16] seg1 @noinit; int seg1n = 0;
+    char*[20] seg0 @noinit; int seg0n = 0;
+    char*[20] seg1 @noinit; int seg1n = 0;
     int seg = 0;
     bool has_pipe = false;
     char* infile  = null;
@@ -418,13 +450,13 @@ fn void shell_run_line(char** tokens, int token_count)
             else { outfile = target; append = t[1] == '>'; }
             continue;
         }
-        if (seg == 0) { if (seg0n < 15) { seg0[seg0n++] = t; } }
-        else          { if (seg1n < 15) { seg1[seg1n++] = t; } }
+        if (seg == 0) { if (seg0n < 19) { seg0[seg0n++] = t; } }
+        else          { if (seg1n < 19) { seg1[seg1n++] = t; } }
     }
 
     if (bad || seg0n == 0 || (has_pipe && seg1n == 0)) {
         print("shell: malformed pipeline\n");
-        return;
+        return 2;
     }
     seg0[seg0n] = null;
     seg1[seg1n] = null;
@@ -432,10 +464,10 @@ fn void shell_run_line(char** tokens, int token_count)
     // No pipe, no redirection: the plain path, builtins included.
     if (!has_pipe && infile == null && outfile == null) {
         char* c0 = seg0[0];
-        if (!shell_dispatch_common(c0, &seg0[1], seg0n - 1)) {
-            shell_exec_external(c0, &seg0[1], seg0n - 1);
+        if (shell_dispatch_common(c0, &seg0[1], seg0n - 1)) {
+            return g_shell_status;
         }
-        return;
+        return shell_exec_external(c0, &seg0[1], seg0n - 1);
     }
 
     // `< file`: read it now (bounded at the kernel pipe buffer) into a
@@ -448,10 +480,10 @@ fn void shell_run_line(char** tokens, int token_count)
         inflen = fs_read(infile, &infbuf[0], PIPE_FILE_MAX);
         if (inflen < 0) {
             print("shell: "); print(infile); print(": cannot open\n");
-            return;
+            return 2;
         }
         in_pipe = pipe_new();
-        if (in_pipe < 0) { print("shell: out of pipes\n"); return; }
+        if (in_pipe < 0) { print("shell: out of pipes\n"); return 2; }
         pipe_hold(in_pipe, 1, 1);   // shell is the writer until it has fed the bytes in
     }
 
@@ -461,9 +493,9 @@ fn void shell_run_line(char** tokens, int token_count)
     int left_pid = -1; uint left_gen = 0;
     if (has_pipe) {
         mid_pipe = pipe_new();
-        if (mid_pipe < 0) { print("shell: out of pipes\n"); return; }
+        if (mid_pipe < 0) { print("shell: out of pipes\n"); return 2; }
         left_pid = shell_spawn(seg0[0], &seg0[1], seg0n - 1, &left_gen);
-        if (left_pid < 0) { return; }
+        if (left_pid < 0) { return 2; }
         pipe_setout(left_pid, mid_pipe);
         if (in_pipe >= 0) { pipe_setin(left_pid, in_pipe); }
     }
@@ -474,12 +506,15 @@ fn void shell_run_line(char** tokens, int token_count)
     int out_pipe = -1;
     if (outfile != null) {
         out_pipe = pipe_new();
-        if (out_pipe < 0) { print("shell: out of pipes\n"); return; }
+        if (out_pipe < 0) { print("shell: out of pipes\n"); return 2; }
         pipe_hold(out_pipe, 0, 1);  // shell is the reader draining it to the file
     }
     uint last_gen = 0;
     int last_pid = shell_spawn(last_argv[0], &last_argv[1], last_argc - 1, &last_gen);
-    if (last_pid < 0) { return; }
+    if (last_pid < 0) {
+        if (left_pid > 0) { join(left_pid, left_gen); }
+        return 2;
+    }
     if (has_pipe)          { pipe_setin(last_pid, mid_pipe); }
     else if (in_pipe >= 0) { pipe_setin(last_pid, in_pipe); }
     if (out_pipe >= 0)     { pipe_setout(last_pid, out_pipe); }
@@ -492,6 +527,7 @@ fn void shell_run_line(char** tokens, int token_count)
     }
 
     // Pump `>` / `>>`: stream the final stage's stdout to the file.
+    bool redir_failed = false;
     if (out_pipe >= 0) {
         uint off = 0;
         if (append) {
@@ -506,12 +542,109 @@ fn void shell_run_line(char** tokens, int token_count)
             int got = pipe_read(out_pipe, &chunk[0], 512);
             if (got <= 0) { break; }
             int w = fs_write_at(outfile, &chunk[0], got, off);
-            if (w < 0) { print("shell: "); print(outfile); print(": write failed\n"); break; }
+            if (w < 0) { print("shell: "); print(outfile); print(": write failed\n"); redir_failed = true; break; }
             off += (uint)w;
         }
         pipe_hold(out_pipe, 0, -1);
     }
 
     if (left_pid > 0) { join(left_pid, left_gen); }
-    join(last_pid, last_gen);
+    int last_status = join(last_pid, last_gen);
+    // A redirection write failure outranks the command's own status.
+    return redir_failed ? 3 : last_status;
+}
+
+// Which sequencing operator (if any) starts at line[p]: 1 = ` ; `,
+// 2 = ` && `, 3 = ` || `, 0 = none. *op_len gets the operator's byte
+// length including its surrounding spaces. A trailing ` ;` / ` &&` /
+// ` ||` at the very end of the line counts too (no space after).
+fn int sh_seq_op_at(char* line, int p, int* op_len)
+{
+    if (line[p] != ' ') { return 0; }
+    char a = line[p + 1];
+    if (a == ';') {
+        if (line[p + 2] == ' ') { *op_len = 3; return 1; }
+        if (line[p + 2] == 0)   { *op_len = 2; return 1; }
+        return 0;
+    }
+    if ((a == '&' && line[p + 2] == '&') || (a == '|' && line[p + 2] == '|')) {
+        int kind = a == '&' ? 2 : 3;
+        if (line[p + 3] == ' ') { *op_len = 4; return kind; }
+        if (line[p + 3] == 0)   { *op_len = 3; return kind; }
+    }
+    return 0;
+}
+
+// A whole entered line: one or more pipelines joined by ` ; `, ` && `,
+// ` || ` (space-surrounded — `a;b` is not split). Left-associative, all
+// three at one precedence level (simpler than sh's split levels, and
+// predictable): `a && b || c` runs c only if the `a && b` result was
+// non-zero. `;` always runs the next pipeline; `&&` only after success
+// (status 0); `||` only after failure. Each pipeline is `$var`-expanded
+// and tokenised on its own, right before it runs — so `$status` inside
+// a sequenced line reflects the pipeline just before it. Returns the
+// last pipeline's status; also left in g_shell_status for `$status`.
+fn int shell_exec_line(char* line)
+{
+    const int SEQ_MAX_TOKENS = 16;
+    int status = 0;
+    int conn = 0;       // 0 = first (always run), 1 = `;`, 2 = `&&`, 3 = `||`
+    int seg_start = 0;
+    int p = 0;
+
+    for (;;) {
+        int op_len = 0;
+        int op = line[p] == 0 ? -1 : sh_seq_op_at(line, p, &op_len);
+        if (op == 0) { p++; continue; }   // ordinary char, keep scanning
+
+        // op == -1 (end of line) or op >= 1 (a sequencing operator): the
+        // run [seg_start, p) is one pipeline.
+        int seg_len = p - seg_start;
+        bool run = conn == 0
+                || conn == 1
+                || (conn == 2 && status == 0)
+                || (conn == 3 && status != 0);
+
+        // Trim leading spaces of the raw segment for the emptiness check.
+        int s = seg_start;
+        while (s < p && line[s] == ' ') { s++; }
+
+        if (s < p && run) {
+            char[256] seg_raw @noinit;
+            int rn = 0;
+            for (int k = seg_start; k < p && rn < 255; k++) { seg_raw[rn] = line[k]; rn++; }
+            seg_raw[rn] = 0;
+
+            char[512] seg_exp @noinit;
+            shell_expand(&seg_raw[0], &seg_exp[0], 512);
+
+            char*[SEQ_MAX_TOKENS] toks @noinit;
+            int tn = 0;
+            int ti = 0;
+            while (seg_exp[ti] != 0 && tn < SEQ_MAX_TOKENS) {
+                while (seg_exp[ti] == ' ') ti++;
+                if (seg_exp[ti] == 0) break;
+                toks[tn] = &seg_exp[ti];
+                tn++;
+                while (seg_exp[ti] != 0 && seg_exp[ti] != ' ') ti++;
+                if (seg_exp[ti] == ' ') { seg_exp[ti] = 0; ti++; }
+            }
+            if (tn > 0) {
+                status = shell_run_pipeline(&toks[0], tn);
+                g_shell_status = status;   // visible to the next segment's $status
+            }
+        } else if (s >= p && op >= 1) {
+            print("shell: empty command near a ; && || operator\n");
+            status = 2;
+            g_shell_status = status;
+        }
+
+        if (op < 0) { break; }
+        conn = op;
+        p += op_len;
+        seg_start = p;
+    }
+
+    g_shell_status = status;
+    return status;
 }

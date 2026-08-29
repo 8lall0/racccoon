@@ -56,29 +56,10 @@ fn void main() {
 
         if (too_long) continue;
 
-        // $var expansion, then tokenize the result in place. Tokens
-        // point straight into `expanded`, NUL-terminated where the next
-        // space was.
-        char[512] expanded @noinit;
-        shell_expand(&cmdline[0], &expanded[0], 512);
-
-        const int SHELL_MAX_TOKENS = 8;
-        char*[SHELL_MAX_TOKENS] tokens @noinit;
-        int token_count = 0;
-        int ti = 0;
-        while (expanded[ti] != 0 && token_count < SHELL_MAX_TOKENS) {
-            while (expanded[ti] == ' ') ti++;
-            if (expanded[ti] == 0) break;
-            tokens[token_count] = &expanded[ti];
-            token_count++;
-            while (expanded[ti] != 0 && expanded[ti] != ' ') ti++;
-            if (expanded[ti] == ' ') { expanded[ti] = 0; ti++; }
-        }
-        if (token_count == 0) continue;
-
-        // Pipes (`|`) and redirection (`<`, `>`, `>>`); with none of
-        // those it's still just shell_dispatch_common || the /bin
-        // fallback (see shell_run_line, user/shell_common.c3).
-        shell_run_line(&tokens[0], token_count);
+        // `;` / `&&` / `||` sequencing, then per-pipeline `$var`
+        // expansion + tokenising + `|` / `<` / `>` / `>>`; a plain line
+        // is still just shell_dispatch_common || the /bin fallback
+        // (see shell_exec_line, user/shell_common.c3).
+        shell_exec_line(&cmdline[0]);
     }
 }

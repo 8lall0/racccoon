@@ -4,6 +4,49 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-29 (continued) — shell: `;` / `&&` / `||` sequencing + exit status
+
+Roadmap §2.5. `&&` / `||` need a real exit status, which the kernel
+didn't track — so this is a small kernel change plus the shell layer.
+
+**Kernel — exit-status side table** (`src/process.c3`). `exit()` gained
+`exitcode(int)` (`SYS_EXIT` now reads `a0`). `sys_exit` / `sys_kill`
+drop a `(pid, generation, code)` into a small round-robin table
+(`proc_record_exit` — only non-zero codes from a process that had a
+parent, so a clean exit is just the absence of a record); `sys_join`
+picks it up with `proc_take_exit` once it sees the slot is gone and
+returns it. No zombie state, no scheduler change. A killed process
+records -1. `join()`'s wrapper now returns that status (was always 0);
+the only in-tree caller that checks the value (`ipcdeathtest`) expects
+0 for its cleanly-exiting child, unchanged.
+
+**Shell** (`shell_common.c3`). `shell_exec_external` / the renamed
+`shell_run_pipeline` now return a status; a failed `exec` in the child
+is `exitcode(127)`; failing builtins (`cd`, `su`) set `g_shell_status`.
+New `shell_exec_line(char* raw_line)` replaces the token-based entry
+point: it splits the raw line on ` ; ` / ` && ` / ` || `
+(space-surrounded), then **expands + tokenises each pipeline on its own,
+right before it runs** — so `$status` (rc's, new in `shell_var_value`)
+inside a sequenced line reflects the pipeline just before it. All three
+operators are one left-associative precedence level (`a && b || c` runs
+`c` only if `a && b` failed). `SHELL_MAX_TOKENS` 8 → 16. New trivial
+`/bin/true` and `/bin/false`.
+
+**Verified QEMU** (`disk_dual` + `disk.img`): `true && echo` / `false
+&& echo` / `false || echo` / `true || echo` all gate correctly;
+`false && a || b` → `b`; `cmd ; echo $status` shows 127 / 1 / 0 as
+expected; `&&` composes with `|` and with `>`; full regression
+(`killtest` / `rforktest` / `ipcdeathtest` / `fsdkilltest` /
+`mutextest` / `threadtest` / `p9test` / `nstest` / `p9fstest` /
+`mounttest` / `envtest` / `fsneg` / `bigreadtest` / `runtest` /
+`argvtest` on FAT32 / `pathtest` / `fspermtest`) unchanged.
+
+**Duo:** verified on hardware after a reflash + `populate_duo_bin.sh` —
+`true && echo`, `false || echo`, `hello ; echo $status` all behave as
+in QEMU.
+
+---
+
 ## 2026-08-29 (continued) — fsd: trailing-slash path normalization
 
 Follow-up to the pipes work, which surfaced it: `ls /` reported "not

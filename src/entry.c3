@@ -563,6 +563,10 @@ fn void sys_kill(Trap_frame* f) @noinline
 		free_pages((uptr)kill_table2, 1);
 	}
 
+	// A killed process counts as a failed command for the shell's
+	// `&&` / `||` (code -1, same "non-zero = failure" convention).
+	proc_record_exit(kill_target.pid, kill_target.generation, kill_target.parent_pid, -1);
+
 	kill_target.state = PROC_UNUSED;
 	kill_target.pid = 0;
 	f.a0 = 0;
@@ -575,8 +579,12 @@ fn void sys_kill(Trap_frame* f) @noinline
 // which never returns (the scan can't pick a PROC_UNUSED self).
 // (Was inlined in handle_syscall as a c3c-0.8.2 landmine workaround;
 // 0.8.3 probe 2026-08-28 showed the extraction is safe now.)
-fn void sys_exit() @noinline
+fn void sys_exit(Trap_frame* f) @noinline
 {
+		// Stash the exit code for a parent's join() (only non-zero codes
+		// from a child that has a parent — see proc_record_exit).
+		proc_record_exit(current_proc.pid, current_proc.generation, current_proc.parent_pid, (int)f.a0);
+
 		// Anyone parked in ipc_send/ipc_reply toward us would hang
 		// forever on a rendezvous we can no longer complete — wake them
 		// with a failure. Before pid is cleared below (the sweep keys
@@ -1889,7 +1897,9 @@ fn void sys_join(Trap_frame* f) @noinline
 		}
 		current_proc.in_blocking_wait = false;
 		blocking_depth--;
-		f.a0 = 0;
+		// The joined process's exit code, if one was recorded (0 for a
+		// clean exit / no record) — the shell reads this for `&&`/`||`.
+		f.a0 = (ulong)(long)proc_take_exit(join_pid, join_generation);
 }
 
 // futex wait: block while the user word still holds the expected value.
@@ -2195,7 +2205,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			current_proc.in_blocking_wait = false;
 			blocking_depth--;
 		case SYS_EXIT:
-			sys_exit();
+			sys_exit(f);
 		case SYS_IPC_SEND:
 			sys_ipc_send(f);
 		case SYS_IPC_CALL:

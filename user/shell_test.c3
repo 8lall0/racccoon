@@ -184,7 +184,7 @@ fn void main() {
         char[512] expanded @noinit;
         shell_expand(&cmdline[0], &expanded[0], 512);
 
-        const int SHELL_MAX_TOKENS = 8;
+        const int SHELL_MAX_TOKENS = 16;
         char*[SHELL_MAX_TOKENS] tokens @noinit;
         int token_count = 0;
         int ti = 0;
@@ -2119,10 +2119,12 @@ fn void main() {
                 print(")\n");
             }
         } else {
-            // Pipes (`|`) and redirection (`<`, `>`, `>>`); with none
-            // of those it's still just shell_dispatch_common || the
-            // /bin fallback (see shell_run_line, user/shell_common.c3).
-            shell_run_line(&tokens[0], token_count);
+            // Not a dev/test builtin: hand the raw line to the real
+            // executor — `;` / `&&` / `||` sequencing, then per-pipeline
+            // `$var` expansion + `|` / `<` / `>` / `>>`, else just
+            // shell_dispatch_common || the /bin fallback (see
+            // shell_exec_line, user/shell_common.c3).
+            shell_exec_line(&cmdline[0]);
         }
     }
 }

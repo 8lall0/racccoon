@@ -63,7 +63,15 @@ const int RFMEM  = 1 << 1; // share the parent's address space instead of copyin
 
 // @export gives these functions C-compatible names so asm can call them
 fn void exit() @noreturn @export("exit") {
-    syscall(SYS_EXIT, 0, 0, 0);
+    exitcode(0);
+}
+
+// exit() with a status: 0 = success, non-zero = failure (the shell's
+// `&&` / `||` key on this via join()'s return — see src/process.c3's
+// exit-status side table). Only meaningful for a process someone
+// join()s; a fire-and-forget server's code goes nowhere.
+fn void exitcode(int code) @noreturn @export("exitcode") {
+    syscall(SYS_EXIT, code, 0, 0);
     // Unreachable in practice — the kernel frees this process and switches
     // away permanently on SYS_EXIT, it never returns here. Kept as a
     // fallback so this still satisfies @noreturn if that ever changes.
