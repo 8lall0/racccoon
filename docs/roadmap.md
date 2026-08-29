@@ -189,15 +189,28 @@ not bourne. Interleaved with §1/§2 rather than a phase of its own.
   its notify with `sstatus.SIE` globally off, diskd acks the
   virtio-mmio ISR, and `DISKD_READ`/`_WRITE` moved 10/11 → 210/211 off
   the P9/FS verb range (see docs/devlog.md 2026-08-29).
+- **globbing** — a pipeline word with an unquoted `*` / `?` is expanded
+  against the filesystem before its stage runs (`glob_match` +
+  `shell_glob_into`, user/shell_common.c3): `*` any run, `?` one char,
+  last path component only; no match → literal (rc's rule). Quoted
+  metachars stay literal.
+- **`bind` / `mount` / `unmount` + `namespace`** — `SYS_NS_LIST` (45)
+  and `SYS_NS_BIND` (46); builtins in `shell_dispatch_common` (both
+  shells). `mount <srv> <dir>` binds a `srv_post`'d name;
+  `bind <source> <dir>` binds whatever serves `<source>`; `namespace` /
+  `ns` prints the table. Builtins not `/bin` commands — a namespace
+  change only flows parent → child at spawn. A mount at `/mnt/x/` only
+  resolves for paths with the trailing slash (same wart every boot
+  mount has — `SYS_NS_RESOLVE` fix left for later).
+- **boot-time `login`** — `shell.c3` prompts `login: <name>` against
+  `/adm/users` (name only, no password field), then `setuid` + `cd
+  /usr/<name>`. `root` always works; no `/adm/users` → comes up as
+  root. Also a `login <user>` builtin. `shell_readline()` extracted +
+  shared.
 
 **Still to do:**
-- globbing; backslash escapes.
+- backslash escapes; `{a,b}` brace expansion.
 - builtins as pipeline stages.
-- `bind`/`mount`/`unmount` builtins + a `namespace` view (the §1
-  leftover) — `SYS_NS_MOUNT`/`_UNMOUNT` exist.
-- a boot-time `login` — the console still comes up as a root shell.
-  Now that `cd`/`$home` exist it's a small `/bin/login` (or folded into
-  shell startup): prompt for a name, `setuid`, `cd $home`, loop.
 - `&` background jobs, `^Z`/`jobs` — later.
 - `#!` scripts + `if`/`for`/`while` — much later.
 

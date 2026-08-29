@@ -4,6 +4,77 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-29 (continued) — shell: bind/mount/namespace, login, globbing
+
+Roadmap §2.5, three of the "still to do" items in one pass (they all
+live in `user/shell_common.c3`).
+
+### bind / mount / unmount + namespace
+
+Two new syscalls:
+
+- **`SYS_NS_LIST` (45)** — copies the caller's own namespace out, one
+  36-byte record per live mount (32-byte prefix + 4-byte LE pid). Same
+  per-process scope and generation-staleness drop as `SYS_NS_RESOLVE`.
+- **`SYS_NS_BIND` (46)** — Plan 9's `bind`: resolve a path through the
+  caller's namespace (longest-prefix, exactly like `SYS_NS_RESOLVE`),
+  then add/replace a mount at a new prefix pointing at that same server.
+  The insert half is identical to `SYS_NS_MOUNT`; only the source
+  differs — an existing path vs. a posted `srv` name.
+
+Both inlined into `handle_syscall`'s switch next to `SYS_NS_UNMOUNT`
+(the c3c "complex function from the switch" landmine still means simple
+inline cases are the safe choice).
+
+Builtins in `shell_dispatch_common` (both shells): `namespace`/`ns`,
+`mount <srv> <dir>`, `bind <source> <dir>`, `unmount`/`umount <dir>`.
+Builtins, not `/bin` commands, for the same reason `mountusb` is — a
+namespace change only ever flows parent → child at spawn, never back.
+Mount points are absolutised against cwd and given a trailing slash (the
+`Mount.prefix` convention).
+
+Known wart, not new: a mount at `/mnt/x/` only resolves for paths that
+*include* the trailing slash — `ls /mnt/x/` works, `ls /mnt/x` doesn't.
+Every boot mount already behaves this way (`ls /proc/` vs `ls /proc`).
+`SYS_NS_RESOLVE` would need to also match a path that equals a prefix
+minus its trailing `/`; left for later.
+
+### boot-time login
+
+`shell.c3` runs `shell_login()` after the boot settle: `login: <name>`
+against `/adm/users` (name only — there's no password field), then
+`setuid` + `cd /usr/<name>`. `root` is always in `/adm/users` so no
+lockout; a root partition with no `/adm/users` at all comes up as root
+rather than looping. `exit` → the kernel respawns a fresh root shell,
+same as `su` already relied on. Also a `login <user>` builtin so
+`shell_test.c3` (the QEMU build, which skips the startup prompt) can
+exercise it. `shell.c3`'s inline line editor extracted to
+`shell_readline()` and shared.
+
+### globbing
+
+Any pipeline word with an unquoted `*` / `?` is expanded against the
+filesystem before its stage runs (`glob_match` — linear backtracking —
+plus `shell_glob_into`). `*` any run, `?` one char, last path component
+only (earlier components literal). No match → the pattern stands
+literally (rc's rule, not sh's). Quoted metachars stay literal.
+`STAGE_WORDS_MAX` 48 → 72 for headroom; expanded strings packed into a
+2 KB per-pipeline buffer that `stage_words[]` points into.
+
+### verification
+
+QEMU disk_dual + FAT32: full regression green (bigreadtest, pathtest,
+fsneg, fspermtest, p9fstest, mounttest, envtest, killtest, ipcdeathtest,
+fsdkilltest, runtest, nstest, hardentest, srvtest); multi-stage
+pipelines 8/8; `namespace`, `bind / /mnt/x` then `ls /mnt/x/` (lists
+root), `login glenda` (prompt → `glenda /usr/glenda %`, `$user`, cwd),
+`echo /bin/*a*` → `cat false head whoami`, `echo '*'` literal, no-match
+literal — all verified. Duo kernel + user binaries build clean; hardware
+verification pending (the Duo card has `/adm/users` with root/glenda,
+and `/usr/glenda` + `/usr/root`).
+
+---
+
 ## 2026-08-29 (continued) — multi-stage pipelines: the kernel race, fixed
 
 Roadmap §2.5. Followed up the previous entry's root-cause work with a
