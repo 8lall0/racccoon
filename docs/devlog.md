@@ -4,6 +4,73 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-29 (continued) — multi-stage pipelines: the kernel race, fixed
+
+Roadmap §2.5. Followed up the previous entry's root-cause work with a
+real fix. `a | b | c` (up to `MAX_STAGES = 6`) now works — 4-stage
+hammered 15/15 at tight input spacing, mixed pipe/redirect combos
+25/25, `head` mid-pipeline, full QEMU regression green on both
+disk_dual and FAT32.
+
+**The deadlock, recapped.** 3+ concurrent `exec()`s (one per pipeline
+stage) each park in `SYS_IPC_CALL`'s cooperative yield loop. Those
+loops `yield()` but never `sret`, so hardware-cleared `sstatus.SIE`
+stays globally off and no interrupt is delivered as a trap. diskd's
+disk-completion wait is a busy poll of its inbox that relies on the
+virtio-blk IRQ notify; with SIE off the notify never arrives, diskd
+spins forever, fsd (blocked on diskd) hangs, the pipeline stage
+(blocked on fsd during `exec`) hangs, and the shell's `join()` hangs.
+Plus a verb collision: `DISKD_READ == 10 == P9_REMOVE`, so a stray
+unconsumed diskd reply in fsd's inbox got re-dispatched as P9_REMOVE
+into a mutual fsd↔diskd reply deadlock.
+
+**The fix (five parts):**
+
+1. **`Process.driver_irq_pending`** — a `bool` flag *separate* from the
+   IPC inbox (`has_message`/`msg_type`/`msg_from`), so routing an IRQ
+   notify can never clobber, or be clobbered by, a real client request
+   sitting in the inbox. The earlier attempts that poked
+   `has_message = true` all failed exactly here — they ate a pending
+   fsd request.
+2. **`service_pending_external_irq()`** — extracted from `handle_trap`;
+   claims / routes / completes one PLIC IRQ and sets the target
+   driver's `driver_irq_pending`. Now called from **both** the trap
+   handler **and** `sys_ipc_poll`.
+3. **`sys_ipc_poll` drains the PLIC by hand** via (2) and returns a
+   synthetic `DISKD_IRQ_NOTIFY` when `driver_irq_pending` is set —
+   *before* it looks at the real inbox, and without touching
+   `has_message`. So diskd's spin poll gets its completion notify even
+   with SIE globally off.
+4. **diskd acks the virtio-mmio ISR** (`INTERRUPT_STATUS` read →
+   `INTERRUPT_ACK` write, new regs in `virtio.c3`) after each request,
+   so the level-triggered IRQ line drops. A permanently-asserted line
+   re-traps on every `sret` and storms the PLIC — which is what broke
+   the earlier attempts once `sys_ipc_poll` started draining the PLIC.
+5. **`DISKD_READ`/`_WRITE` moved 10/11 → 210/211**, clear of the P9
+   (3–10) and FS (20–28) ranges, so a stray diskd reply in fsd's inbox
+   is dropped as unknown instead of mis-dispatched. `sdd.c3` (Duo)
+   tracks the same constants — fsd↔sdd is a wire protocol, reflash
+   both together.
+
+`shell_run_pipeline` reworked to N stages: flat `stage_words` argv
+storage, N-1 inter-stage pipes plus optional `<` on the first stage and
+`>`/`>>` on the last, spawn-all-then-wire-then-join.
+
+Heisenbug caveat from last session still holds: any debug print shifts
+timing enough to hide the original hang, so verification is by tight
+hammer loops (`sleep 0.9` between pipelines), not instrumented runs.
+
+Duo kernel + user binaries build clean; the 10/11→210/211 change is a
+wire-protocol change between fsd and sdd, so Duo needs both reflashed
+and the `/bin` binaries repopulated together. Duo hardware verification
+pending.
+
+`src/entry.c3`, `src/process.c3`, `user/block/diskd.c3`,
+`user/block/sdd.c3`, `user/fs/fsd.c3`, `user/virtio.c3`,
+`user/shell_common.c3`.
+
+---
+
 ## 2026-08-29 (continued) — multi-stage pipelines: blocked on a kernel race
 
 Roadmap §2.5. Attempted `a | b | c` (3+ stages). The shell side worked
