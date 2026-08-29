@@ -140,6 +140,37 @@ child a namespace that only has what it needs."
 
 ---
 
+## 2.5 The shell
+
+The through-line — where §1 and §2 become usable. An `rc`-style pass,
+not bourne. Interleaved with §1/§2 rather than a phase of its own.
+
+**Done:**
+- **cwd** (`e89affb`) — `Process.cwd` (kernel), `SYS_CHDIR`/`SYS_GETCWD`,
+  inherited across rfork, kept by exec. `fs_abspath()` in every `fs_*`
+  wrapper + `exec()` resolves relative paths against it. `cd` (with
+  `.`/`..` normalisation, `/usr/$user` home), `pwd`. Prompt shows it:
+  `root /usr/glenda #`.
+- **`$var` expansion** (`5fc3c69`) — `shell_expand()` before tokenising.
+  `$user`/`$cwd`/`$home` synthesised; anything else is `/env/<name>`,
+  empty if unset. `echo` builtin.
+
+**Still to do:**
+- **`|` pipes** and **`>` / `<` / `>>` redirection** — needs the
+  storage/IPC model to grow a byte-stream notion (today everything is
+  request/reply; a pipe is a different shape). Probably a small `pipe`
+  server or a kernel pipe primitive.
+- `;` / `&&` / `||` sequencing; quoting; globbing.
+- `bind`/`mount`/`unmount` builtins + a `namespace` view (the §1
+  leftover) — `SYS_NS_MOUNT`/`_UNMOUNT` exist.
+- a boot-time `login` — the console still comes up as a root shell.
+  Now that `cd`/`$home` exist it's a small `/bin/login` (or folded into
+  shell startup): prompt for a name, `setuid`, `cd $home`, loop.
+- `&` background jobs, `^Z`/`jobs` — later.
+- `#!` scripts + `if`/`for`/`while` — much later.
+
+---
+
 ## 3. Hardware FPU / why floats panic today
 
 ### The current situation

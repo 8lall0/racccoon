@@ -4,6 +4,49 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-29 (continued) — shell: boot-quiet, cwd, $var
+
+Roadmap §2.5. Three commits, making §1/§2 usable at the prompt.
+
+**Boot-log pollution** (`138b6ab`). Server init logs kept landing after
+the prompt (usbd/ethd/gpiod spawn *after* the shell — the "usbd never
+blocks so idle never makes the shell" deadlock; and ethd's link poll /
+fsd2's mount finish seconds later). `Process.is_boot_server` (set for
+the 10 kernel-spawned servers + respawns) + `g_boot_quiet` +
+`SYS_BOOT_QUIET`: once set, `SYS_PUTCHAR` from a boot server is dropped.
+The shell calls it after `shell_boot_settle(ticks)` — ~3s QEMU / ~6s
+Duo (raw `rdtime` delta, per-board — no board-agnostic "seconds" in
+user mode). Supervisor `svc:` lines stay (kernel-side, rare, useful).
+A `dmesg` recall of the dropped lines is a later add.
+
+**cwd** (`e89affb`). `Process.cwd` (absolute, `""` = root), inherited
+across rfork, kept by exec — like uid/namespace. `SYS_CHDIR` /
+`SYS_GETCWD`. `user.c3`'s `fs_abspath()` — injected into every `fs_*`
+wrapper and `exec()` — resolves a relative path against cwd; absolute
+passes through; empty means "the cwd" (so `ls` with no arg lists where
+you are). `exec_path()`'s default PATH is now `/bin/` (absolute).
+`cd` builtin (`.`/`..`/`//` normalised, home `/usr/$user` falling back
+to `/`), `pwd`. Prompt: `root /usr/glenda #`.
+
+**`$var` expansion** (`5fc3c69`). `shell_expand()` runs before
+tokenising. `$user`/`$cwd`(`$PWD`)/`$home` synthesised from the shell's
+cached state + `getcwd()`; anything else reads `/env/<name>`, empty if
+unset (rc semantics). `$` not followed by a name char stays literal.
+`echo` builtin (there was none). No braces/quotes yet.
+
+**Verified QEMU:** `cd`/`pwd`/`..`, `ls`/`cat` resolving under cwd,
+`echo hello $user` → `hello root`, `$cwd` tracks `cd`, `$user` reflects
+`su`, `$5` literal; clean `root /` prompt with all boot chatter above
+it. Full regression (`pathtest` / `fsneg` / `fspermtest` / `envtest` /
+`bigreadtest` / `runtest` / `argvtest` / the p9/fs suite) unchanged.
+**Duo:** boot-quiet confirmed on hardware (clean prompt, logs above).
+The cwd/`$var` binaries in the Duo's `/bin` are stale until
+`scripts/populate_duo_bin.sh` is re-run — a kernel-only reflash can't
+touch the ext2 partition; builtins (`cd`/`pwd`/`echo`/`$var`) work
+regardless.
+
+---
+
 ## 2026-08-29 (continued) — §2: the Plan 9 user model (identity + read enforcement)
 
 Roadmap §2, two commits.
