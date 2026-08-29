@@ -483,11 +483,14 @@ dance).
 
 ---
 
-## 2026-08-29 — session summary: xpad STALL → cleanup pass → roadmap → resiliency
+## 2026-08-29 — session summary: xpad STALL → cleanup → roadmap → resiliency → §1/§2 → the shell (§2.5)
 
 One long session (2026-08-28 into the 29th). A reported bug, then
 structural cleanup, then — prompted by the user thinking about where
-the project goes next — a roadmap doc and the first two slices of it.
+the project goes next — a roadmap doc, and then a sustained push down
+it: resiliency (§5), the Plan 9 file structure (§1) and user model
+(§2), and finally the shell (§2.5) built out from a bare `> ` prompt
+to cwd + `$var` + pipes + redirection + `;`/`&&`/`||` + quoting.
 Per-topic entries below; the arc:
 
 ### Bug + cleanup
@@ -560,9 +563,68 @@ Per-topic entries below; the arc:
 **After this session there are no "hang forever" IPC paths, and a
 crashed fsd recovers on its own.**
 
+### §1 Plan 9 file structure + §2 user model
+
+11. **Canonical tree + hardcoded-pid removal** (`f025db5` and around) —
+    `/bin /lib /usr/$user /adm /tmp /mnt` seeded identically on QEMU
+    (`build.sh`) and Duo (`populate_duo_bin.sh`);
+    `docs/filesystem-layout.md` is the reference. `echod` (was baked as
+    pid 2 in `namespace[0]`) and the block driver (`DISKD_PID=3`) now
+    come from `echod_pid` / a `SYS_FS_PARTITION_INFO` out-param. An
+    `Irq_route` table + `mount_generation()` fell out of the same pass.
+
+12. **User model — identity + read enforcement** (`d1de99d` /
+    `05aa0bf`) — `/adm/users` (`uid:name`), `user_uid_by_name` /
+    `user_name_by_uid`, `SYS_GETUID`, `su <user>` (one-way, Plan 9's
+    "become none, never come back"), `/bin/whoami`, the prompt shows
+    the user (`root #` / `glenda %`). `ext2_read_allowed` / `_may_read`
+    gate fsd's read/list/stat/`P9_OPEN` on the requester uid (ext2
+    only, root bypasses).
+
+### §2.5 The shell
+
+13. **boot-quiet, cwd, `$var`** (`138b6ab` / `e89affb` / `5fc3c69`) —
+    `SYS_BOOT_QUIET` silences boot-server console spam once the prompt
+    settles; `Process.cwd` + `SYS_CHDIR`/`SYS_GETCWD` + `fs_abspath()`
+    in every `fs_*` wrapper, `cd`/`pwd`; `shell_expand()` before
+    tokenising — `$user`/`$cwd`/`$home` synthesised, else `/env/<name>`.
+
+14. **pipes + redirection** (`0a9ccab`) — kernel pipe primitive
+    (`src/pipe.c3`: ring buffer + writer/reader refcounts;
+    `Process.stdout_pipe`/`stdin_pipe`); `SYS_PUTCHAR`/`GETCHAR` route
+    through it; syscalls 39–44. `shell_run_pipeline` wires one `|` plus
+    `<`/`>`/`>>`. `/bin/echo`, stdin-aware `cat`.
+
+15. **`fsd` trailing-slash normalization** (`cfad305`) — `ls /` and
+    `ls /bin/` reported "not found" (`ext2_leaf_name("/")` is `""`).
+
+16. **`;` / `&&` / `||` + exit status** (`d3da7ac`) — kernel exit-status
+    side table (`sys_exit`/`sys_kill` record `(pid, gen, code)`,
+    `sys_join` returns it), `exit()` → `exitcode(int)`. `shell_exec_line`
+    splits on ` ; ` / ` && ` / ` || `, expands + tokenises each pipeline
+    just before it runs so `$status` mid-line is right. `/bin/true`,
+    `/bin/false`.
+
+17. **quoting** (`c450706`) — `shell_expand_q()` + a `qmask` byte array:
+    `'...'` fully literal, `"..."` literal but `$name` expands; the
+    tokeniser splits and recognises operators only on unquoted bytes.
+
+18. **`/bin/head` + multi-stage pipelines — shelved** (`a3d3f04` /
+    `83e592f`) — `head [-n N]` (first stdin filter, works in 2-stage).
+    `a | b | c` (3+ stages) is **blocked on a kernel race**: 3
+    concurrent `exec()`s keep `sstatus.SIE` globally off, so diskd's
+    busy-spin disk-completion wait starves → fsd blocks on diskd → the
+    stage blocks on fsd → the shell's `join()` hangs. Root cause fully
+    pinned; two fix attempts (PLIC drain from `yield()`; diskd used-ring
+    poll + virtio ISR ack) both hit a different wall (`bigreadtest`
+    regressed / still hangs downstream). Filed in roadmap §2.5 for a
+    focused session.
+
 **Deferred:** timebase dedup (poor ratio — `kbd.c3` compile-time
 const); interrupt-driven ethernet RX (needs a test peer); device-driver
-supervision (needs the pid hardcodes gone first).
+supervision (needs the pid hardcodes gone first); multi-stage pipelines
+(kernel race, above); the §1 `bind`/`mount` builtins + namespace view;
+a boot-time `login`.
 
 ---
 
