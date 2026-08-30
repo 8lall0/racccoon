@@ -620,6 +620,78 @@ way Plan 9 does.
 
 ---
 
+## 7. A C library + POSIX layer → self-hosting (in progress)
+
+### Why
+
+To compile racccoon's own programs *on* racccoon. The realistic path
+isn't LLVM-via-wasm (a 50–200× interpreter running a 30–100 MB module —
+glacial, and won't fit 64 MiB) — it's porting a **small native
+compiler** (TinyCC class: ~30k lines of C, its own asm + linker + cpp,
+no LLVM). That needs a C runtime + libc + POSIX-shaped surface for
+real Unix C to build and run against.
+
+### Shape
+
+```
+C programs (tcc, coreutils, …)
+libc:  stdio · stdlib · string · ctype · math · time · setjmp
+POSIX layer:  fd table · open/read/write/close/lseek · stat/fstat ·
+              fork/execve/waitpid · dirent · mmap(anon) · errno · env
+              · pipe/dup2 (limited) · signals (stubbed)
+racccoon syscall stubs + crt0
+```
+
+The **POSIX layer** is the translation: racccoon is path-based
+(`fs_read_at(path, buf, len, off)`), POSIX is fd-based. A userspace fd
+table maps `fd → {path, offset, flags, kind}`; `read(fd)` becomes
+`fs_read_at(table[fd].path, …, table[fd].offset)` + an offset bump,
+`fork`→`rfork`, `waitpid`→`join`. Almost no kernel changes (env needs
+an exec convention; that's it).
+
+Built with `riscv64-unknown-elf-gcc -march=rv64imafdc -mabi=lp64d
+-mcmodel=medany -ffreestanding -nostdlib -nostdinc` + our own headers,
+`crt0`, `libracccoon.a` (`lib/racccoon-libc/`, `build.sh` there,
+wired into `scripts/build.sh`, no-ops without a riscv64 C compiler).
+Programs are flattened to a raw binary (`objcopy`) and run via the
+flat-binary exec path like the c3 `/bin` commands.
+
+### Stages
+
+1. **C beachhead. DONE** — `crt0` + `ecall` syscall stubs + `_exit` +
+   console `write`/`read`; `test/c-src/ctest.c` runs on racccoon,
+   echoes its argv, sets its exit code. `argv[0]`: racccoon's exec ABI
+   carries only the args (a c3 `args[0]` is the first real arg), so the
+   crt0 synthesises a placeholder `argv[0]` and shifts the args to
+   `argv[1..]` — a real name is deferred to §7.6.
+2. **malloc** — a real `malloc`/`free`/`realloc`/`calloc` free-list over
+   `SYS_MAP` (the first heap allocator in the tree; `/bin/wasm`'s bump
+   `wasm_alloc` could adopt it).
+3. **freestanding core** — `string.h`, `stdlib.h` (atoi, strtol, qsort,
+   bsearch, abs, getenv, `exit`/`atexit`), `ctype.h`, `errno.h`,
+   `assert.h`, `setjmp.h` (asm), `limits.h`/`stdint.h` conventions.
+4. **POSIX fd layer** — `open`/`close`/`read`/`write`/`lseek`/`unlink`/
+   `stat`/`fstat`/`getcwd`/`chdir`/`mkdir`/`opendir`/`readdir` over the
+   c3 `fs_*` exports (link `user.c3` as a lib, or reimplement the `p9`
+   codec in C).
+5. **stdio** — `FILE*` + buffering; `fopen`…`fclose`/`fread`/`fwrite`/
+   `fgets`/`fseek`/`ftell`; `printf`/`fprintf`/`snprintf`/`vsnprintf`
+   (the format engine); `stdin`/`stdout`/`stderr`.
+6. **process** — `fork`/`execve`/`execvp`/`waitpid`/`getpid`/`environ`/
+   `mmap(MAP_ANONYMOUS)`; resolve the `argv[0]` / env question (kernel
+   exec-passes-name, or an argv/env convention crt0 unpacks).
+7. **TinyCC cross-build** — `tcc` for `riscv64-racccoon` against
+   stages 2–6; `tcc hello.c -o hello` on racccoon → a runnable binary.
+8. **TinyCC self-hosts** — `tcc` compiles its own source on racccoon.
+
+### Not doing
+
+Full glibc/musl compatibility, threads, dynamic linking, a full
+`<termios.h>`/job-control surface. Just enough POSIX for a
+self-contained compiler and small Unix utilities.
+
+---
+
 ## Sequencing
 
 ```

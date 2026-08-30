@@ -4,6 +4,41 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-31 — a C program runs on racccoon (roadmap §7 stage 1)
+
+First step of the C-library / self-hosting track. The goal isn't
+LLVM-via-wasm (glacial, won't fit 64 MiB) — it's a native C runtime so
+a small compiler (TinyCC class) can eventually build and run here.
+
+`lib/racccoon-libc/`: a `crt0` (`_start` → unpack the argv blob → call
+`main` → `_exit`) and `ecall` syscall stubs, built with
+`riscv64-unknown-elf-gcc -march=rv64imafdc -mabi=lp64d -mcmodel=medany
+-ffreestanding -nostdlib -nostdinc` + our own `<unistd.h>` +
+`<racccoon/syscall.h>`. `build.sh` there produces `crt0.o` +
+`libracccoon.a`, cross-compiles `test/c-src/*.c`, and flattens each to
+a raw binary (`objcopy`) — racccoon's flat-binary exec path is simpler
+and better-tested than its ELF loader, and a C program's layout is
+otherwise identical to the c3 `/bin` commands. Wired into
+`scripts/build.sh`; no-ops cleanly with no riscv64 C compiler.
+
+`ctest` on racccoon:
+```
+ctest            -> hello from C on racccoon                (exit 0)
+ctest one two    -> hello from C on racccoon
+                    argv[1..]: one two                       (exit 3)
+```
+
+**argv[0] gap**: racccoon's exec ABI passes only the arguments — a c3
+program's `args[0]` is its first real arg. POSIX C wants `argv[0]` =
+program name, so the crt0 synthesises a placeholder there and shifts
+the args to `argv[1..]`. A real name (kernel exec-passes-name, or an
+argv/env convention) is deferred to the process-layer stage (§7.6).
+
+Roadmap §7 has the full 8-stage plan. Nothing in the c3 userspace
+changed; `wasmtest` + regression still green.
+
+---
+
 ## 2026-08-30 — survive OOM + a userspace crash (no swap)
 
 Two robustness holes closed. (User asked about swap — that's a poor fit:
