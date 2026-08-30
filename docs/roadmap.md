@@ -366,9 +366,17 @@ programs need more.
    FP means the operators lower straight to `fadd.d` etc.; `sqrt` and
    the roundings use small `@naked` asm helpers (the block `asm{}` form
    only knows integer lw/sw). Fixtures `float` → 88, `float2` → 80.
-3. **More host imports** — deeper `fsd` / env integration as real
+3. **Real compiled programs. STARTED.** `test/wasm-src/{fib,upper}.zig`
+   → `wasm32-freestanding` via `zig`, importing the `racccoon` host
+   module directly. `wasm fib.wasm 50` → `12586269025`. The Zig output
+   used nothing outside the milestone-1/2 opcode set (no bulk-memory /
+   SIMD / `0xFC`) — so it ran with no interpreter changes. Next as real
+   modules need it: bulk-memory (`memory.copy`/`fill`), a WASI-subset
+   shim if a concrete program wants one, raising `FUNCS_MAX` / type
+   limits, `env` / AssemblyScript import compat.
+4. **More host imports** — deeper `fsd` / env integration as real
    programs need it.
-4. Multi-module / a table of importable host modules — later.
+5. Multi-module / a table of importable host modules — later.
 
 ### Why
 

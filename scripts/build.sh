@@ -20,8 +20,27 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
 
   # Hand-built .wasm test fixtures for /bin/wasm (no wat2wasm on this
   # host — the bytes are assembled by the Python script). Seeded onto
-  # every disk image below next to /bin.
+  # every disk image below next to /bin. Cleaned first so a renamed or
+  # removed fixture doesn't linger on the images.
+  rm -rf build/wasm
   python3 test/mkwasm.py build/wasm
+
+  # Real programs compiled from Zig (test/wasm-src/*.zig) — proof
+  # /bin/wasm runs actual compiler output, not just hand-assembled
+  # bytes. Built with `zig` if it's on PATH, else the committed
+  # .wasm next to the source is used as-is.
+  for z in test/wasm-src/*.zig; do
+    [ -e "$z" ] || continue
+    name=$(basename "$z" .zig)
+    if command -v zig >/dev/null 2>&1 && \
+       zig build-exe "$z" -target wasm32-freestanding -O ReleaseSmall \
+         -fno-entry --export=_start -femit-bin="build/wasm/$name.wasm" 2>/dev/null; then
+      cp "build/wasm/$name.wasm" "test/wasm-src/$name.wasm"   # refresh the committed fallback
+    else
+      cp "test/wasm-src/$name.wasm" "build/wasm/$name.wasm"
+    fi
+    rm -f "$name.wasm.o" "build/wasm/$name.wasm.o" 2>/dev/null
+  done
 
   # The disk images built below are pristine masters — every one is
   # rm -f'd and rebuilt from scratch on each run, so re-running this

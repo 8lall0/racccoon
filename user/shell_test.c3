@@ -1960,7 +1960,7 @@ fn void main() {
             // _start computes 2+3 and calls racccoon.print_i32 -> the
             // console shows "5"; _start has no result so it exits 0.
             int wt_ok = 0;
-            char*[8] wt_fx;
+            char*[10] wt_fx;
             wt_fx[0] = "add.wasm";     // -> "5"    (call + host import)
             wt_fx[1] = "mem.wasm";     // -> "142"  (linear memory + grow)
             wt_fx[2] = "loop.wasm";    // -> "55"   (block/loop/br/br_if)
@@ -1969,11 +1969,15 @@ fn void main() {
             wt_fx[5] = "echo.wasm";    // -> "a b"  (table + call_indirect + print_str + arg)
             wt_fx[6] = "float.wasm";   // -> "88"   (f64 sqrt/mul/floor/div + f32 mul + trunc)
             wt_fx[7] = "float2.wasm";  // -> "80"   (f64 neg/abs/min/max/copysign/convert/promote/gt)
-            for (int wf = 0; wf < 8; wf++) {
+            wt_fx[8] = "fib.wasm";     // -> "6765" (real Zig program: `fib.wasm 20`, i64 loop + arg)
+            wt_fx[9] = "upper.wasm";   // -> "HI"   (real Zig program: `upper.wasm hi`, mem + print_str)
+            for (int wf = 0; wf < 10; wf++) {
                 char* wt_arg = wt_fx[wf];
                 char*[3] wt_av;
                 wt_av[0] = wt_arg; wt_av[1] = "a"; wt_av[2] = "b";
-                int wt_ac = wf == 5 ? 3 : 1;
+                if (wf == 8) { wt_av[1] = "20"; }
+                if (wf == 9) { wt_av[1] = "hi"; }
+                int wt_ac = (wf == 5) ? 3 : ((wf == 8 || wf == 9) ? 2 : 1);
                 uint wt_gen = 0;
                 int wt_c = rfork(RFPROC, &wt_gen);
                 if (wt_c == 0) {

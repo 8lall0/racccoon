@@ -4,6 +4,35 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — wasm §4: real compiled programs run (milestone 3, first cut)
+
+`/bin/wasm` runs actual compiler output, not just hand-assembled bytes.
+Two programs in `test/wasm-src/`, compiled from **Zig** to
+`wasm32-freestanding` (`zig build-exe … -O ReleaseSmall -fno-entry
+--export=_start`), importing the `racccoon` host module directly (no
+WASI):
+
+- `fib.zig` — `wasm fib.wasm [n]` → the n-th Fibonacci number, default
+  n=10. Parses argv[0] out of linear memory, i64 accumulate loop.
+  `wasm fib.wasm 50` → `12586269025`, `fib.wasm 90` →
+  `2880067194370816120` (full i64).
+- `upper.zig` — `wasm upper.wasm <text>` → the text upper-cased.
+  `arg` + `print_str` + a linear-memory read/write loop.
+
+The Zig output exercised everything the milestone-1/2 opcode set
+already covers — the shadow-stack global (`global.get 0` / `i32.sub` /
+`global.set 0`), `block`/`loop`/`br_if`, `local.tee`, `i32.load8_u`,
+i32+i64 arithmetic, `call` to imports — with **no bulk-memory / SIMD /
+0xFC ops**, so nothing new was needed in the interpreter. Good sign for
+milestone 3.
+
+`scripts/build.sh` compiles `test/wasm-src/*.zig` with `zig` if it's on
+PATH, else falls back to the committed `.wasm` next to each source.
+`wasmtest` now runs 10 fixtures (8 hand-built + fib + upper). QEMU
+green; Duo builds clean.
+
+---
+
 ## 2026-08-30 — §5.5 supervisor-respawn: two fixes + sharper tests
 
 Chasing the two driver-respawn bugs the §5.5 fault tests found.
