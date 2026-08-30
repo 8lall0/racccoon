@@ -41,7 +41,10 @@ Three supporting pieces, each a real bug found while building it:
 
 `hungservertest` (shell_test.c3) + a test-only `ECHOD_HANG` verb prove
 it end to end. QEMU: passes; killtest / fsdkilltest / storagekilltest /
-ipcdeathtest / regression all still green.
+ipcdeathtest / regression all still green. Duo boots clean with the
+refactored teardown + watchdog (the watchdog itself isn't reachable
+from the production shell, but the `proc_destroy` / `create_process`
+changes underpin every kill path).
 
 ### envd crash policy (§5.4)
 
