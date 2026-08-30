@@ -418,13 +418,15 @@ Generation counters back most of the stale-reference handling:
   exhaustion; `SYS_MAP` / `SYS_EXEC` / `SYS_RFORK` pre-check the free
   pool (incl. page-table overhead) and fail the syscall. `alloc_pages()`
   still panics — but only the boot-time callers use it, where a failure
-  means unbootable anyway. `oomtest`.
+  means unbootable anyway. The allocator scans only the real
+  `__free_ram_end − __free_ram` span (`ram_page_count()`), not the
+  hardcoded 64 MiB ceiling. `oomtest`, Duo-verified.
 - **A user-mode fault kills just that process.** `handle_trap` tears
   down a process that takes a page fault / illegal instruction / etc.
   from U-mode (`proc_destroy` + `yield`, like SYS_EXIT); only an
-  S-mode exception still panics. `faulttest`. (Swap / demand paging is
-  *not* planned — storage is behind userspace servers the kernel can't
-  IPC, and the board is 64 MiB.)
+  S-mode exception still panics. `faulttest`, Duo-verified. (Swap /
+  demand paging is *not* planned — storage is behind userspace servers
+  the kernel can't IPC, and the board is 64 MiB.)
 
 ### The gaps
 
