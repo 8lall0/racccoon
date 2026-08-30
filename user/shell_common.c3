@@ -62,6 +62,123 @@ int      g_shell_uid = -1;
 // shell_run_pipeline.
 int g_shell_status = 0;
 
+// --- background jobs (`cmd &`, `jobs`, `wait`) -----------------------
+// The shell is one long-lived process, so a plain global table is all
+// this needs. A job is a whole backgrounded pipeline — up to
+// JOB_STAGES pids, each with its rfork generation so a recycled pid
+// can't be mistaken for a still-running stage (same guard join() and
+// the namespace already use). Reaped lazily: shell_jobs_reap() runs
+// once per prompt (from shell_prompt), polls each job with proc_info,
+// and join()s the finished ones — join returns at once for an
+// already-dead pid, so this never blocks.
+const int JOBS_MAX     = 8;
+const int JOB_STAGES    = 6;   // must match shell_run_pipeline's MAX_STAGES
+const int JOB_CMD_MAX   = 72;
+
+struct Job
+{
+    bool used;
+    int  jobno;
+    int  npid;
+    int[JOB_STAGES]  pid;
+    uint[JOB_STAGES] gen;
+    char[JOB_CMD_MAX] cmd;
+}
+Job[JOBS_MAX] g_jobs;
+int g_next_jobno = 1;
+
+// Register a just-spawned background pipeline and print `[N] <lead pid>`.
+fn void shell_job_add(int* pids, uint* gens, int n, char* cmd, int cmdlen)
+{
+    int slot = -1;
+    for (int i = 0; i < JOBS_MAX; i++) { if (!g_jobs[i].used) { slot = i; break; } }
+    if (slot < 0) { print("shell: too many background jobs\n"); return; }
+    Job* j = &g_jobs[slot];
+    j.used  = true;
+    j.jobno = g_next_jobno; g_next_jobno++;
+    j.npid  = n > JOB_STAGES ? JOB_STAGES : n;
+    for (int i = 0; i < j.npid; i++) { j.pid[i] = pids[i]; j.gen[i] = gens[i]; }
+    int s = 0;
+    while (s < cmdlen && cmd[s] == ' ') { s++; }   // trim leading space
+    int c = 0;
+    while (s < cmdlen && c < JOB_CMD_MAX - 1) { j.cmd[c] = cmd[s]; c++; s++; }
+    j.cmd[c] = 0;
+    print("[");
+    print_uint((uint)j.jobno);
+    print("] ");
+    print_uint((uint)pids[n - 1]);
+    putchar('\n');
+}
+
+fn bool job_stage_alive(int pid, uint gen)
+{
+    uint g = 0;
+    return proc_info(pid, null, &g, null) == 0 && g == gen;
+}
+
+// Print one finished job's line: `[N] done|exit S|killed   <cmd>`.
+fn void job_report(Job* j, int st)
+{
+    print("[");
+    print_uint((uint)j.jobno);
+    print("] ");
+    if (st == 0)      { print("done   "); }
+    else if (st < 0)  { print("killed "); }
+    else              { print("exit "); print_uint((uint)st); print("  "); }
+    print(&j.cmd[0]);
+    putchar('\n');
+}
+
+// Once per prompt: reap every job whose stages are all gone.
+fn void shell_jobs_reap()
+{
+    for (int i = 0; i < JOBS_MAX; i++) {
+        if (!g_jobs[i].used) { continue; }
+        Job* j = &g_jobs[i];
+        bool alive = false;
+        for (int k = 0; k < j.npid; k++) {
+            if (job_stage_alive(j.pid[k], j.gen[k])) { alive = true; break; }
+        }
+        if (alive) { continue; }
+        int st = 0;
+        for (int k = 0; k < j.npid; k++) { st = join(j.pid[k], j.gen[k]); }
+        job_report(j, st);
+        j.used = false;
+    }
+}
+
+// `jobs` builtin.
+fn void shell_jobs_list()
+{
+    shell_jobs_reap();   // report + drop anything that has already finished
+    bool listed = false;
+    for (int i = 0; i < JOBS_MAX; i++) {
+        if (!g_jobs[i].used) { continue; }
+        listed = true;
+        Job* j = &g_jobs[i];
+        print("[");
+        print_uint((uint)j.jobno);
+        print("] running  ");
+        print(&j.cmd[0]);
+        putchar('\n');
+    }
+    if (!listed) { print("no background jobs\n"); }
+}
+
+// `wait` builtin — block (cooperatively, via join) until every current
+// background job has finished, reporting each as it's collected.
+fn void shell_jobs_wait()
+{
+    for (int i = 0; i < JOBS_MAX; i++) {
+        if (!g_jobs[i].used) { continue; }
+        Job* j = &g_jobs[i];
+        int st = 0;
+        for (int k = 0; k < j.npid; k++) { st = join(j.pid[k], j.gen[k]); }
+        job_report(j, st);
+        j.used = false;
+    }
+}
+
 fn void shell_refresh_user()
 {
     g_shell_uid = getuid();
@@ -84,6 +201,7 @@ fn void shell_boot_settle(ulong settle_ticks)
 // `%`). Both shells call this instead of a bare "> ".
 fn void shell_prompt()
 {
+    shell_jobs_reap();   // report any background job that finished since last time
     if (g_shell_uid < 0) { shell_refresh_user(); }
     print(&g_shell_user[0]);
     putchar(' ');
@@ -634,6 +752,12 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
                 print("unmountusb: unmounted\n");
             }
             return true;
+        } else if (strcmp(cmd, "jobs") == 0) {
+            shell_jobs_list();
+            return true;
+        } else if (strcmp(cmd, "wait") == 0) {
+            shell_jobs_wait();
+            return true;
         } else if (strcmp(cmd, "login") == 0) {
             if (cmd_argc < 1) {
                 print("usage: login <user>\n");
@@ -911,7 +1035,14 @@ fn int shell_expand_q(char* in, char* out, char* qmask, int cap)
 // literal (rc's rule).
 // Returns the exit status of the last stage (0 = success); a shell-side
 // error (bad syntax, unterminated quote, unopenable redirection) is 2.
-fn int shell_run_pipeline(char* seg, int seg_len)
+//
+// `bg` (from a trailing `&`) spawns the stages and returns 0 without
+// waiting — the job goes into g_jobs, reaped at the next prompt. A
+// background job can't use `<` / `>` / `>>` (the shell pumps those
+// itself, which would block). An output-only builtin still works
+// backgrounded (it runs in the forked stage child); a side-effecting
+// one (`cd`, `su`, …) hits the /bin path and 127s.
+fn int shell_run_pipeline(char* seg, int seg_len, bool bg)
 {
     char[256] raw @noinit;
     int rn = seg_len < 255 ? seg_len : 255;
@@ -1046,9 +1177,15 @@ fn int shell_run_pipeline(char* seg, int seg_len)
         print("shell: `>` redirect only on the last pipeline stage\n");
         return 2;
     }
+    if (bg && (infile != null || outfile != null)) {
+        print("shell: a background job can't use < / > / >>\n");
+        return 2;
+    }
 
     // No pipe, no redirection: the plain path, builtins included.
-    if (nstages == 1 && infile == null && outfile == null) {
+    // (Skipped for `&` — a backgrounded command always goes through the
+    // spawn loop below, even a single one, so it gets a real child pid.)
+    if (!bg && nstages == 1 && infile == null && outfile == null) {
         char* c0 = stage_words[0];
         if (shell_dispatch_common(c0, &stage_words[1], stage_n[0] - 1)) {
             return g_shell_status;
@@ -1115,6 +1252,16 @@ fn int shell_run_pipeline(char* seg, int seg_len)
         if (stdout_p >= 0) { pipe_setout(spid[s], stdout_p); }
     }
 
+    // Background: hand the whole pipeline to the job table and return
+    // now. The inter-stage pipes need no shell-side hold — each child
+    // holds its own ends and they free themselves once the last stage
+    // exits (in_pipe / out_pipe are always -1 here: redirection was
+    // rejected above).
+    if (bg) {
+        shell_job_add(&spid[0], &sgen[0], nstages, seg, seg_len);
+        return 0;
+    }
+
     // Feed `< file`, then drop our writer so stage 0 sees EOF once it
     // has drained the buffer.
     if (in_pipe >= 0) {
@@ -1154,9 +1301,10 @@ fn int shell_run_pipeline(char* seg, int seg_len)
 }
 
 // Which sequencing operator (if any) starts at line[p]: 1 = ` ; `,
-// 2 = ` && `, 3 = ` || `, 0 = none. *op_len gets the operator's byte
-// length including its surrounding spaces. A trailing ` ;` / ` &&` /
-// ` ||` at the very end of the line counts too (no space after).
+// 2 = ` && `, 3 = ` || `, 4 = ` & ` (background), 0 = none. *op_len
+// gets the operator's byte length including its surrounding spaces. A
+// trailing ` ;` / ` &&` / ` ||` / ` &` at the very end of the line
+// counts too (no space after).
 fn int sh_seq_op_at(char* line, int p, int* op_len)
 {
     if (line[p] != ' ') { return 0; }
@@ -1170,6 +1318,10 @@ fn int sh_seq_op_at(char* line, int p, int* op_len)
         int kind = a == '&' ? 2 : 3;
         if (line[p + 3] == ' ') { *op_len = 4; return kind; }
         if (line[p + 3] == 0)   { *op_len = 3; return kind; }
+    }
+    if (a == '&' && line[p + 2] != '&') {   // single `&` — background
+        if (line[p + 2] == ' ') { *op_len = 3; return 4; }
+        if (line[p + 2] == 0)   { *op_len = 2; return 4; }
     }
     return 0;
 }
@@ -1187,7 +1339,7 @@ fn int sh_seq_op_at(char* line, int p, int* op_len)
 fn int shell_exec_line(char* line)
 {
     int status = 0;
-    int conn = 0;       // 0 = first (always run), 1 = `;`, 2 = `&&`, 3 = `||`
+    int conn = 0;       // 0 = first (always run), 1 = `;`, 2 = `&&`, 3 = `||`, 4 = `&`
     int seg_start = 0;
     int p = 0;
     char quote = 0;     // 0, '\'' or '"' — a sequencing op inside a quote is literal
@@ -1210,6 +1362,7 @@ fn int shell_exec_line(char* line)
         int seg_len = p - seg_start;
         bool run = conn == 0
                 || conn == 1
+                || conn == 4
                 || (conn == 2 && status == 0)
                 || (conn == 3 && status != 0);
 
@@ -1218,10 +1371,11 @@ fn int shell_exec_line(char* line)
         while (s < p && line[s] == ' ') { s++; }
 
         if (s < p && run) {
-            status = shell_run_pipeline(&line[seg_start], seg_len);
+            // op == 4 -> this segment is `cmd &`: spawn and don't wait.
+            status = shell_run_pipeline(&line[seg_start], seg_len, op == 4);
             g_shell_status = status;   // visible to the next segment's $status
         } else if (s >= p && op >= 1) {
-            print("shell: empty command near a ; && || operator\n");
+            print("shell: empty command near a ; && || & operator\n");
             status = 2;
             g_shell_status = status;
         }
