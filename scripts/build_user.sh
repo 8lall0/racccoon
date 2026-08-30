@@ -3,6 +3,7 @@
 set -e
 
 LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
+LLVM_MC=${LLVM_MC:-llvm-mc}
 LLVM_LLD=${LLVM_LLD:-/opt/riscv/bin/ld.lld}
 
 # std::nolibc::{mem,atomic,fmt,main_stub} — the freestanding pieces
@@ -54,13 +55,14 @@ build_user_program() {
     -D RACCCOON \
     --target elf-riscv64 \
     --riscv-cpu=rvimac \
+    --riscv-abi=double \
     --output-dir "build/user/$name/obj" \
     "${sources[@]}"
 
   local obj_dir="build/user/$name/obj/obj/elf-riscv64"
 
-  # RV64 port: no libclang_rt.builtins-riscv64 available or needed — see
-  # build.sh's matching comment.
+  # rv64imafdc/lp64d (--riscv-abi=double): hardware FP inline, no
+  # compiler-rt soft-float builtins to link. See build.sh's matching comment.
   echo "==> Linking $name.elf..."
   $LLVM_LLD \
     "$obj_dir"/*.o \
@@ -76,13 +78,25 @@ build_user_program() {
     "build/user/$name.bin"
 
   echo "==> Embedding binary as linkable object..."
+  # llvm-mc + .incbin, not objcopy -Ibinary: an -Ibinary wrapper has
+  # e_flags = 0 (soft-float ABI), and since the kernel went rv64imafdc
+  # (double-float ABI) ld.lld now rejects linking the two together. The
+  # .s stub assembled with --target-abi=lp64d carries matching e_flags.
+  # Same _binary_<name>_bin_start/_end symbols objcopy produced (kernel.c3
+  # computes the size as end - start, doesn't use _bin_size).
   (
     cd build/user
-    $LLVM_OBJCOPY \
-      -Ibinary \
-      -Oelf64-littleriscv \
-      "$name.bin" \
-      "$name.bin.o"
+    cat > "$name.bin.s" <<STUB
+	.section .rodata._binary_${name}_bin, "a"
+	.balign 8
+	.globl _binary_${name}_bin_start
+_binary_${name}_bin_start:
+	.incbin "${name}.bin"
+	.globl _binary_${name}_bin_end
+_binary_${name}_bin_end:
+STUB
+    $LLVM_MC --triple=riscv64 --mattr=+m,+a,+c,+f,+d --target-abi=lp64d \
+      --filetype=obj -o "$name.bin.o" "$name.bin.s"
   )
 
   echo "==> Done: build/user/$name.bin.o"

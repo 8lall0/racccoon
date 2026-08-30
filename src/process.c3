@@ -307,6 +307,15 @@ struct Process
 	// the moment that stopped being true. See docs/devlog.md.
 	ulong saved_sepc;
 
+	// FP register file save slot: f0-f31 as raw 64-bit bit patterns
+	// [0..31], then fcsr [32]. Written by fp_save() / read by fp_restore()
+	// (below), which yield() calls to bracket every switch_context —
+	// switch_context is @naked and preserves no FP regs, and the C906's
+	// f-registers are a single non-banked set, so a preempted FP
+	// computation would otherwise be silently clobbered by the next
+	// process's FP use. Eager (every switch), not lazy — see yield().
+	ulong[33] fp_area;
+
 	// Set (to the user-space futex word's address) while this process is
 	// PROC_BLOCKED inside SYS_FUTEX_WAIT, cleared back to 0 the instant
 	// SYS_FUTEX_WAKE wakes it — see src/entry.c3's own cases for both.
@@ -729,6 +738,136 @@ fn void flush_tlb() @naked @noinline
     `);
 }
 
+// --- FP register file save/restore ----------------------------------------
+// a0 = &Process.fp_area (ulong[33]: f0-f31 at 8*0..8*31, fcsr at 8*32).
+// Opaque asm — block asm{} doesn't recognise fsd/fld/frcsr/fscsr. Called
+// from yield() around switch_context (and fp_save from sys_rfork). Needs
+// sstatus.FS >= Initial (set at boot, kernel.c3) or the FP ops trap.
+fn void fp_save(uptr area) @naked @noinline @nostrip
+{
+	asm(`
+        fsd f0,  8 * 0(a0)
+        fsd f1,  8 * 1(a0)
+        fsd f2,  8 * 2(a0)
+        fsd f3,  8 * 3(a0)
+        fsd f4,  8 * 4(a0)
+        fsd f5,  8 * 5(a0)
+        fsd f6,  8 * 6(a0)
+        fsd f7,  8 * 7(a0)
+        fsd f8,  8 * 8(a0)
+        fsd f9,  8 * 9(a0)
+        fsd f10, 8 * 10(a0)
+        fsd f11, 8 * 11(a0)
+        fsd f12, 8 * 12(a0)
+        fsd f13, 8 * 13(a0)
+        fsd f14, 8 * 14(a0)
+        fsd f15, 8 * 15(a0)
+        fsd f16, 8 * 16(a0)
+        fsd f17, 8 * 17(a0)
+        fsd f18, 8 * 18(a0)
+        fsd f19, 8 * 19(a0)
+        fsd f20, 8 * 20(a0)
+        fsd f21, 8 * 21(a0)
+        fsd f22, 8 * 22(a0)
+        fsd f23, 8 * 23(a0)
+        fsd f24, 8 * 24(a0)
+        fsd f25, 8 * 25(a0)
+        fsd f26, 8 * 26(a0)
+        fsd f27, 8 * 27(a0)
+        fsd f28, 8 * 28(a0)
+        fsd f29, 8 * 29(a0)
+        fsd f30, 8 * 30(a0)
+        fsd f31, 8 * 31(a0)
+        frcsr t0
+        sd t0, 8 * 32(a0)
+        ret
+    `);
+}
+
+fn void fp_restore(uptr area) @naked @noinline @nostrip
+{
+	asm(`
+        fld f0,  8 * 0(a0)
+        fld f1,  8 * 1(a0)
+        fld f2,  8 * 2(a0)
+        fld f3,  8 * 3(a0)
+        fld f4,  8 * 4(a0)
+        fld f5,  8 * 5(a0)
+        fld f6,  8 * 6(a0)
+        fld f7,  8 * 7(a0)
+        fld f8,  8 * 8(a0)
+        fld f9,  8 * 9(a0)
+        fld f10, 8 * 10(a0)
+        fld f11, 8 * 11(a0)
+        fld f12, 8 * 12(a0)
+        fld f13, 8 * 13(a0)
+        fld f14, 8 * 14(a0)
+        fld f15, 8 * 15(a0)
+        fld f16, 8 * 16(a0)
+        fld f17, 8 * 17(a0)
+        fld f18, 8 * 18(a0)
+        fld f19, 8 * 19(a0)
+        fld f20, 8 * 20(a0)
+        fld f21, 8 * 21(a0)
+        fld f22, 8 * 22(a0)
+        fld f23, 8 * 23(a0)
+        fld f24, 8 * 24(a0)
+        fld f25, 8 * 25(a0)
+        fld f26, 8 * 26(a0)
+        fld f27, 8 * 27(a0)
+        fld f28, 8 * 28(a0)
+        fld f29, 8 * 29(a0)
+        fld f30, 8 * 30(a0)
+        fld f31, 8 * 31(a0)
+        ld t0, 8 * 32(a0)
+        fscsr t0
+        ret
+    `);
+}
+
+// Zero every FP register + fcsr — SYS_EXEC uses this so a fresh image
+// starts with a clean rounding mode / no sticky flags, not the previous
+// image's leftover FP state.
+fn void fp_reset() @naked @noinline @nostrip
+{
+	asm(`
+        fmv.d.x f0,  x0
+        fmv.d.x f1,  x0
+        fmv.d.x f2,  x0
+        fmv.d.x f3,  x0
+        fmv.d.x f4,  x0
+        fmv.d.x f5,  x0
+        fmv.d.x f6,  x0
+        fmv.d.x f7,  x0
+        fmv.d.x f8,  x0
+        fmv.d.x f9,  x0
+        fmv.d.x f10, x0
+        fmv.d.x f11, x0
+        fmv.d.x f12, x0
+        fmv.d.x f13, x0
+        fmv.d.x f14, x0
+        fmv.d.x f15, x0
+        fmv.d.x f16, x0
+        fmv.d.x f17, x0
+        fmv.d.x f18, x0
+        fmv.d.x f19, x0
+        fmv.d.x f20, x0
+        fmv.d.x f21, x0
+        fmv.d.x f22, x0
+        fmv.d.x f23, x0
+        fmv.d.x f24, x0
+        fmv.d.x f25, x0
+        fmv.d.x f26, x0
+        fmv.d.x f27, x0
+        fmv.d.x f28, x0
+        fmv.d.x f29, x0
+        fmv.d.x f30, x0
+        fmv.d.x f31, x0
+        fscsr x0
+        ret
+    `);
+}
+
 const SSTATUS_SPIE = (1 << 5);
 const SSTATUS_SUM   = (1 << 18); // let S-mode access U-mode pages (needed for syscalls like readfile/writefile that dereference user pointers directly)
                                   // Same bit positions on RV64: sstatus's low, commonly-used bits are defined identically across XLEN in the priv spec.
@@ -736,12 +875,14 @@ const SSTATUS_SUM   = (1 << 18); // let S-mode access U-mode pages (needed for s
 fn void user_entry() @naked @noinline @noreturn
 {
 	// USER_BASE (kernel.c3's const of the same name) and
-	// SSTATUS_SPIE|SSTATUS_SUM (0x40020, this file's consts above)
+	// SSTATUS_SPIE|SSTATUS_SUM|FS_INITIAL (0x42020 = 0x40020 | (1<<13),
+	// this file's consts above + entry.c3's SSTATUS_FS_INITIAL)
 	// hardcoded: compile-time asm() only supports %s substitution, so the
-	// constants can't be interpolated here. USER_BASE must also match
-	// user/user.ld's base address. `li` with a small constant like this
-	// compiles the same way regardless of XLEN, so this function is
-	// otherwise unchanged from the RV32 version.
+	// constants can't be interpolated here. The FS bit starts a fresh
+	// process with the FPU usable (its f-regs were zeroed by
+	// create_process + loaded by yield()'s fp_restore). USER_BASE must
+	// also match user/user.ld's base address. `li` with a small constant
+	// like this compiles the same way regardless of XLEN.
 	//
 	// a0/a1 explicitly zeroed: user/user.c3's start() (this process's
 	// very first instruction after sret) passes a0/a1 straight through
@@ -757,7 +898,7 @@ fn void user_entry() @naked @noinline @noreturn
 	asm(`
         li t0, 0x1000000
         csrw sepc, t0
-        li t1, 0x40020
+        li t1, 0x42020
         csrw sstatus, t1
         li a0, 0
         li a1, 0
@@ -952,6 +1093,9 @@ fn Process* create_process(void* image, uint image_size)
 	proc.cwd[0] = 0; // root
 	proc.stdout_pipe = -1;
 	proc.stdin_pipe = -1;
+	// A reused slot must not start with a previous occupant's f-regs /
+	// fcsr — yield()'s fp_restore loads this on the first schedule.
+	for (int k = 0; k < 33; k++) { proc.fp_area[k] = 0; }
 
 	// Default namespace: "/srv/echo/" resolves to echod, which is always
 	// pid 2 (see kernel.c3 — it's the first process spawned after idle,
@@ -1303,6 +1447,17 @@ fn void yield() @noinline
 
 	Process* prev = current_proc;
 	current_proc = next;
+
+	// Bracket the switch with a full FP save/restore. Eager, not lazy:
+	// switch_context is @naked (preserves no FP regs, incl. callee-saved
+	// fs0-fs11) and is the *only* caller of it, so this one spot covers
+	// every context switch. Cost is ~66 FP mem ops (< 1us); the timer
+	// fires ~1Hz and the frequent yield() callers (driver poll loops) are
+	// integer-only. A conditional save (skip when sstatus.FS != Dirty,
+	// then push FS to Clean) is the optimisation to reach for only if a
+	// yield()/sec counter ever shows it matters.
+	fp_save((uptr)&prev.fp_area);
+	fp_restore((uptr)&next.fp_area);
 
 	switch_context(&prev.sp, &next.sp, ((ulong)(uptr)next.page_table >> 12) | SATP_SV39, (uptr)&next.stack + STACK_SIZE);
 }

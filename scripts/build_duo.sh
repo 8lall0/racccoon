@@ -21,7 +21,7 @@ LLC=${LLC:-llc}
 
   echo "==> Compiling kernel to LLVM IR (racccoon-duo target)..."
   rm -rf build/obj build/llvm build/obj_medany build/kernel_duo.*
-  c3c build racccoon-duo --no-entry --safe=no --riscv-cpu=rvimac --emit-llvm
+  c3c build racccoon-duo --no-entry --safe=no --riscv-cpu=rvimac --riscv-abi=double --emit-llvm
 
   # Same medium (medany) code-model workaround as scripts/build.sh — see
   # that script's own comment and docs/devlog.md for the full story.
@@ -31,7 +31,7 @@ LLC=${LLC:-llc}
   mkdir -p build/obj_medany
   for f in build/llvm/elf-riscv64/*.ll; do
     name=$(basename "$f" .ll)
-    $LLC -mtriple=riscv64-unknown-elf -mattr=+m,+a,+c \
+    $LLC -mtriple=riscv64-unknown-elf -mattr=+m,+a,+c,+f,+d \
       -code-model=medium -relocation-model=static \
       -filetype=obj -o "build/obj_medany/$name.o" "$f"
   done

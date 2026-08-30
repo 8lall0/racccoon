@@ -247,7 +247,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
 
   echo "==> Compiling kernel to LLVM IR..."
   rm -rf build/obj build/llvm build/obj_medany build/kernel.*
-  c3c build racccoon --no-entry --safe=no --riscv-cpu=rvimac --emit-llvm
+  c3c build racccoon --no-entry --safe=no --riscv-cpu=rvimac --riscv-abi=double --emit-llvm
 
   # RV64 port: c3c's own object-file codegen only knows RISC-V's default
   # "small"/medlow code model, which requires every absolute address it
@@ -269,7 +269,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   mkdir -p build/obj_medany
   for f in build/llvm/elf-riscv64/*.ll; do
     name=$(basename "$f" .ll)
-    $LLC -mtriple=riscv64-unknown-elf -mattr=+m,+a,+c \
+    $LLC -mtriple=riscv64-unknown-elf -mattr=+m,+a,+c,+f,+d \
       -code-model=medium -relocation-model=static \
       -filetype=obj -o "build/obj_medany/$name.o" "$f"
   done
@@ -290,14 +290,29 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   echo "==> Re-embedding the test shell as this kernel's own shell..."
   mkdir -p build/user_qemu_shell
   cp build/user/shell_test.bin build/user_qemu_shell/shell.bin
+  # llvm-mc + .incbin (see build_user.sh's matching comment): -Ibinary
+  # wrappers carry soft-float e_flags, which ld.lld now rejects against
+  # the rv64imafdc kernel.
   (
     cd build/user_qemu_shell
-    $LLVM_OBJCOPY -Ibinary -Oelf64-littleriscv shell.bin shell.bin.o
+    cat > shell.bin.s <<'STUB'
+	.section .rodata._binary_shell_bin, "a"
+	.balign 8
+	.globl _binary_shell_bin_start
+_binary_shell_bin_start:
+	.incbin "shell.bin"
+	.globl _binary_shell_bin_end
+_binary_shell_bin_end:
+STUB
+    "${LLVM_MC:-llvm-mc}" --triple=riscv64 --mattr=+m,+a,+c,+f,+d --target-abi=lp64d \
+      --filetype=obj -o shell.bin.o shell.bin.s
   )
 
   echo "==> Linking kernel.elf (with embedded shell)..."
-  # No libclang_rt.builtins-riscv64 to link against (see
-  # src/kernel/softfloat_stubs.c3's own comment for why that's fine).
+  # Built rv64imafdc/lp64d (--riscv-abi=double above + llc -mattr=+f,+d), so
+  # LLVM emits hardware FP inline — no compiler-rt soft-float builtins to
+  # resolve, hence no libclang_rt.builtins-riscv64 needed. (Pre-FPU this
+  # linked against src/kernel/softfloat_stubs.c3's panic stubs instead.)
   $LLVM_LLD \
     build/obj_medany/*.o \
     build/user_qemu_shell/shell.bin.o \

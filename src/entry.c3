@@ -213,6 +213,16 @@ macro write_csr(String $reg, value)
 
 const SIE_SEIE     = (1 << 9);  // sie: supervisor external interrupt enable
 const SSTATUS_SIE  = (1 << 1);  // sstatus: global supervisor interrupt enable
+
+// sstatus.FS (bits 14:13) — FP unit state: 0 Off, 1 Initial, 2 Clean,
+// 3 Dirty. Set to Initial once at boot (kernel.c3) so hardware FP is
+// usable; f0-f31 + fcsr are then saved/restored on every context switch
+// (yield(), process.c3). CLEAN/DIRTY are only referenced by the optional
+// conditional-save path — see yield()'s own comment.
+const SSTATUS_FS_MASK    = (3 << 13);
+const SSTATUS_FS_INITIAL = (1 << 13);
+const SSTATUS_FS_CLEAN   = (2 << 13);
+const SSTATUS_FS_DIRTY   = (3 << 13);
 // SSTATUS_SPIE (what sret restores SIE from — see handle_trap's own end,
 // below) is process.c3's own const, not redeclared here: unlike
 // DISKD_READ/etc across the separate user-mode binaries, entry.c3 and
@@ -687,6 +697,13 @@ fn void sys_rfork(Trap_frame* f) @noinline
 
 		child.has_message = false;
 		child.driver_irq_pending = false; // reused-slot hygiene (a driver's slot never actually gets rfork'd, but keep it clean)
+		// FP state: the child inherits the parent's, exactly (fork copy
+		// semantics). The live f-registers still hold the parent's values
+		// here — kernel_entry saves GPRs only and the handler is
+		// integer-only — so snapshot them straight into the child's area
+		// rather than struct-copying parent.fp_area (avoids any question
+		// about how a 264-byte aggregate copy lowers).
+		fp_save((uptr)&child.fp_area);
 		// Same reused-slot reasoning as has_message above — a
 		// previous occupant of this slot could have been killed
 		// while genuinely mid a blocking wait (SYS_KILL's own
@@ -1139,6 +1156,17 @@ fn void sys_exec(Trap_frame* f) @noinline
 		// stale sp says is irrelevant the moment a fresh image
 		// starts running.
 		current_proc.saved_sepc = exec_entry_point;
+
+		// Fresh image, fresh FP state: zero the saved f-regs + fcsr and
+		// the live ones. Unlike fork (copy semantics — inherit the
+		// parent's fcsr), exec starts a different program, which must not
+		// see the old image's rounding mode or sticky exception flags.
+		// The live reset matters because sys_exec returns through the
+		// normal trap tail (no switch_context / fp_restore) — the new
+		// image runs immediately on whatever's in the hardware f-regs.
+		for (int fk = 0; fk < 33; fk++) { current_proc.fp_area[fk] = 0; }
+		fp_reset();
+
 		// argc/argv's own base address, handed off via a0/a1 exactly
 		// the way a normal syscall would hand back a return value —
 		// safe to repurpose them for this instead, since control

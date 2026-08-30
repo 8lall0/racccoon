@@ -1939,6 +1939,59 @@ fn void main() {
             } else {
                 print("storagekilltest: FAILED\n");
             }
+        } else if (strcmp(cmd, "fputest") == 0) {
+            // Hardware FPU (roadmap §3): prove f-registers survive a
+            // context switch and a fork. No %f in the print path — scale
+            // to an integer and show N.mmm by hand.
+            double fp_x = 1.0;
+            for (int fi = 0; fi < 10; fi++) { fp_x = fp_x * 1.1; }   // 1.1^10 ≈ 2.5937
+            long fp_xs = (long)(fp_x * 1000.0 + 0.5);
+
+            // Fork a child that hammers float math (and blocks on IPC, so
+            // the scheduler switches back and forth) while the parent
+            // holds a live double in a register across the whole thing.
+            double fp_guard = 1234.5;
+            uint fpc_gen = 0;
+            int fpc = rfork(RFPROC, &fpc_gen);
+            if (fpc == 0) {
+                char[8] fp_sync @noinit;
+                int fp_pp = ipc_recv(&fp_sync, 8);
+                double fp_c = 2.0;
+                for (int fj = 0; fj < 20; fj++) { fp_c = fp_c / 1.5 + 0.25; }
+                long fp_cs = (long)(fp_c * 1000.0 + 0.5);
+                // child's own fp_guard-equivalent, inherited from parent
+                bool fp_inh = (long)(fp_guard * 10.0 + 0.5) == 12345;
+                ipc_send(fp_pp, 0, fp_inh ? "y" : "n", 2);
+                // hand the child's result back as a small int in the pid
+                exitcode((int)(fp_cs % 100));
+            } else if (fpc > 0) {
+                ipc_send(fpc, 0, "go", 3);
+                char[8] fp_ack @noinit;
+                ipc_recv(&fp_ack, 8);
+                int fp_child_code = join(fpc, fpc_gen);   // child result: (long)(0.75*1000) % 100 = 50
+                // Parent's live double must be untouched by the child's
+                // float work + the two context switches.
+                bool fp_guard_ok = (long)(fp_guard * 10.0 + 0.5) == 12345;
+                bool fp_child_inh = strcmp(&fp_ack, "y") == 0;
+                double fp_after = fp_x + fp_guard;   // more float, post-fork
+                long fp_afters = (long)(fp_after * 100.0 + 0.5);   // ~123709
+                if (fp_xs == 2594 && fp_guard_ok && fp_child_inh
+                    && fp_afters == 123709 && fp_child_code == 50) {
+                    print("fputest: ok (1.1^10=");
+                    print_uint((uint)(fp_xs / 1000)); putchar('.');
+                    print_uint((uint)(fp_xs % 1000));
+                    print(", guard held across fork+switch)\n");
+                } else {
+                    print("fputest: FAILED xs="); print_uint((uint)fp_xs);
+                    print(" guard="); print_uint((uint)fp_guard_ok);
+                    print(" inh="); print_uint((uint)fp_child_inh);
+                    print(" after="); print_uint((uint)fp_afters);
+                    print(" ccode="); print_uint((uint)fp_child_code);
+                    putchar('\n');
+                }
+            } else {
+                print("fputest: FAILED (rfork)\n");
+            }
         } else if (strcmp(cmd, "netdkilltest") == 0) {
             // The storage driver's supervisor path (storagekilltest),
             // one driver over: kill netd and confirm the supervisor

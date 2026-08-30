@@ -2,6 +2,7 @@ module kernel;
 
 import std::io;
 import board;
+import panic;
 
 // Also hardcoded (can't be interpolated into compile-time asm() strings,
 // see write_reg's comment in entry.c3) as the literal 0x1000000 in
@@ -85,6 +86,19 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	write_csr("sscratch", (uptr)&boot_trap_stack + boot_trap_stack.len);
 
 	board::plic_init();
+
+	// Turn the FPU on (sstatus.FS = Initial) — the C906 and QEMU virt both
+	// have F+D, and the kernel is built rv64imafdc now (scripts/build.sh).
+	// Field surgery, not `| bit`: an OR would corrupt a Clean handoff into
+	// Dirty. The read-back probe turns a fused-off / mis-handed-off FPU
+	// into a clear panic here instead of a bare scause=2 later.
+	ulong fs_sstatus = read_reg("sstatus");
+	write_csr("sstatus", (fs_sstatus & ~SSTATUS_FS_MASK) | SSTATUS_FS_INITIAL);
+	if ((read_reg("sstatus") & SSTATUS_FS_MASK) == 0)
+	{
+		panic::panic("FPU unavailable (sstatus.FS won't set) — rebuild soft-float");
+	}
+
 	enable_external_interrupts();
 	enable_user_timer_access();
 	// Re-enabled after switching arm_timer() (entry.c3) to the SBI
