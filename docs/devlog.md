@@ -4,6 +4,37 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — refactor: split shell_common.c3
+
+Bookkeeping after the §2.5 burst. `user/shell_common.c3` had gone from
+~770 to 1391 lines this session (login, namespace builtins, globbing,
+brace expansion, background jobs all landed there), mixing four
+unrelated concerns. Split, pure code movement (commit `5c22687`):
+
+- `user/shell_words.c3` (343) — text → argv words: `sh_name_*`,
+  `shell_var_value`, `shell_expand`, `shell_expand_q`, `glob_match` +
+  `shell_glob_into`, the four `shell_brace_*`.
+- `user/shell_jobs.c3` (121) — `struct Job` + `g_jobs` + the six job
+  functions.
+- `user/shell_common.c3` (943) — the exec core: readline, prompt,
+  `shell_dispatch_common`, `shell_spawn*`, `shell_run_pipeline`,
+  `shell_exec_line`, login.
+
+All `module user`, so cross-file calls and shared consts (`BRACE_BUF`,
+`JOB_STAGES`, `g_shell_status`) just resolve; `build_user.sh`'s two
+shell targets list the new files. No behaviour change — feature spot
+checks + regression green, Duo builds clean.
+
+Considered but shelved (user's call): a real scripting language.
+Current shell is already rc-flavoured, which fixes most of what's wrong
+with bourne/bash (word splitting, quoting, list vs string). Going
+further — typed values + structured pipelines (Elvish-shaped, which
+would map cleanly onto the one-shell-process + separate-command-process
+model) vs. rc-style `if`/`while`/`for`/`fn` on the current model — is a
+design project, not an increment. Set aside.
+
+---
+
 ## 2026-08-30 — shell: background jobs (`cmd &`, `jobs`, `wait`)
 
 Roadmap §2.5. A trailing `&` (or ` & ` mid-line — `a & b &` works)
