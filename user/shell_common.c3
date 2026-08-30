@@ -219,11 +219,20 @@ fn bool shell_login_once(char* name)
 // lock yourself out.
 fn void shell_login()
 {
-    // No user database at all (an unprovisioned root partition) — come
-    // up as root rather than loop forever on a prompt nothing can
-    // satisfy.
+    // Wait for /adm/users to be readable before deciding whether to
+    // prompt. On the Duo the SD driver + ext2 mount can still be
+    // finishing when the shell starts — a one-shot read here would see
+    // -1 and skip login on a perfectly good card. Retry for a bounded
+    // window; a genuinely unprovisioned root partition still falls
+    // through to a root console once it expires.
     char[8] probe @noinit;
-    if (fs_read("/adm/users", &probe[0], 8) < 0) { return; }
+    bool have_db = false;
+    ulong deadline = rdtime() + 250000000; // ~10s at the Duo's 25MHz
+    while (rdtime() < deadline) {
+        if (fs_read("/adm/users", &probe[0], 8) >= 0) { have_db = true; break; }
+        yield();
+    }
+    if (!have_db) { return; }
 
     for (;;) {
         print("login: ");
