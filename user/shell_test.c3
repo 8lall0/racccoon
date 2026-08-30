@@ -2150,6 +2150,79 @@ fn void main() {
                     print("ipcdeathtest: FAILED\n");
                 }
             }
+        } else if (strcmp(cmd, "gpiodkilltest") == 0) {
+            // §5.5, Duo-only: gpiod isn't spawned on QEMU (no GPIO
+            // controller on the virt board). Kill it, let the supervisor
+            // respawn it (SVC_KIND_GPIOD -> setup_gpiod_mappings re-maps
+            // bank A/C + the pinmux page), confirm the fresh gpiod came
+            // back and re-posted /srv/gpiod/.
+            //
+            // This checks the respawn + srv_post half only. Whether the
+            // respawned gpiod's *hardware* re-init actually works is a
+            // separate question — do `gpio C24 dir out` afterwards. On
+            // the real Duo that currently hangs: the respawned gpiod
+            // wedges in its MMIO re-init and never reaches its IPC poll
+            // loop (docs/roadmap.md §5.5). Don't send an IPC to it here
+            // — sys_ipc_call would block forever on the alive-but-wedged
+            // peer (gpiod has watch_hangs = false).
+            if (ns_mount_wait("/srv/gpiod/", "gpiod", 5) < 0) {
+                print("gpiodkilltest: skipped (no gpiod — not a Duo?)\n");
+            } else {
+                uint gk_m = 0;
+                int gk_old = ns_resolve("/srv/gpiod/", &gk_m);
+                int gk_killed = gk_old > 0 ? kill(gk_old, 0) : -1;
+                int gk_new = -1;
+                ulong gk_deadline = rdtime() + 250000000; // ~10s at Duo's 25MHz
+                while (gk_new < 0 && rdtime() < gk_deadline) {
+                    yield();
+                    ns_mount("/srv/gpiod/", "gpiod");   // re-point at the fresh post
+                    uint m = 0;
+                    int np = ns_resolve("/srv/gpiod/", &m);
+                    if (np > 0 && np != gk_old) {
+                        uint g = 0;
+                        if (proc_info(np, null, &g, null) == 0) { gk_new = np; }
+                    }
+                }
+                if (gk_killed == 0 && gk_new > 0) {
+                    print("gpiodkilltest: ok (gpiod killed, respawned, /srv/gpiod/ re-posted)\n");
+                    print("  `gpio C24 dir out` to check the hw re-init (known to hang — §5.5)\n");
+                } else {
+                    print("gpiodkilltest: FAILED\n");
+                }
+            }
+        } else if (strcmp(cmd, "usbdkilltest") == 0) {
+            // §5.5, Duo-only: usbd isn't spawned on QEMU. Kill it, let
+            // the supervisor respawn it (SVC_KIND_USBD ->
+            // setup_usbd_mappings re-maps the DWC2 MMIO + DMA ring), and
+            // confirm the fresh usbd came back and re-posted /srv/usbd/.
+            // A full HID re-enumeration check needs a device on the bus
+            // and a keystroke — this covers the respawn + MMIO re-map +
+            // srv_post half, which is what the supervisor path owns.
+            if (ns_mount_wait("/srv/usbd/", "usbd", 5) < 0) {
+                print("usbdkilltest: skipped (no usbd — not a Duo?)\n");
+            } else {
+                uint uk_m = 0;
+                int uk_old = ns_resolve("/srv/usbd/", &uk_m);
+                int uk_killed = uk_old > 0 ? kill(uk_old, 0) : -1;
+                int uk_new = -1;
+                ulong uk_deadline = rdtime() + 250000000; // ~10s at Duo's 25MHz
+                while (uk_new < 0 && rdtime() < uk_deadline) {
+                    yield();
+                    ns_mount("/srv/usbd/", "usbd");
+                    uint m = 0;
+                    int np = ns_resolve("/srv/usbd/", &m);
+                    if (np > 0 && np != uk_old) {
+                        uint g = 0;
+                        if (proc_info(np, null, &g, null) == 0) { uk_new = np; }
+                    }
+                }
+                if (uk_killed == 0 && uk_new > 0) {
+                    print("usbdkilltest: ok (usbd killed, respawned, /srv/usbd/ re-posted)\n");
+                    print("  now press a key — if it echoes, HID re-enum works too\n");
+                } else {
+                    print("usbdkilltest: FAILED\n");
+                }
+            }
         } else if (strcmp(cmd, "rforktest") == 0) {
             // Plain rfork(RFPROC): the child gets an independent copy of
             // this process's address space (src/entry.c3's SYS_RFORK,

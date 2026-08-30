@@ -394,9 +394,10 @@ Generation counters back most of the stale-reference handling:
 - `SYS_NS_RESOLVE` re-checks the mounted server's pid+generation are
   live before handing the pid back — a stale mount resolves to failure
   (or the `""` catch-all), never to whatever reused the slot.
-- `SYS_IPC_SEND` / `SYS_IPC_REPLY` check the peer exists (+ generation
-  on reply) **at the start** — sending to an already-dead server returns
-  −1 immediately.
+- `SYS_IPC_SEND` / `SYS_IPC_REPLY` / `SYS_IPC_CALL` check the peer
+  exists (+ generation) at the start **and** re-check `ipc_peer_gone()`
+  on every wait iteration — a peer that dies mid-rendezvous returns −1,
+  not a hang (§5.1, `262d45b` / `6879b89`).
 - Kernel idle loop respawns the **shell** if nothing is `PROC_RUNNABLE`
   (prevents a total-idle lockup when the shell exits).
 
@@ -404,17 +405,21 @@ Generation counters back most of the stale-reference handling:
 
 1. ~~**No supervision / respawn for servers.**~~ **Closed** — the
    supervisor (§5.2 below) covers every server and driver now.
-2. **Clients block forever if a server dies mid-request.**
-   `SYS_IPC_SEND` blocks on `while (!msg_acked) yield()` with no
-   timeout. If the server crashes after `has_message = true` but before
-   `SYS_IPC_REPLY`, the sender is stuck permanently. Symmetric: a server
-   mid-reply-rendezvous to a client that dies hangs the same way. This
-   is `SYS_KILL`'s own documented "left blocked forever" gap.
-3. **`sys_exit` doesn't unblock IPC partners** — it frees pages, marks
-   the slot `PROC_UNUSED`, and yields. Anyone waiting on it stays
-   waiting.
-4. **Inbox wedge** — `while (target.has_message) yield()` spins forever
-   if the target died with `has_message` still set.
+2. ~~**Clients block forever if a server dies mid-request.**~~ **Closed**
+   (`262d45b`, `6879b89` — §5.1 below). Every `sys_ipc_send` /
+   `sys_ipc_reply` / `sys_ipc_call` wait loop checks `ipc_peer_gone()`
+   each iteration and returns −1 if the peer's slot goes dead or the
+   `sys_exit`/`sys_kill` sweep flagged it. The p9_* client wrappers
+   already turn that −1 into their own −1 return; servers just loop back
+   to `ipc_recv`. `ipcdeathtest`.
+3. ~~**`sys_exit` doesn't unblock IPC partners.**~~ **Closed** (same
+   commits) — `proc_destroy` calls `ipc_wake_waiters_on(victim)`, which
+   sweeps the table and sets `ipc_peer_died` + wakes anyone whose
+   `ipc_wait_pid`/`generation` matches the dying process.
+4. ~~**Inbox wedge** — `while (target.has_message) yield()` spins forever
+   if the target died with `has_message` still set.~~ **Closed** — that
+   loop is now `while (!ipc_inbox_available(target))` with the same
+   `ipc_peer_gone()` bail.
 5. **A hung (not exited) server is invisible.** ~~An infinite loop looks
    alive; clients wait forever with no signal.~~ **Closed** (`§5.6`
    watchdog, commit below): the supervisor kills any supervised server
@@ -468,11 +473,30 @@ Generation counters back most of the stale-reference handling:
      usbd / ethd / gpiod get **respawn-on-exit only** (their bring-up
      legitimately blocks their IPC poll for seconds — a USB bus reset,
      a PHY train — which would false-trip the stall check).
-   - **Fault-tested**: fsd (`fsdkilltest`), storage (`storagekilltest`),
-     netd (`netdkilltest`), the hang watchdog (`hungservertest`).
-     **Not fault-tested**: sdd's respawn on real hardware, and
-     usbd/ethd/gpiod (Duo-only, production shell) — re-init idempotent
-     by inspection (DWC2 CSFTRST, DMA soft reset).
+   - **Fault-tested, QEMU**: fsd (`fsdkilltest`), storage
+     (`storagekilltest`, diskd), netd (`netdkilltest`), the hang
+     watchdog (`hungservertest`) — all pass.
+   - **Fault-tested, real Duo** (2026-08-30, `DUO_TEST_SHELL=1` kernel):
+     - `usbdkilltest` — **PASS.** usbd killed, supervisor respawns it,
+       `setup_usbd_mappings` re-maps the DWC2 MMIO + DMA, `/srv/usbd/`
+       re-posts. (Full HID re-enum unverified — no device on the bus.)
+     - `fsdkilltest` — **FAIL.** Supervisor respawns fsd (`svc:
+       respawned fsd`) but the follow-up read fails. QEMU's fsd→diskd
+       path passes; the Duo's fsd→sdd re-attach doesn't. Not yet
+       diagnosed.
+     - `gpiodkilltest` — respawn + `/srv/gpiod/` re-post **PASS**, but
+       the respawned gpiod's **hardware re-init hangs**: an IPC to it
+       (or `gpio C24 dir out`) blocks forever — it wedges in its MMIO
+       re-init and never reaches its poll loop. gpiod has
+       `watch_hangs = false`, so nothing kills the wedged instance.
+       Not yet diagnosed — likely `setup_gpiod_mappings` not restoring
+       the pinmux page's strong-order mapping, or a pin-block reset the
+       first-boot path gets for free.
+     - `netdkilltest` — **N/A on Duo.** netd exits before `srv_post`
+       (self-test needs DHCP + a carrier the Duo link never gets — see
+       "Ethernet status"), so there's nothing to kill.
+   - **Still not fault-tested**: sdd's own respawn (distinct from the
+     fsd-above-it case), ethd.
    - Kernel-side, not a userspace `/bin/init`: the servers' privileged
      setup (`setup_*_mappings`) is kernel-only, and the binaries are
      embedded in the kernel image, not on disk — a userspace init would

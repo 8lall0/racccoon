@@ -4,6 +4,47 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — §5.5: fault-test driver respawn on the real Duo
+
+§5.1 IPC failure propagation turned out to already be done (`262d45b` /
+`6879b89`) — the roadmap's "gaps 2/3/4" prose was stale; corrected it,
+and the resiliency battery (`ipcdeathtest` / `fsdkilltest` /
+`hungservertest` / `netdkilltest` / `storagekilltest`) is green in QEMU.
+
+The genuinely-open piece was §5.5: usbd / ethd / gpiod respawn has only
+ever been "idempotent by inspection," never fault-tested on hardware
+(they run under the production shell, which has no test builtins). So:
+
+- **`DUO_TEST_SHELL=1`** in `build_duo.sh` — embeds `shell_test.c3` as
+  the Duo kernel's shell (same re-embed trick `build.sh` uses for QEMU).
+  `DUO_TEST_SHELL=1 DUO_SD_PART=… bash scripts/reflash_duo.sh`, then
+  reflash production after.
+- New `gpiodkilltest` / `usbdkilltest` in `shell_test.c3` — kill the
+  driver, wait for the supervisor respawn, confirm it re-posts its
+  `/srv/*/` name. They skip cleanly on QEMU (driver not present).
+
+Real-Duo results:
+
+- **`usbdkilltest` PASS** — respawn + DWC2 MMIO/DMA re-map + `/srv/usbd/`
+  re-post all work.
+- **`fsdkilltest` FAIL** on the Duo (passes on QEMU). Supervisor
+  respawns fsd, but the read afterwards fails — the fsd→sdd re-attach
+  path on real hardware, not the fsd→diskd one QEMU exercises.
+- **`gpiodkilltest`**: respawn + re-post PASS, but the respawned
+  gpiod's **hardware re-init hangs** — an IPC to it blocks forever; it
+  wedges in MMIO re-init and never reaches its poll loop. `watch_hangs
+  = false` means nothing kills the wedged instance. `gpiodkilltest` now
+  stops at the re-post check (no IPC) so it can't hang the test shell.
+- `netdkilltest` N/A on the Duo — netd exits before `srv_post` (no
+  carrier for its self-test).
+
+Two real supervisor-respawn bugs found (fsd-on-sdd, gpiod hw re-init),
+both filed in roadmap §5.5, neither diagnosed yet. The test
+infrastructure that found them is committed; the fixes are their own
+task.
+
+---
+
 ## 2026-08-30 — shell: readline accepts LF, not just CR
 
 Chasing a spurious "`command not found`" (empty/garbage command name) on

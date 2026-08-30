@@ -40,10 +40,38 @@ LLC=${LLC:-llc}
       -filetype=obj -o "build/obj_medany/$name.o" "$f"
   done
 
+  # DUO_TEST_SHELL=1 embeds shell_test.c3 (the dev shell with the
+  # *killtest / wasmtest / etc. builtins) instead of the production
+  # shell.c3 — for exercising things that only exist on real hardware
+  # (usbd/ethd/gpiod respawn, a fixture off the SD card). Same
+  # re-embed-under-the-canonical-symbol-name trick scripts/build.sh
+  # uses for the QEMU image. Reflash the production kernel afterwards.
+  SHELL_OBJ=build/user/shell.bin.o
+  if [ "${DUO_TEST_SHELL:-0}" = "1" ]; then
+    echo "==> DUO_TEST_SHELL=1 — embedding shell_test.c3 as the shell"
+    mkdir -p build/user_duo_shell
+    cp build/user/shell_test.bin build/user_duo_shell/shell.bin
+    (
+      cd build/user_duo_shell
+      cat > shell.bin.s <<'STUB'
+	.section .rodata._binary_shell_bin, "a"
+	.balign 8
+	.globl _binary_shell_bin_start
+_binary_shell_bin_start:
+	.incbin "shell.bin"
+	.globl _binary_shell_bin_end
+_binary_shell_bin_end:
+STUB
+      "${LLVM_MC:-llvm-mc}" --triple=riscv64 --mattr=+m,+a,+c,+f,+d --target-abi=lp64d \
+        --filetype=obj -o shell.bin.o shell.bin.s
+    )
+    SHELL_OBJ=build/user_duo_shell/shell.bin.o
+  fi
+
   echo "==> Linking kernel_duo.elf (with embedded shell)..."
   $LLVM_LLD \
     build/obj_medany/*.o \
-    build/user/shell.bin.o \
+    "$SHELL_OBJ" \
     build/user/echod.bin.o \
     build/user/diskd.bin.o \
     build/user/sdd.bin.o \
