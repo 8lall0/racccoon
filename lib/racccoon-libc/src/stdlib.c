@@ -162,14 +162,7 @@ int atexit(void (*fn)(void))
 	return 0;
 }
 
-/* --- environment: real table arrives at stage 6 --- */
-
-char *getenv(const char *name) { (void)name; return NULL; }
-int   setenv(const char *name, const char *value, int overwrite)
-{
-	(void)name; (void)value; (void)overwrite; errno = ENOSYS; return -1;
-}
-int   unsetenv(const char *name) { (void)name; return 0; }
+/* environment: getenv / setenv / putenv / unsetenv live in rc_env.c */
 
 /* --- rand (glibc TYPE_0 minimal LCG) --- */
 

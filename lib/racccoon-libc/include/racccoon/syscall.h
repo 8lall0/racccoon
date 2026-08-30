@@ -17,6 +17,7 @@
 #define RC_SYS_JOIN             13
 #define RC_SYS_PROC_INFO       17
 #define RC_SYS_KILL           18
+#define RC_SYS_PARENT_INFO    23
 #define RC_SYS_EXEC          24
 #define RC_SYS_IPC_CALL     34
 #define RC_SYS_GETUID       35
@@ -27,7 +28,15 @@
 #define RC_SYS_TIMEBASE     49
 #define RC_SYS_GETPID       50
 
-/* fsd IPC verbs (user/user.c3 authoritative) + wire limits */
+/* rfork(2) flags (user/user.c3 authoritative) */
+#define RC_RFPROC             (1 << 0)
+#define RC_RFMEM              (1 << 1)
+
+/* fsd IPC verbs (user/user.c3 authoritative) + wire limits.
+ * FS_READ / FS_WRITE are the legacy whole-file verbs — still the only
+ * ones envd (user/sys/envd.c3, the /env store) speaks. */
+#define RC_FS_READ            20
+#define RC_FS_WRITE           21
 #define RC_FS_DELETE          22
 #define RC_FS_LIST            23
 #define RC_FS_MKDIR           24

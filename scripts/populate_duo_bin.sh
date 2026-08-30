@@ -77,6 +77,16 @@ if [ -f "build/user/echod.elf" ]; then
   echo "==> Copying build/user/echod.elf -> $MNT/bin/echod.elf..."
   cp "build/user/echod.elf" "$MNT/bin/echod.elf"
 fi
+
+# C libc test programs (roadmap §7), if the C libc build produced any —
+# same as scripts/build.sh seeds onto the QEMU images. Harmless on a
+# production card (just extra /bin entries); lets the libc stages be
+# checked on real hardware (stage6test, exiter, ...).
+for c in build/libc/*.bin; do
+  [ -e "$c" ] || continue
+  echo "==> Copying $c -> $MNT/bin/$(basename "$c" .bin)..."
+  cp "$c" "$MNT/bin/$(basename "$c" .bin)"
+done
 sync
 
 echo "==> Unmounting..."

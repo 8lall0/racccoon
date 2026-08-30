@@ -695,9 +695,19 @@ flat-binary exec path like the c3 `/bin` commands.
    `src/printf.c` — one `vformat()` over an emit callback:
    `d i u o x X c s p % f F e E g G`, `hh/h/l/ll/j/z/t/L`, `- + # 0`,
    `*`. Floats via the hw FPU. `stage5test` → ok.
-6. **process** — `fork`/`execve`/`execvp`/`waitpid`/`getpid`/`environ`/
-   `mmap(MAP_ANONYMOUS)`; resolve the `argv[0]` / env question (kernel
-   exec-passes-name, or an argv/env convention crt0 unpacks).
+6. **process. DONE** — `src/rc_proc.c`: `fork` (→ `rfork(RFPROC)`),
+   `execve`/`execv`/`execvp`/`execl`/`execlp` (read the image through
+   fsd, pack the blob, one `SYS_EXEC`), `wait`/`waitpid` (→ `SYS_JOIN`
+   on a `(pid,generation)` the libc records at `fork`; no any-child
+   primitive — oldest first), `system`, `getppid` (`SYS_PARENT_INFO`).
+   `<sys/mman.h>`: `mmap(MAP_ANONYMOUS)` → `SYS_MAP`, `munmap`/`mprotect`
+   no-ops. `src/rc_env.c`: real `environ` + `getenv`/`setenv`/`putenv`/
+   `unsetenv`, with `getenv` falling back to the `/env` store (envd).
+   **argv[0] / env resolved with no kernel ABI change** — an
+   `execve`-packed blob leads with a `0x01` marker, then argv (argv[0]
+   first), then an optional `0x02` marker + env; the crt0 tells this
+   apart from a c3 `exec()`'s plain blob (which still gets a synthesised
+   argv[0]). `stage6test` (+ `test/c-src/exiter.c`) → ok.
 7. **TinyCC cross-build** — `tcc` for `riscv64-racccoon` against
    stages 2–6; `tcc hello.c -o hello` on racccoon → a runnable binary.
 8. **TinyCC self-hosts** — `tcc` compiles its own source on racccoon.

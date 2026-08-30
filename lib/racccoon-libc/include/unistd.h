@@ -36,6 +36,15 @@ pid_t   getppid(void);
 int     getuid(void);
 __attribute__((noreturn)) void _exit(int code);
 
+pid_t   fork(void);
+int     execve(const char *path, char *const argv[], char *const envp[]);
+int     execv(const char *path, char *const argv[]);
+int     execvp(const char *file, char *const argv[]);
+int     execl(const char *path, const char *arg, ...);
+int     execlp(const char *file, const char *arg, ...);
+
+extern char **environ;
+
 /* --- racccoon-specific --- */
 void         *__rc_map_pages(unsigned long nbytes);
 int           __rc_stdin_is_console(void);

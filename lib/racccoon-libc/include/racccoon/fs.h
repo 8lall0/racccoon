@@ -14,6 +14,10 @@ void  __rc_abspath(const char *rel, char *out);
  * delete/rename) / 0 (stat). type: 0 = file, 1 = directory. */
 long  __rc_fs_read_at(const char *path, void *buf, long len, unsigned long off);
 long  __rc_fs_write_at(const char *path, const void *buf, long len, unsigned long off);
+
+/* legacy whole-file verbs — the only ones the /env store (envd) speaks */
+long  __rc_fs_read(const char *path, void *buf, long len);
+long  __rc_fs_write(const char *path, const void *buf, long len);
 int   __rc_fs_stat(const char *path, unsigned long *size_out, int *type_out);
 int   __rc_fs_list(const char *path, void *out, int max_entries);   /* -> entry count */
 int   __rc_fs_mkdir(const char *path);

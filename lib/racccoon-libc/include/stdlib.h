@@ -34,10 +34,14 @@ void  qsort(void *base, size_t n, size_t size, int (*cmp)(const void *, const vo
 void *bsearch(const void *key, const void *base, size_t n, size_t size,
               int (*cmp)(const void *, const void *));
 
-/* --- environment (stage 6 fills getenv in; NULL for now) --- */
+/* --- environment (rc_env.c) --- */
 char *getenv(const char *name);
 int   setenv(const char *name, const char *value, int overwrite);
 int   unsetenv(const char *name);
+int   putenv(char *string);
+
+/* --- run a command line via the shell (rc_proc.c) --- */
+int   system(const char *command);
 
 /* --- pseudo-random --- */
 #define RAND_MAX 0x7fffffff

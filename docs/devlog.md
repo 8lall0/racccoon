@@ -102,6 +102,52 @@ round-trip) → ok, runs twice.
 The C library now has malloc, `<string.h>`, `<stdlib.h>`, the POSIX fd
 layer, and stdio — enough to build and run substantial C.
 
+**Stage 6 — the process layer.** `src/rc_proc.c`: `fork` (→
+`rfork(RFPROC)`, child gets 0, the libc records `(pid, generation)` for
+`wait`), `execve`/`execv`/`execvp`/`execl`/`execlp` (read the whole
+image through fsd into a malloc'd buffer, pack the argv/env blob right
+after it, one `SYS_EXEC`), `wait`/`waitpid` (→ `SYS_JOIN`; no
+any-child primitive, so `wait()` / `waitpid(-1)` joins the oldest
+outstanding child, and `WNOHANG` is accepted but not honoured — the
+join always blocks), `system` (fork + `execvp("sh", …)` — returns 127
+until there's an `sh` on racccoon), `getppid` (`SYS_PARENT_INFO`).
+`<sys/mman.h>`: `mmap(MAP_ANONYMOUS)` → `SYS_MAP`; `munmap`/`mprotect`
+are no-ops (the bump allocator never returns pages, and its pages are
+already R+W+X). `src/rc_env.c`: a real `environ` +
+`getenv`/`setenv`/`putenv`/`unsetenv` — the initial `environ` is the
+crt0's static seed array, the first mutation copies it to a malloc'd
+growable one; `getenv` falls back to racccoon's per-process `/env`
+store (`user/sys/envd.c3`, the legacy `FS_READ` verb — the only one
+envd speaks) so a C program still sees `PATH` and anything else a c3
+parent set there.
+
+**argv[0] and env, with no kernel ABI change.** racccoon's `SYS_EXEC`
+passes only `argc` + a plain `arg\0arg\0…` blob — no program name, no
+environment. Rather than widen the syscall, the libc's `execve` writes
+a blob the crt0 (`src/start.c`) recognises: a `0x01` marker byte, then
+`argc` strings *the first of which is argv[0]*, then — if `envp` was
+non-empty — a `0x02` marker and `KEY=VAL\0…` ended by an empty string.
+The crt0 tells this apart from a c3 `exec()`'s plain blob by that first
+byte (`0x01` never begins a path or a normal argument) and still
+synthesises a placeholder argv[0] for the c3-packed case. So a libc
+program `execve`'d by another libc program gets a real argv[0] and a
+real `environ`; one launched from the c3 shell still gets the
+placeholder (and `getenv` reads `/env` for what it needs).
+
+`stage6test` — fork+exit-code, `wait()` any-child, `execve`/`execvp`
+exit codes, argv[0] delivery, `envp` delivery to the child's
+`getenv()`, `setenv`/`getenv`/`unsetenv` in-process, a 200 KB
+anonymous `mmap` round-trip — → ok on both the FAT32 and ext2 images.
+`test/c-src/exiter.c` is the fork/exec target. Regression
+(`stage3test`/`stage4test`/`stage5test`/`malloctest`/`ctest`/
+`wasmtest`) still green — the only shared-surface change is the crt0's
+new dual-path blob decode, which those all exercise. Nothing in the
+kernel or the c3 userspace changed.
+
+Remaining: **§7.7 TinyCC cross-build** (its own hurdle is
+`EXEC_MAX_IMAGE_SIZE = 262144` — `tcc` is bigger, so this likely wants
+the ELF loader or a raised cap), then **§7.8 self-host**.
+
 ---
 
 ## 2026-08-30 — survive OOM + a userspace crash (no swap)

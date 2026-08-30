@@ -112,6 +112,50 @@ long __rc_fs_write_at(const char *path, const void *buf, long len, unsigned long
 	return *(int *)req;
 }
 
+/* Legacy whole-file FS_READ / FS_WRITE (verbs 20 / 21). envd (the /env
+ * store) only ever implements these, not the offset-aware FS_READ_AT /
+ * FS_WRITE_AT — wire format is the plain one: path at req[0..99], length
+ * at req[100], reply result at req[0], data from req[4]. */
+long __rc_fs_read(const char *path, void *buf, long len)
+{
+	char ap[128]; __rc_abspath(path, ap);
+	char req[RC_FS_MSG_MAX];
+	int pid = resolve_stripped(ap, req);
+	if (pid < 0) return -1;
+
+	if (len < 0) len = 0;
+	if (len > RC_FS_MSG_MAX - 4) len = RC_FS_MSG_MAX - 4;
+	*(unsigned *)(req + 100) = (unsigned)len;
+
+	unsigned rv = 0;
+	int from = rc_fsd_call(pid, RC_FS_READ, req, RC_FS_MSG_MAX, &rv);
+	if (from <= 0 || rv != RC_FS_READ) return -1;
+
+	int result = *(int *)req;
+	if (result < 0) return result;
+	if (result > len) result = (int)len;
+	memcpy(buf, req + 4, (size_t)result);
+	return result;
+}
+
+long __rc_fs_write(const char *path, const void *buf, long len)
+{
+	char ap[128]; __rc_abspath(path, ap);
+	char req[RC_FS_MSG_MAX];
+	int pid = resolve_stripped(ap, req);
+	if (pid < 0) return -1;
+
+	if (len < 0) len = 0;
+	if (len > RC_FS_MSG_MAX - 104) len = RC_FS_MSG_MAX - 104;
+	*(unsigned *)(req + 100) = (unsigned)len;
+	memcpy(req + 104, buf, (size_t)len);
+
+	unsigned rv = 0;
+	int from = rc_fsd_call(pid, RC_FS_WRITE, req, RC_FS_MSG_MAX, &rv);
+	if (from <= 0 || rv != RC_FS_WRITE) return -1;
+	return *(int *)req;
+}
+
 int __rc_fs_stat(const char *path, unsigned long *size_out, int *type_out)
 {
 	char ap[128]; __rc_abspath(path, ap);

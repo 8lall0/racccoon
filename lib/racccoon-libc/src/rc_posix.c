@@ -17,7 +17,11 @@
 /* --- direct-syscall bits --------------------------------------------- */
 
 pid_t getpid(void)  { return (pid_t)__rc_syscall3(0, 0, 0, RC_SYS_GETPID); }
-pid_t getppid(void) { return 0; }   /* SYS_PARENT_INFO exists; not needed yet */
+pid_t getppid(void)
+{
+	long r = __rc_syscall3((long)getpid(), 0, 0, RC_SYS_PARENT_INFO);
+	return r < 0 ? 0 : (pid_t)r;
+}
 int   getuid(void)  { return (int)__rc_syscall3(0, 0, 0, RC_SYS_GETUID); }
 
 int chdir(const char *path)
