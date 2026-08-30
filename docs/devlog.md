@@ -32,7 +32,9 @@ The `reseat` in `supervisor_spawn` already covers the dynamic
 its own srv name. `SVC_MAX` was already 10 (QEMU registers 7, Duo 9).
 
 QEMU: `netdkilltest` + `hungservertest` + `storagekilltest` +
-`fsdkilltest` + full regression green. Duo builds clean.
+`fsdkilltest` + full regression green. Duo boots clean with usbd / ethd
+/ gpiod registered (the boot-ordering-sensitive spawn path — usbd after
+the shell — is unchanged, just three more `supervisor_register` calls).
 
 §5 gap #1 ("no supervision for servers") is now closed outright.
 
