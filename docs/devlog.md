@@ -24,8 +24,8 @@ plain words keep pointing into `exp`.
 
 QEMU: all cases above verified plus `{1,2,3} | cat | cat`; regression
 green (bigreadtest, pathtest, mounttest, killtest, envtest, nstest,
-srvtest, p9fstest, runtest); multi-stage pipelines 5/5. Duo kernel
-builds clean, hw verification pending.
+srvtest, p9fstest, runtest); multi-stage pipelines 5/5. **Duo hardware
+verified** on the console.
 
 ---
 
