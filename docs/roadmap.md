@@ -476,9 +476,10 @@ Generation counters back most of the stale-reference handling:
    `SYS_FS_PARTITION_INFO` and re-queries on an IPC failure, and the
    `reseat` covers the dynamic `/mnt/usb/` / `/srv/gpiod/` mounts.
    - `Service.watch_hangs` splits the hang watchdog from respawn:
-     usbd / ethd / gpiod get **respawn-on-exit only** (their bring-up
+     usbd / ethd get **respawn-on-exit only** (their bring-up
      legitimately blocks their IPC poll for seconds — a USB bus reset,
-     a PHY train — which would false-trip the stall check).
+     a PHY train — which would false-trip the stall check). gpiod moved
+     to `watch_hangs = true` (3 MMIO writes, not a slow reset).
    - **Fault-tested, QEMU**: fsd (`fsdkilltest`), storage
      (`storagekilltest`, diskd), netd (`netdkilltest`), the hang
      watchdog (`hungservertest`) — all pass.
@@ -504,16 +505,22 @@ Generation counters back most of the stale-reference handling:
        Two real fixes made along the way: (a) the QEMU-10MHz killtest
        deadlines (`SYS_TIMEBASE` / `timebase_hz()`); (b) `fsd`'s
        `diskd_rw` retry was gated on `rr_pid != g_diskd_pid`, which
-       never fires on a same-slot respawn — dropped that gate.
-       Re-verify on the Duo pending.
+       never fires on a same-slot respawn — dropped that gate. **All
+       four killtests (fsd/sdd/usbd/gpiod) now PASS on the real Duo.**
      - `netdkilltest` — **N/A on Duo.** netd exits before `srv_post`
        (self-test needs DHCP + a carrier the Duo link never gets — see
        "Ethernet status"), so there's nothing to kill.
-   - **§5.5 status**: usbd + gpiod respawn Duo-verified; fsd + sdd
-     respawn still failing on the Duo; ethd untested (no link).
-   - New: `SYS_TIMEBASE` (#49) / `timebase_hz()` — `board::TIMEBASE_HZ`
-     to userspace; every killtest deadline is now
-     `rdtime() + timebase_hz() * 20` (20 s wall-clock, any board).
+   - **§5.5 CLOSED**: fsd, sdd, usbd, gpiod supervisor respawn all
+     fault-verified on the real Duo (`DUO_TEST_SHELL=1` kernel, the
+     four `*killtest` builtins). ethd untested — no working link.
+   - Bugs fixed getting there: `create_process` didn't clear
+     `driver_irq_pending` (a respawned driver's first `SYS_IPC_POLL`
+     returned the synthetic IRQ-notify); `SYS_TIMEBASE` (#49) /
+     `timebase_hz()` so killtest deadlines are wall-clock not
+     QEMU-10MHz tick counts; `fsd` `diskd_rw` retry un-gated from
+     `rr_pid != g_diskd_pid`; the tests probed a QEMU-only fixture.
+     Diagnostic kept: the `loud` builtin (`SYS_BOOT_QUIET a0=1`)
+     un-silences a respawned boot server's own console output.
    - Kernel-side, not a userspace `/bin/init`: the servers' privileged
      setup (`setup_*_mappings`) is kernel-only, and the binaries are
      embedded in the kernel image, not on disk — a userspace init would

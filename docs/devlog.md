@@ -62,8 +62,9 @@ were wrong; one fixed:
    (same pid, bumped generation — the common case). Dropped that gate.
    Latent on QEMU (fast respawn hits the live replacement first).
 
-§5.5: usbd + gpiod Duo-verified; fsd + sdd re-verify pending with the
-probe fix.
+§5.5: **all four killtests pass on the real Duo** (fsd, sdd, usbd,
+gpiod) — supervisor respawn is fault-verified on hardware for every
+Duo-testable driver. ethd untested (no link). §5.5 closed.
 
 ---
 
