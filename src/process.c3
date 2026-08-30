@@ -307,6 +307,14 @@ struct Process
 	// the moment that stopped being true. See docs/devlog.md.
 	ulong saved_sepc;
 
+	// Next free user virtual address for SYS_MAP (entry.c3) — a bump
+	// pointer just past this process's mapped image (+ argv for an
+	// exec()'d one). Grows upward, never shrinks; every page it hands
+	// out is PAGE_U so proc_destroy's page walk frees it on exit. Set by
+	// create_process / sys_exec; 0 until then (SYS_MAP checks). Bounded
+	// per process (HEAP_MAX_BYTES) so a runaway map can't OOM the kernel.
+	uptr heap_top;
+
 	// FP register file save slot: f0-f31 as raw 64-bit bit patterns
 	// [0..31], then fcsr [32]. Written by fp_save() / read by fp_restore()
 	// (below), which yield() calls to bracket every switch_context —
@@ -1060,6 +1068,10 @@ fn Process* create_process(void* image, uint image_size)
 	proc.state = PROC_RUNNABLE;
 	proc.sp = (uptr)sp;
 	proc.page_table = page_table;
+	// SYS_MAP bump pointer starts one page past the mapped image (which
+	// includes .bss + the 64KB user stack — see user/user.ld). A
+	// create_process()'d process has no argv; sys_exec sets its own.
+	proc.heap_top = (uptr)USER_BASE + (uptr)((image_size + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE);
 	// create_process() never has a "parent" in the fork sense (a fresh
 	// boot-time spawn or a shell respawn, not an existing process
 	// splitting in two) — explicit, not relied-on zero-init, since a

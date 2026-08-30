@@ -32,6 +32,20 @@ fn void clear_bit(uint page_idx)
 	bitmap[page_idx / BITS_PER_WORD] &= ~(1u << (page_idx % BITS_PER_WORD));
 }
 
+// How many pages are currently free. SYS_MAP (entry.c3) pre-checks this
+// before its per-page map loop so an alloc_pages(1) inside it can never
+// hit the panic path — kernel code isn't preempted, so the count stays
+// valid between the check and the allocs.
+fn uint free_page_count()
+{
+	uint free = 0;
+	for (uint i = 0; i < TOTAL_PAGES; i++)
+	{
+		if (!bit_is_set(i)) free++;
+	}
+	return free;
+}
+
 // Finds n consecutive free pages by scanning for a run of n clear bits,
 // marks them used, and returns the physical address of the first page.
 // Addresses are uptr (pointer-sized), not uint: on RV64 a plain uint is

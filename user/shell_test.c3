@@ -1939,6 +1939,30 @@ fn void main() {
             } else {
                 print("storagekilltest: FAILED\n");
             }
+        } else if (strcmp(cmd, "maptest") == 0) {
+            // SYS_MAP: fresh zero-filled RW pages past the image, bumping.
+            char* mp1 = (char*)map_pages(100);      // -> 1 page
+            char* mp2 = (char*)map_pages(9000);     // -> 3 pages, right after
+            bool mp_zero = mp1 != null && mp1[0] == 0 && mp1[4095] == 0;
+            bool mp_bump = mp1 != null && mp2 != null && mp2 == mp1 + 4096;
+            if (mp1 != null) { mp1[0] = 'A'; mp1[4095] = 'Z'; }
+            bool mp_rw = mp1 != null && mp1[0] == 'A' && mp1[4095] == 'Z';
+            // child gets its own fresh heap_top (its own address space)
+            uint mt_gen = 0;
+            int mt_c = rfork(RFPROC, &mt_gen);
+            if (mt_c == 0) {
+                char* cmp = (char*)map_pages(4096);
+                exitcode(cmp != null && cmp[0] == 0 ? 7 : 1);
+            }
+            int mt_code = join(mt_c, mt_gen);
+            if (mp_zero && mp_bump && mp_rw && mt_code == 7) {
+                print("maptest: ok\n");
+            } else {
+                print("maptest: FAILED zero="); print_uint((uint)mp_zero);
+                print(" bump="); print_uint((uint)mp_bump);
+                print(" rw="); print_uint((uint)mp_rw);
+                print(" child="); print_uint((uint)mt_code); putchar('\n');
+            }
         } else if (strcmp(cmd, "fputest") == 0) {
             // Hardware FPU (roadmap §3): prove f-registers survive a
             // context switch and a fork. No %f in the print path — scale

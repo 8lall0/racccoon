@@ -95,6 +95,12 @@ const SYS_PIPE_WRITE    = 43; // feed a buffer into a pipe: a0 = id, a1 = buf, a
 const SYS_PIPE_HOLD     = 44; // the shell claims/releases a pipe end it pumps itself (>/< redirection): a0 = id, a1 = as_writer, a2 = delta (+1/-1)
 const SYS_NS_LIST       = 45; // copy the caller's own namespace (mount table) out: a0 = buf, a1 = max records (36 bytes each: 32-byte prefix + 4-byte LE pid); returns the count — the shell's `namespace`
 const SYS_NS_BIND       = 46; // bind whatever currently serves a1 (a path resolved through the caller's namespace) at a0 (a new prefix) in that same namespace — Plan 9's `bind`, the source-is-a-path counterpart to SYS_NS_MOUNT
+const SYS_MAP           = 47; // map a0 bytes (rounded up to pages) of fresh zero-filled RW memory just past the caller's image, returns the base vaddr or -1 — the userspace "give me a heap" primitive (/bin/wasm's module buffer + stacks + linear memory)
+
+// Per-process SYS_MAP ceiling: the bump pointer can't grow more than this
+// past USER_BASE. 16 MiB is generous for a wasm linear memory and keeps
+// PROCS_MAX processes all maxing out well under the 64 MiB RAM pool.
+const uptr HEAP_MAX_BYTES = 16 * 1024 * 1024;
 
 // Flipped by SYS_BOOT_QUIET (the shell, once, after a settle delay).
 // While true, SYS_PUTCHAR from a process with is_boot_server set is
@@ -697,6 +703,10 @@ fn void sys_rfork(Trap_frame* f) @noinline
 
 		child.has_message = false;
 		child.driver_irq_pending = false; // reused-slot hygiene (a driver's slot never actually gets rfork'd, but keep it clean)
+		// rfork(RFPROC) copies every PAGE_U leaf, so the child's mapped
+		// region — including any pages the parent SYS_MAP'd — matches the
+		// parent's at fork time. Continue the bump pointer from there.
+		child.heap_top = current_proc.heap_top;
 		// FP state: the child inherits the parent's, exactly (fork copy
 		// semantics). The live f-registers still hold the parent's values
 		// here — kernel_entry saves GPRs only and the handler is
@@ -1125,6 +1135,11 @@ fn void sys_exec(Trap_frame* f) @noinline
 		{
 			map_page(current_proc.page_table, exec_argv_base + (uptr)(avp * PAGE_SIZE), argv_staged[avp], PAGE_U | PAGE_R | PAGE_W);
 		}
+
+		// Reset the SYS_MAP bump pointer to just past the new image +
+		// argv. Any pages the *old* image had SYS_MAP'd were freed with
+		// every other PAGE_U leaf in the page-table clear above.
+		current_proc.heap_top = exec_argv_base + (uptr)(argv_page_count * PAGE_SIZE);
 
 		// This process's own page table entries for USER_BASE just
 		// changed, but unlike a normal process switch, satp itself
@@ -2367,6 +2382,37 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				current_proc.namespace[nb_free].server_generation = nb_gen;
 			}
 			f.a0 = 0;
+		case SYS_MAP:
+			// a0 = byte count. Map that many bytes (rounded up to whole
+			// pages) of fresh zero-filled RW+U memory at current_proc.
+			// heap_top, bump it, return the base vaddr — or -1 on a bad
+			// size, the per-process ceiling, or not enough free RAM.
+			// No unmap: proc_destroy / sys_exit walk every PAGE_U leaf
+			// and free it, so a SYS_MAP'd region is reclaimed on exit
+			// for free. Inlined per the "complex fn from the switch"
+			// caution (docs/devlog.md) — it's small.
+			ulong map_bytes = f.a0;
+			if (map_bytes == 0 || map_bytes > HEAP_MAX_BYTES)
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			uint map_pages_n = (uint)((map_bytes + PAGE_SIZE - 1) / PAGE_SIZE);
+			uptr map_base = current_proc.heap_top;
+			if (map_base == 0
+				|| map_base + (uptr)map_pages_n * PAGE_SIZE - (uptr)USER_BASE > HEAP_MAX_BYTES
+				|| (uptr)free_page_count() < (uptr)map_pages_n)
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			for (uint mp = 0; mp < map_pages_n; mp++)
+			{
+				uptr map_phys = alloc_pages(1); // pre-checked free — can't panic
+				map_page(current_proc.page_table, map_base + (uptr)mp * PAGE_SIZE, map_phys, PAGE_U | PAGE_R | PAGE_W);
+			}
+			current_proc.heap_top = map_base + (uptr)map_pages_n * PAGE_SIZE;
+			f.a0 = (ulong)map_base;
 		case SYS_JOIN:
 			sys_join(f);
 		case SYS_FUTEX_WAIT:

@@ -58,6 +58,7 @@ const int SYS_PIPE_WRITE    = 43;
 const int SYS_PIPE_HOLD     = 44;
 const int SYS_NS_LIST       = 45; // copy the caller's namespace out — see src/entry.c3's case
 const int SYS_NS_BIND       = 46; // Plan 9 `bind` — see src/entry.c3's case
+const int SYS_MAP           = 47; // map fresh zero-filled RW pages, returns base vaddr or -1 — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -361,6 +362,21 @@ fn int syscall(long sysno, long arg0, long arg1, long arg2) {
         mv result, $a0;
     }
     return (int)result;
+}
+
+// Like syscall() but keeps the full 64-bit return — for SYS_MAP, whose
+// result is a virtual address, not an int.
+fn long syscall_long(long sysno, long arg0, long arg1, long arg2) {
+    long result;
+    asm {
+        mv $a0, arg0;
+        mv $a1, arg1;
+        mv $a2, arg2;
+        mv $a3, sysno;
+        ecall;
+        mv result, $a0;
+    }
+    return result;
 }
 
 fn int syscall4(long sysno, long arg0, long arg1, long arg2, long arg3) {
@@ -725,6 +741,18 @@ fn int ns_list(char* out_buf, int max_records) @export("ns_list") {
 // namespace is full. Backs the shell's `bind` builtin.
 fn int ns_bind(char* new_prefix, char* source_path) @export("ns_bind") {
     return syscall(SYS_NS_BIND, (long)new_prefix, (long)source_path, 0);
+}
+
+// Map `nbytes` (rounded up to whole pages) of fresh zero-filled RW
+// memory just past this process's image — the userspace "give me a
+// heap" primitive (there's no malloc). Returns the base pointer, or
+// null on a bad size / the 16 MiB per-process ceiling / low RAM. Never
+// unmapped: freed with everything else on exit. `/bin/wasm` uses this
+// for its module buffer, operand/call stacks, and wasm linear memory.
+fn void* map_pages(uint nbytes) @export("map_pages") {
+    long r = syscall_long(SYS_MAP, (long)nbytes, 0, 0);
+    if (r == -1) return null;
+    return (void*)(uptr)r;
 }
 
 // Voluntarily gives up the rest of this process's timeslice once —
