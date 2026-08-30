@@ -25,7 +25,7 @@ QEMU: `echo a\ b`, `echo a\|b`, `echo \$user` (vs `echo $user` →
 `x\y`, `echo \*`, `echo 'a\b'` → `a\b`, `echo done\` all verified;
 regression green (argvtest ok on FAT32 — the disk_dual "FAILED" is the
 known pre-existing ext2 case); quoting / globbing / multi-stage
-unaffected. Duo kernel builds clean, hw verification pending.
+unaffected. **Duo hardware verified** on the console.
 
 ---
 
