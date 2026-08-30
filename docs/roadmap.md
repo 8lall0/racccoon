@@ -421,17 +421,26 @@ Generation counters back most of the stale-reference handling:
      its phase-A loop, so `p9_call`'s `P9_STRAY` bounce is gone and
      `p9_call` is a 5-line shim. `exec()`'s `notify_pid` is no longer
      load-bearing for correctness.
-2. **A supervisor. DONE (first pass)** — commit `7b5b97c`.
+2. **A supervisor. DONE** — commits `7b5b97c` (first pass), `e5f111d`
+   (storage driver).
    `src/supervisor.c3`: a `Service` table registered from `kernel_main`,
    `supervisor_tick()` from the timer trap (~1/s) respawns any exited
    server, updates its `*_pid` global, and `reseat_namespace_mounts()`
    re-points every live process's mounts at the replacement. Restart
-   cap 5. `fsdkilltest` in `shell_test.c3`. **Only fsd/fsd2/procd/envd**
-   — the device drivers need MMIO/DMA re-mapping + carry hardcoded-pid
-   conventions (`fsd.c3`'s `DISKD_PID=3`), and echod's pid 2 is
-   hardcoded in the shell's `ping`. Extending to those means first
-   removing the pid hardcodes (name-resolution instead) and verifying
-   each driver's bring-up is idempotent on a respawn.
+   cap 5. `fsdkilltest` / `storagekilltest` in `shell_test.c3`.
+   Covers **fsd, fsd2, echod, procd, envd, and the block-storage driver
+   (diskd / sdd)**. `Service.kind` (SVC_KIND_*) says which
+   `setup_*_mappings` to re-run after `create_process` — the MMIO + DMA
+   re-mapping the storage driver needs; its PLIC route self-heals
+   (`irq_route_register` overwrites in place). No more hardcoded pids:
+   the shell's `ping` resolves echod through `/srv/echo/`, and fsd
+   learns the storage pid from `SYS_FS_PARTITION_INFO` and re-queries it
+   on an IPC failure (`diskd_rw`).
+   - **Still unsupervised: usbd / ethd / netd / gpiod.** The `kind`
+     switch has slots for them; each needs its bring-up verified
+     idempotent on a respawn and a way to fault-test it (mostly
+     Duo-only). sdd's respawn also isn't yet exercised on real hardware
+     (same mechanism as diskd, which passes on QEMU).
    - Kernel-side, not a userspace `/bin/init`: the servers' privileged
      setup (`setup_*_mappings`) is kernel-only, and the binaries are
      embedded in the kernel image, not on disk — a userspace init would

@@ -4,6 +4,41 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — supervisor: the block-storage driver joins §5
+
+The supervisor already covered fsd / fsd2 / echod / procd / envd — the
+comment in `supervisor.c3` claiming echod was unsupervised (and that the
+shell's `ping` hardcodes pid 2) was just stale; both have been through
+name resolution for a while. Extended it to the one device driver
+everything sits on: **diskd (QEMU) / sdd (Duo)**.
+
+- `Service.needs_fsd_setup` (an fsd-only bool) → `Service.kind`, an
+  `SVC_KIND_*` tag. `supervisor_spawn` switches on it and re-runs the
+  matching `setup_*_mappings` after `create_process` — the MMIO + DMA
+  mappings a driver needs re-established. The switch already has slots
+  for usbd / ethd / netd / gpiod; those aren't registered yet (each
+  needs its bring-up verified idempotent + a fault-test, mostly
+  Duo-only). `SVC_MAX` 6 → 10.
+- The storage driver's PLIC route self-heals for free —
+  `irq_route_register` overwrites in place, and the re-run
+  `setup_diskd_mappings` calls it.
+- fsd re-resolves the storage pid on an IPC failure: `diskd_rw`, when
+  `p9_call` returns ≤ 0 and this isn't the dynamic USB instance
+  (`g_fsd_dynamic`), asks `SYS_FS_PARTITION_INFO` for the current
+  `storage_pid` and retries once. On QEMU the respawn lands back in the
+  same slot (pid unchanged) so this rarely fires, but it covers the
+  general case.
+- Drive-by: `SYS_FS_PARTITION_INFO` never set `f.a0 = 0` on success —
+  harmless only because its one caller checked `< 0`. Fixed.
+
+`storagekilltest` (shell_test.c3): kill the storage driver, confirm the
+supervisor re-inits it and reads recover. QEMU: passes repeatedly, and
+`bigreadtest` / `fsdkilltest` / full regression stay green afterwards.
+Duo kernel builds clean; sdd's respawn on real hardware not yet
+exercised (identical mechanism to diskd).
+
+---
+
 ## 2026-08-30 — refactor: split shell_common.c3
 
 Bookkeeping after the §2.5 burst. `user/shell_common.c3` had gone from
