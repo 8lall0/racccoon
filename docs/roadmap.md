@@ -688,9 +688,13 @@ flat-binary exec path like the c3 `/bin` commands.
    `<fcntl.h>` `<sys/stat.h>` `<sys/types.h>` `<dirent.h>`. `O_CREAT` →
    empty write, `O_TRUNC` → delete+recreate (no fsd truncate),
    `O_APPEND` → seek to size. `SYS_GETPID` (#50). `stage4test` → ok.
-5. **stdio** — `FILE*` + buffering; `fopen`…`fclose`/`fread`/`fwrite`/
-   `fgets`/`fseek`/`ftell`; `printf`/`fprintf`/`snprintf`/`vsnprintf`
-   (the format engine); `stdin`/`stdout`/`stderr`.
+5. **stdio. DONE** — `src/stdio.c` (buffered `FILE`: `fopen`/`fdopen`/
+   `freopen`/`fclose`, `fread`/`fwrite`, `fgetc`/`fgets`/`ungetc`,
+   `fputc`/`fputs`/`puts`, `fseek`/`ftell`/`fflush`/`feof`/`ferror`,
+   `setvbuf`, `perror`, `tmpnam`/`tmpfile`, `getline`/`getdelim`).
+   `src/printf.c` — one `vformat()` over an emit callback:
+   `d i u o x X c s p % f F e E g G`, `hh/h/l/ll/j/z/t/L`, `- + # 0`,
+   `*`. Floats via the hw FPU. `stage5test` → ok.
 6. **process** — `fork`/`execve`/`execvp`/`waitpid`/`getpid`/`environ`/
    `mmap(MAP_ANONYMOUS)`; resolve the `argv[0]` / env question (kernel
    exec-passes-name, or an argv/env convention crt0 unpacks).

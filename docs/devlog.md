@@ -84,6 +84,24 @@ fstat/lseek SET+END/append/mkdir/opendir+readdir/rename/unlink/rmdir,
 idempotent, self-cleaning) → ok, runs twice. QEMU green, Duo builds
 clean.
 
+**Stage 5 — stdio.** `src/stdio.c`: a buffered `FILE` (one malloc'd
+buffer per stream, line-buffered on a tty else fully buffered, stderr
+unbuffered) with `fopen`/`fdopen`/`freopen`/`fclose`, `fread`/`fwrite`,
+`fgetc`/`getc`/`getchar`/`fgets`/`ungetc`, `fputc`/`putc`/`putchar`/
+`fputs`/`puts`, `fseek`/`ftell`/`rewind`/`fflush`/`feof`/`ferror`/
+`fileno`, `setvbuf`, `perror`, `remove`, `tmpnam`/`tmpfile`
+(getpid-seeded), `getline`/`getdelim`. `src/printf.c`: one `vformat()`
+over an emit callback driving `vfprintf`/`vsnprintf`/`vsprintf`/
+`vprintf` + the varargs wrappers — `d i u o x X c s p % f F e E g G`,
+lengths `hh h l ll j z t L`, flags `- + space # 0`, `*` width/prec.
+Floats via the hardware FPU (§3) — correct to the requested precision,
+not shortest-round-trip. `stage5test` (all the format cases +
+snprintf-truncation + a `fprintf`/`fgets`/`getline`/`fseek` FILE*
+round-trip) → ok, runs twice.
+
+The C library now has malloc, `<string.h>`, `<stdlib.h>`, the POSIX fd
+layer, and stdio — enough to build and run substantial C.
+
 ---
 
 ## 2026-08-30 — survive OOM + a userspace crash (no swap)
