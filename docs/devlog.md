@@ -32,9 +32,11 @@ What needed real work:
 
 Fixtures `float.wasm` (sqrt/mul/floor/div + an f32 mul → 88) and
 `float2.wasm` (neg/abs/min/max/copysign/convert/promote/demote/gt →
-80). `wasmtest` runs all 8 now. QEMU green; Duo builds clean;
-`wasm.bin` 101 KiB. Known minor deviations from the spec, noted inline:
-exact NaN payload bits, and `-0.0` in a couple of rounding corners.
+80). `wasmtest` runs all 8 now. QEMU green; **real Duo verified** —
+both fixtures give the right answer on the C906 (after
+`populate_duo_bin.sh` to push the new `/bin/wasm`). `wasm.bin` 101 KiB.
+Known minor deviations from the spec, noted inline: exact NaN payload
+bits, and `-0.0` in a couple of rounding corners.
 
 ---
 
