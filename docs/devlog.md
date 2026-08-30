@@ -4,6 +4,37 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — §5.5 supervisor-respawn: two fixes + sharper tests
+
+Chasing the two driver-respawn bugs the §5.5 fault tests found.
+
+**Real bug: `create_process` didn't clear `driver_irq_pending`.**
+`sys_rfork` clears it (reused-slot hygiene); `create_process` — the
+supervisor's respawn path — didn't. A respawned driver whose slot was
+last held by something with a pending IRQ would have its *first*
+`SYS_IPC_POLL` return the synthetic `DISKD_IRQ_NOTIFY` instead of its
+real inbox state. `src/process.c3`.
+
+**gpiod now gets `watch_hangs = true`.** It was grouped with usbd/ethd
+(whose bring-up legitimately blocks for seconds), but gpiod's bring-up
+is three MMIO writes and its poll loop clears `has_message` every
+iteration — so a stuck inbox genuinely means wedged. Now a respawned
+gpiod that fails to re-init gets killed + respawned by the watchdog
+instead of hanging every IPC client on it forever. `src/kernel.c3`.
+
+**Test bug in `gpiodkilltest` / `usbdkilltest`.** They accepted any pid
+resolved for `/srv/*/`, but (a) during the kill→respawn window that
+path falls to the `""` catch-all (fsd), and (b) a respawn reuses the
+same slot, hence the same pid (`pid = slot + 1`), so "new pid !=
+old pid" never fired — the first Duo run said "no respawn seen" even
+though `svc: respawned gpiod` had printed. Now guarded on the
+prefix-match length (`m == 11` / `m == 10`, like `netdkilltest`) **and**
+a generation change vs the killed instance.
+
+QEMU regression green. Real-Duo re-test pending.
+
+---
+
 ## 2026-08-30 — head / cat: don't block bare on the console
 
 `head` (and `cat`) with no file argument read stdin — the pipeline-

@@ -315,8 +315,15 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		gpiod_proc.is_boot_server = true;
 		setup_gpiod_mappings(gpiod_proc);
 		io::print("gpiod created\n");
+		// watch_hangs = true (unlike usbd/ethd): gpiod's bring-up is
+		// three MMIO writes, not a multi-second bus reset / PHY train,
+		// and its poll loop clears has_message every iteration — so a
+		// stuck inbox for SVC_STALL_LIMIT ticks genuinely means wedged.
+		// Gives the driver-respawn path (§5.5) a safety net: a respawned
+		// gpiod that fails to re-init gets killed + respawned rather
+		// than hanging every client that IPCs it forever.
 		supervisor_register("gpiod", (char*)&_binary_gpiod_bin_start, (char*)&_binary_gpiod_bin_end,
-			SVC_KIND_GPIOD, 0, false, false, null, gpiod_proc);
+			SVC_KIND_GPIOD, 0, false, true, null, gpiod_proc);
 	}
 
 	// Single call site for create_process(shell) below (a *respawn*

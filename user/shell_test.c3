@@ -2156,22 +2156,24 @@ fn void main() {
             // §5.5, Duo-only: gpiod isn't spawned on QEMU (no GPIO
             // controller on the virt board). Kill it, let the supervisor
             // respawn it (SVC_KIND_GPIOD -> setup_gpiod_mappings re-maps
-            // bank A/C + the pinmux page), confirm the fresh gpiod came
-            // back and re-posted /srv/gpiod/.
+            // bank A/C + the pinmux page), then send a real SET_DIR to
+            // confirm the fresh gpiod re-mapped its MMIO, rebuilt its pin
+            // table, and services IPC.
             //
-            // This checks the respawn + srv_post half only. Whether the
-            // respawned gpiod's *hardware* re-init actually works is a
-            // separate question — do `gpio C24 dir out` afterwards. On
-            // the real Duo that currently hangs: the respawned gpiod
-            // wedges in its MMIO re-init and never reaches its IPC poll
-            // loop (docs/roadmap.md §5.5). Don't send an IPC to it here
-            // — sys_ipc_call would block forever on the alive-but-wedged
-            // peer (gpiod has watch_hangs = false).
+            // Guards: (a) only accept a pid that resolved *through the
+            // /srv/gpiod/ mount* (prefix length 11) — between the kill
+            // and the respawn, /srv/gpiod/ falls to the "" catch-all
+            // (fsd); (b) require a *different generation* than the
+            // instance we killed — a respawn reuses the same slot, hence
+            // the same pid (pid = slot + 1), so "np != old pid" never
+            // fires. Same m-guard netdkilltest uses (m == 5 for "/net/").
             if (ns_mount_wait("/srv/gpiod/", "gpiod", 5) < 0) {
                 print("gpiodkilltest: skipped (no gpiod — not a Duo?)\n");
             } else {
                 uint gk_m = 0;
                 int gk_old = ns_resolve("/srv/gpiod/", &gk_m);
+                uint gk_old_gen = 0;
+                if (gk_old > 0) { proc_info(gk_old, null, &gk_old_gen, null); }
                 int gk_killed = gk_old > 0 ? kill(gk_old, 0) : -1;
                 int gk_new = -1;
                 ulong gk_deadline = rdtime() + 250000000; // ~10s at Duo's 25MHz
@@ -2180,16 +2182,25 @@ fn void main() {
                     ns_mount("/srv/gpiod/", "gpiod");   // re-point at the fresh post
                     uint m = 0;
                     int np = ns_resolve("/srv/gpiod/", &m);
-                    if (np > 0 && np != gk_old) {
+                    if (np > 0 && m == 11) {
                         uint g = 0;
-                        if (proc_info(np, null, &g, null) == 0) { gk_new = np; }
+                        if (proc_info(np, null, &g, null) == 0 && g != gk_old_gen) { gk_new = np; }
                     }
                 }
-                if (gk_killed == 0 && gk_new > 0) {
-                    print("gpiodkilltest: ok (gpiod killed, respawned, /srv/gpiod/ re-posted)\n");
-                    print("  `gpio C24 dir out` to check the hw re-init (known to hang — §5.5)\n");
+                int gk_resp = -1;
+                if (gk_new > 0) {
+                    char[8] gk_req @noinit;
+                    gk_req[0] = 'C'; gk_req[1] = (char)24; gk_req[2] = (char)1; // GPIOC24 dir=out
+                    uint gk_rv = 0;
+                    int gk_from = p9_call_path("/srv/gpiod/", 1 /*GPIO_IPC_SET_DIR*/, &gk_req[0], 8, &gk_req[0], 8, &gk_rv);
+                    if (gk_from > 0 && gk_rv == 1 && gk_req[0] == 0) { gk_resp = 0; }
+                }
+                if (gk_killed == 0 && gk_new > 0 && gk_resp == 0) {
+                    print("gpiodkilltest: ok (gpiod killed, respawned, re-inited, C24 dir set)\n");
+                } else if (gk_killed == 0 && gk_new > 0) {
+                    print("gpiodkilltest: FAILED — respawned + re-posted, but SET_DIR got no valid reply (hw re-init? §5.5)\n");
                 } else {
-                    print("gpiodkilltest: FAILED\n");
+                    print("gpiodkilltest: FAILED — no respawn seen within the deadline\n");
                 }
             }
         } else if (strcmp(cmd, "usbdkilltest") == 0) {
@@ -2200,11 +2211,16 @@ fn void main() {
             // A full HID re-enumeration check needs a device on the bus
             // and a keystroke — this covers the respawn + MMIO re-map +
             // srv_post half, which is what the supervisor path owns.
+            // Guards: resolved through /srv/usbd/ (prefix len 10) AND a
+            // different generation than the killed instance (a respawn
+            // reuses the slot -> same pid). Same shape as gpiodkilltest.
             if (ns_mount_wait("/srv/usbd/", "usbd", 5) < 0) {
                 print("usbdkilltest: skipped (no usbd — not a Duo?)\n");
             } else {
                 uint uk_m = 0;
                 int uk_old = ns_resolve("/srv/usbd/", &uk_m);
+                uint uk_old_gen = 0;
+                if (uk_old > 0) { proc_info(uk_old, null, &uk_old_gen, null); }
                 int uk_killed = uk_old > 0 ? kill(uk_old, 0) : -1;
                 int uk_new = -1;
                 ulong uk_deadline = rdtime() + 250000000; // ~10s at Duo's 25MHz
@@ -2213,9 +2229,9 @@ fn void main() {
                     ns_mount("/srv/usbd/", "usbd");
                     uint m = 0;
                     int np = ns_resolve("/srv/usbd/", &m);
-                    if (np > 0 && np != uk_old) {
+                    if (np > 0 && m == 10) {
                         uint g = 0;
-                        if (proc_info(np, null, &g, null) == 0) { uk_new = np; }
+                        if (proc_info(np, null, &g, null) == 0 && g != uk_old_gen) { uk_new = np; }
                     }
                 }
                 if (uk_killed == 0 && uk_new > 0) {

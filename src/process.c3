@@ -1101,6 +1101,12 @@ fn Process* create_process(void* image, uint image_size)
 	proc.has_message = false;
 	proc.msg_acked = false;
 	proc.msg_from = 0;
+	// Same reused-slot hygiene sys_rfork already does: a slot whose
+	// previous occupant left driver_irq_pending set would otherwise make
+	// a respawned driver's very first SYS_IPC_POLL return the synthetic
+	// DISKD_IRQ_NOTIFY instead of its real inbox state. Missing here was
+	// a gap — create_process is the supervisor's respawn path.
+	proc.driver_irq_pending = false;
 	proc.is_boot_server = false; // kernel.c3 / supervisor_spawn set it for servers
 	proc.cwd[0] = 0; // root
 	proc.stdout_pipe = -1;
