@@ -149,3 +149,114 @@ char *strdup(const char *s)
 	if (p) memcpy(p, s, n);
 	return p;
 }
+
+char *strndup(const char *s, size_t max)
+{
+	size_t n = 0;
+	while (n < max && s[n]) n++;
+	char *p = malloc(n + 1);
+	if (p) { memcpy(p, s, n); p[n] = 0; }
+	return p;
+}
+
+size_t strnlen(const char *s, size_t max)
+{
+	size_t n = 0;
+	while (n < max && s[n]) n++;
+	return n;
+}
+
+size_t strspn(const char *s, const char *set)
+{
+	size_t n = 0;
+	for (; s[n]; n++) if (!strchr(set, s[n])) break;
+	return n;
+}
+
+size_t strcspn(const char *s, const char *set)
+{
+	size_t n = 0;
+	for (; s[n]; n++) if (strchr(set, s[n])) break;
+	return n;
+}
+
+char *strpbrk(const char *s, const char *set)
+{
+	for (; *s; s++) if (strchr(set, *s)) return (char *)s;
+	return NULL;
+}
+
+char *strtok_r(char *s, const char *sep, char **save)
+{
+	if (!s) s = *save;
+	if (!s) return NULL;
+	s += strspn(s, sep);
+	if (!*s) { *save = NULL; return NULL; }
+	char *end = s + strcspn(s, sep);
+	if (*end) { *end = 0; *save = end + 1; }
+	else *save = NULL;
+	return s;
+}
+
+char *strtok(char *s, const char *sep)
+{
+	static char *save;
+	return strtok_r(s, sep, &save);
+}
+
+char *strsep(char **sp, const char *sep)
+{
+	char *s = *sp;
+	if (!s) return NULL;
+	char *end = s + strcspn(s, sep);
+	if (*end) { *end = 0; *sp = end + 1; }
+	else *sp = NULL;
+	return s;
+}
+
+void *memrchr(const void *s, int c, size_t n)
+{
+	const unsigned char *p = (const unsigned char *)s + n;
+	while (n--) if (*--p == (unsigned char)c) return (void *)p;
+	return NULL;
+}
+
+void *memmem(const void *hay, size_t hn, const void *needle, size_t nn)
+{
+	if (nn == 0) return (void *)hay;
+	if (nn > hn) return NULL;
+	const char *h = hay;
+	for (size_t i = 0; i + nn <= hn; i++)
+		if (h[i] == *(const char *)needle && memcmp(h + i, needle, nn) == 0)
+			return (void *)(h + i);
+	return NULL;
+}
+
+/* --- <strings.h> --- */
+
+static int lc(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
+int strcasecmp(const char *a, const char *b)
+{
+	while (*a && lc((unsigned char)*a) == lc((unsigned char)*b)) { a++; b++; }
+	return lc((unsigned char)*a) - lc((unsigned char)*b);
+}
+
+int strncasecmp(const char *a, const char *b, size_t n)
+{
+	for (; n && *a && lc((unsigned char)*a) == lc((unsigned char)*b); a++, b++, n--)
+		;
+	if (!n) return 0;
+	return lc((unsigned char)*a) - lc((unsigned char)*b);
+}
+
+void bzero(void *s, size_t n) { memset(s, 0, n); }
+void bcopy(const void *src, void *dst, size_t n) { memmove(dst, src, n); }
+
+int ffs(int v)
+{
+	if (!v) return 0;
+	int i = 1;
+	while (!(v & 1)) { v >>= 1; i++; }
+	return i;
+}

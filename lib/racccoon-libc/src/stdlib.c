@@ -59,8 +59,9 @@ long strtol(const char *s, char **end, int base)
 	return (long)strtoull(s, end, base);
 }
 
-int  atoi(const char *s) { return (int)strtol(s, NULL, 10); }
-long atol(const char *s) { return strtol(s, NULL, 10); }
+int       atoi(const char *s) { return (int)strtol(s, NULL, 10); }
+long      atol(const char *s) { return strtol(s, NULL, 10); }
+long long atoll(const char *s) { return strtoll(s, NULL, 10); }
 
 double strtod(const char *s, char **end)
 {
@@ -92,8 +93,18 @@ double strtod(const char *s, char **end)
 	return neg ? -val : val;
 }
 
+/* strtof reuses strtod (float<-double is a hw convert); strtold lives
+ * in src/quad.c so a program that never needs long double doesn't drag
+ * in libgcc's soft-quad routines. */
+float strtof(const char *s, char **end) { return (float)strtod(s, end); }
+
 int  abs(int x)  { return x < 0 ? -x : x; }
 long labs(long x) { return x < 0 ? -x : x; }
+long long llabs(long long x) { return x < 0 ? -x : x; }
+
+long imaxabs(long j) { return j < 0 ? -j : j; }
+long strtoimax(const char *s, char **end, int base) { return (long)strtoull(s, end, base); }
+unsigned long strtoumax(const char *s, char **end, int base) { return strtoull(s, end, base); }
 
 /* --- qsort (median-of-three quicksort, insertion for small runs) --- */
 

@@ -349,3 +349,70 @@ struct dirent *readdir(DIR *d)
 void rewinddir(DIR *d) { if (d) d->pos = 0; }
 
 int closedir(DIR *d) { free(d); return 0; }
+
+/* --- odds and ends the ported tools reach for ------------------- */
+
+/* No symlinks on racccoon — realpath() is just cwd-relative -> absolute
+ * plus a copy. resolved may be NULL (malloc a PATH_MAX buffer). */
+char *realpath(const char *path, char *resolved)
+{
+	char tmp[128];
+	__rc_abspath(path, tmp);
+
+	unsigned long size = 0; int type = 0;
+	if (__rc_fs_stat(tmp, &size, &type) != 0) { errno = ENOENT; return NULL; }
+
+	if (!resolved) {
+		resolved = malloc(128);
+		if (!resolved) { errno = ENOMEM; return NULL; }
+	}
+	strcpy(resolved, tmp);
+	return resolved;
+}
+
+/* fsd carries no mode bits — accept and ignore. */
+int chmod(const char *path, mode_t mode) { (void)path; (void)mode; return 0; }
+
+/* fsd has no truncate primitive. length 0 is the common case (rewrite a
+ * file from scratch) — delete + recreate. Non-zero is best-effort no-op. */
+int ftruncate(int fd, off_t length)
+{
+	fd_init();
+	if (fd < 0 || fd >= FD_MAX || fdtab[fd].kind != K_FILE) { errno = EBADF; return -1; }
+	if (length == 0) {
+		__rc_fs_delete(fdtab[fd].path, 0);
+		if (__rc_fs_write_at(fdtab[fd].path, "", 0, 0) < 0) { errno = EIO; return -1; }
+		fdtab[fd].off = 0;
+	}
+	return 0;
+}
+
+int pipe(int fds[2]) { (void)fds; errno = ENOSYS; return -1; }
+
+long sysconf(int name)
+{
+	switch (name) {
+	case _SC_PAGESIZE:          return 4096;
+	case _SC_NPROCESSORS_ONLN:  return 1;
+	case _SC_CLK_TCK:           return 1000000;
+	case _SC_OPEN_MAX:          return FD_MAX;
+	default:                    return -1;
+	}
+}
+
+int getpagesize(void) { return 4096; }
+
+/* No scheduler sleep primitive exposed to userspace yet — spin on the
+ * `time` CSR. Coarse, but sleep() is only ever a politeness call here. */
+unsigned sleep(unsigned sec)  { usleep(sec * 1000000u); return 0; }
+
+int usleep(unsigned usec)
+{
+	unsigned long hz = __rc_timebase_hz();
+	if (hz == 0) return 0;
+	unsigned long ticks = ((unsigned long)usec * hz) / 1000000UL;
+	unsigned long start, now;
+	__asm__ volatile ("rdtime %0" : "=r"(start));
+	do { __asm__ volatile ("rdtime %0" : "=r"(now)); } while (now - start < ticks);
+	return 0;
+}

@@ -42,8 +42,15 @@ fi
 
 CFLAGS="-march=rv64imafdc -mabi=lp64d -mcmodel=medany -ffreestanding -fno-pic
         -fno-stack-protector -fno-builtin -Os -Wall -Wextra -std=c11
+        -ffunction-sections -fdata-sections
         -nostdinc -isystem $($CC_RC -print-file-name=include)
         -I lib/racccoon-libc/include"
+
+# libgcc: the compiler support library (soft long-double / 128-bit
+# helpers, __*di3, …). Not libc — fine to link. Only routines a program
+# actually references are pulled in.
+LIBGCC_RC="${LIBGCC_RC:-$($CC_RC -print-libgcc-file-name 2>/dev/null)}"
+[ -e "$LIBGCC_RC" ] || LIBGCC_RC=""
 
 OUT="build/libc"
 mkdir -p "$OUT/obj"
@@ -74,8 +81,8 @@ for src in test/c-src/*.c; do
   [ -e "$src" ] || continue
   name=$(basename "$src" .c)
   $CC_RC $CFLAGS -c "$src" -o "$OUT/obj/$name.o"
-  $LD_RC -T lib/racccoon-libc/racccoon-libc.ld -o "$OUT/$name.elf" \
-    "$OUT/crt0.o" "$OUT/obj/$name.o" "$OUT/libracccoon.a"
+  $LD_RC --gc-sections -T lib/racccoon-libc/racccoon-libc.ld -o "$OUT/$name.elf" \
+    "$OUT/crt0.o" "$OUT/obj/$name.o" "$OUT/libracccoon.a" $LIBGCC_RC
   $OBJCOPY_RC --set-section-flags .bss=alloc,contents -O binary \
     "$OUT/$name.elf" "$OUT/$name.bin"
   echo "==> Done: $OUT/$name.bin"

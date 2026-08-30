@@ -21,9 +21,10 @@
 
 extern char **environ;
 
-/* kernel limits — keep in sync with src/entry.c3 */
-#define RC_EXEC_IMAGE_MAX 262144
-#define RC_EXEC_BLOB_MAX  4096
+/* kernel limits — keep in sync with src/entry.c3 (EXEC_MAX_IMAGE_SIZE /
+ * EXEC_MAX_ARGV_SIZE) */
+#define RC_EXEC_IMAGE_MAX 1048576
+#define RC_EXEC_BLOB_MAX  16384
 #define RC_READ_CHUNK     (RC_FS_MSG_MAX - 4)
 
 #define LIBC_ARGV0_MARK 0x01

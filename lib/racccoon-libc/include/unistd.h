@@ -25,10 +25,23 @@ int     isatty(int fd);
 int     dup(int fd);
 int     dup2(int oldfd, int newfd);
 int     access(const char *path, int mode);
+int     ftruncate(int fd, off_t length);
+int     pipe(int fds[2]);
+char   *realpath(const char *path, char *resolved);
+int     chmod(const char *path, mode_t mode);
+long    sysconf(int name);
+int     getpagesize(void);
+unsigned sleep(unsigned sec);
+int     usleep(unsigned usec);
 #define F_OK 0
 #define R_OK 4
 #define W_OK 2
 #define X_OK 1
+#define _SC_PAGESIZE       1
+#define _SC_PAGE_SIZE      1
+#define _SC_NPROCESSORS_ONLN 2
+#define _SC_CLK_TCK        3
+#define _SC_OPEN_MAX       4
 
 /* --- process --- */
 pid_t   getpid(void);

@@ -3,6 +3,11 @@
 
 #include <stddef.h>
 
+/* glibc puts alloca() in <stdlib.h>'s reach; ported code expects it. */
+#ifndef alloca
+#define alloca(n) __builtin_alloca(n)
+#endif
+
 /* --- heap (stage 2) --- */
 void *malloc(size_t size);
 void *calloc(size_t nmemb, size_t size);
@@ -26,8 +31,12 @@ unsigned long  strtoul(const char *s, char **end, int base);
 long long      strtoll(const char *s, char **end, int base);
 unsigned long long strtoull(const char *s, char **end, int base);
 double         strtod(const char *s, char **end);
+float          strtof(const char *s, char **end);
+long double    strtold(const char *s, char **end);
 int            abs(int x);
 long           labs(long x);
+long long      llabs(long long x);
+long long      atoll(const char *s);
 
 /* --- sort / search --- */
 void  qsort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *));
