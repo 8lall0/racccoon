@@ -1953,14 +1953,16 @@ fn void main() {
             // _start computes 2+3 and calls racccoon.print_i32 -> the
             // console shows "5"; _start has no result so it exits 0.
             int wt_ok = 0;
-            char*[6] wt_fx;
+            char*[8] wt_fx;
             wt_fx[0] = "add.wasm";     // -> "5"    (call + host import)
             wt_fx[1] = "mem.wasm";     // -> "142"  (linear memory + grow)
             wt_fx[2] = "loop.wasm";    // -> "55"   (block/loop/br/br_if)
             wt_fx[3] = "fac.wasm";     // -> "120"  (if/else + recursion)
             wt_fx[4] = "start.wasm";   // -> "123"  (SEC_START + mutable global + print_i64)
             wt_fx[5] = "echo.wasm";    // -> "a b"  (table + call_indirect + print_str + arg)
-            for (int wf = 0; wf < 6; wf++) {
+            wt_fx[6] = "float.wasm";   // -> "88"   (f64 sqrt/mul/floor/div + f32 mul + trunc)
+            wt_fx[7] = "float2.wasm";  // -> "80"   (f64 neg/abs/min/max/copysign/convert/promote/gt)
+            for (int wf = 0; wf < 8; wf++) {
                 char* wt_arg = wt_fx[wf];
                 char*[3] wt_av;
                 wt_av[0] = wt_arg; wt_av[1] = "a"; wt_av[2] = "b";

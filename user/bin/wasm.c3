@@ -10,12 +10,20 @@ import std::nolibc::mem;
 //
 //   wasm foo.wasm [args...]
 //
-// Milestones 1a-1d: decode + validate + interpret the integer core:
-// consts, locals/globals, calls, all i32/i64 arithmetic, linear memory,
-// control flow (block/loop/if/br/br_table), and — 1d — the table +
-// element + start sections, call_indirect, and the host imports
-// print_str / arg_count / arg / read_file / write_file / time / print_i64.
-// Next: float ops (§4 milestone 2).
+// Milestones 1a-1d: the integer core — consts, locals/globals, calls,
+// all i32/i64 arithmetic, linear memory, control flow
+// (block/loop/if/br/br_table), the table + element + start sections,
+// call_indirect, and the host imports print_str / arg_count / arg /
+// read_file / write_file / time / print_i64.
+//
+// Milestone 2: f32/f64 — const/load/store, all arithmetic + comparison
+// + min/max/copysign/sqrt + the directed roundings, the full i32/i64
+// <-> f32/f64 conversion set (trapping and 0xFC saturating), and
+// reinterpret/promote/demote. Hardware FP (§3): the operators lower to
+// fadd.d etc. directly; sqrt and the roundings use small @naked asm.
+//
+// Next: milestone 3 — real compiled programs (raise limits, decide
+// AssemblyScript / `env` import compat).
 //
 // All working memory (the module bytes, the value/locals/frame stacks,
 // the section tables) comes from map_pages() (SYS_MAP) — userspace has
@@ -116,12 +124,52 @@ const char OP_I64_AND = 0x83; const char OP_I64_OR = 0x84; const char OP_I64_XOR
 const char OP_I64_SHL = 0x86; const char OP_I64_SHR_S = 0x87; const char OP_I64_SHR_U = 0x88;
 const char OP_I64_ROTL = 0x89; const char OP_I64_ROTR = 0x8a;
 
+// f32 comparisons 0x5b..0x60
+const char OP_F32_EQ = 0x5b; const char OP_F32_NE = 0x5c; const char OP_F32_LT = 0x5d;
+const char OP_F32_GT = 0x5e; const char OP_F32_LE = 0x5f; const char OP_F32_GE = 0x60;
+// f64 comparisons 0x61..0x66
+const char OP_F64_EQ = 0x61; const char OP_F64_NE = 0x62; const char OP_F64_LT = 0x63;
+const char OP_F64_GT = 0x64; const char OP_F64_LE = 0x65; const char OP_F64_GE = 0x66;
+
+// f32 numeric 0x8b..0x98
+const char OP_F32_ABS = 0x8b; const char OP_F32_NEG = 0x8c; const char OP_F32_CEIL = 0x8d;
+const char OP_F32_FLOOR = 0x8e; const char OP_F32_TRUNC = 0x8f; const char OP_F32_NEAREST = 0x90;
+const char OP_F32_SQRT = 0x91; const char OP_F32_ADD = 0x92; const char OP_F32_SUB = 0x93;
+const char OP_F32_MUL = 0x94; const char OP_F32_DIV = 0x95; const char OP_F32_MIN = 0x96;
+const char OP_F32_MAX = 0x97; const char OP_F32_COPYSIGN = 0x98;
+// f64 numeric 0x99..0xa6
+const char OP_F64_ABS = 0x99; const char OP_F64_NEG = 0x9a; const char OP_F64_CEIL = 0x9b;
+const char OP_F64_FLOOR = 0x9c; const char OP_F64_TRUNC = 0x9d; const char OP_F64_NEAREST = 0x9e;
+const char OP_F64_SQRT = 0x9f; const char OP_F64_ADD = 0xa0; const char OP_F64_SUB = 0xa1;
+const char OP_F64_MUL = 0xa2; const char OP_F64_DIV = 0xa3; const char OP_F64_MIN = 0xa4;
+const char OP_F64_MAX = 0xa5; const char OP_F64_COPYSIGN = 0xa6;
+
 // conversions
 const char OP_I32_WRAP_I64    = 0xa7;
+const char OP_I32_TRUNC_F32_S = 0xa8; const char OP_I32_TRUNC_F32_U = 0xa9;
+const char OP_I32_TRUNC_F64_S = 0xaa; const char OP_I32_TRUNC_F64_U = 0xab;
 const char OP_I64_EXTEND_I32_S = 0xac; const char OP_I64_EXTEND_I32_U = 0xad;
+const char OP_I64_TRUNC_F32_S = 0xae; const char OP_I64_TRUNC_F32_U = 0xaf;
+const char OP_I64_TRUNC_F64_S = 0xb0; const char OP_I64_TRUNC_F64_U = 0xb1;
+const char OP_F32_CONVERT_I32_S = 0xb2; const char OP_F32_CONVERT_I32_U = 0xb3;
+const char OP_F32_CONVERT_I64_S = 0xb4; const char OP_F32_CONVERT_I64_U = 0xb5;
+const char OP_F32_DEMOTE_F64  = 0xb6;
+const char OP_F64_CONVERT_I32_S = 0xb7; const char OP_F64_CONVERT_I32_U = 0xb8;
+const char OP_F64_CONVERT_I64_S = 0xb9; const char OP_F64_CONVERT_I64_U = 0xba;
+const char OP_F64_PROMOTE_F32 = 0xbb;
+const char OP_I32_REINTERPRET_F32 = 0xbc; const char OP_I64_REINTERPRET_F64 = 0xbd;
+const char OP_F32_REINTERPRET_I32 = 0xbe; const char OP_F64_REINTERPRET_I64 = 0xbf;
 const char OP_I32_EXTEND8_S  = 0xc0; const char OP_I32_EXTEND16_S = 0xc1;
 const char OP_I64_EXTEND8_S  = 0xc2; const char OP_I64_EXTEND16_S = 0xc3;
 const char OP_I64_EXTEND32_S = 0xc4;
+
+// saturating-truncation prefix (0xfc <subop>) — the subset real
+// LLVM/wasm-ld output actually emits
+const char OP_PREFIX_FC = 0xfc;
+const uint FC_I32_TRUNC_SAT_F32_S = 0; const uint FC_I32_TRUNC_SAT_F32_U = 1;
+const uint FC_I32_TRUNC_SAT_F64_S = 2; const uint FC_I32_TRUNC_SAT_F64_U = 3;
+const uint FC_I64_TRUNC_SAT_F32_S = 4; const uint FC_I64_TRUNC_SAT_F32_U = 5;
+const uint FC_I64_TRUNC_SAT_F64_S = 6; const uint FC_I64_TRUNC_SAT_F64_U = 7;
 
 const int WPAGE = 65536;             // wasm linear-memory page size
 const int MEM_HARD_CAP_PAGES = 240;  // ~15 MiB — under HEAP_MAX_BYTES with room for the other allocs
@@ -816,6 +864,134 @@ fn long vpop()
     return g_vstack[g_vtop];
 }
 
+// --- float <-> value-stack packing ---------------------------------
+// f64 occupies the whole 64-bit slot; f32 lives in the low 32 bits
+// (upper 32 are don't-care, exactly like i32). Reinterpret via a
+// pointer cast — no conversion.
+fn double  vpop_f64()        { long b = vpop(); return *(double*)&b; }
+fn void    vpush_f64(double d){ vpush(*(long*)&d); }
+fn float   vpop_f32()        { long b = vpop(); uint u = (uint)b; return *(float*)&u; }
+fn void    vpush_f32(float f) { uint u = *(uint*)&f; vpush((long)u); }
+
+// --- FP instructions the compiler won't emit from an operator -------
+// sqrt and the directed roundings need the actual RISC-V ops. @naked +
+// opaque asm(`...`), the same escape hatch src/process.c3's fp_save
+// uses (the block asm{} form only knows integer lw/sw). lp64d: a
+// double arg arrives in fa0, the return goes back in fa0.
+fn double f_sqrt_d(double x) @naked @noinline @nostrip { asm(`fsqrt.d fa0, fa0
+    ret`); }
+fn float  f_sqrt_s(float x)  @naked @noinline @nostrip { asm(`fsqrt.s fa0, fa0
+    ret`); }
+// round-to-integral, ties-to-even (wasm `nearest`): convert to i64 with
+// the round-nearest mode, convert back. The C3-side wrappers below guard
+// the |x| >= 2^52 / NaN / inf cases where this would saturate or be lossy.
+fn double f_rint_d(double x)  @naked @noinline @nostrip { asm(`fcvt.l.d a0, fa0, rne
+    fcvt.d.l fa0, a0
+    ret`); }
+fn double f_ceil_d(double x)  @naked @noinline @nostrip { asm(`fcvt.l.d a0, fa0, rup
+    fcvt.d.l fa0, a0
+    ret`); }
+fn double f_floor_d(double x) @naked @noinline @nostrip { asm(`fcvt.l.d a0, fa0, rdn
+    fcvt.d.l fa0, a0
+    ret`); }
+
+const double F_TWO52 = 4503599627370496.0;   // 2^52 — every double this size or larger is already integral
+
+// wasm f64 round ops. `kind`: 0 nearest, 1 ceil, 2 floor, 3 trunc.
+// NaN / inf / already-integral pass straight through; the sign of a
+// zero result is taken from the input (wasm keeps -0.0).
+fn double f_round_d(double x, int kind)
+{
+    if (x != x) { return x; }                     // NaN
+    double ax = x < 0.0 ? -x : x;
+    if (!(ax < F_TWO52)) { return x; }             // inf, or too big to be non-integral
+    double r;
+    switch (kind)
+    {
+        case 1:  r = f_ceil_d(x);
+        case 2:  r = f_floor_d(x);
+        case 3:  r = (double)(long)x;              // trunc = round-toward-zero
+        default: r = f_rint_d(x);                  // nearest, ties-to-even
+    }
+    if (r == 0.0 && x < 0.0)
+    {
+        long negzero = (long)0x8000000000000000;
+        return *(double*)&negzero;
+    }
+    return r;
+}
+
+// wasm min/max: if either operand is NaN the result is NaN; -0 < +0.
+// (RISC-V fmin.d/fmax.d differ on the NaN case, so do it by hand.)
+fn double f_min_d(double a, double b)
+{
+    if (a != a || b != b) { double q = a != a ? a : b; long n = *(long*)&q | (long)0x0008000000000000; return *(double*)&n; }
+    if (a == 0.0 && b == 0.0) { long na = *(long*)&a; long nb = *(long*)&b; long n = na | nb; return *(double*)&n; } // -0 if either is -0
+    return a < b ? a : b;
+}
+fn double f_max_d(double a, double b)
+{
+    if (a != a || b != b) { double q = a != a ? a : b; long n = *(long*)&q | (long)0x0008000000000000; return *(double*)&n; }
+    if (a == 0.0 && b == 0.0) { long na = *(long*)&a; long nb = *(long*)&b; long n = na & nb; return *(double*)&n; } // +0 unless both -0
+    return a > b ? a : b;
+}
+
+// f64 -> i64 truncation with wasm's trap-on-out-of-range semantics
+// (die() is our clean exit). `is_signed` picks the range.
+fn long f_trunc_to_i64(double x, bool is_signed)
+{
+    if (x != x) { die("f->i: NaN"); }
+    if (is_signed)
+    {
+        if (!(x >= -9223372036854775808.0 && x < 9223372036854775808.0)) { die("f->i: out of range"); }
+        return (long)x;
+    }
+    if (!(x >= 0.0 && x < 18446744073709551616.0)) { die("f->i: out of range"); }
+    if (x < 9223372036854775808.0) { return (long)x; }
+    return (long)(x - 9223372036854775808.0) | (long)0x8000000000000000;
+}
+
+fn int f_trunc_to_i32(double x, bool is_signed)
+{
+    if (x != x) { die("f->i: NaN"); }
+    if (is_signed)
+    {
+        if (!(x >= -2147483648.0 && x < 2147483648.0)) { die("f->i: out of range"); }
+        return (int)x;
+    }
+    if (!(x >= 0.0 && x < 4294967296.0)) { die("f->i: out of range"); }
+    return (int)(uint)(long)x;
+}
+
+// saturating variant (0xfc trunc_sat): clamp instead of trap; NaN -> 0.
+fn long f_trunc_sat_i64(double x, bool is_signed)
+{
+    if (x != x) { return 0; }
+    if (is_signed)
+    {
+        if (x <= -9223372036854775808.0) { return (long)0x8000000000000000; }
+        if (x >= 9223372036854775808.0)  { return (long)0x7FFFFFFFFFFFFFFF; }
+        return (long)x;
+    }
+    if (x <= 0.0) { return 0; }
+    if (x >= 18446744073709551616.0) { return (long)0xFFFFFFFFFFFFFFFF; }
+    if (x < 9223372036854775808.0) { return (long)x; }
+    return (long)(x - 9223372036854775808.0) | (long)0x8000000000000000;
+}
+fn int f_trunc_sat_i32(double x, bool is_signed)
+{
+    if (x != x) { return 0; }
+    if (is_signed)
+    {
+        if (x <= -2147483648.0) { return (int)0x80000000; }
+        if (x >= 2147483648.0)  { return (int)0x7FFFFFFF; }
+        return (int)x;
+    }
+    if (x <= 0.0) { return 0; }
+    if (x >= 4294967296.0) { return (int)0xFFFFFFFF; }
+    return (int)(uint)(long)x;
+}
+
 // copy a (ptr,len) region of linear memory into `out` as a NUL-terminated
 // string, truncating to cap-1 bytes. dies if the region is out of bounds.
 fn void mem_cstr(uint off, uint len, char* out, int cap)
@@ -1098,6 +1274,14 @@ fn void interp()
                 g_globals[(int)gsi] = vpop();
             case OP_I32_CONST: vpush((long)imm_i32(fr));
             case OP_I64_CONST: vpush(imm_i64(fr));
+            case OP_F32_CONST:
+                if (fr.ip + 4 > g_mod_len) { die("truncated f32.const"); }
+                vpush((long)(*(uint*)&g_mod[fr.ip]));
+                fr.ip += 4;
+            case OP_F64_CONST:
+                if (fr.ip + 8 > g_mod_len) { die("truncated f64.const"); }
+                vpush(*(long*)&g_mod[fr.ip]);
+                fr.ip += 8;
 
             // --- memory loads ---
             case OP_I32_LOAD:     uint e = mem_ea(fr, 4); vpush((long)*(int*)&g_mem[e]);
@@ -1226,6 +1410,93 @@ fn void interp()
             case OP_I64_EXTEND8_S:    vpush((long)(char)vpop());
             case OP_I64_EXTEND16_S:   vpush((long)(short)vpop());
             case OP_I64_EXTEND32_S:   vpush((long)(int)vpop());
+
+            // --- f32/f64 comparisons (result i32 0/1) ---
+            case OP_F32_EQ: float b = vpop_f32(); float a = vpop_f32(); vpush(a == b ? 1 : 0);
+            case OP_F32_NE: float b = vpop_f32(); float a = vpop_f32(); vpush(a != b ? 1 : 0);
+            case OP_F32_LT: float b = vpop_f32(); float a = vpop_f32(); vpush(a < b ? 1 : 0);
+            case OP_F32_GT: float b = vpop_f32(); float a = vpop_f32(); vpush(a > b ? 1 : 0);
+            case OP_F32_LE: float b = vpop_f32(); float a = vpop_f32(); vpush(a <= b ? 1 : 0);
+            case OP_F32_GE: float b = vpop_f32(); float a = vpop_f32(); vpush(a >= b ? 1 : 0);
+            case OP_F64_EQ: double b = vpop_f64(); double a = vpop_f64(); vpush(a == b ? 1 : 0);
+            case OP_F64_NE: double b = vpop_f64(); double a = vpop_f64(); vpush(a != b ? 1 : 0);
+            case OP_F64_LT: double b = vpop_f64(); double a = vpop_f64(); vpush(a < b ? 1 : 0);
+            case OP_F64_GT: double b = vpop_f64(); double a = vpop_f64(); vpush(a > b ? 1 : 0);
+            case OP_F64_LE: double b = vpop_f64(); double a = vpop_f64(); vpush(a <= b ? 1 : 0);
+            case OP_F64_GE: double b = vpop_f64(); double a = vpop_f64(); vpush(a >= b ? 1 : 0);
+
+            // --- f32 numeric ---
+            case OP_F32_ABS:  uint u = (uint)vpop() & 0x7FFFFFFFu; vpush((long)u);
+            case OP_F32_NEG:  uint u = (uint)vpop() ^ 0x80000000u; vpush((long)u);
+            case OP_F32_CEIL:    vpush_f32((float)f_round_d((double)vpop_f32(), 1));
+            case OP_F32_FLOOR:   vpush_f32((float)f_round_d((double)vpop_f32(), 2));
+            case OP_F32_TRUNC:   vpush_f32((float)f_round_d((double)vpop_f32(), 3));
+            case OP_F32_NEAREST: vpush_f32((float)f_round_d((double)vpop_f32(), 0));
+            case OP_F32_SQRT: vpush_f32(f_sqrt_s(vpop_f32()));
+            case OP_F32_ADD:  float b = vpop_f32(); float a = vpop_f32(); vpush_f32(a + b);
+            case OP_F32_SUB:  float b = vpop_f32(); float a = vpop_f32(); vpush_f32(a - b);
+            case OP_F32_MUL:  float b = vpop_f32(); float a = vpop_f32(); vpush_f32(a * b);
+            case OP_F32_DIV:  float b = vpop_f32(); float a = vpop_f32(); vpush_f32(a / b);
+            case OP_F32_MIN:  float b = vpop_f32(); float a = vpop_f32(); vpush_f32((float)f_min_d((double)a, (double)b));
+            case OP_F32_MAX:  float b = vpop_f32(); float a = vpop_f32(); vpush_f32((float)f_max_d((double)a, (double)b));
+            case OP_F32_COPYSIGN: uint sb = (uint)vpop(); uint sa = (uint)vpop();
+                vpush((long)((sa & 0x7FFFFFFFu) | (sb & 0x80000000u)));
+
+            // --- f64 numeric ---
+            case OP_F64_ABS:  ulong u = (ulong)vpop() & 0x7FFFFFFFFFFFFFFFu; vpush((long)u);
+            case OP_F64_NEG:  ulong u = (ulong)vpop() ^ 0x8000000000000000u; vpush((long)u);
+            case OP_F64_CEIL:    vpush_f64(f_round_d(vpop_f64(), 1));
+            case OP_F64_FLOOR:   vpush_f64(f_round_d(vpop_f64(), 2));
+            case OP_F64_TRUNC:   vpush_f64(f_round_d(vpop_f64(), 3));
+            case OP_F64_NEAREST: vpush_f64(f_round_d(vpop_f64(), 0));
+            case OP_F64_SQRT: vpush_f64(f_sqrt_d(vpop_f64()));
+            case OP_F64_ADD:  double b = vpop_f64(); double a = vpop_f64(); vpush_f64(a + b);
+            case OP_F64_SUB:  double b = vpop_f64(); double a = vpop_f64(); vpush_f64(a - b);
+            case OP_F64_MUL:  double b = vpop_f64(); double a = vpop_f64(); vpush_f64(a * b);
+            case OP_F64_DIV:  double b = vpop_f64(); double a = vpop_f64(); vpush_f64(a / b);
+            case OP_F64_MIN:  double b = vpop_f64(); double a = vpop_f64(); vpush_f64(f_min_d(a, b));
+            case OP_F64_MAX:  double b = vpop_f64(); double a = vpop_f64(); vpush_f64(f_max_d(a, b));
+            case OP_F64_COPYSIGN: ulong sb = (ulong)vpop(); ulong sa = (ulong)vpop();
+                vpush((long)((sa & 0x7FFFFFFFFFFFFFFFu) | (sb & 0x8000000000000000u)));
+
+            // --- float conversions ---
+            case OP_I32_TRUNC_F32_S: vpush((long)f_trunc_to_i32((double)vpop_f32(), true));
+            case OP_I32_TRUNC_F32_U: vpush((long)(uint)f_trunc_to_i32((double)vpop_f32(), false));
+            case OP_I32_TRUNC_F64_S: vpush((long)f_trunc_to_i32(vpop_f64(), true));
+            case OP_I32_TRUNC_F64_U: vpush((long)(uint)f_trunc_to_i32(vpop_f64(), false));
+            case OP_I64_TRUNC_F32_S: vpush(f_trunc_to_i64((double)vpop_f32(), true));
+            case OP_I64_TRUNC_F32_U: vpush(f_trunc_to_i64((double)vpop_f32(), false));
+            case OP_I64_TRUNC_F64_S: vpush(f_trunc_to_i64(vpop_f64(), true));
+            case OP_I64_TRUNC_F64_U: vpush(f_trunc_to_i64(vpop_f64(), false));
+            case OP_F32_CONVERT_I32_S: vpush_f32((float)(int)vpop());
+            case OP_F32_CONVERT_I32_U: vpush_f32((float)(uint)vpop());
+            case OP_F32_CONVERT_I64_S: vpush_f32((float)vpop());
+            case OP_F32_CONVERT_I64_U: vpush_f32((float)(ulong)vpop());
+            case OP_F32_DEMOTE_F64:    vpush_f32((float)vpop_f64());
+            case OP_F64_CONVERT_I32_S: vpush_f64((double)(int)vpop());
+            case OP_F64_CONVERT_I32_U: vpush_f64((double)(uint)vpop());
+            case OP_F64_CONVERT_I64_S: vpush_f64((double)vpop());
+            case OP_F64_CONVERT_I64_U: vpush_f64((double)(ulong)vpop());
+            case OP_F64_PROMOTE_F32:   vpush_f64((double)vpop_f32());
+            case OP_I32_REINTERPRET_F32: vpush((long)((uint)vpop()));
+            case OP_I64_REINTERPRET_F64: break;   // bits already there
+            case OP_F32_REINTERPRET_I32: vpush((long)((uint)vpop()));
+            case OP_F64_REINTERPRET_I64: break;   // bits already there
+
+            case OP_PREFIX_FC:
+                uint sub = imm_u32(fr);
+                switch (sub)
+                {
+                    case FC_I32_TRUNC_SAT_F32_S: vpush((long)f_trunc_sat_i32((double)vpop_f32(), true));
+                    case FC_I32_TRUNC_SAT_F32_U: vpush((long)(uint)f_trunc_sat_i32((double)vpop_f32(), false));
+                    case FC_I32_TRUNC_SAT_F64_S: vpush((long)f_trunc_sat_i32(vpop_f64(), true));
+                    case FC_I32_TRUNC_SAT_F64_U: vpush((long)(uint)f_trunc_sat_i32(vpop_f64(), false));
+                    case FC_I64_TRUNC_SAT_F32_S: vpush(f_trunc_sat_i64((double)vpop_f32(), true));
+                    case FC_I64_TRUNC_SAT_F32_U: vpush(f_trunc_sat_i64((double)vpop_f32(), false));
+                    case FC_I64_TRUNC_SAT_F64_S: vpush(f_trunc_sat_i64(vpop_f64(), true));
+                    case FC_I64_TRUNC_SAT_F64_U: vpush(f_trunc_sat_i64(vpop_f64(), false));
+                    default: die("unimplemented 0xfc subop");
+                }
 
             default:
                 print("wasm: unimplemented opcode 0x");

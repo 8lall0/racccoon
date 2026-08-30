@@ -243,6 +243,63 @@ code = [body([], startf_body), body([], start_body)]
 fixtures["start.wasm"] = module(t, imp, fn_, exp, code, start=1, globals_=globals_)
 
 
+# --- float.wasm : f64 + f32 math (§4 milestone 2) -> "88" -------------
+# type 0: () -> ()      _start
+# type 1: (i64) -> ()   racccoon.print_i64
+t = [functype([], []), functype([I64], [])]
+imp = [import_func("racccoon", "print_i64", 1)]     # funcidx 0
+fn_ = [0]                                            # funcidx 1: _start
+exp = [export_func("_start", 1)]
+def f64c(x): return b"\x44" + struct.pack("<d", x)
+def f32c(x): return b"\x43" + struct.pack("<f", x)
+F64_SQRT, F64_ADD, F64_MUL, F64_FLOOR, F64_DIV = b"\x9f", b"\xa0", b"\xa2", b"\x9c", b"\xa3"
+F32_MUL = b"\x94"
+I64_TRUNC_F64_S = b"\xb0"
+I32_TRUNC_F32_S = b"\xa8"
+I64_EXTEND_I32_S = b"\xac"
+I64_ADD = b"\x7c"
+# local 0 = d (f64). d = sqrt(4)+10.5 = 12.5; floor(d*d)/2 = 156/2 = 78.
+# f32: trunc(2.5 * 4.0) = 10.  78 + 10 = 88.
+fbody = (
+    f64c(4.0) + F64_SQRT + f64c(10.5) + F64_ADD + LS(0) +
+    LG(0) + LG(0) + F64_MUL + F64_FLOOR + f64c(2.0) + F64_DIV + I64_TRUNC_F64_S +
+    f32c(2.5) + f32c(4.0) + F32_MUL + I32_TRUNC_F32_S + I64_EXTEND_I32_S +
+    I64_ADD + call(0)
+)
+code = [body([(1, F64)], fbody)]
+fixtures["float.wasm"] = module(t, imp, fn_, exp, code)
+
+# --- float2.wasm : neg/abs/min/max/copysign/convert/promote/gt -> "80" -
+t = [functype([], []), functype([I64], [])]
+imp = [import_func("racccoon", "print_i64", 1)]
+fn_ = [0]
+exp = [export_func("_start", 1)]
+F64_NEG, F64_ABS, F64_MIN, F64_MAX, F64_COPYSIGN = b"\x9a", b"\x99", b"\xa4", b"\xa5", b"\xa6"
+F64_GT = b"\x64"
+F64_CONVERT_I32_S = b"\xb7"
+F64_PROMOTE_F32 = b"\xbb"
+F32_DEMOTE_F64 = b"\xb6"
+I64_MUL = b"\x7e"
+# x=100; x += -25 -> 75; min(x,80)->75; max(x,50)->75;
+# abs(copysign(x,-1)) -> 75; +convert(3) -> 78; +promote(f32 2.0) -> 80;
+# demote->f32->promote (80 exact); trunc -> 80; * (x>79.5 ? 1 : 0) -> 80
+f2 = (
+    f64c(100.0) + LS(0) +
+    f64c(25.0) + F64_NEG + LG(0) + F64_ADD + LS(0) +
+    LG(0) + f64c(80.0) + F64_MIN + LS(0) +
+    LG(0) + f64c(50.0) + F64_MAX + LS(0) +
+    LG(0) + f64c(-1.0) + F64_COPYSIGN + F64_ABS +
+    i32c(3) + F64_CONVERT_I32_S + F64_ADD +
+    f32c(2.0) + F64_PROMOTE_F32 + F64_ADD +
+    F32_DEMOTE_F64 + F64_PROMOTE_F32 + LS(0) +
+    LG(0) + I64_TRUNC_F64_S +
+    LG(0) + f64c(79.5) + F64_GT + I64_EXTEND_I32_S +
+    I64_MUL + call(0)
+)
+code = [body([(1, F64)], f2)]
+fixtures["float2.wasm"] = module(t, imp, fn_, exp, code)
+
+
 def main():
     outdir = sys.argv[1] if len(sys.argv) > 1 else "build/wasm"
     os.makedirs(outdir, exist_ok=True)

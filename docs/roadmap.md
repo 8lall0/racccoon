@@ -358,8 +358,14 @@ programs need more.
    `proc_exit`, `arg_count`/`arg`, `read_file`/`write_file`, `time`.
    Fixtures `add`/`loop`/`mem`/`fac`/`start`/`echo` (hand-assembled by
    `test/mkwasm.py`), QEMU-verified via `wasmtest`.
-2. **Float** — the `f32`/`f64` opcodes, now that §3 (hardware FP) has
-   landed. *(next)*
+2. **Float. DONE** — milestone 2. Every `f32`/`f64` opcode:
+   `const`/`load`/`store`, arithmetic + comparison, `min`/`max`/
+   `copysign`/`sqrt`/`abs`/`neg` + the four directed roundings, the full
+   i32/i64 ↔ f32/f64 conversion set (trapping *and* the `0xFC`
+   saturating variants), `reinterpret`/`promote`/`demote`. §3's hardware
+   FP means the operators lower straight to `fadd.d` etc.; `sqrt` and
+   the roundings use small `@naked` asm helpers (the block `asm{}` form
+   only knows integer lw/sw). Fixtures `float` → 88, `float2` → 80.
 3. **More host imports** — deeper `fsd` / env integration as real
    programs need it.
 4. Multi-module / a table of importable host modules — later.

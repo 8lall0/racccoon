@@ -4,6 +4,40 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — wasm §4 milestone 2: f32/f64
+
+The float opcodes for `/bin/wasm`. §3 (hardware FP, `rv64imafdc/lp64d`)
+did the heavy lifting: C3's `double`/`float` operators lower straight to
+`fadd.d` / `flt.d` / `fneg.d` / `fcvt.d.l` etc., so most of the ~60 new
+opcodes are one line each over `vpop_f64`/`vpush_f32`-style
+reinterpret helpers (the value stack already stores raw 64-bit).
+
+What needed real work:
+- **`sqrt` + the directed roundings** — no stdlib, and the block
+  `asm{}` form only knows integer `lw`/`sw`. Small `@naked` helpers with
+  opaque `asm(\`fsqrt.d fa0, fa0 … ret\`)` (the escape hatch
+  `src/process.c3`'s `fp_save` already uses). `ceil`/`floor`/`nearest`
+  are `fcvt.l.d` with `rup`/`rdn`/`rne` + `fcvt.d.l`, wrapped in a C3
+  guard for NaN / ±inf / `|x| ≥ 2^52` (already integral) / the `-0.0`
+  sign of a zero result.
+- **`min`/`max`** — RISC-V `fmin.d`/`fmax.d` differ from wasm on NaN
+  (they return the non-NaN operand; wasm wants NaN), so done by hand
+  with an explicit NaN check and the −0/+0 tie rule.
+- **`trunc` conversions** — wasm traps on out-of-range / NaN (our
+  `die()` = clean exit); the `0xFC` `trunc_sat` family clamps instead.
+  Explicit range checks against the exact `±2^31` / `±2^63` / `2^64`
+  bounds, unsigned split at `2^63`.
+- **`f{32,64}.const`** — turned out 1b never added these to the interp
+  switch (only to the const-expr reader + the load-time scan). Fixed.
+
+Fixtures `float.wasm` (sqrt/mul/floor/div + an f32 mul → 88) and
+`float2.wasm` (neg/abs/min/max/copysign/convert/promote/demote/gt →
+80). `wasmtest` runs all 8 now. QEMU green; Duo builds clean;
+`wasm.bin` 101 KiB. Known minor deviations from the spec, noted inline:
+exact NaN payload bits, and `-0.0` in a couple of rounding corners.
+
+---
+
 ## 2026-08-30 — §5.5: fault-test driver respawn on the real Duo
 
 §5.1 IPC failure propagation turned out to already be done (`262d45b` /
