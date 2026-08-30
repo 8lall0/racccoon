@@ -249,9 +249,8 @@ stub remains (std::io's lone `fptrunc fp128` in an unreached path; no Q
 ext). Embedded-binary wrappers moved to `llvm-mc --target-abi=lp64d`
 `.incbin` (an `objcopy -Ibinary` wrapper's soft-float e_flags no longer
 link against the hard-float kernel). `fputest` (shell_test.c3) proves
-f-regs survive fork + context switches. QEMU verified; Duo pending (one
-risk: stock OpenSBI v0.9's handoff `mstatus.FS` — `PATCH_OPENSBI=1`
-reflash if it traps).
+f-regs survive fork + context switches. QEMU + Duo verified (plain
+reflash — stock OpenSBI v0.9 hands `mstatus.FS` off usable).
 
 <details><summary>Original problem statement (kept for reference)</summary>
 

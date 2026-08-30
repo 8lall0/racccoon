@@ -55,10 +55,9 @@ QEMU boots clean (no FPU panic, no `scause=2`). New `fputest`: `double`
 arithmetic, a live `double` held in a parent register across `fork` + an
 IPC round-trip + `join` (two context switches), and FP-state inheritance to
 the child — passes repeatedly. Full regression + shell smoke (globbing,
-brace expansion, background jobs, pipelines) green. Duo kernel + user build
-clean; the one residual hardware risk is the stock vendor OpenSBI v0.9's
-handoff `mstatus.FS` — if the Duo panics with "FPU unavailable" or
-`scause=2`, reflash with `PATCH_OPENSBI=1`.
+brace expansion, background jobs, pipelines) green. **Duo boots clean** on
+the plain reflash — stock vendor OpenSBI v0.9 hands `mstatus.FS` off usable,
+no `PATCH_OPENSBI=1` needed, no `scause=2`.
 
 ---
 
