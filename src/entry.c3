@@ -97,6 +97,7 @@ const SYS_NS_LIST       = 45; // copy the caller's own namespace (mount table) o
 const SYS_NS_BIND       = 46; // bind whatever currently serves a1 (a path resolved through the caller's namespace) at a0 (a new prefix) in that same namespace — Plan 9's `bind`, the source-is-a-path counterpart to SYS_NS_MOUNT
 const SYS_MAP           = 47; // map a0 bytes (rounded up to pages) of fresh zero-filled RW memory just past the caller's image, returns the base vaddr or -1 — the userspace "give me a heap" primitive (/bin/wasm's module buffer + stacks + linear memory)
 const SYS_STDIN_ISATTY  = 48; // 1 if the caller's stdin is the console, 0 if a pipe — a poor-man's isatty(0) for the stdin-reading filters (/bin/head, /bin/cat)
+const SYS_TIMEBASE      = 49; // board::TIMEBASE_HZ — the `time` CSR's tick rate, so userspace can turn an rdtime() delta into wall-clock seconds (QEMU 10MHz vs Duo 25MHz)
 
 // Per-process SYS_MAP ceiling: the bump pointer can't grow more than this
 // past USER_BASE. 16 MiB is generous for a wasm linear memory and keeps
@@ -2651,6 +2652,13 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// (no tty layer), so a bare `head` on the console would
 			// otherwise wait for the user to hand-type `limit` lines.
 			f.a0 = current_proc.stdin_pipe < 0 ? 1 : 0;
+		case SYS_TIMEBASE:
+			// The `time` CSR's tick rate (board::TIMEBASE_HZ). Lets a
+			// caller turn an rdtime() delta into seconds without
+			// hardcoding a board-specific constant — the killtests use
+			// it so their respawn deadlines are the same wall-clock
+			// budget on QEMU (10 MHz) and the Duo (25 MHz).
+			f.a0 = board::TIMEBASE_HZ;
 		case SYS_CHDIR:
 			// a0 = the new cwd, already made absolute + normalised by
 			// the caller (user.c3's cd path logic). The kernel just

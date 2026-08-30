@@ -494,22 +494,22 @@ Generation counters back most of the stale-reference handling:
        IRQ-notify instead of the real request. Also: gpiod now has
        `watch_hangs = true` (its bring-up is 3 MMIO writes, not a slow
        bus reset) as a net.
-     - `fsdkilltest` / `storagekilltest` — **still FAIL on the Duo**
-       (both pass on QEMU's fsd→diskd path). `storagekilltest` shows a
-       *double* `svc: respawned sdd` — the first respawn's
-       `sdd_enumerate()` fails and `panic()`s, the supervisor respawns
-       again, that fails too. The respawned sdd can't re-enumerate the
-       card. Suspects: the SD clock left at run-speed (the cold-boot
-       path inherits BootROM's identification clock; `sdd_raise_clock`
-       bumped it and nothing lowers it again), or stale SDHCI
-       controller / SDMA state. Diagnostic hook added: `loud` builtin +
-       `boot_loud()` (SYS_BOOT_QUIET a0=1) un-silences a respawned
-       server's own prints, so `loud; storagekilltest` shows where
-       `sdd_enumerate` actually fails. Not yet diagnosed further.
+     - `fsdkilltest` / `storagekilltest` — **PASS.** The earlier Duo
+       failures were a *test-harness timing bug*, not a driver bug: the
+       respawn deadlines were hardcoded tick counts calibrated for
+       QEMU's 10 MHz `time` CSR, giving only ~1.2 s / ~4 s of real
+       budget on the Duo's 25 MHz clock — not enough for the 1 Hz
+       supervisor tick plus a real SD card re-enumeration (CMD0 → CMD8
+       → ~0x4f ACMD41 tries → CMD2/3/7 → clock raise). With `loud`, the
+       respawned sdd was seen enumerating the card cleanly every time.
+       New `SYS_TIMEBASE` (#49) / `timebase_hz()`; every killtest
+       deadline is now `rdtime() + timebase_hz() * 20` — the same
+       20 s wall-clock budget on any board.
      - `netdkilltest` — **N/A on Duo.** netd exits before `srv_post`
        (self-test needs DHCP + a carrier the Duo link never gets — see
        "Ethernet status"), so there's nothing to kill.
-   - **Still not fault-tested**: ethd.
+   - **§5.5 is closed** for every Duo-testable driver (fsd, sdd, usbd,
+     gpiod). Not fault-tested: ethd (no working link on the Duo).
    - Kernel-side, not a userspace `/bin/init`: the servers' privileged
      setup (`setup_*_mappings`) is kernel-only, and the binaries are
      embedded in the kernel image, not on disk — a userspace init would

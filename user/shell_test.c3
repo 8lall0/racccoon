@@ -1913,7 +1913,7 @@ fn void main() {
             // Wait real wall-clock time (the supervisor ticks ~1/s from
             // the timer) and keep retrying the read. rdtime() the same
             // way mutextest/cycletest do — real time, not an insn count.
-            ulong fk_deadline = rdtime() + 30000000; // ~3s at QEMU's 10MHz
+            ulong fk_deadline = rdtime() + timebase_hz() * 20; // 20s wall-clock, any board
             int fk_after = -1;
             while (fk_after < 0 && rdtime() < fk_deadline) {
                 yield();
@@ -1936,7 +1936,7 @@ fn void main() {
             char[64] sk_buf @noinit;
             int sk_before = fs_read("hello.txt", &sk_buf, 64);
             int sk_killed = sk_pid > 0 ? kill(sk_pid, 0) : -1;
-            ulong sk_deadline = rdtime() + 100000000; // ~10s at QEMU's 10MHz
+            ulong sk_deadline = rdtime() + timebase_hz() * 20; // 20s wall-clock, any board
             int sk_after = -1;
             while (sk_after < 0 && rdtime() < sk_deadline) {
                 yield();
@@ -2067,7 +2067,7 @@ fn void main() {
                 int nk_pid = ns_resolve("/net/", &nk_m);
                 int nk_killed = nk_pid > 0 ? kill(nk_pid, 0) : -1;
                 int nk_ok = -1;
-                ulong nk_deadline = rdtime() + 50000000; // ~5s at QEMU 10MHz
+                ulong nk_deadline = rdtime() + timebase_hz() * 20; // 20s wall-clock, any board
                 while (nk_ok < 0 && rdtime() < nk_deadline) {
                     yield();
                     uint m = 0;
@@ -2105,7 +2105,7 @@ fn void main() {
             // timer tick as the kill, so "/srv/echo/" now resolves to the
             // fresh echod. Round-trip to prove it serves again.
             int hg_ok = -1;
-            ulong hg_deadline = rdtime() + 100000000; // ~10s at QEMU's 10MHz
+            ulong hg_deadline = rdtime() + timebase_hz() * 20; // 20s wall-clock, any board
             while (hg_ok < 0 && rdtime() < hg_deadline) {
                 yield();
                 // Only probe once "/srv/echo/" resolves to the echod
@@ -2176,7 +2176,7 @@ fn void main() {
                 if (gk_old > 0) { proc_info(gk_old, null, &gk_old_gen, null); }
                 int gk_killed = gk_old > 0 ? kill(gk_old, 0) : -1;
                 int gk_new = -1;
-                ulong gk_deadline = rdtime() + 250000000; // ~10s at Duo's 25MHz
+                ulong gk_deadline = rdtime() + timebase_hz() * 20; // 20s wall-clock, any board
                 while (gk_new < 0 && rdtime() < gk_deadline) {
                     yield();
                     ns_mount("/srv/gpiod/", "gpiod");   // re-point at the fresh post
@@ -2223,7 +2223,7 @@ fn void main() {
                 if (uk_old > 0) { proc_info(uk_old, null, &uk_old_gen, null); }
                 int uk_killed = uk_old > 0 ? kill(uk_old, 0) : -1;
                 int uk_new = -1;
-                ulong uk_deadline = rdtime() + 250000000; // ~10s at Duo's 25MHz
+                ulong uk_deadline = rdtime() + timebase_hz() * 20; // 20s wall-clock, any board
                 while (uk_new < 0 && rdtime() < uk_deadline) {
                     yield();
                     ns_mount("/srv/usbd/", "usbd");

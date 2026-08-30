@@ -60,6 +60,7 @@ const int SYS_NS_LIST       = 45; // copy the caller's namespace out — see src
 const int SYS_NS_BIND       = 46; // Plan 9 `bind` — see src/entry.c3's case
 const int SYS_MAP           = 47; // map fresh zero-filled RW pages, returns base vaddr or -1 — see src/entry.c3's case
 const int SYS_STDIN_ISATTY  = 48; // 1 = console, 0 = pipe — see src/entry.c3's case
+const int SYS_TIMEBASE      = 49; // the `time` CSR tick rate (Hz) — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -1119,6 +1120,12 @@ fn ulong rdtime() @export("rdtime") {
         sd t0, 0(t1)
     `);
     return rdtime_tmp;
+}
+
+// The `time` CSR tick rate (Hz). rdtime() + timebase_hz() * N == N
+// seconds from now, on any board.
+fn ulong timebase_hz() @export("timebase_hz") {
+    return (ulong)syscall(SYS_TIMEBASE, 0, 0, 0);
 }
 
 fn void putchar(char ch) @export("putchar") {

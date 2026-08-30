@@ -31,25 +31,25 @@ though `svc: respawned gpiod` had printed. Now guarded on the
 prefix-match length (`m == 11` / `m == 10`, like `netdkilltest`) **and**
 a generation change vs the killed instance.
 
-Real-Duo re-test: **`gpiodkilltest` and `usbdkilltest` both PASS now.**
+Real-Duo re-test: **`gpiodkilltest` and `usbdkilltest` both PASS.**
 The `driver_irq_pending` clear (+ the test's generation guard) fixed
 the gpiod case — the respawned gpiod re-maps its MMIO, rebuilds its pin
 table, and services a real SET_DIR on the status-LED pin.
 
-Still failing: **`fsdkilltest` / `storagekilltest` on the Duo.**
-`storagekilltest` prints `svc: respawned sdd` *twice* — the first
-respawn's `sdd_enumerate()` fails, `panic()`s, the supervisor respawns
-again, that fails too. A respawned sdd can't re-enumerate the SD card.
-The cold-boot path gets BootROM's identification-speed clock for free;
-a respawn inherits whatever `sdd_raise_clock` left (run speed), and
-`sdd_pad_power_clock_init` deliberately never touches the clock
-divisor. Prime suspect, unconfirmed.
+**`fsdkilltest` / `storagekilltest` also PASS — the Duo failures were a
+test-harness timing bug, not a driver bug.** With the new `loud`
+diagnostic (`SYS_BOOT_QUIET a0=1` / `boot_loud()`), the respawned sdd
+was watched enumerating the card *cleanly every time*: CMD0 ok, CMD8
+0x1aa, ACMD41 ready after 0x4f tries, CMD2/3/7 ok, clock raised, "card
+ready". The test still said FAILED because its respawn deadline was a
+hardcoded tick count (`rdtime() + 100000000`) calibrated for QEMU's
+10 MHz `time` CSR — only ~4 s of real budget on the Duo's 25 MHz clock,
+and `fsdkilltest`'s was ~1.2 s. That's not enough for the 1 Hz
+supervisor tick plus a real SD re-enumeration.
 
-To see where enumeration actually fails, added a diagnostic:
-`SYS_BOOT_QUIET` now takes `a0` (1 = re-enable output), `boot_loud()`
-wrapper, and a `loud` builtin in the dev shell. `loud; storagekilltest`
-surfaces the respawned sdd's own `sdd: CMD0 …` prints, which are
-otherwise silenced exactly like the original's.
+Fix: `SYS_TIMEBASE` (#49) → `timebase_hz()`. Every killtest deadline is
+now `rdtime() + timebase_hz() * 20` — 20 s wall-clock on any board.
+§5.5 is closed for every Duo-testable driver (fsd, sdd, usbd, gpiod).
 
 ---
 
