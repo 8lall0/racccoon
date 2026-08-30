@@ -4,6 +4,44 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — wasm §4: SYS_MAP + /bin/wasm milestone 1a
+
+Started the WebAssembly interpreter (roadmap §4). Two commits.
+
+**`SYS_MAP` (`dc860c2`)** — userspace had no heap and a `/bin` image is
+capped at `EXEC_MAX_IMAGE_SIZE` (256 KiB, `.bss` included). `SYS_MAP
+(nbytes) → vaddr` maps page-rounded fresh zero-filled RW+U memory at a
+per-process `heap_top` bump pointer. No unmap needed —
+`proc_destroy`/`sys_exec` already walk every `PAGE_U` leaf. Bounded at
+16 MiB/process; `free_page_count()` pre-check so the per-page
+`alloc_pages(1)` can't hit the OOM panic. `heap_top` inits past the
+image in `create_process`, past image+argv in `sys_exec`, copied from
+the parent in `sys_rfork` (which copies every `PAGE_U` leaf anyway).
+`maptest` covers zero-fill / bump / RW / a forked child's own heap / no
+leak across runs. First step toward a real userspace allocator.
+
+**`/bin/wasm` 1a (`800d313`)** — the decoder (LEB128, section walk,
+type/import/func/global/export/code, every read bounds-checked against
+the section end — the `sys_exec` ELF-parser discipline) + an
+explicit-frame interpreter (no native recursion — the `ext2_resolve_
+block` pattern) for `i32/i64.const`, `local.get/set/tee`,
+`global.get/set`, `call`, `return`/`end`, `drop`, `nop`, `unreachable`,
+`i32.add/sub/mul`. Host module `"racccoon"` (not WASI):
+`print_i32`, `proc_exit`. All working memory `SYS_MAP`'d. `wasm.bin` is
+84 KiB.
+
+Fixtures are hand-assembled by `test/mkwasm.py` (no `wat2wasm` on the
+host); `build.sh` seeds `build/wasm/*.wasm` onto every disk image next
+to `/bin`. QEMU: `wasm add.wasm` prints `5` (`2 + 3` through the host
+import), exits 0; `wasmtest` confirms; regression green; Duo builds
+clean.
+
+Next: 1b (full integer opcode set + linear memory), 1c (control flow +
+the branch sidetable), 1d (`call_indirect` + more host imports), 2
+(float ops).
+
+---
+
 ## 2026-08-30 — hardware FPU (§3)
 
 Floats used to `panic()` — soft-float `rv64imac`, no compiler-rt linked,
