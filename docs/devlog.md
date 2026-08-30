@@ -4,6 +4,35 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — shell: output-only builtins as pipeline stages
+
+Roadmap §2.5. `pwd`, `hello`, `namespace` / `ns` now work as pipeline
+stages — `namespace | head -n 2`, `pwd | cat > f`, `pwd | cat | cat`.
+
+A pipeline stage is a forked child, so the trick is just: for a
+pipeable builtin, `rfork` and let the child run `shell_dispatch_common`
+(the exact same path a plain command takes) and then `exit()`. The
+parent has already wired that child's stdout to the stage pipe before
+it runs — same cooperative "wire before the child runs" guarantee the
+external-command stages rely on. New `shell_spawn_stage()` picks builtin
+vs. `/bin` spawn; the spawn loop calls it instead of `shell_spawn()`.
+
+Gated (`shell_builtin_pipeable`) to output-only builtins with no
+shell-process side effect. `cd` / `su` / `login` / `mount` / `bind` /
+`exit` / `mountusb` are out — their whole point is a side effect on the
+shell's own long-lived process, which a child can't deliver; in a
+pipeline they fall through to the `/bin` path and 127 like any unknown
+command (`cd /bin | cat` → `cd: command not found`, and `pwd` is
+unchanged afterward). `echo` / `whoami` are out too — real `/bin`
+binaries already cover them. The no-pipe/no-redirection path is
+untouched: builtins still run in-process there, so `cd` works.
+
+QEMU disk_dual: the cases above plus regression green (bigreadtest,
+pathtest, mounttest, killtest, envtest, nstest, srvtest, p9fstest); Duo
+kernel builds clean, hw verification pending.
+
+---
+
 ## 2026-08-29 (continued) — shell: bind/mount/namespace, login, globbing
 
 Roadmap §2.5, three of the "still to do" items in one pass (they all

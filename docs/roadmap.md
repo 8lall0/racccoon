@@ -207,10 +207,15 @@ not bourne. Interleaved with §1/§2 rather than a phase of its own.
   /usr/<name>`. `root` always works; no `/adm/users` → comes up as
   root. Also a `login <user>` builtin. `shell_readline()` extracted +
   shared.
+- **output-only builtins as pipeline stages** — `pwd` / `hello` /
+  `namespace` / `ns` run as a forked child (via `shell_spawn_stage` →
+  `shell_dispatch_common`) when they appear in a pipeline or with
+  redirection (`namespace | head -n 2`, `pwd > f`). Side-effecting
+  builtins (`cd`, `su`, `mount`, …) stay out — a child can't deliver
+  their effect; they 127 in a pipeline.
 
 **Still to do:**
 - backslash escapes; `{a,b}` brace expansion.
-- builtins as pipeline stages.
 - `&` background jobs, `^Z`/`jobs` — later.
 - `#!` scripts + `if`/`for`/`while` — much later.
 
