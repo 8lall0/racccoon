@@ -34,8 +34,19 @@ everything sits on: **diskd (QEMU) / sdd (Duo)**.
 `storagekilltest` (shell_test.c3): kill the storage driver, confirm the
 supervisor re-inits it and reads recover. QEMU: passes repeatedly, and
 `bigreadtest` / `fsdkilltest` / full regression stay green afterwards.
-Duo kernel builds clean; sdd's respawn on real hardware not yet
-exercised (identical mechanism to diskd).
+Duo boots clean with sdd registered under the supervisor; a fault-test
+of sdd's *respawn* on real hardware still needs a dev-shell build (the
+Duo runs the production shell, which has no `storagekilltest`).
+
+Side quest while verifying on the Duo: `shell_login()`'s one-shot
+`fs_read("/adm/users")` (the "unprovisioned card → root console"
+fallback) now retries for ~10 s first — a slightly larger kernel image
+had started racing the SD-driver + ext2-mount bring-up. That turned out
+not to be the actual problem this time, though: the SD card in use had
+its ext2 partition at sector 526336, not the `FS_PARTITION_START_SECTOR`
+2099200 the Duo kernel reads — so every FS read failed and login was
+skipped. Re-seating the correct card (DUOBOOT at 2048/1 GiB, ext2 at
+2099200) fixed it; the retry stays as cheap insurance.
 
 ---
 
