@@ -163,13 +163,21 @@ fn void main() {
                 }
                 continue;
             }
+            // A stray NUL (UART framing error) or a bare LF at the start
+            // of a line (the trailing half of a CRLF the CR already
+            // consumed, or a double-tap) must not become a one-character
+            // phantom command — swallow it silently. Same fix as
+            // shell_common.c3's shell_readline (production shell).
+            if (ch == 0 || (ch == '\n' && i == 0)) {
+                continue;
+            }
             putchar(ch);
             if (i == 127) {
                 print("\ncommand line too long\n");
                 too_long = true;
                 break;
             }
-            if (ch == '\r') {
+            if (ch == '\r' || ch == '\n') {
                 print("\n");
                 cmdline[i] = 0;
                 break;

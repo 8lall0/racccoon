@@ -4,6 +4,31 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — shell: readline accepts LF, not just CR
+
+Chasing a spurious "`command not found`" (empty/garbage command name) on
+the real Duo that showed up while testing `/bin/wasm`. It wasn't wasm,
+`SYS_MAP`, or the kernel — 108 fork/exec/`SYS_MAP`/exit cycles ran clean
+in QEMU. It was **`shell_readline`**: it only ended a line on `\r`, so a
+stray `\n` — from a serial terminal sending CRLF, a double-Enter, a
+paste, a UART hiccup — got stored as an ordinary character. A leftover
+`\n` at the head of the next line turned `wasm fac.wasm` into
+`\nwasm fac.wasm`, tokenised to a command named `\nwasm` → `/bin/\nwasm`
+not found. Reproduced exactly in QEMU by feeding `\r\n` instead of `\r`.
+
+Fix, in both readline loops (`shell_common.c3:shell_readline` for the
+production shell, `shell_test.c3`'s own inline copy for the QEMU dev
+shell): swallow a NUL or a bare leading `\n`; end the line on `\r` **or**
+`\n` (a trailing LF from CRLF then reads back as an empty line, which
+`shell_exec_line` already no-ops). Real Duo: pressing Enter on an empty
+prompt, double-Enter, and repeated `wasm` runs are all clean now — the
+phantom is gone.
+
+Unrelated minor thing noticed: `/bin/head` with no file argument blocks
+reading the console instead of printing usage.
+
+---
+
 ## 2026-08-30 — wasm §4: /bin/wasm milestones 1b–1d (integer core done)
 
 Finished the integer subset of `/bin/wasm`. Milestone 1a landed the

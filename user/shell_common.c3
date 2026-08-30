@@ -151,12 +151,23 @@ fn int shell_readline(char* buf, int cap)
             if (i > 0) { i--; print("\b \b"); }
             continue;
         }
+        // A stray NUL (a UART framing error / line break shows up as one)
+        // or a bare LF at the start of a line (the trailing half of a
+        // CRLF the previous line's CR already consumed, or a double-tap)
+        // must not become a one-character phantom command — swallow it,
+        // no echo, no store.
+        if (ch == 0 || (ch == '\n' && i == 0)) {
+            continue;
+        }
         putchar(ch);
         if (i == cap - 1) {
             print("\ncommand line too long\n");
             return -1;
         }
-        if (ch == '\r') {
+        // CR or LF ends the line — accept either so a CRLF terminal works
+        // (its CR ends the command; the following LF then reads back here
+        // as an empty line, which shell_exec_line treats as a no-op).
+        if (ch == '\r' || ch == '\n') {
             print("\n");
             buf[i] = 0;
             return i;
