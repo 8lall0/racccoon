@@ -47,23 +47,74 @@ const char EXT_TABLE  = 1;
 const char EXT_MEM    = 2;
 const char EXT_GLOBAL = 3;
 
-// opcodes handled this milestone
 const char OP_UNREACHABLE = 0x00;
 const char OP_NOP         = 0x01;
 const char OP_END         = 0x0b;
 const char OP_RETURN      = 0x0f;
 const char OP_CALL        = 0x10;
 const char OP_DROP        = 0x1a;
+const char OP_SELECT      = 0x1b;
 const char OP_LOCAL_GET   = 0x20;
 const char OP_LOCAL_SET   = 0x21;
 const char OP_LOCAL_TEE   = 0x22;
 const char OP_GLOBAL_GET  = 0x23;
 const char OP_GLOBAL_SET  = 0x24;
-const char OP_I32_CONST   = 0x41;
-const char OP_I64_CONST   = 0x42;
-const char OP_I32_ADD     = 0x6a;
-const char OP_I32_SUB     = 0x6b;
-const char OP_I32_MUL     = 0x6c;
+
+// memory load/store  0x28..0x40
+const char OP_I32_LOAD    = 0x28; const char OP_I64_LOAD    = 0x29;
+const char OP_F32_LOAD    = 0x2a; const char OP_F64_LOAD    = 0x2b;
+const char OP_I32_LOAD8_S = 0x2c; const char OP_I32_LOAD8_U = 0x2d;
+const char OP_I32_LOAD16_S= 0x2e; const char OP_I32_LOAD16_U= 0x2f;
+const char OP_I64_LOAD8_S = 0x30; const char OP_I64_LOAD8_U = 0x31;
+const char OP_I64_LOAD16_S= 0x32; const char OP_I64_LOAD16_U= 0x33;
+const char OP_I64_LOAD32_S= 0x34; const char OP_I64_LOAD32_U= 0x35;
+const char OP_I32_STORE   = 0x36; const char OP_I64_STORE   = 0x37;
+const char OP_F32_STORE   = 0x38; const char OP_F64_STORE   = 0x39;
+const char OP_I32_STORE8  = 0x3a; const char OP_I32_STORE16 = 0x3b;
+const char OP_I64_STORE8  = 0x3c; const char OP_I64_STORE16 = 0x3d;
+const char OP_I64_STORE32 = 0x3e;
+const char OP_MEMORY_SIZE = 0x3f; const char OP_MEMORY_GROW = 0x40;
+
+const char OP_I32_CONST   = 0x41; const char OP_I64_CONST   = 0x42;
+const char OP_F32_CONST   = 0x43; const char OP_F64_CONST   = 0x44;
+
+// i32 comparisons 0x45..0x4f
+const char OP_I32_EQZ  = 0x45; const char OP_I32_EQ  = 0x46; const char OP_I32_NE  = 0x47;
+const char OP_I32_LT_S = 0x48; const char OP_I32_LT_U = 0x49; const char OP_I32_GT_S = 0x4a;
+const char OP_I32_GT_U = 0x4b; const char OP_I32_LE_S = 0x4c; const char OP_I32_LE_U = 0x4d;
+const char OP_I32_GE_S = 0x4e; const char OP_I32_GE_U = 0x4f;
+// i64 comparisons 0x50..0x5a
+const char OP_I64_EQZ  = 0x50; const char OP_I64_EQ  = 0x51; const char OP_I64_NE  = 0x52;
+const char OP_I64_LT_S = 0x53; const char OP_I64_LT_U = 0x54; const char OP_I64_GT_S = 0x55;
+const char OP_I64_GT_U = 0x56; const char OP_I64_LE_S = 0x57; const char OP_I64_LE_U = 0x58;
+const char OP_I64_GE_S = 0x59; const char OP_I64_GE_U = 0x5a;
+
+// i32 numeric 0x67..0x78
+const char OP_I32_CLZ = 0x67; const char OP_I32_CTZ = 0x68; const char OP_I32_POPCNT = 0x69;
+const char OP_I32_ADD = 0x6a; const char OP_I32_SUB = 0x6b; const char OP_I32_MUL = 0x6c;
+const char OP_I32_DIV_S = 0x6d; const char OP_I32_DIV_U = 0x6e;
+const char OP_I32_REM_S = 0x6f; const char OP_I32_REM_U = 0x70;
+const char OP_I32_AND = 0x71; const char OP_I32_OR = 0x72; const char OP_I32_XOR = 0x73;
+const char OP_I32_SHL = 0x74; const char OP_I32_SHR_S = 0x75; const char OP_I32_SHR_U = 0x76;
+const char OP_I32_ROTL = 0x77; const char OP_I32_ROTR = 0x78;
+// i64 numeric 0x79..0x8a
+const char OP_I64_CLZ = 0x79; const char OP_I64_CTZ = 0x7a; const char OP_I64_POPCNT = 0x7b;
+const char OP_I64_ADD = 0x7c; const char OP_I64_SUB = 0x7d; const char OP_I64_MUL = 0x7e;
+const char OP_I64_DIV_S = 0x7f; const char OP_I64_DIV_U = 0x80;
+const char OP_I64_REM_S = 0x81; const char OP_I64_REM_U = 0x82;
+const char OP_I64_AND = 0x83; const char OP_I64_OR = 0x84; const char OP_I64_XOR = 0x85;
+const char OP_I64_SHL = 0x86; const char OP_I64_SHR_S = 0x87; const char OP_I64_SHR_U = 0x88;
+const char OP_I64_ROTL = 0x89; const char OP_I64_ROTR = 0x8a;
+
+// conversions
+const char OP_I32_WRAP_I64    = 0xa7;
+const char OP_I64_EXTEND_I32_S = 0xac; const char OP_I64_EXTEND_I32_U = 0xad;
+const char OP_I32_EXTEND8_S  = 0xc0; const char OP_I32_EXTEND16_S = 0xc1;
+const char OP_I64_EXTEND8_S  = 0xc2; const char OP_I64_EXTEND16_S = 0xc3;
+const char OP_I64_EXTEND32_S = 0xc4;
+
+const int WPAGE = 65536;             // wasm linear-memory page size
+const int MEM_HARD_CAP_PAGES = 240;  // ~15 MiB — under HEAP_MAX_BYTES with room for the other allocs
 
 // host function ids (module "racccoon")
 const int HOST_PRINT_I32 = 0;
@@ -124,6 +175,11 @@ long*   g_globals;  int  g_nglobals;   // value only; mutability not enforced ye
 long*   g_vstack;   int  g_vtop;
 long*   g_locals;   int  g_ltop;
 WFrame* g_frames;   int  g_fcount;
+
+char*   g_mem;             // linear memory (SYS_MAP'd LAST so memory.grow can extend it)
+int     g_mem_pages;       // current size in 64 KiB pages
+int     g_mem_cap_pages;   // pre-allocated ceiling (declared max, capped)
+bool    g_has_mem;
 
 // --- fatal-exit helper ------------------------------------------------
 fn void die(char* msg)
@@ -359,6 +415,115 @@ fn void decode_code(Cur* c)
     }
 }
 
+// SEC_MEM=5 — at most one memory. Allocated here (SYS_MAP), and since
+// nothing else map_pages() after decode, memory.grow can extend the
+// region in place. Section order (MEM before DATA) means g_mem exists
+// before decode_data runs.
+fn void decode_mem(Cur* c)
+{
+    uint n = read_u32(c);
+    if (n == 0) { return; }
+    if (n > 1) { die("multi-memory unsupported"); }
+    char flag = cur_byte(c);
+    uint minp = read_u32(c);
+    uint maxp = (flag & 1) != 0 ? read_u32(c) : 0;
+    if ((int)minp > MEM_HARD_CAP_PAGES) { die("initial memory too large"); }
+    int cap = (int)minp;
+    if ((flag & 1) != 0 && (int)maxp <= 64 && (int)maxp > cap) { cap = (int)maxp; }
+    if (cap < 1) { cap = 1; }
+    g_mem = wasm_alloc((uint)(cap * WPAGE));
+    g_mem_pages = (int)minp;
+    g_mem_cap_pages = cap;
+    g_has_mem = true;
+}
+
+// SEC_DATA=11 — active data segments only (mode 0: memidx implicit 0,
+// offset is a const expr). Runs after decode_mem alloc'd g_mem.
+fn void decode_data(Cur* c)
+{
+    uint n = read_u32(c);
+    for (uint i = 0; i < n; i++)
+    {
+        uint mode = read_u32(c);
+        if (mode != 0) { die("passive/explicit data segment unsupported"); }
+        // offset expr: a single i32.const then END
+        if (cur_byte(c) != OP_I32_CONST) { die("data offset not i32.const"); }
+        int off = read_i32(c);
+        if (cur_byte(c) != OP_END) { die("data offset not END-terminated"); }
+        uint len = read_u32(c);
+        if (len > c.end - c.p) { die("data segment past end"); }
+        if (!g_has_mem) { die("data segment with no memory"); }
+        long lim = (long)g_mem_pages * WPAGE;
+        if (off < 0 || (long)off + (long)len > lim) { die("data segment out of bounds"); }
+        for (uint k = 0; k < len; k++) { g_mem[(uint)off + k] = g_mod[c.p + k]; }
+        c.p += len;
+    }
+}
+
+// --- immediate readers (advance fr.ip) --------------------------------
+fn uint imm_u32(WFrame* fr)
+{
+    Cur c; c.p = fr.ip; c.end = g_mod_len;
+    uint v = read_u32(&c);
+    fr.ip = c.p;
+    return v;
+}
+
+fn int imm_i32(WFrame* fr)
+{
+    Cur c; c.p = fr.ip; c.end = g_mod_len;
+    int v = read_i32(&c);
+    fr.ip = c.p;
+    return v;
+}
+
+fn long imm_i64(WFrame* fr)
+{
+    Cur c; c.p = fr.ip; c.end = g_mod_len;
+    long v = read_i64(&c);
+    fr.ip = c.p;
+    return v;
+}
+
+// memarg: align (ignored) + offset. Returns the effective linear-memory
+// address, bounds-checked for `size` bytes; dies on OOB.
+fn uint mem_ea(WFrame* fr, int size)
+{
+    imm_u32(fr);                       // align hint — ignored
+    uint moff = imm_u32(fr);
+    uint base = (uint)vpop();           // i32 dynamic address
+    long ea = (long)base + (long)moff;
+    if (!g_has_mem) { die("memory op with no memory"); }
+    long lim = (long)g_mem_pages * WPAGE;
+    if (ea < 0 || ea + (long)size > lim) { die("out-of-bounds memory access"); }
+    return (uint)ea;
+}
+
+// --- bit-count helpers (no stdlib) ----------------------------------
+fn int clz32(uint x) { if (x == 0) return 32; int n = 0; while ((x & 0x80000000u) == 0) { n++; x <<= 1; } return n; }
+fn int ctz32(uint x) { if (x == 0) return 32; int n = 0; while ((x & 1u) == 0) { n++; x >>= 1; } return n; }
+fn int pop32(uint x)  { int n = 0; while (x != 0) { n += (int)(x & 1u); x >>= 1; } return n; }
+fn int clz64(ulong x) { if (x == 0) return 64; int n = 0; while ((x & 0x8000000000000000u) == 0) { n++; x <<= 1; } return n; }
+fn int ctz64(ulong x) { if (x == 0) return 64; int n = 0; while ((x & 1u) == 0) { n++; x >>= 1; } return n; }
+fn int pop64(ulong x)  { int n = 0; while (x != 0) { n += (int)(x & 1u); x >>= 1; } return n; }
+
+fn int wasm_mem_grow(int delta)
+{
+    int old = g_mem_pages;
+    if (delta < 0) { return -1; }
+    long want = (long)old + (long)delta;
+    if (want > MEM_HARD_CAP_PAGES) { return -1; }
+    if ((int)want > g_mem_cap_pages)
+    {
+        int extra = (int)want - g_mem_cap_pages;
+        char* p = (char*)map_pages((uint)(extra * WPAGE));
+        if (p == null || p != g_mem + g_mem_cap_pages * WPAGE) { return -1; }
+        g_mem_cap_pages = (int)want;
+    }
+    g_mem_pages = (int)want;
+    return old;
+}
+
 // --- top-level decode --------------------------------------------------
 fn void decode_module()
 {
@@ -393,13 +558,13 @@ fn void decode_module()
                 case SEC_IMPORT: decode_imports(&sc);
                 case SEC_FUNC:   decode_funcsec(&sc);
                 case SEC_TABLE:  break; // 1d
-                case SEC_MEM:    break; // 1b
+                case SEC_MEM:    decode_mem(&sc);
                 case SEC_GLOBAL: decode_globals(&sc);
                 case SEC_EXPORT: decode_exports(&sc);
                 case SEC_START:  break; // 1d
                 case SEC_ELEM:   break; // 1d
                 case SEC_CODE:   decode_code(&sc);
-                case SEC_DATA:   break; // 1b
+                case SEC_DATA:   decode_data(&sc);
                 default: die("bad section id");
             }
         }
@@ -495,82 +660,173 @@ fn void interp()
 
         switch (op)
         {
-            case OP_NOP:
-                break;
-            case OP_UNREACHABLE:
-                die("unreachable executed");
-            case OP_END:
-                // no blocks yet -> end of function
-                frame_return();
-            case OP_RETURN:
-                frame_return();
-            case OP_DROP:
-                vpop();
+            case OP_NOP:      break;
+            case OP_UNREACHABLE: die("unreachable executed");
+            case OP_END:      frame_return();     // no blocks yet -> function end
+            case OP_RETURN:   frame_return();
+            case OP_DROP:     vpop();
+            case OP_SELECT:
+                long sc = vpop(); long sv2 = vpop(); long sv1 = vpop();
+                vpush((int)sc != 0 ? sv1 : sv2);
             case OP_CALL:
-                Cur cc; cc.p = fr.ip; cc.end = g_mod_len;
-                uint callee = read_u32(&cc);
-                fr.ip = cc.p;
+                uint callee = imm_u32(fr);
                 if ((int)callee >= g_nfuncs) { die("call idx"); }
-                if (g_funcs[callee].is_import)
-                {
-                    host_call(g_funcs[callee].host_id);
-                }
-                else
-                {
-                    push_frame((int)callee);
-                }
+                if (g_funcs[callee].is_import) { host_call(g_funcs[callee].host_id); }
+                else { push_frame((int)callee); }
             case OP_LOCAL_GET:
-                Cur lg; lg.p = fr.ip; lg.end = g_mod_len;
-                uint li = read_u32(&lg);
-                fr.ip = lg.p;
+                uint li = imm_u32(fr);
                 if ((int)li >= g_funcs[fr.func_idx].nlocals) { die("local idx"); }
                 vpush(g_locals[fr.locals_base + (int)li]);
             case OP_LOCAL_SET:
-                Cur ls; ls.p = fr.ip; ls.end = g_mod_len;
-                uint si = read_u32(&ls);
-                fr.ip = ls.p;
+                uint si = imm_u32(fr);
                 if ((int)si >= g_funcs[fr.func_idx].nlocals) { die("local idx"); }
                 g_locals[fr.locals_base + (int)si] = vpop();
             case OP_LOCAL_TEE:
-                Cur lt; lt.p = fr.ip; lt.end = g_mod_len;
-                uint ti = read_u32(&lt);
-                fr.ip = lt.p;
-                if ((int)ti >= g_funcs[fr.func_idx].nlocals) { die("local idx"); }
-                g_locals[fr.locals_base + (int)ti] = g_vstack[g_vtop - 1];
+                uint tti = imm_u32(fr);
+                if ((int)tti >= g_funcs[fr.func_idx].nlocals) { die("local idx"); }
+                g_locals[fr.locals_base + (int)tti] = g_vstack[g_vtop - 1];
             case OP_GLOBAL_GET:
-                Cur gg; gg.p = fr.ip; gg.end = g_mod_len;
-                uint gi = read_u32(&gg);
-                fr.ip = gg.p;
+                uint gi = imm_u32(fr);
                 if ((int)gi >= g_nglobals) { die("global idx"); }
                 vpush(g_globals[(int)gi]);
             case OP_GLOBAL_SET:
-                Cur gs; gs.p = fr.ip; gs.end = g_mod_len;
-                uint gsi = read_u32(&gs);
-                fr.ip = gs.p;
+                uint gsi = imm_u32(fr);
                 if ((int)gsi >= g_nglobals) { die("global idx"); }
                 g_globals[(int)gsi] = vpop();
-            case OP_I32_CONST:
-                Cur ic; ic.p = fr.ip; ic.end = g_mod_len;
-                int iv = read_i32(&ic);
-                fr.ip = ic.p;
-                vpush((long)iv);
-            case OP_I64_CONST:
-                Cur jc; jc.p = fr.ip; jc.end = g_mod_len;
-                long jv = read_i64(&jc);
-                fr.ip = jc.p;
-                vpush(jv);
-            case OP_I32_ADD:
-                int a2 = (int)vpop(); int a1 = (int)vpop();
-                vpush((long)(a1 + a2));
-            case OP_I32_SUB:
-                int s2 = (int)vpop(); int s1 = (int)vpop();
-                vpush((long)(s1 - s2));
-            case OP_I32_MUL:
-                int m2 = (int)vpop(); int m1 = (int)vpop();
-                vpush((long)(m1 * m2));
+            case OP_I32_CONST: vpush((long)imm_i32(fr));
+            case OP_I64_CONST: vpush(imm_i64(fr));
+
+            // --- memory loads ---
+            case OP_I32_LOAD:     uint e = mem_ea(fr, 4); vpush((long)*(int*)&g_mem[e]);
+            case OP_I64_LOAD:     uint e = mem_ea(fr, 8); vpush(*(long*)&g_mem[e]);
+            case OP_F32_LOAD:     uint e = mem_ea(fr, 4); vpush((long)(uint)*(uint*)&g_mem[e]);
+            case OP_F64_LOAD:     uint e = mem_ea(fr, 8); vpush(*(long*)&g_mem[e]);
+            case OP_I32_LOAD8_S:  uint e = mem_ea(fr, 1); vpush((long)(int)*(char*)&g_mem[e]);
+            case OP_I32_LOAD8_U:  uint e = mem_ea(fr, 1); vpush((long)((uint)g_mem[e] & 0xff));
+            case OP_I32_LOAD16_S: uint e = mem_ea(fr, 2); vpush((long)(int)*(short*)&g_mem[e]);
+            case OP_I32_LOAD16_U: uint e = mem_ea(fr, 2); vpush((long)(uint)*(ushort*)&g_mem[e]);
+            case OP_I64_LOAD8_S:  uint e = mem_ea(fr, 1); vpush((long)*(char*)&g_mem[e]);
+            case OP_I64_LOAD8_U:  uint e = mem_ea(fr, 1); vpush((long)((ulong)g_mem[e] & 0xff));
+            case OP_I64_LOAD16_S: uint e = mem_ea(fr, 2); vpush((long)*(short*)&g_mem[e]);
+            case OP_I64_LOAD16_U: uint e = mem_ea(fr, 2); vpush((long)(ulong)*(ushort*)&g_mem[e]);
+            case OP_I64_LOAD32_S: uint e = mem_ea(fr, 4); vpush((long)*(int*)&g_mem[e]);
+            case OP_I64_LOAD32_U: uint e = mem_ea(fr, 4); vpush((long)(ulong)(uint)*(uint*)&g_mem[e]);
+
+            // --- memory stores (value popped first, then address) ---
+            case OP_I32_STORE:   long v = vpop(); uint e = mem_ea(fr, 4); *(int*)&g_mem[e] = (int)v;
+            case OP_I64_STORE:   long v = vpop(); uint e = mem_ea(fr, 8); *(long*)&g_mem[e] = v;
+            case OP_F32_STORE:   long v = vpop(); uint e = mem_ea(fr, 4); *(uint*)&g_mem[e] = (uint)v;
+            case OP_F64_STORE:   long v = vpop(); uint e = mem_ea(fr, 8); *(long*)&g_mem[e] = v;
+            case OP_I32_STORE8:  long v = vpop(); uint e = mem_ea(fr, 1); g_mem[e] = (char)v;
+            case OP_I32_STORE16: long v = vpop(); uint e = mem_ea(fr, 2); *(ushort*)&g_mem[e] = (ushort)v;
+            case OP_I64_STORE8:  long v = vpop(); uint e = mem_ea(fr, 1); g_mem[e] = (char)v;
+            case OP_I64_STORE16: long v = vpop(); uint e = mem_ea(fr, 2); *(ushort*)&g_mem[e] = (ushort)v;
+            case OP_I64_STORE32: long v = vpop(); uint e = mem_ea(fr, 4); *(uint*)&g_mem[e] = (uint)v;
+
+            case OP_MEMORY_SIZE: imm_u32(fr); vpush((long)g_mem_pages);
+            case OP_MEMORY_GROW: imm_u32(fr); int d = (int)vpop(); vpush((long)wasm_mem_grow(d));
+
+            // --- i32 comparisons (result i32 0/1) ---
+            case OP_I32_EQZ:  vpush((int)vpop() == 0 ? 1 : 0);
+            case OP_I32_EQ:   int b = (int)vpop(); int a = (int)vpop(); vpush(a == b ? 1 : 0);
+            case OP_I32_NE:   int b = (int)vpop(); int a = (int)vpop(); vpush(a != b ? 1 : 0);
+            case OP_I32_LT_S: int b = (int)vpop(); int a = (int)vpop(); vpush(a < b ? 1 : 0);
+            case OP_I32_LT_U: uint b = (uint)vpop(); uint a = (uint)vpop(); vpush(a < b ? 1 : 0);
+            case OP_I32_GT_S: int b = (int)vpop(); int a = (int)vpop(); vpush(a > b ? 1 : 0);
+            case OP_I32_GT_U: uint b = (uint)vpop(); uint a = (uint)vpop(); vpush(a > b ? 1 : 0);
+            case OP_I32_LE_S: int b = (int)vpop(); int a = (int)vpop(); vpush(a <= b ? 1 : 0);
+            case OP_I32_LE_U: uint b = (uint)vpop(); uint a = (uint)vpop(); vpush(a <= b ? 1 : 0);
+            case OP_I32_GE_S: int b = (int)vpop(); int a = (int)vpop(); vpush(a >= b ? 1 : 0);
+            case OP_I32_GE_U: uint b = (uint)vpop(); uint a = (uint)vpop(); vpush(a >= b ? 1 : 0);
+
+            // --- i64 comparisons ---
+            case OP_I64_EQZ:  vpush(vpop() == 0 ? 1 : 0);
+            case OP_I64_EQ:   long b = vpop(); long a = vpop(); vpush(a == b ? 1 : 0);
+            case OP_I64_NE:   long b = vpop(); long a = vpop(); vpush(a != b ? 1 : 0);
+            case OP_I64_LT_S: long b = vpop(); long a = vpop(); vpush(a < b ? 1 : 0);
+            case OP_I64_LT_U: ulong b = (ulong)vpop(); ulong a = (ulong)vpop(); vpush(a < b ? 1 : 0);
+            case OP_I64_GT_S: long b = vpop(); long a = vpop(); vpush(a > b ? 1 : 0);
+            case OP_I64_GT_U: ulong b = (ulong)vpop(); ulong a = (ulong)vpop(); vpush(a > b ? 1 : 0);
+            case OP_I64_LE_S: long b = vpop(); long a = vpop(); vpush(a <= b ? 1 : 0);
+            case OP_I64_LE_U: ulong b = (ulong)vpop(); ulong a = (ulong)vpop(); vpush(a <= b ? 1 : 0);
+            case OP_I64_GE_S: long b = vpop(); long a = vpop(); vpush(a >= b ? 1 : 0);
+            case OP_I64_GE_U: ulong b = (ulong)vpop(); ulong a = (ulong)vpop(); vpush(a >= b ? 1 : 0);
+
+            // --- i32 numeric ---
+            case OP_I32_CLZ:    vpush((long)clz32((uint)vpop()));
+            case OP_I32_CTZ:    vpush((long)ctz32((uint)vpop()));
+            case OP_I32_POPCNT: vpush((long)pop32((uint)vpop()));
+            case OP_I32_ADD:    int b = (int)vpop(); int a = (int)vpop(); vpush((long)(a + b));
+            case OP_I32_SUB:    int b = (int)vpop(); int a = (int)vpop(); vpush((long)(a - b));
+            case OP_I32_MUL:    int b = (int)vpop(); int a = (int)vpop(); vpush((long)(a * b));
+            case OP_I32_DIV_S:  int b = (int)vpop(); int a = (int)vpop();
+                if (b == 0) { die("i32.div_s by zero"); }
+                if (a == -2147483648 && b == -1) { die("i32.div_s overflow"); }
+                vpush((long)(a / b));
+            case OP_I32_DIV_U:  uint b = (uint)vpop(); uint a = (uint)vpop();
+                if (b == 0) { die("i32.div_u by zero"); }
+                vpush((long)(a / b));
+            case OP_I32_REM_S:  int b = (int)vpop(); int a = (int)vpop();
+                if (b == 0) { die("i32.rem_s by zero"); }
+                vpush((long)(a == -2147483648 && b == -1 ? 0 : a % b));
+            case OP_I32_REM_U:  uint b = (uint)vpop(); uint a = (uint)vpop();
+                if (b == 0) { die("i32.rem_u by zero"); }
+                vpush((long)(a % b));
+            case OP_I32_AND:   int b = (int)vpop(); int a = (int)vpop(); vpush((long)(a & b));
+            case OP_I32_OR:    int b = (int)vpop(); int a = (int)vpop(); vpush((long)(a | b));
+            case OP_I32_XOR:   int b = (int)vpop(); int a = (int)vpop(); vpush((long)(a ^ b));
+            case OP_I32_SHL:   uint b = (uint)vpop() & 31; uint a = (uint)vpop(); vpush((long)(int)(a << b));
+            case OP_I32_SHR_S: uint b = (uint)vpop() & 31; int a = (int)vpop(); vpush((long)(a >> b));
+            case OP_I32_SHR_U: uint b = (uint)vpop() & 31; uint a = (uint)vpop(); vpush((long)(int)(a >> b));
+            case OP_I32_ROTL:  uint b = (uint)vpop() & 31; uint a = (uint)vpop();
+                vpush((long)(int)(b == 0 ? a : (a << b) | (a >> (32 - b))));
+            case OP_I32_ROTR:  uint b = (uint)vpop() & 31; uint a = (uint)vpop();
+                vpush((long)(int)(b == 0 ? a : (a >> b) | (a << (32 - b))));
+
+            // --- i64 numeric ---
+            case OP_I64_CLZ:    vpush((long)clz64((ulong)vpop()));
+            case OP_I64_CTZ:    vpush((long)ctz64((ulong)vpop()));
+            case OP_I64_POPCNT: vpush((long)pop64((ulong)vpop()));
+            case OP_I64_ADD:    long b = vpop(); long a = vpop(); vpush(a + b);
+            case OP_I64_SUB:    long b = vpop(); long a = vpop(); vpush(a - b);
+            case OP_I64_MUL:    long b = vpop(); long a = vpop(); vpush(a * b);
+            case OP_I64_DIV_S:  long b = vpop(); long a = vpop();
+                if (b == 0) { die("i64.div_s by zero"); }
+                if (a == (long)0x8000000000000000 && b == -1) { die("i64.div_s overflow"); }
+                vpush(a / b);
+            case OP_I64_DIV_U:  ulong b = (ulong)vpop(); ulong a = (ulong)vpop();
+                if (b == 0) { die("i64.div_u by zero"); }
+                vpush((long)(a / b));
+            case OP_I64_REM_S:  long b = vpop(); long a = vpop();
+                if (b == 0) { die("i64.rem_s by zero"); }
+                vpush(a == (long)0x8000000000000000 && b == -1 ? 0 : a % b);
+            case OP_I64_REM_U:  ulong b = (ulong)vpop(); ulong a = (ulong)vpop();
+                if (b == 0) { die("i64.rem_u by zero"); }
+                vpush((long)(a % b));
+            case OP_I64_AND:   long b = vpop(); long a = vpop(); vpush(a & b);
+            case OP_I64_OR:    long b = vpop(); long a = vpop(); vpush(a | b);
+            case OP_I64_XOR:   long b = vpop(); long a = vpop(); vpush(a ^ b);
+            case OP_I64_SHL:   ulong b = (ulong)vpop() & 63; ulong a = (ulong)vpop(); vpush((long)(a << b));
+            case OP_I64_SHR_S: ulong b = (ulong)vpop() & 63; long a = vpop(); vpush(a >> b);
+            case OP_I64_SHR_U: ulong b = (ulong)vpop() & 63; ulong a = (ulong)vpop(); vpush((long)(a >> b));
+            case OP_I64_ROTL:  ulong b = (ulong)vpop() & 63; ulong a = (ulong)vpop();
+                vpush((long)(b == 0 ? a : (a << b) | (a >> (64 - b))));
+            case OP_I64_ROTR:  ulong b = (ulong)vpop() & 63; ulong a = (ulong)vpop();
+                vpush((long)(b == 0 ? a : (a >> b) | (a << (64 - b))));
+
+            // --- conversions ---
+            case OP_I32_WRAP_I64:     vpush((long)(int)vpop());
+            case OP_I64_EXTEND_I32_S: vpush((long)(int)vpop());
+            case OP_I64_EXTEND_I32_U: vpush((long)((ulong)(uint)vpop()));
+            case OP_I32_EXTEND8_S:    vpush((long)(int)(char)(int)vpop());
+            case OP_I32_EXTEND16_S:   vpush((long)(int)(short)(int)vpop());
+            case OP_I64_EXTEND8_S:    vpush((long)(char)vpop());
+            case OP_I64_EXTEND16_S:   vpush((long)(short)vpop());
+            case OP_I64_EXTEND32_S:   vpush((long)(int)vpop());
+
             default:
                 print("wasm: unimplemented opcode 0x");
-                print_hex8((uint)(char)op);
+                print_hex8((uint)(char)op & 0xff);
                 putchar('\n');
                 exitcode(1);
         }

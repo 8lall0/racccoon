@@ -132,6 +132,32 @@ start_body = (
 code = [body([(2, I32)], start_body)]
 fixtures["loop.wasm"] = module(t, imp, fn, exp, code)
 
+# --- mem.wasm : data seg + load/store/grow/compare -> "142" -----------
+# type 0: () -> ()      _start
+# type 1: (i32) -> ()   racccoon.print_i32
+t = [functype([], []), functype([I32], [])]
+imp = [import_func("racccoon", "print_i32", 1)]         # funcidx 0
+fn  = [0]                                                # funcidx 1: _start
+exp = [export_func("_start", 1)]
+mem = b"\x00" + uleb(1)                                 # limits: flag 0, min 1 page
+I32_LOAD  = lambda off: b"\x28\x02" + uleb(off)         # align=2
+I32_STORE = lambda off: b"\x36\x02" + uleb(off)
+# active data segment (mode 0) @ offset 0: bytes  0A 00 00 00  (= i32 10)
+data = [uleb(0) + i32c(0) + END + uleb(4) + bytes([10, 0, 0, 0])]
+# mem[0] starts at 10 (data seg). store 10+32 at mem[4]; grow +1;
+# print load(mem[4]) + memory.size*50  = 42 + 2*50 = 142
+start_body = (
+    i32c(4) + i32c(0) + I32_LOAD(0) + i32c(32) + I32_ADD + I32_STORE(0) +
+    i32c(1) + b"\x40\x00" + DROP +                      # memory.grow 1
+    i32c(4) + I32_LOAD(0) +                             # 42
+    b"\x3f\x00" + i32c(50) + I32_MUL +                  # memory.size(=2) * 50 = 100
+    I32_ADD +                                            # 142
+    call(0)
+)
+code = [body([], start_body)]
+fixtures["mem.wasm"] = module(t, imp, fn, exp, code, mem=mem, data=data)
+
+
 def main():
     outdir = sys.argv[1] if len(sys.argv) > 1 else "build/wasm"
     os.makedirs(outdir, exist_ok=True)
