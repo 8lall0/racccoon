@@ -178,7 +178,12 @@ not bourne. Interleaved with §1/§2 rather than a phase of its own.
   `'...'` fully literal (`''` → `'`), `"..."` literal but `$name`
   expands. The tokeniser splits only on unquoted whitespace and treats
   `|` / `<` / `>` / `>>` / `;` / `&&` / `||` as operators only when
-  unquoted. Unterminated quote → status 2. No backslash escapes.
+  unquoted. Unterminated quote → status 2.
+- **backslash escapes** — `\<char>` outside quotes is `<char>` literal
+  (`\ ` escaped space, `\|` `\$` `\*` escaped operator/dollar/metachar);
+  inside `"..."`, `\` escapes only `` $ ` " \ ``; inside `'...'` it's
+  literal. Escaped bytes get `qmask = 1` so the tokeniser already does
+  the right thing.
 - **`/bin/head`** — first stdin filter (`ls | head -n 3`); `head [-n N]`,
   reads stdin only, default 10 lines.
 - **multi-stage pipelines (`a | b | c`)** — up to `MAX_STAGES = 6`,
@@ -215,7 +220,7 @@ not bourne. Interleaved with §1/§2 rather than a phase of its own.
   their effect; they 127 in a pipeline.
 
 **Still to do:**
-- backslash escapes; `{a,b}` brace expansion.
+- `{a,b}` brace expansion.
 - `&` background jobs, `^Z`/`jobs` — later.
 - `#!` scripts + `if`/`for`/`while` — much later.
 

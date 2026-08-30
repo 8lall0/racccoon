@@ -4,6 +4,31 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — shell: backslash escapes
+
+Roadmap §2.5. `\<char>` outside quotes takes `<char>` literally — `\ `
+an escaped space (an argument spans it), `\|` / `\;` / `\&` an escaped
+operator, `\$` a literal dollar, `\*` a literal glob metachar; a
+trailing `\` is itself literal. Inside `"..."`, `\` escapes only
+`` $ ` " \ `` (sh's rule — every other `\x` keeps both bytes). Inside
+`'...'` the backslash stays literal, unchanged.
+
+Nearly free to add: `shell_expand_q` emits the escaped byte with
+`qmask = 1`, and the tokeniser already reads a quoted byte as ordinary
+text — no split, no operator, no glob, no `$`. The only other touch is
+`shell_exec_line` (which splits `;` / `&&` / `||` *before* expand_q
+runs): it now skips `\x` pairs so an escaped operator or quote there
+can't wrongly split the line or flip its quote tracker.
+
+QEMU: `echo a\ b`, `echo a\|b`, `echo \$user` (vs `echo $user` →
+`root`), `echo a \; b` → `a ; b`, `echo "a \" b"`, `echo "x\\y"` →
+`x\y`, `echo \*`, `echo 'a\b'` → `a\b`, `echo done\` all verified;
+regression green (argvtest ok on FAT32 — the disk_dual "FAILED" is the
+known pre-existing ext2 case); quoting / globbing / multi-stage
+unaffected. Duo kernel builds clean, hw verification pending.
+
+---
+
 ## 2026-08-30 — shell: output-only builtins as pipeline stages
 
 Roadmap §2.5. `pwd`, `hello`, `namespace` / `ns` now work as pipeline
