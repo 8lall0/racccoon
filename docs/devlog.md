@@ -23,7 +23,7 @@ unrelated concerns. Split, pure code movement (commit `5c22687`):
 All `module user`, so cross-file calls and shared consts (`BRACE_BUF`,
 `JOB_STAGES`, `g_shell_status`) just resolve; `build_user.sh`'s two
 shell targets list the new files. No behaviour change — feature spot
-checks + regression green, Duo builds clean.
+checks + regression green, Duo builds clean and boots.
 
 Considered but shelved (user's call): a real scripting language.
 Current shell is already rc-flavoured, which fixes most of what's wrong
