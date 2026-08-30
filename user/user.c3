@@ -59,6 +59,7 @@ const int SYS_PIPE_HOLD     = 44;
 const int SYS_NS_LIST       = 45; // copy the caller's namespace out — see src/entry.c3's case
 const int SYS_NS_BIND       = 46; // Plan 9 `bind` — see src/entry.c3's case
 const int SYS_MAP           = 47; // map fresh zero-filled RW pages, returns base vaddr or -1 — see src/entry.c3's case
+const int SYS_STDIN_ISATTY  = 48; // 1 = console, 0 = pipe — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -1120,6 +1121,13 @@ fn void putchar(char ch) @export("putchar") {
 
 fn int getchar() @export("getchar") {
     return syscall(SYS_GETCHAR, 0, 0, 0);
+}
+
+// 1 if stdin is the console, 0 if the shell wired it to a pipe. The
+// stdin-reading filters use it to print usage instead of blocking on
+// the console (which has no EOF) when run bare with no pipe.
+fn int stdin_is_console() @export("stdin_is_console") {
+    return syscall(SYS_STDIN_ISATTY, 0, 0, 0);
 }
 
 fn void print(char* s) {

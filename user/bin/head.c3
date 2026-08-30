@@ -21,6 +21,14 @@ fn void main(String[] args) {
         return;
     }
 
+    // Run bare on the console with nothing piped in: there's no console
+    // EOF, so the read loop below would just wait for the user to
+    // hand-type `limit` newline-terminated lines. Print usage instead.
+    if (stdin_is_console() != 0) {
+        print("usage: head [-n count]   (reads stdin — use it in a pipeline)\n");
+        return;
+    }
+
     int lines = 0;
     while (lines < limit) {
         int c = getchar();

@@ -96,6 +96,7 @@ const SYS_PIPE_HOLD     = 44; // the shell claims/releases a pipe end it pumps i
 const SYS_NS_LIST       = 45; // copy the caller's own namespace (mount table) out: a0 = buf, a1 = max records (36 bytes each: 32-byte prefix + 4-byte LE pid); returns the count — the shell's `namespace`
 const SYS_NS_BIND       = 46; // bind whatever currently serves a1 (a path resolved through the caller's namespace) at a0 (a new prefix) in that same namespace — Plan 9's `bind`, the source-is-a-path counterpart to SYS_NS_MOUNT
 const SYS_MAP           = 47; // map a0 bytes (rounded up to pages) of fresh zero-filled RW memory just past the caller's image, returns the base vaddr or -1 — the userspace "give me a heap" primitive (/bin/wasm's module buffer + stacks + linear memory)
+const SYS_STDIN_ISATTY  = 48; // 1 if the caller's stdin is the console, 0 if a pipe — a poor-man's isatty(0) for the stdin-reading filters (/bin/head, /bin/cat)
 
 // Per-process SYS_MAP ceiling: the bump pointer can't grow more than this
 // past USER_BASE. 16 MiB is generous for a wasm linear memory and keeps
@@ -2637,6 +2638,15 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// process (the shell's prompt, /bin/whoami) know who it is
 			// without a getpid()+proc_info(self) round trip.
 			f.a0 = (ulong)(uint)current_proc.uid;
+		case SYS_STDIN_ISATTY:
+			// 1 if the caller's stdin is the console, 0 if it's a pipe.
+			// A poor-man's isatty(0): the stdin-reading filters
+			// (/bin/head, /bin/cat) use it to print usage instead of
+			// silently blocking on the console when run bare with no
+			// pipe wired and no file argument. There's no console EOF
+			// (no tty layer), so a bare `head` on the console would
+			// otherwise wait for the user to hand-type `limit` lines.
+			f.a0 = current_proc.stdin_pipe < 0 ? 1 : 0;
 		case SYS_CHDIR:
 			// a0 = the new cwd, already made absolute + normalised by
 			// the caller (user.c3's cd path logic). The kernel just

@@ -4,6 +4,23 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — head / cat: don't block bare on the console
+
+`head` (and `cat`) with no file argument read stdin — the pipeline-
+filter case (`ls | head -n 3`). Run bare on the console, though, they
+blocked: there's no tty layer, so no console EOF, and `getchar()` just
+waited for the user to hand-type lines.
+
+New `SYS_STDIN_ISATTY` (#48) — one line, `f.a0 = current_proc.stdin_pipe
+< 0`. A poor-man's `isatty(0)`. `stdin_is_console()` wrapper in user.c3.
+`head` / `cat`, when invoked with no file arg *and* `stdin_is_console()`,
+print usage instead of entering the read loop. In a pipeline
+(`stdin_pipe >= 0`) they behave exactly as before. QEMU-verified: bare
+`head` / `cat` → usage; `ls | head -n 3` and `echo hi | cat` still work;
+regression green. Duo builds clean.
+
+---
+
 ## 2026-08-30 — wasm §4 milestone 2: f32/f64
 
 The float opcodes for `/bin/wasm`. §3 (hardware FP, `rv64imafdc/lp64d`)
