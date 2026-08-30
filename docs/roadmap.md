@@ -672,9 +672,13 @@ flat-binary exec path like the c3 `/bin` commands.
    the standard requires freestanding (`memcpy`/`memmove`/`memset`/
    `memcmp`) plus the common `str*`. `malloctest` (20 k-iteration churn
    + scrambled frees) → ok, no heap growth.
-3. **freestanding core** — `stdlib.h` (atoi, strtol, qsort, bsearch,
-   abs, getenv, `atexit`), `ctype.h`, `errno.h`, `assert.h`, `setjmp.h`
-   (asm), `limits.h`/`stdint.h` conventions.
+3. **freestanding core. DONE** — `<ctype.h>` (ASCII), `<errno.h>`
+   (global, single-threaded), `<assert.h>`, `<setjmp.h>` +
+   `src/setjmp.S` (ra/sp/s0-s11/fs0-fs11), `<stdlib.h>`: `strto*`
+   family, `atoi`/`atol`/`strtod`, `abs`/`labs`, `qsort` (mo3
+   quicksort), `bsearch`, `atexit` (run by `exit`), `rand`/`srand`,
+   `getenv` (NULL until §7.6). `stage3test` → ok. (`limits.h`/
+   `stdint.h`/`stdarg.h` resolve to gcc's freestanding headers.)
 4. **POSIX fd layer** — `open`/`close`/`read`/`write`/`lseek`/`unlink`/
    `stat`/`fstat`/`getcwd`/`chdir`/`mkdir`/`opendir`/`readdir` over the
    c3 `fs_*` exports (link `user.c3` as a lib, or reimplement the `p9`

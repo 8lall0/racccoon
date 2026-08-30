@@ -1,14 +1,20 @@
-/* exit() / abort(). atexit handlers + stdio flushing arrive with the
- * later stages; for now exit() is just _exit(). abort() exits with the
- * conventional 128 + SIGABRT code (racccoon has no signals). */
+/* exit() runs the atexit handlers (LIFO), then _exit(). stdio flushing
+ * is layered on in the stdio stage. abort() skips the handlers and
+ * exits with the conventional 128 + SIGABRT code (racccoon has no
+ * signals). */
 #include <stdlib.h>
+
+extern void (*__libc_atexit_fns[])(void);
+extern int  __libc_atexit_n;
 
 void exit(int code)
 {
+	while (__libc_atexit_n > 0)
+		__libc_atexit_fns[--__libc_atexit_n]();
 	_exit(code);
 }
 
 void abort(void)
 {
-	_exit(134);   /* 128 + SIGABRT */
+	_exit(134);
 }

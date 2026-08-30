@@ -51,9 +51,10 @@ mkdir -p "$OUT/obj"
 echo "==> C libc: $CC_RC  ($($CC_RC -dumpversion))"
 
 # --- library ----------------------------------------------------------
-for src in lib/racccoon-libc/src/*.c; do
+for src in lib/racccoon-libc/src/*.c lib/racccoon-libc/src/*.S; do
   [ -e "$src" ] || continue
-  name=$(basename "$src" .c)
+  name=$(basename "$src")
+  name=${name%.*}
   $CC_RC $CFLAGS -c "$src" -o "$OUT/obj/$name.o"
 done
 

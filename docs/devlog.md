@@ -52,6 +52,18 @@ including the four the C standard requires even freestanding
 scrambled live allocs with integrity checks) → `malloctest: ok`, runs
 twice with no heap growth.
 
+**Stage 3 — freestanding core.** `<ctype.h>` (ASCII, no locale),
+`<errno.h>` (Linux/asm-generic numbers, `errno` a plain global —
+single-threaded), `<assert.h>` (re-includable, honours `NDEBUG`;
+failure → a line on stderr then `abort`), `<setjmp.h>` +
+`src/setjmp.S` (rv64/lp64d: ra/sp/s0-s11/fs0-fs11), `<stdlib.h>`:
+`strtoull`/`strtoll`/`strtoul`/`strtol`/`atoi`/`atol`/`strtod`,
+`abs`/`labs`, `qsort` (median-of-three quicksort, insertion for small
+runs), `bsearch`, `atexit` (LIFO, run by `exit`), `rand`/`srand`
+(LCG), `getenv` (NULL until §7.6). `stage3test` → ok — incl.
+`setjmp`/`longjmp` across 400-deep recursion and `qsort` on 5000
+elements.
+
 ---
 
 ## 2026-08-30 — survive OOM + a userspace crash (no swap)
