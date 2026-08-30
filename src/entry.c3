@@ -2151,8 +2151,12 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 		case SYS_BOOT_QUIET:
 			// The shell calls this once, after a short settle delay, to
-			// stop boot-server console output. One-way for the boot.
-			g_boot_quiet = true;
+			// stop boot-server console output landing on the console
+			// after the prompt is up. a0 == 1 turns it back ON — a
+			// diagnostic escape hatch (the dev shell's `loud` builtin)
+			// for watching a *respawned* boot server's own init chatter,
+			// which is otherwise silenced exactly like the original's.
+			g_boot_quiet = f.a0 != 1;
 			f.a0 = 0;
 		case SYS_GETCHAR:
 			current_proc.in_blocking_wait = true;

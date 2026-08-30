@@ -849,6 +849,12 @@ fn void boot_quiet() @export("boot_quiet") {
     syscall(SYS_BOOT_QUIET, 0, 0, 0);
 }
 
+// Diagnostic: re-enable boot-server console output (the dev shell's
+// `loud` builtin) — to watch a respawned server's own init chatter.
+fn void boot_loud() @export("boot_loud") {
+    syscall(SYS_BOOT_QUIET, 1, 0, 0);
+}
+
 // --- Current working directory ---
 fn int chdir(char* abs_path) @export("chdir") {
     return syscall(SYS_CHDIR, (long)abs_path, 0, 0);

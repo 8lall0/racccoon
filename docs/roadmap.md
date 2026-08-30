@@ -486,23 +486,30 @@ Generation counters back most of the stale-reference handling:
      - `usbdkilltest` — **PASS.** usbd killed, supervisor respawns it,
        `setup_usbd_mappings` re-maps the DWC2 MMIO + DMA, `/srv/usbd/`
        re-posts. (Full HID re-enum unverified — no device on the bus.)
-     - `fsdkilltest` — **FAIL.** Supervisor respawns fsd (`svc:
-       respawned fsd`) but the follow-up read fails. QEMU's fsd→diskd
-       path passes; the Duo's fsd→sdd re-attach doesn't. Not yet
-       diagnosed.
-     - `gpiodkilltest` — respawn + `/srv/gpiod/` re-post **PASS**, but
-       the respawned gpiod's **hardware re-init hangs**: an IPC to it
-       (or `gpio C24 dir out`) blocks forever — it wedges in its MMIO
-       re-init and never reaches its poll loop. gpiod has
-       `watch_hangs = false`, so nothing kills the wedged instance.
-       Not yet diagnosed — likely `setup_gpiod_mappings` not restoring
-       the pinmux page's strong-order mapping, or a pin-block reset the
-       first-boot path gets for free.
+     - `gpiodkilltest` — **PASS.** Respawned gpiod re-maps its MMIO,
+       rebuilds its pin table, and services a real SET_DIR on GPIOC24.
+       **Root cause** of the earlier apparent wedge: `create_process`
+       didn't clear `driver_irq_pending` (a gap vs `sys_rfork`) — a
+       respawned driver's first `SYS_IPC_POLL` returned the synthetic
+       IRQ-notify instead of the real request. Also: gpiod now has
+       `watch_hangs = true` (its bring-up is 3 MMIO writes, not a slow
+       bus reset) as a net.
+     - `fsdkilltest` / `storagekilltest` — **still FAIL on the Duo**
+       (both pass on QEMU's fsd→diskd path). `storagekilltest` shows a
+       *double* `svc: respawned sdd` — the first respawn's
+       `sdd_enumerate()` fails and `panic()`s, the supervisor respawns
+       again, that fails too. The respawned sdd can't re-enumerate the
+       card. Suspects: the SD clock left at run-speed (the cold-boot
+       path inherits BootROM's identification clock; `sdd_raise_clock`
+       bumped it and nothing lowers it again), or stale SDHCI
+       controller / SDMA state. Diagnostic hook added: `loud` builtin +
+       `boot_loud()` (SYS_BOOT_QUIET a0=1) un-silences a respawned
+       server's own prints, so `loud; storagekilltest` shows where
+       `sdd_enumerate` actually fails. Not yet diagnosed further.
      - `netdkilltest` — **N/A on Duo.** netd exits before `srv_post`
        (self-test needs DHCP + a carrier the Duo link never gets — see
        "Ethernet status"), so there's nothing to kill.
-   - **Still not fault-tested**: sdd's own respawn (distinct from the
-     fsd-above-it case), ethd.
+   - **Still not fault-tested**: ethd.
    - Kernel-side, not a userspace `/bin/init`: the servers' privileged
      setup (`setup_*_mappings`) is kernel-only, and the binaries are
      embedded in the kernel image, not on disk — a userspace init would

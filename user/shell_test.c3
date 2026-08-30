@@ -2380,6 +2380,13 @@ fn void main() {
                 putchar((char)('0' + race_ok_b));
                 print(" (1=correct reply, 0=corrupted or lost)\n");
             }
+        } else if (strcmp(cmd, "loud") == 0) {
+            // Re-enable boot-server console output (undoes the settle-time
+            // boot_quiet()). For watching a *respawned* server's init
+            // chatter — e.g. `loud` then `storagekilltest` to see the
+            // respawned sdd's own CMD0/CMD8/ACMD41 enumeration prints.
+            boot_loud();
+            print("boot-server output re-enabled\n");
         } else if (strcmp(cmd, "kbdpush") == 0) {
             // Stage-3 smoke test for the kernel keystroke queue
             // (src/kbd.c3): push a few bytes through SYS_KBD_PUSH and
