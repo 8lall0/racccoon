@@ -20,13 +20,16 @@ fn void svc_puts(char* s) @noinline
 // runs once per timer tick (~1/s, from handle_trap's SCAUSE_SUPERVISOR_TIMER
 // case) and re-spawns any that have exited.
 //
-// Only the pure-IPC / trivial-setup servers are supervised: fsd, fsd2,
-// procd, envd. The device drivers (diskd/sdd/usbd/ethd/netd/gpiod) are
-// NOT here — they'd need their MMIO/DMA mappings re-established and some
-// carry hardcoded-pid conventions (user/fs/fsd.c3's DISKD_PID = 3) that
-// a respawn into a different slot would break. echod is deliberately
-// left unsupervised too (it's the IPC test server; user/shell.c3's
-// "ping" hardcodes its pid 2).
+// Supervised: the pure-IPC servers (fsd, fsd2, echod, procd, envd) plus
+// the block-storage driver (diskd on QEMU / sdd on the Duo) — the one
+// device driver everything else depends on. Its MMIO + DMA mappings are
+// re-established on respawn via Service.kind (setup_diskd_mappings /
+// setup_sdd_mappings) and its PLIC route self-heals (irq_route_register
+// overwrites in place). fsd re-resolves the storage pid on an IPC
+// failure (user/fs/fsd.c3's diskd_rw), so a respawn into a new slot is
+// transparent to it. usbd/ethd/netd/gpiod are still unsupervised — the
+// kind switch has slots for them, but each needs its bring-up verified
+// idempotent and a way to fault-test it (mostly Duo-only).
 //
 // A respawned server lands in whatever slot is free, so its pid usually
 // changes. supervisor_spawn() therefore (a) updates the *_pid global the
@@ -37,8 +40,18 @@ fn void svc_puts(char* s) @noinline
 // ns_resolve(). An fid held open across the crash is still dead; a client
 // that gets -1 from a p9 op is expected to re-attach (see the roadmap).
 
-const int SVC_MAX = 6;
+const int SVC_MAX = 10;
 const int SVC_RESTART_LIMIT = 5;
+
+// Post-create setup each service needs, dispatched in supervisor_spawn().
+const int SVC_KIND_PLAIN = 0;  // echod / procd / envd — nothing
+const int SVC_KIND_FSD   = 1;  // setup_fsd_mappings(proc, partition, secondary)
+const int SVC_KIND_DISKD = 2;  // setup_diskd_mappings(proc) — QEMU virtio-blk
+const int SVC_KIND_SDD   = 3;  // setup_sdd_mappings(proc)   — Duo SD
+const int SVC_KIND_USBD  = 4;  // not registered yet
+const int SVC_KIND_ETHD  = 5;  // not registered yet
+const int SVC_KIND_NETD  = 6;  // not registered yet
+const int SVC_KIND_GPIOD = 7;  // not registered yet
 
 struct Service
 {
@@ -46,14 +59,13 @@ struct Service
 	char* bin_start;
 	char* bin_end;
 
-	// fsd needs setup_fsd_mappings(proc, partition, secondary) after
-	// create_process; procd/envd need nothing.
-	bool  needs_fsd_setup;
-	uint  fsd_partition;
-	bool  fsd_secondary;
+	int   kind;            // SVC_KIND_* — which setup_*_mappings to run on respawn
+	uint  fsd_partition;   // SVC_KIND_FSD only
+	bool  fsd_secondary;   // SVC_KIND_FSD only
 
 	// The kernel global the default-namespace seeding reads for this
-	// server (fsd_pid / fsd2_pid / procd_pid / envd_pid), or null.
+	// server (fsd_pid / fsd2_pid / echod_pid / procd_pid / envd_pid /
+	// storage_pid), or null.
 	int*  pid_global;
 
 	int   pid;
@@ -68,7 +80,7 @@ int service_count;
 
 // Called from kernel_main right after a supervisable server is spawned.
 fn void supervisor_register(char* name, char* bin_start, char* bin_end,
-	bool needs_fsd_setup, uint fsd_partition, bool fsd_secondary,
+	int kind, uint fsd_partition, bool fsd_secondary,
 	int* pid_global, Process* proc)
 {
 	if (service_count >= SVC_MAX || proc == null) { return; }
@@ -77,7 +89,7 @@ fn void supervisor_register(char* name, char* bin_start, char* bin_end,
 	s.name           = name;
 	s.bin_start      = bin_start;
 	s.bin_end        = bin_end;
-	s.needs_fsd_setup = needs_fsd_setup;
+	s.kind           = kind;
 	s.fsd_partition  = fsd_partition;
 	s.fsd_secondary  = fsd_secondary;
 	s.pid_global     = pid_global;
@@ -124,9 +136,16 @@ fn void supervisor_spawn(Service* s)
 	Process* p = create_process((void*)s.bin_start, img_size);
 
 	p.is_boot_server = true;
-	if (s.needs_fsd_setup)
+	switch (s.kind)
 	{
-		setup_fsd_mappings(p, s.fsd_partition, s.fsd_secondary);
+		case SVC_KIND_FSD:   setup_fsd_mappings(p, s.fsd_partition, s.fsd_secondary);
+		case SVC_KIND_DISKD: setup_diskd_mappings(p);
+		case SVC_KIND_SDD:   setup_sdd_mappings(p);
+		case SVC_KIND_USBD:  setup_usbd_mappings(p);
+		case SVC_KIND_ETHD:  setup_ethd_mappings(p);
+		case SVC_KIND_NETD:  setup_netd_mappings(p);
+		case SVC_KIND_GPIOD: setup_gpiod_mappings(p);
+		default: break;
 	}
 
 	s.pid        = p.pid;

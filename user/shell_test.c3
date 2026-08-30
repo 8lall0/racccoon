@@ -1916,6 +1916,29 @@ fn void main() {
             } else {
                 print("fsdkilltest: FAILED\n");
             }
+        } else if (strcmp(cmd, "storagekilltest") == 0) {
+            // Like fsdkilltest, one layer down: kill the block-storage
+            // driver (diskd on QEMU / sdd on the Duo) and confirm the
+            // supervisor re-inits it (SVC_KIND_DISKD/_SDD re-run the
+            // MMIO+DMA setup) and fsd re-resolves its new pid on the
+            // next read (user/fs/fsd.c3's diskd_rw). docs/roadmap.md §5.
+            uint sk_part = 0;
+            int  sk_pid  = 0;
+            int sk_info = fs_partition_info(&sk_part, null, &sk_pid);
+            char[64] sk_buf @noinit;
+            int sk_before = fs_read("hello.txt", &sk_buf, 64);
+            int sk_killed = sk_pid > 0 ? kill(sk_pid, 0) : -1;
+            ulong sk_deadline = rdtime() + 100000000; // ~10s at QEMU's 10MHz
+            int sk_after = -1;
+            while (sk_after < 0 && rdtime() < sk_deadline) {
+                yield();
+                sk_after = fs_read("hello.txt", &sk_buf, 64);
+            }
+            if (sk_info == 0 && sk_pid > 0 && sk_before >= 0 && sk_killed == 0 && sk_after == sk_before) {
+                print("storagekilltest: ok (storage driver killed, respawned, reads work)\n");
+            } else {
+                print("storagekilltest: FAILED\n");
+            }
         } else if (strcmp(cmd, "ipcdeathtest") == 0) {
             // Proves the IPC rendezvous no longer hangs forever when the
             // peer dies mid-transfer (src/entry.c3 sys_exit /

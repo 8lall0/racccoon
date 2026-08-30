@@ -103,18 +103,15 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 
 	io::print("4: Idle configured\n");
 
-	// Spawned once, here, not through the respawn loop below — echod is
-	// the IPC test server (see docs/devlog.md), not something that needs
-	// to come back after exiting. It's always the first process created
-	// after idle, so it always lands in the first free slot and gets
-	// pid 2 — user/shell.c3's "ping" command hardcodes that. Good enough
-	// for proving IPC works; a real name -> pid lookup is namespace work,
-	// not part of this first slice.
+	// The IPC test server (see docs/devlog.md). Supervised like the rest
+	// now; the shell's "ping" resolves it through the namespace
+	// ("/srv/echo/" -> echod_pid, healed on respawn by the supervisor),
+	// so its slot/pid is no longer load-bearing.
 	Process* echod_proc = create_process((void*)&_binary_echod_bin_start, (uint)((uptr)&_binary_echod_bin_end - (uptr)&_binary_echod_bin_start));
 	echod_proc.is_boot_server = true;
 	echod_pid = echod_proc.pid;
 	supervisor_register("echod", (char*)&_binary_echod_bin_start, (char*)&_binary_echod_bin_end,
-		false, 0, false, &echod_pid, echod_proc);
+		SVC_KIND_PLAIN, 0, false, &echod_pid, echod_proc);
 	io::print("Idle process started\n");
 
 	// diskd/fsd (see user/diskd.c3 and user/fsd.c3, microkernel plan
@@ -128,19 +125,20 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	// server that was never spawned.
 	if (board::HAS_BLOCK_DEVICE)
 	{
-		// Created after echod so echod keeps its pid-2 convention above.
 		// Which driver — board::HAS_SD_BLOCK/HAS_VIRTIO_BLOCK (mutually
 		// exclusive, see board.c3) pick real-SD (Duo, user/sdd.c3) vs
-		// virtio-blk (QEMU, user/diskd.c3). Either way the driver process
-		// lands in this same third slot (pid 3, right after idle/echod),
-		// which is what lets fsd.c3's DISKD_PID hardcode stay valid
-		// unchanged regardless of which board this is.
+		// virtio-blk (QEMU, user/diskd.c3). fsd learns whichever pid this
+		// lands at from SYS_FS_PARTITION_INFO (storage_pid), not a fixed
+		// slot, and re-queries it if the driver respawns — so the two are
+		// supervised now (SVC_KIND_DISKD / _SDD re-run the MMIO+DMA setup).
 		if (board::HAS_SD_BLOCK)
 		{
 			Process* sdd_proc = create_process((void*)&_binary_sdd_bin_start, (uint)((uptr)&_binary_sdd_bin_end - (uptr)&_binary_sdd_bin_start));
 			sdd_proc.is_boot_server = true;
 			setup_sdd_mappings(sdd_proc);
 			storage_pid = sdd_proc.pid;
+			supervisor_register("sdd", (char*)&_binary_sdd_bin_start, (char*)&_binary_sdd_bin_end,
+				SVC_KIND_SDD, 0, false, &storage_pid, sdd_proc);
 			io::print("sdd created\n");
 		}
 		else if (board::HAS_VIRTIO_BLOCK)
@@ -149,6 +147,8 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 			diskd_proc.is_boot_server = true;
 			setup_diskd_mappings(diskd_proc);
 			storage_pid = diskd_proc.pid;
+			supervisor_register("diskd", (char*)&_binary_diskd_bin_start, (char*)&_binary_diskd_bin_end,
+				SVC_KIND_DISKD, 0, false, &storage_pid, diskd_proc);
 			io::print("diskd created\n");
 		}
 
@@ -166,7 +166,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		setup_fsd_mappings(fsd_proc, board::FS_PARTITION_START_SECTOR, false);
 		fsd_pid = fsd_proc.pid;
 		supervisor_register("fsd", (char*)&_binary_fsd_bin_start, (char*)&_binary_fsd_bin_end,
-			true, board::FS_PARTITION_START_SECTOR, false, &fsd_pid, fsd_proc);
+			SVC_KIND_FSD, board::FS_PARTITION_START_SECTOR, false, &fsd_pid, fsd_proc);
 		io::print("fsd created\n");
 
 		// A second, simultaneously-mounted fsd instance, reachable under
@@ -186,7 +186,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 			setup_fsd_mappings(fsd2_proc, board::FS_PARTITION_2_START_SECTOR, true);
 			fsd2_pid = fsd2_proc.pid;
 			supervisor_register("fsd2", (char*)&_binary_fsd_bin_start, (char*)&_binary_fsd_bin_end,
-				true, board::FS_PARTITION_2_START_SECTOR, true, &fsd2_pid, fsd2_proc);
+				SVC_KIND_FSD, board::FS_PARTITION_2_START_SECTOR, true, &fsd2_pid, fsd2_proc);
 			io::print("fsd2 created\n");
 		}
 	}
@@ -204,7 +204,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	procd_proc.is_boot_server = true;
 	procd_pid = procd_proc.pid;
 	supervisor_register("procd", (char*)&_binary_procd_bin_start, (char*)&_binary_procd_bin_end,
-		false, 0, false, &procd_pid, procd_proc);
+		SVC_KIND_PLAIN, 0, false, &procd_pid, procd_proc);
 	io::print("procd created\n");
 
 	// envd (the "/env/" server, user/envd.c3) — same unconditional,
@@ -217,7 +217,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	envd_proc.is_boot_server = true;
 	envd_pid = envd_proc.pid;
 	supervisor_register("envd", (char*)&_binary_envd_bin_start, (char*)&_binary_envd_bin_end,
-		false, 0, false, &envd_pid, envd_proc);
+		SVC_KIND_PLAIN, 0, false, &envd_pid, envd_proc);
 	io::print("envd created\n");
 
 	// The shell — created explicitly here, BEFORE usbd below, not left

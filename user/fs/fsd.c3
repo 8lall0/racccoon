@@ -85,13 +85,11 @@ const uint DISKD_WRITE   = 211;
 const uint DISKD_MSG_MAX = 516;
 const uint SECTOR_SIZE   = 512;
 
-// diskd (or sdd, on the Duo) is always pid 3: created third in a fixed
-// boot-time order (idle, echod, diskd-or-sdd, fsd — see kernel.c3), same
-// hardcoded-by-convention approach as echod's pid 2 in shell.c3's "ping".
-// fsd is a fixed, internal-only client of a fixed, internal-only
-// service; fsd's *own* clients (the shell) go through namespace
-// resolution instead, so they never need to know fsd's pid at all — see
-// user.c3's fs_read/fs_write.
+// The storage driver's pid (diskd on QEMU, sdd on the Duo). fsd learns
+// it from SYS_FS_PARTITION_INFO at mount, and re-queries it if the
+// driver respawns (see g_diskd_pid / diskd_rw below) — no fixed slot.
+// fsd's *own* clients (the shell) go through namespace resolution, so
+// they never need to know fsd's pid at all — see user.c3's fs_read.
 //
 // Mutable, not `const`, since a dynamically exec()'d fsd instance
 // (main()'s own args.len==1 branch, for mounting a USB Mass Storage
@@ -103,7 +101,14 @@ const uint SECTOR_SIZE   = 512;
 // Boot fsd/fsd2 overwrite this from SYS_FS_PARTITION_INFO's storage-pid
 // out-param in fs_mount(); the dynamic USB instance sets it from a
 // name resolution. The initial value is just a harmless placeholder.
-int g_diskd_pid = 0;
+//
+// The storage driver (diskd/sdd) is supervised now, so it can respawn
+// into a new pid — diskd_rw() re-queries SYS_FS_PARTITION_INFO on an IPC
+// failure and retries once, which is transparent for a boot fsd. Skipped
+// for the dynamic USB instance (g_fsd_dynamic): its backend is usbd,
+// resolved by name, and fs_partition_info() returns nothing useful there.
+int  g_diskd_pid   = 0;
+bool g_fsd_dynamic = false;
 
 // board::FS_PARTITION_START_SECTOR, learned via syscall — board is a
 // kernel-only module (see user/sdd.c3's own header comment for why),
@@ -402,6 +407,21 @@ fn bool diskd_rw(char* buf, uint sector, bool is_write)
 	uint verb = is_write ? DISKD_WRITE : DISKD_READ;
 	uint reply_verb = 0;
 	int from = p9_call(g_diskd_pid, verb, &req, DISKD_MSG_MAX, &req, DISKD_MSG_MAX, &reply_verb);
+	if (from <= 0 && !g_fsd_dynamic)
+	{
+		// The storage driver may have died and been respawned into a new
+		// pid — SYS_IPC_CALL aborts with -1 when its target is gone. Ask
+		// the kernel for the current storage pid and retry once; the
+		// supervisor's re-init leaves the device usable again.
+		uint rr_part = 0;
+		int  rr_pid  = 0;
+		if (fs_partition_info(&rr_part, null, &rr_pid) == 0 && rr_pid > 0 && rr_pid != g_diskd_pid)
+		{
+			g_diskd_pid = rr_pid;
+			reply_verb = 0;
+			from = p9_call(g_diskd_pid, verb, &req, DISKD_MSG_MAX, &req, DISKD_MSG_MAX, &reply_verb);
+		}
+	}
 	if (from <= 0 || reply_verb != verb) return false;
 
 	char status = req[0];
@@ -462,6 +482,7 @@ fn void fs_reserve_protection_summary()
 // instance of itself).
 fn void fs_mount(bool dynamic_mode, char* dynamic_self_name)
 {
+	g_fsd_dynamic = dynamic_mode;
 	bool is_secondary = false;
 	if (!dynamic_mode)
 	{

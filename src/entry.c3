@@ -2302,6 +2302,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			{
 				*fs_storage_pid_out = storage_pid;
 			}
+			f.a0 = 0;
 		case SYS_RFORK:
 			sys_rfork(f);
 		case SYS_NS_UNMOUNT:
