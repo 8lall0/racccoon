@@ -69,9 +69,10 @@ fsdkilltest, runtest, nstest, hardentest, srvtest); multi-stage
 pipelines 8/8; `namespace`, `bind / /mnt/x` then `ls /mnt/x/` (lists
 root), `login glenda` (prompt → `glenda /usr/glenda %`, `$user`, cwd),
 `echo /bin/*a*` → `cat false head whoami`, `echo '*'` literal, no-match
-literal — all verified. Duo kernel + user binaries build clean; hardware
-verification pending (the Duo card has `/adm/users` with root/glenda,
-and `/usr/glenda` + `/usr/root`).
+literal — all verified. **Duo hardware verified** (reflash only —
+everything is in the kernel-embedded shell): `login` prompt at boot,
+`login glenda` / drop / `exit`, globbing, and `namespace` / `bind` /
+`unmount` all work on the console.
 
 ---
 
