@@ -4,6 +4,31 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — shell: brace expansion
+
+Roadmap §2.5. `{a,b,c}` → three words, `pre{x,y}post` →
+`prexpost preypost`, `{a,b}{c,d}` cartesian, nested `{a,{b,c}}`. A group
+with no top-level comma (`{a}`, a leftover `${x}`) or an unmatched `{`
+stays literal; quoted (`"{a,b}"`) and escaped (`\{a,b}`) braces too.
+
+Runs per word in `shell_run_pipeline`'s stage loop, *before* globbing:
+`shell_brace_split` finds the first unquoted `{`, its match, and the
+depth-1 commas; `shell_brace_rec` recurses on `prefix + alt + suffix`
+for each alternative (depth/count/buffer bounded). So `/bin/{c,l}*`
+brace-expands to `/bin/c* /bin/l*` and then globs each →
+`/bin/cat /bin/ls`. Quoting is honoured at the token's first brace only;
+deeper levels operate on the assembled string (a quoted brace nested
+inside an alternative isn't re-protected — real use doesn't hit it).
+Only brace-carrying tokens are copied into the 1 KB result buffer;
+plain words keep pointing into `exp`.
+
+QEMU: all cases above verified plus `{1,2,3} | cat | cat`; regression
+green (bigreadtest, pathtest, mounttest, killtest, envtest, nstest,
+srvtest, p9fstest, runtest); multi-stage pipelines 5/5. Duo kernel
+builds clean, hw verification pending.
+
+---
+
 ## 2026-08-30 — shell: backslash escapes
 
 Roadmap §2.5. `\<char>` outside quotes takes `<char>` literally — `\ `

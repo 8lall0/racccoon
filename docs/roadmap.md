@@ -184,6 +184,11 @@ not bourne. Interleaved with §1/§2 rather than a phase of its own.
   inside `"..."`, `\` escapes only `` $ ` " \ ``; inside `'...'` it's
   literal. Escaped bytes get `qmask = 1` so the tokeniser already does
   the right thing.
+- **brace expansion** — `{a,b}c` → `ac bc`, `pre{x,y}post`,
+  `{a,b}{c,d}` cartesian, nested `{a,{b,c}}`; runs per word before
+  globbing (`/bin/{c,l}*` → glob of each). No-comma / unmatched /
+  quoted / escaped braces stay literal. `shell_brace_split` +
+  `shell_brace_rec`, bounded.
 - **`/bin/head`** — first stdin filter (`ls | head -n 3`); `head [-n N]`,
   reads stdin only, default 10 lines.
 - **multi-stage pipelines (`a | b | c`)** — up to `MAX_STAGES = 6`,
@@ -220,7 +225,6 @@ not bourne. Interleaved with §1/§2 rather than a phase of its own.
   their effect; they 127 in a pipeline.
 
 **Still to do:**
-- `{a,b}` brace expansion.
 - `&` background jobs, `^Z`/`jobs` — later.
 - `#!` scripts + `if`/`for`/`while` — much later.
 
