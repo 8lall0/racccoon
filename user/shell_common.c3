@@ -383,6 +383,100 @@ fn int shell_glob_into(char* pat, char* names, int* nb, int nb_cap, char** words
     return matched;
 }
 
+// --- brace expansion --------------------------------------------------
+// `{a,b}c` -> "ac" "bc"; `pre{x,y}post` and `{a,b}{c,d}` cartesian;
+// nested `{a,{b,c}}` too. A brace group with no top-level comma (`{a}`,
+// a leftover `${x}`) and an unmatched `{` are both left literal. Only
+// unquoted `{ , }` play (qmask 0). Quoting is honoured at the token's
+// first brace; deeper levels operate on the already-assembled string,
+// so a quoted brace *inside* a brace alternative isn't re-protected —
+// an obscure case real use never hits (`ls *.{c3,md}`, `mkdir {a,b}`).
+
+const int BRACE_MAX     = 24;   // per-token expansion cap
+const int BRACE_BUF     = 1024; // packed result storage (brace tokens only)
+const int BRACE_DEPTH   = 8;
+
+// Locate the token's first unquoted `{`, its matching `}`, and the
+// top-level (depth 1) comma positions. `qm` may be null (recursion,
+// where alignment is lost — then every brace counts). Returns the comma
+// count; *open_out < 0 means "no expandable brace here".
+fn int shell_brace_split(char* s, char* qm, int* open_out, int* close_out, int* commas, int commas_max)
+{
+    int open = -1;
+    for (int k = 0; s[k] != 0; k++) {
+        if (s[k] == '{' && (qm == null || qm[k] == 0)) { open = k; break; }
+    }
+    if (open < 0) { *open_out = -1; return 0; }
+
+    int depth = 0;
+    int nc = 0;
+    for (int j = open; s[j] != 0; j++) {
+        if (qm != null && qm[j] != 0) { continue; }
+        char ch = s[j];
+        if (ch == '{') { depth++; }
+        else if (ch == '}') {
+            depth--;
+            if (depth == 0) { *open_out = open; *close_out = j; return nc; }
+        }
+        else if (ch == ',' && depth == 1) {
+            if (nc < commas_max) { commas[nc] = j; }
+            nc++;
+        }
+    }
+    *open_out = -1;   // unmatched `{`
+    return 0;
+}
+
+// Append `s` verbatim as one result.
+fn int shell_brace_emit(char* s, char* buf, int* bo, int buf_cap, char** res, int* rn, int res_max)
+{
+    if (*rn >= res_max) { return 0; }
+    int start = *bo;
+    int w = start;
+    for (int k = 0; s[k] != 0 && w < buf_cap - 1; k++) { buf[w] = s[k]; w++; }
+    if (w >= buf_cap - 1) { return 0; }
+    buf[w] = 0; w++;
+    res[*rn] = &buf[start];
+    (*rn)++;
+    *bo = w;
+    return 1;
+}
+
+fn int shell_brace_rec(char* s, char* qm, char* buf, int* bo, int buf_cap, char** res, int* rn, int res_max, int depth)
+{
+    int open = -1;
+    int close = -1;
+    int[BRACE_MAX] commas @noinit;
+    int nc = shell_brace_split(s, qm, &open, &close, &commas[0], BRACE_MAX);
+
+    if (open < 0 || nc == 0 || nc >= BRACE_MAX || depth >= BRACE_DEPTH || *rn >= res_max) {
+        return shell_brace_emit(s, buf, bo, buf_cap, res, rn, res_max);
+    }
+
+    int total = 0;
+    int seg_start = open + 1;
+    for (int a = 0; a <= nc; a++) {
+        int seg_end = a < nc ? commas[a] : close;
+        char[256] combo @noinit;
+        int w = 0;
+        for (int k = 0; k < open && w < 255; k++) { combo[w] = s[k]; w++; }
+        for (int k = seg_start; k < seg_end && w < 255; k++) { combo[w] = s[k]; w++; }
+        for (int k = close + 1; s[k] != 0 && w < 255; k++) { combo[w] = s[k]; w++; }
+        combo[w] = 0;
+        total += shell_brace_rec(&combo[0], null, buf, bo, buf_cap, res, rn, res_max, depth + 1);
+        seg_start = seg_end + 1;
+    }
+    return total;
+}
+
+// Expand `tok` (qmask slice `qm`) into `res[]`, strings packed into
+// `buf[*bo..]`. Returns the result count (also left in *rn).
+fn int shell_brace_expand(char* tok, char* qm, char* buf, int* bo, int buf_cap, char** res, int* rn, int res_max)
+{
+    *rn = 0;
+    return shell_brace_rec(tok, qm, buf, bo, buf_cap, res, rn, res_max, 0);
+}
+
 // Dispatches the small set of real, end-user shell builtins shared by
 // both the production shell (shell.c3) and the test shell
 // (shell_test.c3) — hello/exit/mountusb/su/cd/login/mount/bind/…
@@ -810,9 +904,11 @@ fn int shell_expand_q(char* in, char* out, char* qmask, int cap)
 // output-only builtins (`pwd` / `hello` / `namespace`, see
 // shell_builtin_pipeable) also work as stages, run in a forked child.
 // `< file` is capped at the kernel pipe buffer (PIPE_BUF, src/pipe.c3).
-// Any word carrying an unquoted `*` / `?` is glob-expanded against the
-// filesystem before the stage runs (last path component only); a
-// pattern that matches nothing is left literal (rc's rule).
+// A word carrying an unquoted `{a,b,...}` is brace-expanded first
+// (`x.{c3,md}` -> `x.c3 x.md`, cartesian across multiple groups); then
+// any word with an unquoted `*` / `?` is glob-expanded against the
+// filesystem (last path component only), a no-match pattern staying
+// literal (rc's rule).
 // Returns the exit status of the last stage (0 = success); a shell-side
 // error (bad syntax, unterminated quote, unopenable redirection) is 2.
 fn int shell_run_pipeline(char* seg, int seg_len)
@@ -877,6 +973,11 @@ fn int shell_run_pipeline(char* seg, int seg_len)
     char[GLOB_NAMES_BUF] glob_names @noinit;
     int gnb = 0;
 
+    // Same deal for brace-expanded words (only tokens that contain a
+    // brace are copied in here — plain words keep pointing into `exp`).
+    char[BRACE_BUF] brace_buf @noinit;
+    int bbo = 0;
+
     int nstages = 1;
     int sw = 0;
     stage_off[0] = 0; stage_n[0] = 0;
@@ -907,14 +1008,35 @@ fn int shell_run_pipeline(char* seg, int seg_len)
             }
             continue;
         }
-        if (tok_glob[i]) {
-            int gm = shell_glob_into(t, &glob_names[0], &gnb, GLOB_NAMES_BUF,
-                                     &stage_words[0], &sw, STAGE_WORDS_MAX);
-            stage_n[nstages - 1] += gm;
-            // rc: a pattern that matches nothing stands as a literal word.
-            if (gm == 0 && sw < STAGE_WORDS_MAX) { stage_words[sw] = t; sw++; stage_n[nstages - 1]++; }
-        } else if (sw < STAGE_WORDS_MAX) {
-            stage_words[sw] = t; sw++; stage_n[nstages - 1]++;
+        // A word: brace-expand it if it carries an unquoted `{`, then
+        // glob each result. A plain word skips both and points straight
+        // into `exp`.
+        int toff = (int)(t - &exp[0]);
+        bool has_brace = false;
+        for (int q = 0; t[q] != 0; q++) {
+            if (t[q] == '{' && qm[toff + q] == 0) { has_brace = true; break; }
+        }
+        char*[BRACE_MAX] bres @noinit;
+        int bn = 1;
+        bres[0] = t;
+        if (has_brace) {
+            int brn = 0;
+            shell_brace_expand(t, &qm[toff], &brace_buf[0], &bbo, BRACE_BUF, &bres[0], &brn, BRACE_MAX);
+            bn = brn;
+            if (bn == 0) { bres[0] = t; bn = 1; }   // buffer full -> literal
+        }
+
+        for (int b = 0; b < bn; b++) {
+            char* w = bres[b];
+            if (tok_glob[i]) {
+                int gm = shell_glob_into(w, &glob_names[0], &gnb, GLOB_NAMES_BUF,
+                                         &stage_words[0], &sw, STAGE_WORDS_MAX);
+                stage_n[nstages - 1] += gm;
+                // rc: a pattern that matches nothing stands as a literal word.
+                if (gm == 0 && sw < STAGE_WORDS_MAX) { stage_words[sw] = w; sw++; stage_n[nstages - 1]++; }
+            } else if (sw < STAGE_WORDS_MAX) {
+                stage_words[sw] = w; sw++; stage_n[nstages - 1]++;
+            }
         }
     }
 
