@@ -679,10 +679,15 @@ flat-binary exec path like the c3 `/bin` commands.
    quicksort), `bsearch`, `atexit` (run by `exit`), `rand`/`srand`,
    `getenv` (NULL until §7.6). `stage3test` → ok. (`limits.h`/
    `stdint.h`/`stdarg.h` resolve to gcc's freestanding headers.)
-4. **POSIX fd layer** — `open`/`close`/`read`/`write`/`lseek`/`unlink`/
-   `stat`/`fstat`/`getcwd`/`chdir`/`mkdir`/`opendir`/`readdir` over the
-   c3 `fs_*` exports (link `user.c3` as a lib, or reimplement the `p9`
-   codec in C).
+4. **POSIX fd layer. DONE** — `src/rc_fs.c` reimplements racccoon's
+   path-based fs in C over `SYS_NS_RESOLVE` + `SYS_IPC_CALL` to fsd
+   (linking `user.o` collides with the crt0's `main`/`exit`/`start`).
+   `src/rc_posix.c`: a 64-slot userspace fd table behind `open`/`close`/
+   `read`/`write`/`lseek`/`dup`/`dup2`/`fcntl`/`isatty`; `stat`/`fstat`/
+   `mkdir`/`unlink`/`rmdir`/`rename`/`access`; `opendir`/`readdir`.
+   `<fcntl.h>` `<sys/stat.h>` `<sys/types.h>` `<dirent.h>`. `O_CREAT` →
+   empty write, `O_TRUNC` → delete+recreate (no fsd truncate),
+   `O_APPEND` → seek to size. `SYS_GETPID` (#50). `stage4test` → ok.
 5. **stdio** — `FILE*` + buffering; `fopen`…`fclose`/`fread`/`fwrite`/
    `fgets`/`fseek`/`ftell`; `printf`/`fprintf`/`snprintf`/`vsnprintf`
    (the format engine); `stdin`/`stdout`/`stderr`.

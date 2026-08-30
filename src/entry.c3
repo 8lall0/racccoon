@@ -98,6 +98,7 @@ const SYS_NS_BIND       = 46; // bind whatever currently serves a1 (a path resol
 const SYS_MAP           = 47; // map a0 bytes (rounded up to pages) of fresh zero-filled RW memory just past the caller's image, returns the base vaddr or -1 — the userspace "give me a heap" primitive (/bin/wasm's module buffer + stacks + linear memory)
 const SYS_STDIN_ISATTY  = 48; // 1 if the caller's stdin is the console, 0 if a pipe — a poor-man's isatty(0) for the stdin-reading filters (/bin/head, /bin/cat)
 const SYS_TIMEBASE      = 49; // board::TIMEBASE_HZ — the `time` CSR's tick rate, so userspace can turn an rdtime() delta into wall-clock seconds (QEMU 10MHz vs Duo 25MHz)
+const SYS_GETPID        = 50; // the caller's own pid — a c3 program gets its children's pids from rfork() but never its own; the C libc's getpid() needs it (temp-file names, etc.)
 
 // Per-process SYS_MAP ceiling: the bump pointer can't grow more than this
 // past USER_BASE. 16 MiB is generous for a wasm linear memory and keeps
@@ -2713,6 +2714,11 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// it so their respawn deadlines are the same wall-clock
 			// budget on QEMU (10 MHz) and the Duo (25 MHz).
 			f.a0 = board::TIMEBASE_HZ;
+		case SYS_GETPID:
+			// The caller's own pid. Always succeeds. A c3 program
+			// learns its children's pids from rfork() but has no way
+			// to ask for its own — the C libc's getpid() needs it.
+			f.a0 = (ulong)(uint)current_proc.pid;
 		case SYS_CHDIR:
 			// a0 = the new cwd, already made absolute + normalised by
 			// the caller (user.c3's cd path logic). The kernel just

@@ -64,6 +64,26 @@ runs), `bsearch`, `atexit` (LIFO, run by `exit`), `rand`/`srand`
 `setjmp`/`longjmp` across 400-deep recursion and `qsort` on 5000
 elements.
 
+**Stage 4 — the POSIX fd layer.** `src/rc_fs.c` reimplements racccoon's
+path-based fs calls in C over `SYS_NS_RESOLVE` + `SYS_IPC_CALL` to fsd,
+byte-for-byte with `user/user.c3`'s `fs_read_at` / `fs_write_at` /
+`fs_stat` / `fs_list` / `fs_mkdir` / `fs_delete` / `fs_rename` (linking
+`user.o` directly wasn't an option — it also defines `main`/`exit`/
+`putchar`/`start`, which collide with the C crt0). On top: `src/
+rc_posix.c` — a 64-slot userspace **fd table** (`fd → {kind, flags,
+offset, abspath}`; 0/1/2 pre-open on the console) behind `open`/`close`/
+`read`/`write`/`lseek`/`dup`/`dup2`/`fcntl`/`isatty`, plus `stat`/
+`fstat`/`lstat`/`mkdir`/`unlink`/`rmdir`/`rename`/`access` straight to
+`__rc_fs_*`, and `opendir`/`readdir`/`closedir`/`rewinddir` over
+`FS_LIST`. Headers: `<fcntl.h>` `<sys/stat.h>` `<sys/types.h>`
+`<dirent.h>`, `<unistd.h>` filled out. `O_CREAT` → an empty
+`FS_WRITE_AT`; `O_TRUNC` → delete-then-recreate (fsd has no truncate);
+`O_APPEND` → seek to size. New `SYS_GETPID` (#50, one line —
+`current_proc.pid`) for `getpid()`. `stage4test` (write/stat/read/
+fstat/lseek SET+END/append/mkdir/opendir+readdir/rename/unlink/rmdir,
+idempotent, self-cleaning) → ok, runs twice. QEMU green, Duo builds
+clean.
+
 ---
 
 ## 2026-08-30 — survive OOM + a userspace crash (no swap)
