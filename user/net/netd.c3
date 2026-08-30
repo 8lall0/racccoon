@@ -389,6 +389,12 @@ fn void main()
 
     netd_self_test(&our_mac[0], our_ip, gateway_ip);
 
+    // Posts under "netd" so a client (today just netdkilltest, which
+    // needs a handle to kill it) can reach it by name — same
+    // Plan-9-style srv_post the other drivers use. netd has no
+    // request/reply clients yet otherwise.
+    srv_post("netd");
+
     print("netd: init done, polling link status\n");
 
     bool last_up = false;

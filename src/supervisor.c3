@@ -71,6 +71,13 @@ struct Service
 	uint  fsd_partition;   // SVC_KIND_FSD only
 	bool  fsd_secondary;   // SVC_KIND_FSD only
 
+	// Hang watchdog applies? Off for usbd/ethd/gpiod: their bring-up
+	// (a USB bus reset + 1s settle, an Ethernet PHY train, …) can
+	// legitimately not touch their IPC poll for seconds, which would
+	// false-trip the has_message stall check. They still get
+	// respawn-on-exit — a driver that panic()s comes back.
+	bool  watch_hangs;
+
 	// The kernel global the default-namespace seeding reads for this
 	// server (fsd_pid / fsd2_pid / echod_pid / procd_pid / envd_pid /
 	// storage_pid), or null.
@@ -95,7 +102,7 @@ int service_count;
 
 // Called from kernel_main right after a supervisable server is spawned.
 fn void supervisor_register(char* name, char* bin_start, char* bin_end,
-	int kind, uint fsd_partition, bool fsd_secondary,
+	int kind, uint fsd_partition, bool fsd_secondary, bool watch_hangs,
 	int* pid_global, Process* proc)
 {
 	if (service_count >= SVC_MAX || proc == null) { return; }
@@ -107,6 +114,7 @@ fn void supervisor_register(char* name, char* bin_start, char* bin_end,
 	s.kind           = kind;
 	s.fsd_partition  = fsd_partition;
 	s.fsd_secondary  = fsd_secondary;
+	s.watch_hangs    = watch_hangs;
 	s.pid_global     = pid_global;
 	s.pid            = proc.pid;
 	s.generation     = proc.generation;
@@ -196,11 +204,13 @@ fn bool supervisor_tick()
 
 		if (live != null && live.generation == s.generation)
 		{
-			// Alive. Watchdog: a server sitting in its ipc_recv loop has
-			// has_message == false; the instant it picks a message up
-			// (before processing) it clears the flag again. So a stuck
-			// flag means the server got a request and never returned to
-			// recv — an infinite loop or a deadlock, not slow work.
+			// Alive. Hang watchdog (skipped for drivers whose bring-up
+			// legitimately blocks their IPC poll for seconds): a server
+			// sitting in its ipc_recv loop has has_message == false; the
+			// instant it picks a message up (before processing) it clears
+			// the flag again. So a stuck flag across SVC_STALL_LIMIT
+			// ticks means it got a request and never returned to recv.
+			if (!s.watch_hangs) { continue; }
 			if (!live.has_message)
 			{
 				s.ever_ready  = true;

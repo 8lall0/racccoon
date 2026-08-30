@@ -111,7 +111,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	echod_proc.is_boot_server = true;
 	echod_pid = echod_proc.pid;
 	supervisor_register("echod", (char*)&_binary_echod_bin_start, (char*)&_binary_echod_bin_end,
-		SVC_KIND_PLAIN, 0, false, &echod_pid, echod_proc);
+		SVC_KIND_PLAIN, 0, false, true, &echod_pid, echod_proc);
 	io::print("Idle process started\n");
 
 	// diskd/fsd (see user/diskd.c3 and user/fsd.c3, microkernel plan
@@ -138,7 +138,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 			setup_sdd_mappings(sdd_proc);
 			storage_pid = sdd_proc.pid;
 			supervisor_register("sdd", (char*)&_binary_sdd_bin_start, (char*)&_binary_sdd_bin_end,
-				SVC_KIND_SDD, 0, false, &storage_pid, sdd_proc);
+				SVC_KIND_SDD, 0, false, true, &storage_pid, sdd_proc);
 			io::print("sdd created\n");
 		}
 		else if (board::HAS_VIRTIO_BLOCK)
@@ -148,7 +148,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 			setup_diskd_mappings(diskd_proc);
 			storage_pid = diskd_proc.pid;
 			supervisor_register("diskd", (char*)&_binary_diskd_bin_start, (char*)&_binary_diskd_bin_end,
-				SVC_KIND_DISKD, 0, false, &storage_pid, diskd_proc);
+				SVC_KIND_DISKD, 0, false, true, &storage_pid, diskd_proc);
 			io::print("diskd created\n");
 		}
 
@@ -166,7 +166,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		setup_fsd_mappings(fsd_proc, board::FS_PARTITION_START_SECTOR, false);
 		fsd_pid = fsd_proc.pid;
 		supervisor_register("fsd", (char*)&_binary_fsd_bin_start, (char*)&_binary_fsd_bin_end,
-			SVC_KIND_FSD, board::FS_PARTITION_START_SECTOR, false, &fsd_pid, fsd_proc);
+			SVC_KIND_FSD, board::FS_PARTITION_START_SECTOR, false, true, &fsd_pid, fsd_proc);
 		io::print("fsd created\n");
 
 		// A second, simultaneously-mounted fsd instance, reachable under
@@ -186,7 +186,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 			setup_fsd_mappings(fsd2_proc, board::FS_PARTITION_2_START_SECTOR, true);
 			fsd2_pid = fsd2_proc.pid;
 			supervisor_register("fsd2", (char*)&_binary_fsd_bin_start, (char*)&_binary_fsd_bin_end,
-				SVC_KIND_FSD, board::FS_PARTITION_2_START_SECTOR, true, &fsd2_pid, fsd2_proc);
+				SVC_KIND_FSD, board::FS_PARTITION_2_START_SECTOR, true, true, &fsd2_pid, fsd2_proc);
 			io::print("fsd2 created\n");
 		}
 	}
@@ -204,7 +204,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	procd_proc.is_boot_server = true;
 	procd_pid = procd_proc.pid;
 	supervisor_register("procd", (char*)&_binary_procd_bin_start, (char*)&_binary_procd_bin_end,
-		SVC_KIND_PLAIN, 0, false, &procd_pid, procd_proc);
+		SVC_KIND_PLAIN, 0, false, true, &procd_pid, procd_proc);
 	io::print("procd created\n");
 
 	// envd (the "/env/" server, user/envd.c3) — same unconditional,
@@ -217,7 +217,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	envd_proc.is_boot_server = true;
 	envd_pid = envd_proc.pid;
 	supervisor_register("envd", (char*)&_binary_envd_bin_start, (char*)&_binary_envd_bin_end,
-		SVC_KIND_PLAIN, 0, false, &envd_pid, envd_proc);
+		SVC_KIND_PLAIN, 0, false, true, &envd_pid, envd_proc);
 	io::print("envd created\n");
 
 	// The shell — created explicitly here, BEFORE usbd below, not left
@@ -260,6 +260,8 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		usbd_proc.is_boot_server = true;
 		setup_usbd_mappings(usbd_proc);
 		io::print("usbd created\n");
+		supervisor_register("usbd", (char*)&_binary_usbd_bin_start, (char*)&_binary_usbd_bin_end,
+			SVC_KIND_USBD, 0, false, false, null, usbd_proc);
 	}
 
 	// ethd (the real Ethernet MAC driver, user/ethd.c3) — Duo only —
@@ -274,6 +276,8 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		ethd_proc.is_boot_server = true;
 		setup_ethd_mappings(ethd_proc);
 		io::print("ethd created\n");
+		supervisor_register("ethd", (char*)&_binary_ethd_bin_start, (char*)&_binary_ethd_bin_end,
+			SVC_KIND_ETHD, 0, false, false, null, ethd_proc);
 	}
 	if (board::HAS_VIRTIO_NET)
 	{
@@ -281,6 +285,8 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		netd_proc.is_boot_server = true;
 		setup_netd_mappings(netd_proc);
 		io::print("netd created\n");
+		supervisor_register("netd", (char*)&_binary_netd_bin_start, (char*)&_binary_netd_bin_end,
+			SVC_KIND_NETD, 0, false, true, null, netd_proc);
 	}
 
 	// gpiod (the GPIO driver, user/gpio/gpiod.c3) — Duo only
@@ -295,6 +301,8 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		gpiod_proc.is_boot_server = true;
 		setup_gpiod_mappings(gpiod_proc);
 		io::print("gpiod created\n");
+		supervisor_register("gpiod", (char*)&_binary_gpiod_bin_start, (char*)&_binary_gpiod_bin_end,
+			SVC_KIND_GPIOD, 0, false, false, null, gpiod_proc);
 	}
 
 	// Single call site for create_process(shell) below (a *respawn*
