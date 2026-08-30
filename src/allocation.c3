@@ -15,7 +15,25 @@ const BITS_PER_WORD = 32;
 const TOTAL_PAGES   = RAM_SIZE / PAGE_SIZE;
 
 // One bit per page over the whole __free_ram pool: 0 = free, 1 = used.
+// Sized for the RAM_SIZE ceiling; a board with less usable free RAM
+// (the Duo — see ram_page_count) just leaves the tail words unused.
 uint[TOTAL_PAGES / BITS_PER_WORD] bitmap;
+
+// The actual number of allocatable pages: the real distance between the
+// linker's __free_ram and __free_ram_end, in pages, capped at
+// TOTAL_PAGES (the bitmap's size). On QEMU src/kernel.ld makes that
+// span exactly RAM_SIZE; on the Duo boards/duo/kernel.ld pins
+// __free_ram_end to the real 64 MiB DRAM window minus the kernel image,
+// the stack, and the reserved top 768 KiB — ~59 MiB, ~1280 pages short
+// of TOTAL_PAGES. Scanning past this hands out addresses beyond
+// physical DRAM; the zero-fill in try_alloc_pages then faults → panic.
+// Only ever hit by something that genuinely exhausts RAM (oomtest).
+fn uint ram_page_count()
+{
+	uptr span = (uptr)&__free_ram_end - (uptr)&__free_ram;
+	uint pages = (uint)(span / PAGE_SIZE);
+	return pages < TOTAL_PAGES ? pages : TOTAL_PAGES;
+}
 
 fn bool bit_is_set(uint page_idx)
 {
@@ -39,7 +57,8 @@ fn void clear_bit(uint page_idx)
 fn uint free_page_count()
 {
 	uint free = 0;
-	for (uint i = 0; i < TOTAL_PAGES; i++)
+	uint limit = ram_page_count();
+	for (uint i = 0; i < limit; i++)
 	{
 		if (!bit_is_set(i)) free++;
 	}
@@ -61,8 +80,9 @@ fn uptr try_alloc_pages(uint n)
 {
 	uint run_start = 0;
 	uint run_len   = 0;
+	uint limit     = ram_page_count();
 
-	for (uint i = 0; i < TOTAL_PAGES; i++)
+	for (uint i = 0; i < limit; i++)
 	{
 		if (bit_is_set(i))
 		{
