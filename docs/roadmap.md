@@ -710,6 +710,16 @@ flat-binary exec path like the c3 `/bin` commands.
    argv[0]). `stage6test` (+ `test/c-src/exiter.c`) → ok.
 7. **TinyCC cross-build** — `tcc` for `riscv64-racccoon` against
    stages 2–6; `tcc hello.c -o hello` on racccoon → a runnable binary.
+   **Groundwork done** (2026-08-31): tcc 0.9.28rc compiles + links clean
+   against the libc (no undefined symbols); ~640 KiB flat image. Closed
+   the libc gaps it needs (`<math.h>` `<time.h>` `<strings.h>`
+   `<inttypes.h>`, ~25 str/stdlib/posix fns, `strerror`) — "stage 6.5",
+   `stage7test`. Kernel `EXEC_MAX_IMAGE_SIZE` 256 KiB → 1 MiB (staging
+   tables moved off the kernel stack); shell exec buffer `SYS_MAP`'d.
+   `scripts/build_tcc.sh` + `lib/tcc/` build it from a `TCC_SRC` checkout
+   (TinyCC not vendored). Remaining: `libtcc1.a` (tcc-compiled),
+   `CONFIG_TCCDIR` payload on an image, then the on-device ladder
+   `tcc -E` → `tcc -c` → `tcc x.c -o x`.
 8. **TinyCC self-hosts** — `tcc` compiles its own source on racccoon.
 
 ### Not doing

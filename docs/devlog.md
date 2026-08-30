@@ -4,6 +4,66 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-31 — §7.7 groundwork: TinyCC cross-compiles clean; libc + exec cap
+
+Spiked the TinyCC port (roadmap §7.7). Cross-compiled tcc 0.9.28rc
+(`-DTCC_TARGET_RISCV64`, `ONE_SOURCE`) with `riscv64-unknown-elf-gcc`
+against `lib/racccoon-libc` + our headers. **`tcc.c` compiles clean and
+links with no undefined symbols** — `crt0.o + tcc.o + libracccoon.a +
+libgcc.a`, `--gc-sections`. That de-risks the whole port: the libc
+surface is sufficient, the numbers are known.
+
+**Size:** ~388 KiB (text 206K + data + bss), dominated by one 128 KiB
+static `hash_ident[TOK_HASH_SIZE]` table; the flat binary with a 256 KiB
+stack is ~640 KiB.
+
+**libc gaps closed (the "stage 6.5" surface):**
+- new headers: `<math.h>` (`ldexp`/`ldexpl`/`frexp`/`fabs`/`pow` — only
+  what a float-literal parser needs), `<time.h>` (fixed build-era clock —
+  no RTC; `clock`/`gettimeofday` read the `time` CSR), `<sys/time.h>`,
+  `<inttypes.h>`, `<strings.h>`.
+- `src/math.c`, `src/quad.c` (long-double / soft-128-bit float, isolated
+  so a program that doesn't use `long double` doesn't drag in libgcc),
+  `src/time.c`.
+- `src/string.c`: `strspn`/`strcspn`/`strpbrk`/`strtok`/`strtok_r`/
+  `strsep`/`strndup`/`strnlen`/`memrchr`/`memmem` + `<strings.h>`
+  (`strcasecmp`/`strncasecmp`/`bzero`/`bcopy`/`ffs`).
+- `src/stdlib.c`: `strtof`/`strtold`/`atoll`/`llabs`/`imaxabs`/
+  `strtoimax`/`strtoumax`, `alloca` macro.
+- `src/errno.c`: a real `strerror`/`strerror_r` table.
+- `src/rc_posix.c`: `realpath` (no symlinks — cwd→abs + copy),
+  `chmod`/`ftruncate`/`pipe`/`sysconf`/`getpagesize`/`sleep`/`usleep`;
+  `getppid` now uses `SYS_PARENT_INFO`.
+- `lib/racccoon-libc/build.sh` links `libgcc.a` and `--gc-sections` for
+  the test programs (the compiler-support lib, not libc).
+- `stage7test` covers all of it → ok on QEMU (FAT32 + ext2).
+
+**Kernel — `EXEC_MAX_IMAGE_SIZE` 256 KiB → 1 MiB**, `EXEC_MAX_ARGV_SIZE`
+4 KiB → 16 KiB. The per-page staging tables (`g_exec_staged` /
+`g_exec_seg_perm`, 256 entries = 3 KiB) moved from `sys_exec`'s stack
+frame to file scope — safe, `sys_exec` never yields, so no second exec
+is ever in flight through that code; re-zeroed every call. `runtest`/
+`argvtest`/`pathtest`/`elftest`/`runtest2`/`elftest2`/`bigreadtest` +
+the supervisor killtests all still green.
+
+**Shell** — `run_exec_buf` (was a 256 KiB static array materialised into
+every shell's `.bss`, and thus into the kernel image) is now `SYS_MAP`'d
+on first use by `exec_buf()`. Only a process that actually `exec()`s a
+child pays for it, and the mapping lives microseconds (it's called in
+the rfork'd child just before `exec`). `shell.bin` 358 KiB → 96 KiB.
+
+**Not yet done (needs on-device iteration):** `scripts/build_tcc.sh` +
+`lib/tcc/` (config.h, linker script) are in place and produce
+`build/tcc/tcc.bin` (643 KiB) + a best-effort `libtcc1.a` from a
+`TCC_SRC=<tinycc checkout>` — TinyCC is **not vendored** (68k lines).
+The bring-up ladder from here: `tcc -E hello.c` → `tcc -c hello.c` →
+`tcc hello.c -o hello` on the real Duo, each its own devlog milestone.
+
+Duo kernels (test + prod shell) build clean. **Duo hardware run still
+pending** — commit is QEMU-verified only.
+
+---
+
 ## 2026-08-31 — a C program runs on racccoon (roadmap §7 stage 1)
 
 First step of the C-library / self-hosting track. The goal isn't

@@ -246,6 +246,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_root_part.img > /dev/null
   done
   for w in build/wasm/*.wasm; do debugfs -w -R "write $w $(basename "$w")" build/disk_dual_root_part.img > /dev/null; done
+  for c in build/libc/*.bin; do [ -e "$c" ] && debugfs -w -R "write $c bin/$(basename "$c" .bin)" build/disk_dual_root_part.img > /dev/null; done
   dd if=build/disk_dual_root_part.img of=build/disk_dual.img bs=512 seek=0 conv=notrunc status=none
   rm -f build/disk_dual_root_part.img
 
@@ -268,6 +269,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_ext2_part.img > /dev/null
   done
   for w in build/wasm/*.wasm; do debugfs -w -R "write $w $(basename "$w")" build/disk_dual_ext2_part.img > /dev/null; done
+  for c in build/libc/*.bin; do [ -e "$c" ] && debugfs -w -R "write $c bin/$(basename "$c" .bin)" build/disk_dual_ext2_part.img > /dev/null; done
   # bigfile.bin — same double-indirect-block fixture as the single-mount
   # ext2 image above, needed here too since bigreadtest always targets
   # "/mnt/fs2/bigfile.bin" (unambiguous, same reasoning as bin/echod above).

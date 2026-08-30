@@ -110,20 +110,21 @@ const uptr HEAP_MAX_BYTES = 16 * 1024 * 1024;
 // dropped — keeps late server init chatter off the prompt.
 bool g_boot_quiet = false;
 
-// Generous cap on the image SYS_EXEC will install — real racccoon
-// binaries (build/user/*.bin) run 70-105KB; this leaves real headroom
-// without being large enough to make a single runaway request a
-// meaningful way to exhaust physical memory. user/user.c3's own
-// exec() wrapper enforces the same bound on its own read-into-buffer
-// loop before ever reaching this syscall.
-const EXEC_MAX_IMAGE_SIZE  = 262144;
+// Cap on the image SYS_EXEC will install. racccoon's own binaries
+// (build/user/*.bin) run 70-105KB, but the C toolchain track (roadmap
+// §7 — a native TinyCC) produces ~450KB images, so this is 1 MiB. The
+// staging arrays it sizes (g_exec_staged / g_exec_seg_perm, below) are
+// file-scope, not on the kernel stack — see their comment. user/user.c3's
+// exec() wrapper and lib/racccoon-libc's execve() both enforce the same
+// bound on their own read-into-buffer loop before reaching this syscall.
+const EXEC_MAX_IMAGE_SIZE  = 1048576;
 const EXEC_MAX_IMAGE_PAGES = EXEC_MAX_IMAGE_SIZE / PAGE_SIZE;
 
-// argv blob cap (user/user.c3's exec(), NUL-separated strings packed
-// right after the image in the same buffer) — one page is plenty for
-// real CLI args, and keeps this a small, fixed second staging pass
-// distinct from the image's own.
-const EXEC_MAX_ARGV_SIZE  = 4096;
+// argv blob cap (user/user.c3's exec() / the libc execve(), NUL-separated
+// strings packed right after the image in the same buffer). 16 KiB — a
+// compiler invocation's argv (many -I/-D/-L, a full env) is bigger than
+// a shell command's, still a small fixed second staging pass.
+const EXEC_MAX_ARGV_SIZE  = 16384;
 const EXEC_MAX_ARGV_PAGES = EXEC_MAX_ARGV_SIZE / PAGE_SIZE;
 
 // Real ELF64/RISC-V executables (racccoon's own toolchain output,
@@ -810,6 +811,15 @@ fn void sys_rfork(Trap_frame* f) @noinline
 // returns to the caller, so a0/a1 are repurposed to hand start()
 // argc + the argv base. (Was inlined as a c3c-0.8.2 switch-call
 // landmine workaround — 0.8.3 probe 2026-08-28 cleared it.)
+// SYS_EXEC's per-page staging tables. File-scope, not stack locals: at
+// EXEC_MAX_IMAGE_PAGES = 256 that's 3 KiB, too much for the 64 KiB
+// kernel stack under sys_exec's already-deep frame. Safe as globals —
+// sys_exec never yields (no blocking call between here and the commit
+// point), so no second exec is ever in flight through this code. Both
+// are fully re-initialised at the top of every sys_exec call.
+uptr[EXEC_MAX_IMAGE_PAGES] g_exec_staged;
+uint[EXEC_MAX_IMAGE_PAGES] g_exec_seg_perm;
+
 fn void sys_exec(Trap_frame* f) @noinline
 {
 		char* exec_image = (char*)(uptr)f.a0;
@@ -850,8 +860,9 @@ fn void sys_exec(Trap_frame* f) @noinline
 		// what's already there" discipline this session's own
 		// ext2 slot-reuse fix already established.
 		//
-		// exec_staged/exec_seg_perm are explicitly zeroed (not
-		// @noinit) rather than relying on the flat-binary path's own
+		// g_exec_staged/g_exec_seg_perm are explicitly zeroed here
+		// (they're persistent file-scope globals) rather than relying
+		// on the flat-binary path's own
 		// "every slot from 0..exec_page_count gets touched
 		// sequentially" — the ELF path below fills these sparsely,
 		// by segment page-range, and needs 0 to reliably mean "not
@@ -859,12 +870,10 @@ fn void sys_exec(Trap_frame* f) @noinline
 		// touches (a real, if rare, alignment gap between segments —
 		// stays unmapped later, not silently zero-filled).
 		uint exec_page_count = 0;
-		uptr[EXEC_MAX_IMAGE_PAGES] exec_staged;
-		uint[EXEC_MAX_IMAGE_PAGES] exec_seg_perm;
 		for (uint zp = 0; zp < EXEC_MAX_IMAGE_PAGES; zp++)
 		{
-			exec_staged[zp] = 0;
-			exec_seg_perm[zp] = 0;
+			g_exec_staged[zp] = 0;
+			g_exec_seg_perm[zp] = 0;
 		}
 		bool exec_stage_ok = true;
 		ulong exec_entry_point = USER_BASE;
@@ -986,7 +995,7 @@ fn void sys_exec(Trap_frame* f) @noinline
 				// letting the last one silently win.
 				for (uint spi = exec_seg_page_start; spi < exec_seg_page_end; spi++)
 				{
-					if (exec_staged[spi] == 0)
+					if (g_exec_staged[spi] == 0)
 					{
 						uptr exec_seg_page = try_alloc_pages(1);
 						if (exec_seg_page == 0)
@@ -994,9 +1003,9 @@ fn void sys_exec(Trap_frame* f) @noinline
 							exec_stage_ok = false;
 							break;
 						}
-						exec_staged[spi] = exec_seg_page;
+						g_exec_staged[spi] = exec_seg_page;
 					}
-					exec_seg_perm[spi] |= exec_seg_flags;
+					g_exec_seg_perm[spi] |= exec_seg_flags;
 					if (spi + 1 > exec_page_count) exec_page_count = spi + 1;
 				}
 				if (!exec_stage_ok) break;
@@ -1020,7 +1029,7 @@ fn void sys_exec(Trap_frame* f) @noinline
 					uint exec_chunk = PAGE_SIZE - exec_dst_in_page;
 					uint exec_remaining = (uint)exec_p_filesz - exec_copied;
 					if (exec_chunk > exec_remaining) exec_chunk = exec_remaining;
-					mem::copy((void*)(exec_staged[exec_dst_page] + exec_dst_in_page), exec_image + exec_p_offset + exec_copied, (sz)exec_chunk);
+					mem::copy((void*)(g_exec_staged[exec_dst_page] + exec_dst_in_page), exec_image + exec_p_offset + exec_copied, (sz)exec_chunk);
 					exec_copied += exec_chunk;
 				}
 			}
@@ -1032,7 +1041,7 @@ fn void sys_exec(Trap_frame* f) @noinline
 				// the generous EXEC_MAX_IMAGE_SIZE ceiling."
 				if (exec_e_entry < (ulong)USER_BASE
 					|| exec_e_entry - (ulong)USER_BASE >= (ulong)(exec_page_count * PAGE_SIZE)
-					|| exec_staged[(uint)((exec_e_entry - (ulong)USER_BASE) / (ulong)PAGE_SIZE)] == 0)
+					|| g_exec_staged[(uint)((exec_e_entry - (ulong)USER_BASE) / (ulong)PAGE_SIZE)] == 0)
 				{
 					exec_stage_ok = false;
 				}
@@ -1046,7 +1055,7 @@ fn void sys_exec(Trap_frame* f) @noinline
 			{
 				for (uint fp = 0; fp < EXEC_MAX_IMAGE_PAGES; fp++)
 				{
-					if (exec_staged[fp] != 0) free_pages(exec_staged[fp], 1);
+					if (g_exec_staged[fp] != 0) free_pages(g_exec_staged[fp], 1);
 				}
 				f.a0 = (ulong)(-1);
 				return;
@@ -1078,15 +1087,15 @@ fn void sys_exec(Trap_frame* f) @noinline
 				if (exec_page == 0)
 				{
 					exec_stage_ok = false;
-					for (uint fp = 0; fp < ep; fp++) free_pages(exec_staged[fp], 1);
+					for (uint fp = 0; fp < ep; fp++) free_pages(g_exec_staged[fp], 1);
 					break;
 				}
 				uint exec_off = ep * PAGE_SIZE;
 				uint exec_remaining = exec_image_size - exec_off;
 				uint exec_copy_size = exec_remaining < PAGE_SIZE ? exec_remaining : PAGE_SIZE;
 				mem::copy((void*)exec_page, exec_image + exec_off, (sz)exec_copy_size);
-				exec_staged[ep] = exec_page;
-				exec_seg_perm[ep] = PAGE_R | PAGE_W | PAGE_X;
+				g_exec_staged[ep] = exec_page;
+				g_exec_seg_perm[ep] = PAGE_R | PAGE_W | PAGE_X;
 			}
 			if (!exec_stage_ok)
 			{
@@ -1127,7 +1136,7 @@ fn void sys_exec(Trap_frame* f) @noinline
 			// change for that path.
 			for (uint fp = 0; fp < exec_page_count; fp++)
 			{
-				if (exec_staged[fp] != 0) free_pages(exec_staged[fp], 1);
+				if (g_exec_staged[fp] != 0) free_pages(g_exec_staged[fp], 1);
 			}
 			f.a0 = (ulong)(-1);
 			return;
@@ -1166,14 +1175,14 @@ fn void sys_exec(Trap_frame* f) @noinline
 
 		// Map the newly staged pages at USER_BASE, with each page's
 		// own accumulated permission (uniform RWX for the flat-binary
-		// path, the real per-segment union for ELF — see exec_seg_perm's
+		// path, the real per-segment union for ELF — see g_exec_seg_perm's
 		// own comment above). A real gap between ELF segments
-		// (exec_staged[mp] == 0) stays unmapped, not silently
+		// (g_exec_staged[mp] == 0) stays unmapped, not silently
 		// zero-filled.
 		for (uint mp = 0; mp < exec_page_count; mp++)
 		{
-			if (exec_staged[mp] == 0) continue;
-			map_page(current_proc.page_table, (uptr)USER_BASE + (uptr)(mp * PAGE_SIZE), exec_staged[mp], PAGE_U | exec_seg_perm[mp]);
+			if (g_exec_staged[mp] == 0) continue;
+			map_page(current_proc.page_table, (uptr)USER_BASE + (uptr)(mp * PAGE_SIZE), g_exec_staged[mp], PAGE_U | g_exec_seg_perm[mp]);
 		}
 
 		// argv's own pages, right after the image's own last mapped
