@@ -1939,6 +1939,22 @@ fn void main() {
             } else {
                 print("storagekilltest: FAILED\n");
             }
+        } else if (strcmp(cmd, "wasmtest") == 0) {
+            // /bin/wasm (roadmap §4): exec it on the add.wasm fixture
+            // (seeded onto every disk image by build.sh). add.wasm's
+            // _start computes 2+3 and calls racccoon.print_i32 -> the
+            // console shows "5"; _start has no result so it exits 0.
+            char* wt_arg = "add.wasm";
+            uint wt_gen = 0;
+            int wt_c = rfork(RFPROC, &wt_gen);
+            if (wt_c == 0) {
+                exec("bin/wasm", &run_exec_buf, RUN_EXEC_BUF_MAX, 0, &wt_arg, 1);
+                exitcode(127);
+            }
+            print("wasm add.wasm -> ");
+            int wt_code = join(wt_c, wt_gen);
+            if (wt_code == 0) { print("wasmtest: ok\n"); }
+            else { print("wasmtest: FAILED code="); print_uint((uint)wt_code); putchar('\n'); }
         } else if (strcmp(cmd, "maptest") == 0) {
             // SYS_MAP: fresh zero-filled RW pages past the image, bumping.
             char* mp1 = (char*)map_pages(100);      // -> 1 page

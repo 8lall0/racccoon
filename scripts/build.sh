@@ -12,6 +12,11 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # Build user app first (produces build/user/shell.bin.o)
   bash scripts/build_user.sh
 
+  # Hand-built .wasm test fixtures for /bin/wasm (no wat2wasm on this
+  # host — the bytes are assembled by the Python script). Seeded onto
+  # every disk image below next to /bin.
+  python3 test/mkwasm.py build/wasm
+
   # The disk images built below are pristine masters — every one is
   # rm -f'd and rebuilt from scratch on each run, so re-running this
   # script is itself a full reset. The scripts/launch64*.sh scripts
@@ -80,9 +85,10 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # bin/{cat,ls,write,rm,mkdir,mv} — the real, argv-taking utilities
   # shell.c3's own /bin/ fallback branch execs (see docs/devlog.md),
   # replacing what used to be hardcoded shell builtins.
-  for u in cat ls echo true false head whoami write rm mkdir mv usbrw fsd gpio; do
+  for u in cat ls echo true false head whoami write rm mkdir mv usbrw fsd gpio wasm; do
     mcopy -i build/disk.img "build/user/$u.bin" "::bin/$u"
   done
+  for w in build/wasm/*.wasm; do mcopy -i build/disk.img "$w" "::$(basename "$w")"; done
 
   # bigfile.bin — deterministic byte[i] = i % 256 pattern, 300000 bytes,
   # genuinely past ext2's own single-indirect reach even at the smallest
@@ -146,9 +152,10 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "sif adm/secret mode 0100600" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_ext2.img > /dev/null
-  for u in cat ls echo true false head whoami write rm mkdir mv usbrw fsd gpio; do
+  for u in cat ls echo true false head whoami write rm mkdir mv usbrw fsd gpio wasm; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_ext2.img > /dev/null
   done
+  for w in build/wasm/*.wasm; do debugfs -w -R "write $w $(basename "$w")" build/disk_ext2.img > /dev/null; done
   debugfs -w -R "write build/bigfile_fixture.bin bigfile.bin" build/disk_ext2.img > /dev/null
 
   echo "==> Building disk image (dual ext2+ext2, for scripts/launch64_dual.sh)..."
@@ -202,9 +209,10 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "write build/adm_users_fixture adm/users" build/disk_dual_root_part.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_root_part.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_root_part.img > /dev/null
-  for u in cat ls echo true false head whoami write rm mkdir mv usbrw fsd gpio; do
+  for u in cat ls echo true false head whoami write rm mkdir mv usbrw fsd gpio wasm; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_root_part.img > /dev/null
   done
+  for w in build/wasm/*.wasm; do debugfs -w -R "write $w $(basename "$w")" build/disk_dual_root_part.img > /dev/null; done
   dd if=build/disk_dual_root_part.img of=build/disk_dual.img bs=512 seek=0 conv=notrunc status=none
   rm -f build/disk_dual_root_part.img
 
@@ -223,9 +231,10 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "mkdir bin" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_ext2_part.img > /dev/null
-  for u in cat ls echo true false head whoami write rm mkdir mv usbrw fsd gpio; do
+  for u in cat ls echo true false head whoami write rm mkdir mv usbrw fsd gpio wasm; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_ext2_part.img > /dev/null
   done
+  for w in build/wasm/*.wasm; do debugfs -w -R "write $w $(basename "$w")" build/disk_dual_ext2_part.img > /dev/null; done
   # bigfile.bin — same double-indirect-block fixture as the single-mount
   # ext2 image above, needed here too since bigreadtest always targets
   # "/mnt/fs2/bigfile.bin" (unambiguous, same reasoning as bin/echod above).

@@ -82,7 +82,7 @@ mkdir "$MNT/emptydir"
 # contiguous path.
 mkdir "$MNT/bin"
 cp build/user/echod.bin "$MNT/bin/echod"
-for u in cat ls write rm mkdir mv usbrw fsd gpio; do
+for u in cat ls write rm mkdir mv usbrw fsd gpio wasm; do
   cp "build/user/$u.bin" "$MNT/bin/$u"
 done
 
