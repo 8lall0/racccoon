@@ -940,6 +940,14 @@ fn Process* create_process(void* image, uint image_size)
 	proc.ipc_wait_generation = 0;
 	proc.ipc_peer_died = false;
 	proc.in_call_reply_wait = false;
+	// A reused slot must not start life with a previous occupant's
+	// unconsumed inbox message (sys_rfork clears this for the same
+	// reason). Missing this let a supervisor-respawned server "consume"
+	// a stale request left by the instance the watchdog just killed and
+	// reply into a rendezvous nobody was waiting on — a deadlock.
+	proc.has_message = false;
+	proc.msg_acked = false;
+	proc.msg_from = 0;
 	proc.is_boot_server = false; // kernel.c3 / supervisor_spawn set it for servers
 	proc.cwd[0] = 0; // root
 	proc.stdout_pipe = -1;

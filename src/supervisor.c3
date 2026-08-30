@@ -43,6 +43,14 @@ fn void svc_puts(char* s) @noinline
 const int SVC_MAX = 10;
 const int SVC_RESTART_LIMIT = 5;
 
+// Watchdog (docs/roadmap.md §5.6): a supervised server with an
+// unconsumed inbox message (has_message stuck true) for this many
+// consecutive ticks is wedged — a healthy server clears has_message the
+// instant it calls ipc_recv, before it even starts processing. ~1
+// tick/s, so this is generous; the point is catching an infinite loop /
+// deadlock, not a slow request.
+const int SVC_STALL_LIMIT = 5;
+
 // Post-create setup each service needs, dispatched in supervisor_spawn().
 const int SVC_KIND_PLAIN = 0;  // echod / procd / envd — nothing
 const int SVC_KIND_FSD   = 1;  // setup_fsd_mappings(proc, partition, secondary)
@@ -73,6 +81,13 @@ struct Service
 	int   restarts;
 	bool  given_up;
 	bool  used;
+
+	// Watchdog state. ever_ready gates it: a server that hasn't yet
+	// reached its ipc_recv loop even once (slow init, e.g. sdd on the
+	// Duo) is "still starting," not "wedged." stall_ticks counts
+	// consecutive ticks with a stuck inbox once it is ready.
+	bool  ever_ready;
+	int   stall_ticks;
 }
 
 Service[SVC_MAX] services;
@@ -98,6 +113,8 @@ fn void supervisor_register(char* name, char* bin_start, char* bin_end,
 	s.restarts       = 0;
 	s.given_up       = false;
 	s.used           = true;
+	s.ever_ready     = false;
+	s.stall_ticks    = 0;
 }
 
 // Re-point every namespace mount that named (old_pid) at (new_pid,
@@ -151,6 +168,8 @@ fn void supervisor_spawn(Service* s)
 	s.pid        = p.pid;
 	s.generation = p.generation;
 	s.restarts++;
+	s.ever_ready  = false;
+	s.stall_ticks = 0;
 	if (s.pid_global != null) { *s.pid_global = p.pid; }
 
 	reseat_namespace_mounts(old_pid, p.pid, p.generation);
@@ -161,15 +180,51 @@ fn void supervisor_spawn(Service* s)
 }
 
 // One maintenance pass — cheap (SVC_MAX * O(1)) when nothing has died.
-fn void supervisor_tick()
+// Returns true if it tore down whatever process was running when the
+// timer fired (a wedged server that happened to be `current_proc`) — the
+// caller must then yield() unconditionally, since sret'ing back into a
+// PROC_UNUSED context with a freed page table would fault.
+fn bool supervisor_tick()
 {
+	bool killed_current = false;
 	for (int i = 0; i < service_count; i++)
 	{
 		Service* s = &services[i];
 		if (!s.used || s.given_up) { continue; }
 
 		Process* live = proc_by_pid(s.pid);
-		if (live != null && live.generation == s.generation) { continue; }
+
+		if (live != null && live.generation == s.generation)
+		{
+			// Alive. Watchdog: a server sitting in its ipc_recv loop has
+			// has_message == false; the instant it picks a message up
+			// (before processing) it clears the flag again. So a stuck
+			// flag means the server got a request and never returned to
+			// recv — an infinite loop or a deadlock, not slow work.
+			if (!live.has_message)
+			{
+				s.ever_ready  = true;
+				s.stall_ticks = 0;
+				continue;
+			}
+			if (!s.ever_ready) { continue; }   // still starting — not wedged
+			s.stall_ticks++;
+			if (s.stall_ticks < SVC_STALL_LIMIT) { continue; }
+
+			svc_puts("svc: ");
+			svc_puts(s.name);
+			svc_puts(" wedged (unconsumed IPC) — killing\n");
+			if (live == current_proc) { killed_current = true; }
+			proc_destroy(live, -1);
+			s.stall_ticks = 0;
+			// Respawn on the *next* tick, via the dead-detection below —
+			// not now: create_process would reuse this same slot, and if
+			// this was current_proc, the caller's yield() would then save
+			// the timer-trap context into the fresh process, corrupting
+			// it. One tick of extra downtime for an already-wedged server
+			// is fine.
+			continue;
+		}
 
 		if (s.restarts >= SVC_RESTART_LIMIT)
 		{
@@ -181,4 +236,5 @@ fn void supervisor_tick()
 		}
 		supervisor_spawn(s);
 	}
+	return killed_current;
 }

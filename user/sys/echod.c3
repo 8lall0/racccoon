@@ -125,6 +125,16 @@ fn void main(String[] args) {
         int from = ipc_recv_type_gen(&buf, 64, &verb, &from_gen);
         if (from <= 0) continue;
 
+        if (verb == ECHOD_HANG) {
+            // Deliberate wedge for hungservertest (shell_test.c3): consume
+            // this message, then spin forever without ever returning to
+            // ipc_recv. The supervisor watchdog (src/supervisor.c3) should
+            // notice the next request piling up unconsumed and kill+respawn
+            // this process. The timer still preempts a bare spin, so the
+            // rest of the system keeps running while it's stuck.
+            for (;;) { yield(); }
+        }
+
         if (verb == P9_TREAD) {
             ipc_reply(from, P9_TREAD, canned, canned_len, from_gen);
         } else if (verb == P9_TWALK) {

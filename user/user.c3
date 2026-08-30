@@ -484,6 +484,12 @@ const uint P9_CREATE = 8;  // request: create a file (or, with P9_DMDIR set in p
 const uint P9_WRITE  = 9;  // request: real pwrite()-style offset-aware write to an opened fid — no holes past the current end (see fsd.c3's own dispatch comment)
 const uint P9_REMOVE = 10; // request: remove a fid's file — always consumes the fid (unless rejected outright by fsd's own dangling-fid safety check)
 
+// Test-only: echod (user/sys/echod.c3) consumes this then spins forever
+// without returning to ipc_recv, so hungservertest (shell_test.c3) can
+// exercise the supervisor's hang watchdog. Far out of every real verb
+// range; nothing else ever sends it.
+const uint ECHOD_HANG = 0xE0FF;
+
 // The real Plan9 DMDIR bit (0x80000000) — set in P9_CREATE's own perm
 // argument to create a directory instead of a regular file. Matches
 // real 9P's own Tcreate exactly, rather than inventing a separate verb

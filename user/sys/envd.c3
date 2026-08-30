@@ -20,6 +20,13 @@ import std::nolibc::mem;
 // already proved for FS_READ/FS_LIST and /proc/<pid>/ctl proved for
 // FS_WRITE.
 //
+// Crash policy (docs/roadmap.md §5.4): a supervisor-respawned envd comes
+// up with an empty env_table, and that's deliberately fine — the table
+// is keyed by (pid, generation), which is meaningless after a respawn,
+// and the shell's own $user/$cwd/$home/$status are computed there, not
+// stored here. "The env server crashed, your vars are gone" is the
+// correct outcome; there's nothing worth persisting.
+//
 // Path shape, after "/env/" is already stripped by the caller's own
 // namespace resolution: a single flat namespace per process (no
 // subdirectories/groups — see this feature's own devlog entry for what

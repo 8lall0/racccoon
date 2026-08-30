@@ -451,6 +451,62 @@ struct Trap_frame @packed
 	ulong sp;
 }
 
+// The shared process-teardown body: record the exit code, wake any IPC
+// partner parked on a rendezvous with this process, drop its pipe ends,
+// free its address space (unless an rfork(RFPROC|RFMEM) sibling still
+// shares the page_table), and mark the slot PROC_UNUSED. Extracted from
+// sys_exit / sys_kill, which had byte-identical teardown bodies; also
+// called by the supervisor watchdog (src/supervisor.c3) on a wedged
+// server. Safe from the timer-trap context the watchdog runs in — it's
+// the same page alloc/free machinery the respawn path there already uses.
+fn void proc_destroy(Process* target, int exit_code) @noinline
+{
+	proc_record_exit(target.pid, target.generation, target.parent_pid, exit_code);
+
+	// A target torn down mid-blocking-wait would otherwise leak its
+	// blocking_depth increment (see the note this used to carry inline in
+	// sys_kill). Only ever true on the kill / watchdog paths — a process
+	// running SYS_EXIT is not in a blocking wait.
+	if (target.in_blocking_wait) blocking_depth--;
+
+	ipc_wake_waiters_on(target);
+	if (target.stdout_pipe >= 0) { pipe_detach(target.stdout_pipe, true);  target.stdout_pipe = -1; }
+	if (target.stdin_pipe  >= 0) { pipe_detach(target.stdin_pipe,  false); target.stdin_pipe  = -1; }
+
+	bool table_shared = false;
+	for (int i = 0; i < PROCS_MAX; i++)
+	{
+		if (&procs[i] == target) continue;
+		if (procs[i].state == PROC_UNUSED) continue;
+		if (procs[i].page_table == target.page_table) { table_shared = true; break; }
+	}
+	if (!table_shared)
+	{
+		ulong* t2 = target.page_table;
+		for (uint vpn2 = 0; vpn2 < 512; vpn2++)
+		{
+			if ((t2[vpn2] & PAGE_V) == 0) continue;
+			ulong* t1 = (ulong*)pte_to_paddr(t2[vpn2]);
+			for (uint vpn1 = 0; vpn1 < 512; vpn1++)
+			{
+				if ((t1[vpn1] & PAGE_V) == 0) continue;
+				ulong* t0 = (ulong*)pte_to_paddr(t1[vpn1]);
+				for (uint vpn0 = 0; vpn0 < 512; vpn0++)
+				{
+					if ((t0[vpn0] & PAGE_V) == 0) continue;
+					if (t0[vpn0] & PAGE_U) { free_pages(pte_to_paddr(t0[vpn0]), 1); }
+				}
+				free_pages((uptr)t0, 1);
+			}
+			free_pages((uptr)t1, 1);
+		}
+		free_pages((uptr)t2, 1);
+	}
+
+	target.state = PROC_UNUSED;
+	target.pid = 0;
+}
+
 // Extracted from handle_syscall's SYS_KILL case (2026-08-28 probe of
 // the c3c switch-call landmine — see the case site). Kills an
 // arbitrary target process: the write half of /proc/<pid>/ctl
@@ -466,12 +522,8 @@ fn void sys_kill(Trap_frame* f) @noinline
 	uint kill_expected_generation = (uint)f.a1;
 	if (kill_pid == current_proc.pid)
 	{
-		// Same self-deadlock-shaped reasoning as SYS_JOIN's
-		// own self-check, though the failure mode here is
-		// different (this would tear down the very page
-		// table the code performing the teardown is running
-		// under) — reject; SYS_EXIT already exists for
-		// killing yourself.
+		// Can't tear down the very page table the running code is
+		// under — reject; SYS_EXIT is how a process kills itself.
 		f.a0 = (ulong)(-1);
 		return;
 	}
@@ -486,167 +538,24 @@ fn void sys_kill(Trap_frame* f) @noinline
 		f.a0 = (ulong)(-1);
 		return;
 	}
-
-	// Leak-safety half of blocking_depth's own fix
-	// (process.c3): this kill tears kill_target down regardless
-	// of what it was doing (the same "any other process
-	// currently blocked... is left blocked forever" gap this
-	// case already accepts, just below) — without this, a
-	// target killed while genuinely mid one of the blocking
-	// waits that incremented blocking_depth would leak that
-	// increment permanently. blocking_depth is only ever
-	// consulted by fork_entry()'s own check now (not
-	// kernel_entry's shared tail — see blocking_depth's own
-	// comment for why not), so a leak here wouldn't wedge the
-	// whole system, just make every future freshly-rfork()'d
-	// child's own first sret conservatively start with
-	// interrupts off — still worth closing cleanly rather than
-	// leaving an ever-growing counter. kill_target.in_blocking_wait
-	// isn't reset here: the slot is about to become PROC_UNUSED
-	// and gets explicitly reset on its next reuse (SYS_RFORK's
-	// own child.in_blocking_wait = false, create_process()'s
-	// equivalent).
-	if (kill_target.in_blocking_wait) blocking_depth--;
-
-	// Same as sys_exit: unblock anyone parked in ipc_send/ipc_reply
-	// toward the process we're killing, before its pid is zeroed below.
-	ipc_wake_waiters_on(kill_target);
-	if (kill_target.stdout_pipe >= 0) { pipe_detach(kill_target.stdout_pipe, true); kill_target.stdout_pipe = -1; }
-	if (kill_target.stdin_pipe >= 0) { pipe_detach(kill_target.stdin_pipe, false); kill_target.stdin_pipe = -1; }
-
-	// Same page-table-teardown-if-not-shared logic as
-	// SYS_EXIT above, just targeting kill_target instead of
-	// current_proc — see that case's own comment for the
-	// full reasoning (shared-table rfork(RFPROC|RFMEM)
-	// siblings, the 3-level Sv39 walk, etc.). Inlined for the
-	// same reason SYS_EXIT is: a call out to a moderately
-	// complex function from inside this switch has
-	// reproducibly broken boot before.
-	bool kill_table_shared = false;
-	for (int kshare_i = 0; kshare_i < PROCS_MAX; kshare_i++)
-	{
-		if (&procs[kshare_i] == kill_target) continue;
-		if (procs[kshare_i].state == PROC_UNUSED) continue;
-		if (procs[kshare_i].page_table == kill_target.page_table)
-		{
-			kill_table_shared = true;
-			break;
-		}
-	}
-
-	if (!kill_table_shared)
-	{
-		ulong* kill_table2 = kill_target.page_table;
-		for (uint kvpn2 = 0; kvpn2 < 512; kvpn2++)
-		{
-			if ((kill_table2[kvpn2] & PAGE_V) == 0) continue;
-			ulong* kill_table1 = (ulong*)pte_to_paddr(kill_table2[kvpn2]);
-
-			for (uint kvpn1 = 0; kvpn1 < 512; kvpn1++)
-			{
-				if ((kill_table1[kvpn1] & PAGE_V) == 0) continue;
-				ulong* kill_table0 = (ulong*)pte_to_paddr(kill_table1[kvpn1]);
-
-				for (uint kvpn0 = 0; kvpn0 < 512; kvpn0++)
-				{
-					if ((kill_table0[kvpn0] & PAGE_V) == 0) continue;
-					if (kill_table0[kvpn0] & PAGE_U)
-					{
-						uptr kill_leaf_paddr = pte_to_paddr(kill_table0[kvpn0]);
-						free_pages(kill_leaf_paddr, 1);
-					}
-				}
-
-				free_pages((uptr)kill_table0, 1);
-			}
-
-			free_pages((uptr)kill_table1, 1);
-		}
-		free_pages((uptr)kill_table2, 1);
-	}
-
 	// A killed process counts as a failed command for the shell's
-	// `&&` / `||` (code -1, same "non-zero = failure" convention).
-	proc_record_exit(kill_target.pid, kill_target.generation, kill_target.parent_pid, -1);
-
-	kill_target.state = PROC_UNUSED;
-	kill_target.pid = 0;
+	// `&&` / `||` (code -1). Teardown is shared with sys_exit and the
+	// supervisor watchdog — see proc_destroy.
+	proc_destroy(kill_target, -1);
 	f.a0 = 0;
 }
 
-// exec()/exit() teardown: frees every page this process's table owns
-// (PAGE_U leaves + the on-demand 2nd/3rd-level tables + the root),
-// unless an rfork(RFPROC|RFMEM) sibling still shares the same
-// page_table pointer. Then marks the slot PROC_UNUSED and yield()s,
-// which never returns (the scan can't pick a PROC_UNUSED self).
-// (Was inlined in handle_syscall as a c3c-0.8.2 landmine workaround;
-// 0.8.3 probe 2026-08-28 showed the extraction is safe now.)
+// SYS_EXIT: tear this process down (proc_destroy — shared with sys_kill)
+// and yield() into whatever runs next; the yield never returns since the
+// slot is PROC_UNUSED now. (Was inlined in handle_syscall as a
+// c3c-0.8.2 landmine workaround; 0.8.3 probe 2026-08-28 showed the
+// extraction is safe.)
 fn void sys_exit(Trap_frame* f) @noinline
 {
-		// Stash the exit code for a parent's join() (only non-zero codes
-		// from a child that has a parent — see proc_record_exit).
-		proc_record_exit(current_proc.pid, current_proc.generation, current_proc.parent_pid, (int)f.a0);
-
-		// Anyone parked in ipc_send/ipc_reply toward us would hang
-		// forever on a rendezvous we can no longer complete — wake them
-		// with a failure. Before pid is cleared below (the sweep keys
-		// on pid+generation).
-		ipc_wake_waiters_on(current_proc);
-
-		// Drop our pipe ends — the other side needs writers/readers to
-		// fall to 0 to see EOF (and the pipe to be freed).
-		if (current_proc.stdout_pipe >= 0) { pipe_detach(current_proc.stdout_pipe, true); current_proc.stdout_pipe = -1; }
-		if (current_proc.stdin_pipe >= 0) { pipe_detach(current_proc.stdin_pipe, false); current_proc.stdin_pipe = -1; }
-
-		bool exit_table_shared = false;
-		for (int share_i = 0; share_i < PROCS_MAX; share_i++)
-		{
-			if (&procs[share_i] == current_proc) continue;
-			if (procs[share_i].state == PROC_UNUSED) continue;
-			if (procs[share_i].page_table == current_proc.page_table)
-			{
-				exit_table_shared = true;
-				break;
-			}
-		}
-
-		if (!exit_table_shared)
-		{
-			ulong* exiting_table2 = current_proc.page_table;
-			for (uint vpn2 = 0; vpn2 < 512; vpn2++)
-			{
-				if ((exiting_table2[vpn2] & PAGE_V) == 0) continue;
-				ulong* table1 = (ulong*)pte_to_paddr(exiting_table2[vpn2]);
-
-				for (uint vpn1 = 0; vpn1 < 512; vpn1++)
-				{
-					if ((table1[vpn1] & PAGE_V) == 0) continue;
-					ulong* table0 = (ulong*)pte_to_paddr(table1[vpn1]);
-
-					for (uint vpn0 = 0; vpn0 < 512; vpn0++)
-					{
-						if ((table0[vpn0] & PAGE_V) == 0) continue;
-						if (table0[vpn0] & PAGE_U)
-						{
-							uptr leaf_paddr = pte_to_paddr(table0[vpn0]);
-							free_pages(leaf_paddr, 1);
-						}
-					}
-
-					free_pages((uptr)table0, 1);
-				}
-
-				free_pages((uptr)table1, 1);
-			}
-			free_pages((uptr)exiting_table2, 1);
-		}
-
-		current_proc.state = PROC_UNUSED;
-		current_proc.pid = 0;
-
-		// yield() never returns here: current_proc is now PROC_UNUSED,
-		// so its scan can't match itself, and switch_context's `ret`
-		// jumps permanently into whatever process it picks instead.
+		proc_destroy(current_proc, (int)f.a0);
+		// yield() never returns here: current_proc is now PROC_UNUSED, so
+		// the scan can't match itself and switch_context's `ret` jumps
+		// permanently into whatever process it picks instead.
 		yield();
 }
 
@@ -2887,13 +2796,15 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 			// (usbd on the Duo, netd's link poll on QEMU). Cheap when
 			// nothing has died (SVC_MAX * O(1)); create_process() is
 			// already trap-safe (SYS_RFORK does the same work).
-			supervisor_tick();
+			bool svc_killed_current = supervisor_tick();
 
 			// Real preemption: force a reschedule on every tick, not
 			// just when a process happens to yield() on its own. See
 			// enable_timer_interrupts()'s own comment above for why
-			// this is safe and why it's gated on pid > 0.
-			if (current_proc.pid > 0)
+			// this is safe and why it's gated on pid > 0. Also yield
+			// unconditionally if the watchdog just tore down the
+			// process we'd otherwise sret back into.
+			if (svc_killed_current || current_proc.pid > 0)
 			{
 				yield();
 			}

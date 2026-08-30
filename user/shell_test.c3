@@ -1939,6 +1939,44 @@ fn void main() {
             } else {
                 print("storagekilltest: FAILED\n");
             }
+        } else if (strcmp(cmd, "hungservertest") == 0) {
+            // Proves the supervisor's hang watchdog (src/supervisor.c3,
+            // docs/roadmap.md §5.6): wedge echod (ECHOD_HANG -> it spins
+            // forever without returning to ipc_recv), then confirm the
+            // watchdog notices the next request piling up unconsumed and
+            // kills + respawns it. NB: if the watchdog is broken this
+            // test hangs at the second send — that's the signal.
+            int hg_pid = ns_resolve("/srv/echo/", null);
+            ipc_send(hg_pid, ECHOD_HANG, "x", 1);   // consumed; echod now spinning
+
+            // Piles up unconsumed in echod's inbox. Blocks until the
+            // watchdog tears the hung echod down (~5 s), which wakes this
+            // send with -1.
+            int hg_wedged = ipc_send(hg_pid, 0, "poke", 5);
+
+            // Recover: the respawn + namespace reseat happen in the same
+            // timer tick as the kill, so "/srv/echo/" now resolves to the
+            // fresh echod. Round-trip to prove it serves again.
+            int hg_ok = -1;
+            ulong hg_deadline = rdtime() + 100000000; // ~10s at QEMU's 10MHz
+            while (hg_ok < 0 && rdtime() < hg_deadline) {
+                yield();
+                // Only probe once "/srv/echo/" resolves to the echod
+                // mount itself (matched-prefix length 10), not the ""
+                // catch-all (length 0) it falls through to while echod is
+                // dead — sending to the root fsd would just hang here.
+                uint hg_mlen = 0;
+                int hp = ns_resolve("/srv/echo/", &hg_mlen);
+                if (hp <= 0 || hg_mlen != 10) continue;
+                if (ipc_send(hp, 0, "hi", 3) < 0) continue;
+                char[64] hr @noinit;
+                if (ipc_recv(&hr, 64) > 0) hg_ok = 0;
+            }
+            if (hg_wedged < 0 && hg_ok == 0) {
+                print("hungservertest: ok (wedged echod killed + respawned, serving again)\n");
+            } else {
+                print("hungservertest: FAILED\n");
+            }
         } else if (strcmp(cmd, "ipcdeathtest") == 0) {
             // Proves the IPC rendezvous no longer hangs forever when the
             // peer dies mid-transfer (src/entry.c3 sys_exit /
