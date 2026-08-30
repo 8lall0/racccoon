@@ -43,7 +43,19 @@ constraint.
 
 `oomtest` / `faulttest` in `shell_test.c3`. QEMU: both pass, full
 regression green (`user fault: pid=10 scause=f … — killing the
-process` prints, shell carries on). Duo builds clean.
+process` prints, shell carries on).
+
+`faulttest` passed on the real Duo first try. `oomtest` panicked it —
+a *pre-existing* latent bug the test surfaced: `RAM_SIZE` / `TOTAL_PAGES`
+is a hardcoded 64 MiB, but `boards/duo/kernel.ld` pins `__free_ram_end`
+to the real DRAM window minus the kernel + stack + reserved top
+768 KiB (~59 MiB, ~1280 pages short). Once RAM was genuinely exhausted,
+`alloc_pages` / `free_page_count` scanned the tail bitmap bits that map
+past physical DRAM → over-reported free, pre-checks passed wrongly, the
+zero-fill wrote past DRAM → fault → panic. Fixed: `ram_page_count()` =
+`min((__free_ram_end − __free_ram)/PAGE_SIZE, TOTAL_PAGES)`, used as the
+scan bound. No change on QEMU (`src/kernel.ld` makes the span exactly
+`RAM_SIZE`). Duo re-verify pending.
 
 ---
 
