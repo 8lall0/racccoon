@@ -17,7 +17,7 @@ New `SYS_STDIN_ISATTY` (#48) — one line, `f.a0 = current_proc.stdin_pipe
 print usage instead of entering the read loop. In a pipeline
 (`stdin_pipe >= 0`) they behave exactly as before. QEMU-verified: bare
 `head` / `cat` → usage; `ls | head -n 3` and `echo hi | cat` still work;
-regression green. Duo builds clean.
+regression green. Real Duo verified too.
 
 ---
 
