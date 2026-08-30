@@ -36,20 +36,26 @@ The `driver_irq_pending` clear (+ the test's generation guard) fixed
 the gpiod case — the respawned gpiod re-maps its MMIO, rebuilds its pin
 table, and services a real SET_DIR on the status-LED pin.
 
-**`fsdkilltest` / `storagekilltest` also PASS — the Duo failures were a
-test-harness timing bug, not a driver bug.** With the new `loud`
-diagnostic (`SYS_BOOT_QUIET a0=1` / `boot_loud()`), the respawned sdd
-was watched enumerating the card *cleanly every time*: CMD0 ok, CMD8
-0x1aa, ACMD41 ready after 0x4f tries, CMD2/3/7 ok, clock raised, "card
-ready". The test still said FAILED because its respawn deadline was a
-hardcoded tick count (`rdtime() + 100000000`) calibrated for QEMU's
-10 MHz `time` CSR — only ~4 s of real budget on the Duo's 25 MHz clock,
-and `fsdkilltest`'s was ~1.2 s. That's not enough for the 1 Hz
-supervisor tick plus a real SD re-enumeration.
+**`fsdkilltest` / `storagekilltest` still FAIL on the Duo.** Two things
+were wrong; one fixed:
 
-Fix: `SYS_TIMEBASE` (#49) → `timebase_hz()`. Every killtest deadline is
-now `rdtime() + timebase_hz() * 20` — 20 s wall-clock on any board.
-§5.5 is closed for every Duo-testable driver (fsd, sdd, usbd, gpiod).
+1. The killtest respawn deadlines were hardcoded tick counts for QEMU's
+   10 MHz `time` CSR — ~4 s (storage) / ~1.2 s (fsd) of real budget on
+   the Duo's 25 MHz clock, nowhere near enough for the 1 Hz supervisor
+   tick + a real SD re-enumeration. **Fixed**: `SYS_TIMEBASE` (#49) /
+   `timebase_hz()`; every killtest deadline is now
+   `rdtime() + timebase_hz() * 20` (20 s wall-clock, any board).
+
+2. Still failing after (1). `storagekilltest` shows a *double*
+   `svc: respawned sdd` with no "wedged" line — a respawned sdd is
+   **exiting** (silent panic), not being stall-killed. Yet with `loud`
+   on, a respawned sdd was watched enumerating the card cleanly every
+   time. So it's timing-dependent: under the load of a blocked fsd +
+   the test, enumeration's wall-clock command budgets get starved, or
+   the first post-respawn DMA read returns a bad status. Need the full
+   `loud; storagekilltest` output (the `sdd: DMA xfer status=…` line).
+
+§5.5 so far: usbd + gpiod respawn Duo-verified; fsd + sdd still open.
 
 ---
 

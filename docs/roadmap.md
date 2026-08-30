@@ -494,22 +494,28 @@ Generation counters back most of the stale-reference handling:
        IRQ-notify instead of the real request. Also: gpiod now has
        `watch_hangs = true` (its bring-up is 3 MMIO writes, not a slow
        bus reset) as a net.
-     - `fsdkilltest` / `storagekilltest` — **PASS.** The earlier Duo
-       failures were a *test-harness timing bug*, not a driver bug: the
-       respawn deadlines were hardcoded tick counts calibrated for
-       QEMU's 10 MHz `time` CSR, giving only ~1.2 s / ~4 s of real
-       budget on the Duo's 25 MHz clock — not enough for the 1 Hz
-       supervisor tick plus a real SD card re-enumeration (CMD0 → CMD8
-       → ~0x4f ACMD41 tries → CMD2/3/7 → clock raise). With `loud`, the
-       respawned sdd was seen enumerating the card cleanly every time.
-       New `SYS_TIMEBASE` (#49) / `timebase_hz()`; every killtest
-       deadline is now `rdtime() + timebase_hz() * 20` — the same
-       20 s wall-clock budget on any board.
+     - `fsdkilltest` / `storagekilltest` — **still FAIL on the Duo**
+       (both pass on QEMU). The killtest-deadline fix below was needed
+       (deadlines were QEMU-10MHz tick counts → ~1.2 s / ~4 s on the
+       Duo's 25 MHz clock) but wasn't the whole story. `storagekilltest`
+       still shows a *double* `svc: respawned sdd` with no "wedged"
+       line — so a respawned sdd is **exiting** (silent panic), not
+       being stall-killed. Yet with `loud` on, a respawned sdd was
+       watched enumerating the card *cleanly* (CMD0/CMD8/ACMD41/
+       CMD2/3/7/clock-raise all ok) — so it's timing-sensitive: under
+       the load of a blocked fsd + the test, either enumeration's
+       wall-clock command budgets get starved, or the first DMA read
+       after respawn returns a bad status. Need the full `loud;
+       storagekilltest` capture (the `sdd: DMA xfer status=…` /
+       `sdd: … TIMED OUT` line) to tell which. Not yet closed.
      - `netdkilltest` — **N/A on Duo.** netd exits before `srv_post`
        (self-test needs DHCP + a carrier the Duo link never gets — see
        "Ethernet status"), so there's nothing to kill.
-   - **§5.5 is closed** for every Duo-testable driver (fsd, sdd, usbd,
-     gpiod). Not fault-tested: ethd (no working link on the Duo).
+   - **§5.5 status**: usbd + gpiod respawn Duo-verified; fsd + sdd
+     respawn still failing on the Duo; ethd untested (no link).
+   - New: `SYS_TIMEBASE` (#49) / `timebase_hz()` — `board::TIMEBASE_HZ`
+     to userspace; every killtest deadline is now
+     `rdtime() + timebase_hz() * 20` (20 s wall-clock, any board).
    - Kernel-side, not a userspace `/bin/init`: the servers' privileged
      setup (`setup_*_mappings`) is kernel-only, and the binaries are
      embedded in the kernel image, not on disk — a userspace init would
