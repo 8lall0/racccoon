@@ -714,18 +714,32 @@ fn int shell_exec_external(char* cmd, char** cmd_argv, int cmd_argc)
 // Quote-aware expansion for one pipeline segment. Copies `in` to `out`
 // with the quote characters removed, expanding $name (via
 // shell_var_value) except inside '...'. qmask[k] is 1 for every out[k]
-// that came from inside quotes (or from a double-quoted expansion) —
-// the tokeniser treats those bytes as ordinary text: never a word
-// split, never an operator. Single quotes are fully literal, and '' is
-// a literal '. Double quotes are literal except $name still expands
-// (its bytes marked quoted, so "$x" stays one word). Returns the out
-// length, or -1 on an unterminated quote.
+// that came from inside quotes (or from a double-quoted expansion, or a
+// backslash escape) — the tokeniser treats those bytes as ordinary
+// text: never a word split, never an operator, never a glob metachar,
+// never a $. Single quotes are fully literal, and '' is a literal '.
+// Double quotes are literal except $name still expands (its bytes
+// marked quoted, so "$x" stays one word) and \ escapes $ ` " \.
+// Outside quotes, \<char> takes <char> literally (\  is an escaped
+// space, \| an escaped pipe, …); a trailing \ is itself literal.
+// Returns the out length, or -1 on an unterminated quote.
 fn int shell_expand_q(char* in, char* out, char* qmask, int cap)
 {
     int o = 0;
     int i = 0;
     while (in[i] != 0 && o < cap - 1) {
         char c = in[i];
+        if (c == '\\') {
+            char nx = in[i + 1];
+            if (nx == 0) {
+                if (o < cap - 1) { out[o] = '\\'; qmask[o] = 1; o++; }
+                i++;
+                continue;
+            }
+            if (o < cap - 1) { out[o] = nx; qmask[o] = 1; o++; }
+            i += 2;
+            continue;
+        }
         if (c == '\'') {
             i++;
             for (;;) {
@@ -747,6 +761,11 @@ fn int shell_expand_q(char* in, char* out, char* qmask, int cap)
             for (;;) {
                 if (in[i] == 0) { return -1; }
                 if (in[i] == '"') { i++; break; }
+                if (in[i] == '\\' && (in[i + 1] == '"' || in[i + 1] == '\\' || in[i + 1] == '$' || in[i + 1] == '`')) {
+                    if (o < cap - 1) { out[o] = in[i + 1]; qmask[o] = 1; o++; }
+                    i += 2;
+                    continue;
+                }
                 if (in[i] == '$' && sh_name_start(in[i + 1])) {
                     i++;
                     char[32] nm @noinit; int n = 0;
@@ -1053,6 +1072,10 @@ fn int shell_exec_line(char* line)
 
     for (;;) {
         char c = line[p];
+        // A backslash escape spans two bytes and neither is ever a
+        // quote toggle or a sequencing operator — skip the pair whole
+        // (outside single quotes; inside '...' a backslash is literal).
+        if (c == '\\' && line[p + 1] != 0 && quote != '\'') { p += 2; continue; }
         if (c != 0 && quote == 0 && (c == '\'' || c == '"')) { quote = c; p++; continue; }
         if (c != 0 && quote != 0 && c == quote)              { quote = 0; p++; continue; }
 
