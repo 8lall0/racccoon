@@ -4,6 +4,56 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — supervisor: hang watchdog + envd crash policy (§5)
+
+Two of the "smaller §5 gaps."
+
+### Watchdog (§5.6, gap #5)
+
+A supervised server stuck in an infinite loop / deadlock used to look
+alive — clients waited on it forever. The supervisor now catches it.
+
+Signal: a server in its `ipc_recv` loop has `has_message == false`; it
+clears the flag the instant it picks a message up, *before* processing.
+So `has_message` stuck true across `SVC_STALL_LIMIT` (5) consecutive
+ticks == "got a request, never returned to recv." `Service.ever_ready`
+gates it — a server that hasn't reached recv even once (slow init, sdd
+on the Duo) is starting, not wedged.
+
+Three supporting pieces, each a real bug found while building it:
+
+- **`proc_destroy(Process*, code)`** — extracted the byte-identical
+  teardown body out of `sys_exit` / `sys_kill` (wake IPC partners, drop
+  pipes, free the address space, free the slot). `sys_exit` is 5 lines
+  now. The watchdog calls it too.
+- **The watchdog defers the respawn one tick.** Killing + respawning in
+  the same tick reuses the just-freed slot; if the wedged server was
+  `current_proc`, the timer trap's `yield()` then saves the trap
+  context *into the fresh process* and corrupts it — booted straight
+  into a store page fault. `supervisor_tick` now returns whether it
+  killed `current_proc` so the timer case can force the yield, and the
+  respawn waits for the next tick's normal dead-detection.
+- **`create_process` clears `has_message` / `msg_acked` / `msg_from`**
+  on a reused slot (`sys_rfork` already did). Without it, a respawned
+  server "consumed" the stale request the killed instance left in the
+  inbox and replied into a rendezvous nobody was in — deadlock. This
+  was the second hang, after the page fault.
+
+`hungservertest` (shell_test.c3) + a test-only `ECHOD_HANG` verb prove
+it end to end. QEMU: passes; killtest / fsdkilltest / storagekilltest /
+ipcdeathtest / regression all still green.
+
+### envd crash policy (§5.4)
+
+Classified as **accept the loss.** `env_table` is `(pid, generation)`-
+keyed — meaningless after any respawn; `$user`/`$cwd`/`$home`/`$status`
+are shell-computed, not stored there; and nothing but the dev tests
+ever writes `/env`. A respawned envd coming up empty *is* correct.
+`fsd`/`fsd2`/`procd`/`echod` are all stateless-rebuildable. Noted in
+`envd.c3` and the roadmap.
+
+---
+
 ## 2026-08-30 — supervisor: the block-storage driver joins §5
 
 The supervisor already covered fsd / fsd2 / echod / procd / envd — the

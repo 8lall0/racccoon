@@ -392,8 +392,12 @@ Generation counters back most of the stale-reference handling:
    waiting.
 4. **Inbox wedge** — `while (target.has_message) yield()` spins forever
    if the target died with `has_message` still set.
-5. **A hung (not exited) server is invisible.** An infinite loop looks
-   alive; clients wait forever with no signal.
+5. **A hung (not exited) server is invisible.** ~~An infinite loop looks
+   alive; clients wait forever with no signal.~~ **Closed** (`§5.6`
+   watchdog, commit below): the supervisor kills any supervised server
+   whose inbox holds an unconsumed message for `SVC_STALL_LIMIT`
+   consecutive ticks — a healthy server clears `has_message` the instant
+   it calls `ipc_recv`.
 6. **In-flight hardware / FS state.** A driver that crashes mid-DMA or
    mid-write leaves the device (and possibly the filesystem) in an
    indeterminate state. `fsd`'s write path is ordering-careful but this
@@ -453,15 +457,30 @@ Generation counters back most of the stale-reference handling:
    simple attach-walk-read-clunk-per-call path — `fsdkilltest` proves
    it), so this only matters for a client holding a long-lived fid.
 4. **State policy per server.** Respawned servers come up empty.
-   `fsd`: fine, re-reads from disk. `envd`: holds per-process env —
-   either persist it to a file under `/usr/$user/lib` or accept the
-   loss. Classify each server stateless-rebuildable vs
-   persist-on-write.
+   Classified:
+   - `fsd` / `fsd2` — stateless-rebuildable: re-reads everything from
+     disk on the next request. Nothing to do.
+   - `procd` — stateless: every answer is a live `SYS_PROC_INFO` call.
+   - `echod` — stateless: a synthetic in-memory tree rebuilt in `main`.
+   - `envd` — **accept the loss.** `env_table` is keyed by `(pid,
+     generation)`, which is meaningless after any respawn; the shell's
+     `$user` / `$cwd` / `$home` / `$status` are shell-computed, not
+     stored here; and nothing but the dev tests ever writes `/env` at
+     all. A respawned envd coming up empty *is* the correct behaviour
+     ("the env server crashed, your vars are gone") — persisting a
+     pid-keyed table to disk would restore nothing usable.
 5. **Device reset on driver respawn.** A respawned `usbd`/`sdd`/`ethd`
    must assume the hardware is in an unknown state and do a full
    re-init (most already do their bring-up unconditionally — verify).
-6. **Watchdog for hangs** (later). A supervisor ping, or the kernel
-   noticing a process hasn't yielded in N ticks and killing it.
+   `diskd`/`sdd` verified: `diskd_init` writes `DEVICE_STATUS = 0`
+   (full virtio reset) before re-negotiating, so it's idempotent — the
+   supervisor's `storagekilltest` respawn-then-read passes repeatedly.
+6. **Watchdog for hangs. DONE** (commit below). `SVC_STALL_LIMIT`
+   consecutive ticks with the server's inbox holding an unconsumed
+   message → the supervisor kills it (the next tick respawns it).
+   `ever_ready` gates it so a slow-starting server (sdd on the Duo)
+   isn't mistaken for wedged. `hungservertest` (shell_test.c3, echod +
+   the `ECHOD_HANG` verb) proves it.
 
 ### Not doing
 
