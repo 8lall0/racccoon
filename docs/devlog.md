@@ -28,8 +28,10 @@ binaries already cover them. The no-pipe/no-redirection path is
 untouched: builtins still run in-process there, so `cd` works.
 
 QEMU disk_dual: the cases above plus regression green (bigreadtest,
-pathtest, mounttest, killtest, envtest, nstest, srvtest, p9fstest); Duo
-kernel builds clean, hw verification pending.
+pathtest, mounttest, killtest, envtest, nstest, srvtest, p9fstest).
+**Duo hardware verified** (reflash only — kernel-embedded shell):
+`namespace | head`, `pwd | cat`, and the side-effecting-builtin 127
+fall-through all confirmed on the console.
 
 ---
 
