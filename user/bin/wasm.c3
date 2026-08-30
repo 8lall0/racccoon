@@ -10,11 +10,10 @@ import std::nolibc::mem;
 //
 //   wasm foo.wasm [args...]
 //
-// Milestone 1a: the module skeleton + a minimal integer opcode set
-// (const / local / global / call / add-sub-mul / return). Enough to run
-// a hand-built module that computes 2+3 and prints 5. Later milestones
-// grow the opcode table, control flow, memory, floats, more host
-// functions.
+// Milestones 1a-1c: decode + validate + interpret the integer core:
+// consts, locals/globals, calls, all i32/i64 arithmetic, linear memory,
+// and control flow (block/loop/if/br/br_table). Next: call_indirect,
+// more host imports, float ops.
 //
 // All working memory (the module bytes, the value/locals/frame stacks,
 // the section tables) comes from map_pages() (SYS_MAP) — userspace has
@@ -49,11 +48,20 @@ const char EXT_GLOBAL = 3;
 
 const char OP_UNREACHABLE = 0x00;
 const char OP_NOP         = 0x01;
+const char OP_BLOCK       = 0x02;
+const char OP_LOOP        = 0x03;
+const char OP_IF          = 0x04;
+const char OP_ELSE        = 0x05;
 const char OP_END         = 0x0b;
+const char OP_BR          = 0x0c;
+const char OP_BR_IF       = 0x0d;
+const char OP_BR_TABLE    = 0x0e;
 const char OP_RETURN      = 0x0f;
 const char OP_CALL        = 0x10;
+const char OP_CALL_INDIRECT = 0x11;
 const char OP_DROP        = 0x1a;
 const char OP_SELECT      = 0x1b;
+const char OP_SELECT_T    = 0x1c;
 const char OP_LOCAL_GET   = 0x20;
 const char OP_LOCAL_SET   = 0x21;
 const char OP_LOCAL_TEE   = 0x22;
@@ -131,6 +139,12 @@ const int VSTACK_MAX   = 8192;   // 64 KiB
 const int LOCALS_MAX   = 8192;   // 64 KiB
 const int FRAMES_MAX   = 512;
 const int MODULE_MAX   = 512 * 1024;
+const int BLOCKS_MAX   = 4096;   // block/loop/if opcodes across the whole module
+const int CTL_MAX      = 1024;   // active control-stack entries
+const int SCAN_MAX     = 512;    // block nesting depth during the load-time scan
+
+// blocktype byte
+const char BT_VOID = 0x40;
 
 struct WType
 {
@@ -163,6 +177,27 @@ struct WFrame
     uint ip;                   // offset into g_mod
     int  locals_base;          // into g_locals
     int  vstack_base;          // value-stack height on entry (for RETURN unwind)
+    int  ctl_base;             // control-stack height on entry
+}
+
+// one block/loop/if opcode, from the load-time scan. start_pc is the
+// offset of the block-kind opcode byte; the whole module's entries are
+// kept in ascending start_pc order for binary search.
+struct WBlock
+{
+    uint start_pc;
+    uint else_pc;              // 0 if none
+    uint end_pc;               // offset of the matching END byte
+    char arity;                // 0 or 1 result value
+}
+
+// an entered block, on the control stack
+struct WCtl
+{
+    char kind;                 // OP_BLOCK / OP_LOOP / OP_IF
+    uint target_pc;            // where a `br` to this label jumps
+    int  vstack_height;        // stack height to restore on branch/exit
+    char arity;
 }
 
 // --- module state (all map_pages'd in wasm_alloc) ---------------------
@@ -180,6 +215,9 @@ char*   g_mem;             // linear memory (SYS_MAP'd LAST so memory.grow can e
 int     g_mem_pages;       // current size in 64 KiB pages
 int     g_mem_cap_pages;   // pre-allocated ceiling (declared max, capped)
 bool    g_has_mem;
+
+WBlock* g_blocks;   int  g_nblocks;   // load-time block sidetable, ascending start_pc
+WCtl*   g_ctl;      int  g_ctop;
 
 // --- fatal-exit helper ------------------------------------------------
 fn void die(char* msg)
@@ -407,6 +445,7 @@ fn void decode_code(Cur* c)
         f.nlocals = nlocals;
         f.code_off = bc.p;
         f.code_end = body_end;
+        scan_function(f);      // fills the block sidetable for this function
 
         c.p = body_end;
         // advance to the next non-import func
@@ -524,6 +563,107 @@ fn int wasm_mem_grow(int delta)
     return old;
 }
 
+// Advance `c` past one instruction (opcode + immediates) and return the
+// opcode. Used only by the load-time block scan.
+fn char next_instr(Cur* c)
+{
+    char op = cur_byte(c);
+    if (op == OP_BLOCK || op == OP_LOOP || op == OP_IF)
+    {
+        // blocktype: a single byte (0x40 or a valtype) or an s33 type index
+        char bt = g_mod[c.p];
+        if (bt == BT_VOID || bt == VT_I32 || bt == VT_I64 || bt == VT_F32 || bt == VT_F64)
+        {
+            c.p++;
+        }
+        else { read_i64(c); }
+    }
+    else if (op == OP_BR || op == OP_BR_IF || op == OP_CALL
+          || (op >= OP_LOCAL_GET && op <= OP_GLOBAL_SET))
+    {
+        read_u32(c);
+    }
+    else if (op == OP_CALL_INDIRECT) { read_u32(c); read_u32(c); }
+    else if (op == OP_BR_TABLE)
+    {
+        uint cnt = read_u32(c);
+        for (uint i = 0; i <= cnt; i++) { read_u32(c); }
+    }
+    else if (op == OP_SELECT_T)
+    {
+        uint cnt = read_u32(c);
+        skip(c, cnt);
+    }
+    else if (op >= OP_I32_LOAD && op <= OP_I64_STORE32) { read_u32(c); read_u32(c); }
+    else if (op == OP_MEMORY_SIZE || op == OP_MEMORY_GROW) { cur_byte(c); }
+    else if (op == OP_I32_CONST || op == OP_I64_CONST) { read_i64(c); }
+    else if (op == OP_F32_CONST) { skip(c, 4); }
+    else if (op == OP_F64_CONST) { skip(c, 8); }
+    else if ((uint)op == 0xfc) { read_u32(c); }   // misc prefix — subop only for now
+    // everything else: no immediates
+    return op;
+}
+
+// Scan a function body once, recording every block/loop/if -> its
+// matching else/end into the global sidetable (ascending start_pc).
+fn void scan_function(WFunc* f)
+{
+    uint[SCAN_MAX] open @noinit;      // start_pc of each open block
+    int[SCAN_MAX]  slot @noinit;      // its g_blocks index
+    int depth = 0;
+
+    Cur c; c.p = f.code_off; c.end = f.code_end;
+    while (c.p < c.end)
+    {
+        uint pc = c.p;
+        char op = next_instr(&c);
+        if (op == OP_BLOCK || op == OP_LOOP || op == OP_IF)
+        {
+            if (depth >= SCAN_MAX) { die("block nesting too deep"); }
+            if (g_nblocks >= BLOCKS_MAX) { die("too many blocks"); }
+            int idx = g_nblocks;
+            g_nblocks++;
+            g_blocks[idx].start_pc = pc;
+            g_blocks[idx].else_pc = 0;
+            g_blocks[idx].end_pc = 0;
+            // arity: re-read the blocktype byte at pc+1
+            char bt = g_mod[pc + 1];
+            g_blocks[idx].arity = (bt == VT_I32 || bt == VT_I64 || bt == VT_F32 || bt == VT_F64) ? (char)1 : (char)0;
+            open[depth] = pc;
+            slot[depth] = idx;
+            depth++;
+        }
+        else if (op == OP_ELSE)
+        {
+            if (depth == 0) { die("else without if"); }
+            g_blocks[slot[depth - 1]].else_pc = pc;
+        }
+        else if (op == OP_END)
+        {
+            if (depth == 0) { break; }  // the function's final END
+            depth--;
+            g_blocks[slot[depth]].end_pc = pc;
+        }
+    }
+    if (depth != 0) { die("unbalanced blocks"); }
+}
+
+// binary search the sidetable by start_pc
+fn WBlock* find_block(uint start_pc)
+{
+    int lo = 0;
+    int hi = g_nblocks - 1;
+    while (lo <= hi)
+    {
+        int mid = (lo + hi) / 2;
+        if (g_blocks[mid].start_pc == start_pc) { return &g_blocks[mid]; }
+        if (g_blocks[mid].start_pc < start_pc) { lo = mid + 1; }
+        else { hi = mid - 1; }
+    }
+    die("block not in sidetable");
+    return null;
+}
+
 // --- top-level decode --------------------------------------------------
 fn void decode_module()
 {
@@ -633,6 +773,7 @@ fn void push_frame(int func_idx)
     fr.ip = f.code_off;
     fr.locals_base = lbase;
     fr.vstack_base = g_vtop;
+    fr.ctl_base = g_ctop;
 }
 
 fn void frame_return()
@@ -645,8 +786,39 @@ fn void frame_return()
     if (nres == 1) { r0 = g_vstack[g_vtop - 1]; }
     g_vtop = fr.vstack_base;
     g_ltop = fr.locals_base;
+    g_ctop = fr.ctl_base;
     g_fcount--;
     if (nres == 1) { vpush(r0); }
+}
+
+// Branch out of `depth` enclosing labels (0 = innermost). Pops that
+// many control entries, sets ip to the (depth+1)th's target, and
+// restores the value stack — keeping the branched-to label's result
+// value(s) if it has arity.
+fn void do_branch(WFrame* fr, uint depth)
+{
+    if ((int)depth >= g_ctop - fr.ctl_base) { die("branch depth"); }
+    WCtl* tgt = &g_ctl[g_ctop - 1 - (int)depth];
+    long keep = 0;
+    bool have = tgt.arity == 1 && g_vtop > tgt.vstack_height;
+    if (have) { keep = g_vstack[g_vtop - 1]; }
+    g_vtop = tgt.vstack_height;
+    if (have) { vpush(keep); }
+    fr.ip = tgt.target_pc;
+    // a branch to a block/if exits it (and everything inside);
+    // a branch to a loop re-enters it, so keep that entry.
+    g_ctop = g_ctop - (int)depth;
+    if (tgt.kind != OP_LOOP) { g_ctop--; }
+}
+
+// read a blocktype at fr.ip, advance past it, return arity (0/1)
+fn char read_blocktype(WFrame* fr)
+{
+    char bt = g_mod[fr.ip];
+    if (bt == BT_VOID) { fr.ip++; return 0; }
+    if (bt == VT_I32 || bt == VT_I64 || bt == VT_F32 || bt == VT_F64) { fr.ip++; return 1; }
+    imm_i64(fr);   // s33 type index — treat as arity from its result count
+    return 0;      // (multi-value block types not fully modelled this milestone)
 }
 
 fn void interp()
@@ -662,12 +834,75 @@ fn void interp()
         {
             case OP_NOP:      break;
             case OP_UNREACHABLE: die("unreachable executed");
-            case OP_END:      frame_return();     // no blocks yet -> function end
+            case OP_END:
+                if (g_ctop > fr.ctl_base) { g_ctop--; }   // block ended naturally
+                else { frame_return(); }
             case OP_RETURN:   frame_return();
             case OP_DROP:     vpop();
             case OP_SELECT:
                 long sc = vpop(); long sv2 = vpop(); long sv1 = vpop();
                 vpush((int)sc != 0 ? sv1 : sv2);
+            case OP_SELECT_T:
+                uint stn = imm_u32(fr);
+                for (uint z = 0; z < stn; z++) { fr.ip++; }
+                long sc = vpop(); long sv2 = vpop(); long sv1 = vpop();
+                vpush((int)sc != 0 ? sv1 : sv2);
+
+            case OP_BLOCK:
+                uint bpc = fr.ip - 1;
+                char bar = read_blocktype(fr);
+                WBlock* bi = find_block(bpc);
+                if (g_ctop >= CTL_MAX) { die("control stack overflow"); }
+                g_ctl[g_ctop].kind = OP_BLOCK;
+                g_ctl[g_ctop].target_pc = bi.end_pc + 1;   // past the END
+                g_ctl[g_ctop].vstack_height = g_vtop;
+                g_ctl[g_ctop].arity = bar;
+                g_ctop++;
+            case OP_LOOP:
+                char lar = read_blocktype(fr);
+                if (g_ctop >= CTL_MAX) { die("control stack overflow"); }
+                g_ctl[g_ctop].kind = OP_LOOP;
+                g_ctl[g_ctop].target_pc = fr.ip;           // back to loop body start
+                g_ctl[g_ctop].vstack_height = g_vtop;
+                g_ctl[g_ctop].arity = 0;                    // loop params, not results
+                g_ctop++;
+            case OP_IF:
+                uint ipc = fr.ip - 1;
+                char iar = read_blocktype(fr);
+                WBlock* ii = find_block(ipc);
+                int cond = (int)vpop();
+                if (g_ctop >= CTL_MAX) { die("control stack overflow"); }
+                g_ctl[g_ctop].kind = OP_IF;
+                g_ctl[g_ctop].target_pc = ii.end_pc + 1;
+                g_ctl[g_ctop].vstack_height = g_vtop;
+                g_ctl[g_ctop].arity = iar;
+                g_ctop++;
+                if (cond == 0)
+                {
+                    fr.ip = ii.else_pc != 0 ? ii.else_pc + 1 : ii.end_pc + 1;
+                    if (ii.else_pc == 0) { g_ctop--; }     // no else: the if is done
+                }
+            case OP_ELSE:
+                // reached by falling off the then-branch: skip to END
+                WCtl* ec = &g_ctl[g_ctop - 1];
+                fr.ip = ec.target_pc;                       // = end_pc + 1
+                g_ctop--;
+            case OP_BR:
+                uint bd = imm_u32(fr);
+                do_branch(fr, bd);
+            case OP_BR_IF:
+                uint bid = imm_u32(fr);
+                if ((int)vpop() != 0) { do_branch(fr, bid); }
+            case OP_BR_TABLE:
+                uint tcnt = imm_u32(fr);
+                uint chosen = 0;
+                uint tsel_raw = (uint)(int)vpop();
+                for (uint ti = 0; ti <= tcnt; ti++)
+                {
+                    uint d = imm_u32(fr);
+                    if (ti == tsel_raw || (tsel_raw >= tcnt && ti == tcnt)) { chosen = d; }
+                }
+                do_branch(fr, chosen);
             case OP_CALL:
                 uint callee = imm_u32(fr);
                 if ((int)callee >= g_nfuncs) { die("call idx"); }
@@ -866,6 +1101,8 @@ fn void main(String[] args)
     g_vstack   = (long*)wasm_alloc((uint)(VSTACK_MAX * 8));
     g_locals   = (long*)wasm_alloc((uint)(LOCALS_MAX * 8));
     g_frames   = (WFrame*)wasm_alloc((uint)(FRAMES_MAX * WFrame::size));
+    g_blocks   = (WBlock*)wasm_alloc((uint)(BLOCKS_MAX * WBlock::size));
+    g_ctl      = (WCtl*)wasm_alloc((uint)(CTL_MAX * WCtl::size));
 
     // read the whole file
     uint total = 0;

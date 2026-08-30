@@ -1945,10 +1945,12 @@ fn void main() {
             // _start computes 2+3 and calls racccoon.print_i32 -> the
             // console shows "5"; _start has no result so it exits 0.
             int wt_ok = 0;
-            char*[2] wt_fx;
-            wt_fx[0] = "add.wasm";     // -> "5"
-            wt_fx[1] = "mem.wasm";     // -> "142" (linear memory + grow)
-            for (int wf = 0; wf < 2; wf++) {
+            char*[4] wt_fx;
+            wt_fx[0] = "add.wasm";     // -> "5"    (call + host import)
+            wt_fx[1] = "mem.wasm";     // -> "142"  (linear memory + grow)
+            wt_fx[2] = "loop.wasm";    // -> "55"   (block/loop/br/br_if)
+            wt_fx[3] = "fac.wasm";     // -> "120"  (if/else + recursion)
+            for (int wf = 0; wf < 4; wf++) {
                 char* wt_arg = wt_fx[wf];
                 uint wt_gen = 0;
                 int wt_c = rfork(RFPROC, &wt_gen);

@@ -158,6 +158,30 @@ code = [body([], start_body)]
 fixtures["mem.wasm"] = module(t, imp, fn, exp, code, mem=mem, data=data)
 
 
+# --- fac.wasm : recursion + if/else -> fac(5) = "120" -----------------
+# type 0: () -> ()        _start
+# type 1: (i32) -> ()     racccoon.print_i32
+# type 2: (i32) -> i32    fac
+t = [functype([], []), functype([I32], []), functype([I32], [I32])]
+imp = [import_func("racccoon", "print_i32", 1)]         # funcidx 0
+fn  = [2, 0]                                             # funcidx 1: fac, 2: _start
+exp = [export_func("_start", 2)]
+I32_LE_S = b"\x4c"
+fac_body = (
+    LG(0) + i32c(1) + I32_LE_S +
+    IF(I32) +
+      i32c(1) +
+    ELSE +
+      LG(0) +
+      LG(0) + i32c(1) + I32_SUB + call(1) +
+      I32_MUL +
+    END
+)
+start_body = i32c(5) + call(1) + call(0)
+code = [body([], fac_body), body([], start_body)]
+fixtures["fac.wasm"] = module(t, imp, fn, exp, code)
+
+
 def main():
     outdir = sys.argv[1] if len(sys.argv) > 1 else "build/wasm"
     os.makedirs(outdir, exist_ok=True)
