@@ -37,6 +37,21 @@ argv/env convention) is deferred to the process-layer stage (§7.6).
 Roadmap §7 has the full 8-stage plan. Nothing in the c3 userspace
 changed; `wasmtest` + regression still green.
 
+**Stage 2 — `malloc` + `<string.h>`.** K&R malloc (TCPL §8.7): a
+circular first-fit free list, coalescing on `free`, growing via
+`morecore` — with `sbrk` swapped for `SYS_MAP` (`__rc_map_pages`).
+`SYS_MAP` is a bump allocator that never gives memory back, but
+consecutive calls are contiguous, so a freed arena coalesces with the
+next one exactly like `sbrk`'s would, and freed blocks are reused
+within the process. `calloc` (overflow-checked), `realloc` (in-place
+shrink, else malloc+copy+free). `<string.h>` in `src/string.c` —
+including the four the C standard requires even freestanding
+(`memcpy`/`memmove`/`memset`/`memcmp`, which gcc emits calls to).
+`exit`/`abort`. `malloctest` (basic + calloc-zeroed + realloc-preserve
++ a 20 000-iteration churn loop that must reuse freed space + 512
+scrambled live allocs with integrity checks) → `malloctest: ok`, runs
+twice with no heap growth.
+
 ---
 
 ## 2026-08-30 — survive OOM + a userspace crash (no swap)

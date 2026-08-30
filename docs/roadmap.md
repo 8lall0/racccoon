@@ -664,12 +664,17 @@ flat-binary exec path like the c3 `/bin` commands.
    carries only the args (a c3 `args[0]` is the first real arg), so the
    crt0 synthesises a placeholder `argv[0]` and shifts the args to
    `argv[1..]` — a real name is deferred to §7.6.
-2. **malloc** — a real `malloc`/`free`/`realloc`/`calloc` free-list over
-   `SYS_MAP` (the first heap allocator in the tree; `/bin/wasm`'s bump
-   `wasm_alloc` could adopt it).
-3. **freestanding core** — `string.h`, `stdlib.h` (atoi, strtol, qsort,
-   bsearch, abs, getenv, `exit`/`atexit`), `ctype.h`, `errno.h`,
-   `assert.h`, `setjmp.h` (asm), `limits.h`/`stdint.h` conventions.
+2. **malloc + `<string.h>`. DONE** — K&R malloc (TCPL §8.7): circular
+   first-fit free list, coalescing on `free`, `morecore` via `SYS_MAP`
+   instead of `sbrk` (consecutive `SYS_MAP` calls are contiguous, so
+   freed arenas coalesce and blocks are reused within the process).
+   `calloc`/`realloc`, `exit`/`abort`. `src/string.c` covers the four
+   the standard requires freestanding (`memcpy`/`memmove`/`memset`/
+   `memcmp`) plus the common `str*`. `malloctest` (20 k-iteration churn
+   + scrambled frees) → ok, no heap growth.
+3. **freestanding core** — `stdlib.h` (atoi, strtol, qsort, bsearch,
+   abs, getenv, `atexit`), `ctype.h`, `errno.h`, `assert.h`, `setjmp.h`
+   (asm), `limits.h`/`stdint.h` conventions.
 4. **POSIX fd layer** — `open`/`close`/`read`/`write`/`lseek`/`unlink`/
    `stat`/`fstat`/`getcwd`/`chdir`/`mkdir`/`opendir`/`readdir` over the
    c3 `fs_*` exports (link `user.c3` as a lib, or reimplement the `p9`
