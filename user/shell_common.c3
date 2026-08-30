@@ -662,6 +662,44 @@ fn int shell_spawn(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out)
             return sh_r;
 }
 
+// Builtins that are safe to run as a pipeline stage: they only produce
+// output and touch no shell-process state, so running one in a forked
+// child (which is what a pipeline stage is) still does the right thing.
+// `cd` / `su` / `login` / `mount` / `bind` / `exit` / `mountusb` are
+// deliberately absent — their whole point is a side effect on the
+// shell's own long-lived process, which a child can't deliver; in a
+// pipeline they fall through to the /bin path and 127 like any unknown
+// command. `echo` / `whoami` aren't here either: they already have real
+// /bin binaries that the pipeline path picks up.
+fn bool shell_builtin_pipeable(char* cmd)
+{
+    return strcmp(cmd, "pwd") == 0
+        || strcmp(cmd, "hello") == 0
+        || strcmp(cmd, "namespace") == 0
+        || strcmp(cmd, "ns") == 0;
+}
+
+// One pipeline stage. A pipeable builtin (above) runs in a forked child
+// whose stdout the caller has already wired to the stage's pipe —
+// shell_dispatch_common does the actual work, exactly as for a plain
+// command, just in a child that then exits. Everything else is an
+// ordinary /bin spawn. Returns the child pid (generation in *gen_out),
+// or -1 on rfork failure — same contract as shell_spawn.
+fn int shell_spawn_stage(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out)
+{
+    if (!shell_builtin_pipeable(cmd)) {
+        return shell_spawn(cmd, cmd_argv, cmd_argc, gen_out);
+    }
+    *gen_out = 0;
+    int r = rfork(RFPROC, gen_out);
+    if (r < 0) { print("rfork failed\n"); return -1; }
+    if (r == 0) {
+        shell_dispatch_common(cmd, cmd_argv, cmd_argc);
+        exit();
+    }
+    return r;
+}
+
 // The /bin/<cmd> fallback — also shared by both shells (see
 // shell_dispatch_common's own comment above for why). Returns the
 // command's exit status (127 if it couldn't be spawned).
@@ -749,8 +787,9 @@ fn int shell_expand_q(char* in, char* out, char* qmask, int cap)
 // `$var`-expanded quote-aware and tokenised here, right before it runs.
 // With no `|`/redirection it's the plain
 // `shell_dispatch_common() || shell_exec_external()` path, builtins and
-// all. A pipeline stage is always an external /bin binary — a builtin
-// like `echo` on the left of a `|` needs /bin/echo (user/bin/echo.c3).
+// all. A pipeline stage is normally an external /bin binary; the
+// output-only builtins (`pwd` / `hello` / `namespace`, see
+// shell_builtin_pipeable) also work as stages, run in a forked child.
 // `< file` is capped at the kernel pipe buffer (PIPE_BUF, src/pipe.c3).
 // Any word carrying an unquoted `*` / `?` is glob-expanded against the
 // filesystem before the stage runs (last path component only); a
@@ -921,7 +960,7 @@ fn int shell_run_pipeline(char* seg, int seg_len)
     for (int s = 0; s < nstages; s++) {
         char** argv = &stage_words[stage_off[s] + 1];
         int    argc = stage_n[s] - 1;
-        spid[s] = shell_spawn(stage_words[stage_off[s]], argv, argc, &sgen[s]);
+        spid[s] = shell_spawn_stage(stage_words[stage_off[s]], argv, argc, &sgen[s]);
         if (spid[s] < 0) {
             for (int k = 0; k < spawned; k++) { kill(spid[k], sgen[k]); }
             if (in_pipe  >= 0) { pipe_hold(in_pipe, 1, -1); }
