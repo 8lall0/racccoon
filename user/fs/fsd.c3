@@ -409,13 +409,23 @@ fn bool diskd_rw(char* buf, uint sector, bool is_write)
 	int from = p9_call(g_diskd_pid, verb, &req, DISKD_MSG_MAX, &req, DISKD_MSG_MAX, &reply_verb);
 	if (from <= 0 && !g_fsd_dynamic)
 	{
-		// The storage driver may have died and been respawned into a new
-		// pid — SYS_IPC_CALL aborts with -1 when its target is gone. Ask
-		// the kernel for the current storage pid and retry once; the
+		// The storage driver may have died and been respawned —
+		// SYS_IPC_CALL aborts with -1 when its target's slot is gone.
+		// Ask the kernel for the current storage pid and retry once; the
 		// supervisor's re-init leaves the device usable again.
+		//
+		// Deliberately NOT gated on `rr_pid != g_diskd_pid`: the
+		// supervisor respawns into the *same slot*, hence the same pid
+		// (pid = slot + 1), with only the generation bumped — so "the
+		// pid didn't change" is the common case, not a reason to skip
+		// the retry. A p9_call to a genuinely-dead pid returns fast, so
+		// an occasional pointless retry is cheap. (This was the Duo
+		// storagekilltest failure: QEMU's respawn is fast enough that
+		// the first p9_call already hits the live replacement, so the
+		// retry never mattered there.)
 		uint rr_part = 0;
 		int  rr_pid  = 0;
-		if (fs_partition_info(&rr_part, null, &rr_pid) == 0 && rr_pid > 0 && rr_pid != g_diskd_pid)
+		if (fs_partition_info(&rr_part, null, &rr_pid) == 0 && rr_pid > 0)
 		{
 			g_diskd_pid = rr_pid;
 			reply_verb = 0;
