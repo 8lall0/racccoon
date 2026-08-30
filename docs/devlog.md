@@ -32,8 +32,7 @@ QEMU: `ls /bin | cat &` → `[1] <pid>` then `[1] done` next prompt;
 `false & wait` → `[2] exit 1`; `echo A | cat | cat & echo B | cat &
 wait` (two jobs, one line); `echod &` + `jobs` → `[N] running echod`;
 `echo x > /tmp/f &` rejected. Regression green (10 tests); sequencing +
-multi-stage (6/6) unaffected. Duo kernel builds clean, hw verification
-pending.
+multi-stage (6/6) unaffected. **Duo hardware verified** on the console.
 
 ---
 
