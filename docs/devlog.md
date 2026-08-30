@@ -4,6 +4,39 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — shell: background jobs (`cmd &`, `jobs`, `wait`)
+
+Roadmap §2.5. A trailing `&` (or ` & ` mid-line — `a & b &` works)
+backgrounds a pipeline. `shell_run_pipeline` grew a `bg` flag: it spawns
+and wires the stages exactly as normal, then registers the whole
+pipeline in a job table (`g_jobs`, 8 slots, each holding every stage's
+`(pid, generation)`) and returns 0 instead of feeding / pumping /
+joining.
+
+Reaping is lazy and never blocks. `shell_prompt` calls
+`shell_jobs_reap()` once per prompt: poll each job's stages with
+`proc_info`, and when all are gone `join()` them — which returns
+immediately for an already-dead pid (`sys_join`'s wait loop breaks on
+the first iteration) — then print `[N] done | exit S | killed  <cmd>`.
+`jobs` lists the running ones (reaping first, so a just-finished job
+still reports); `wait` cooperatively joins every current job.
+
+Limits: no `<` / `>` / `>>` in a background job (the shell pumps those
+itself and would block) — errors. A side-effecting builtin backgrounds
+into the `/bin` path and 127s; an output-only builtin still works (runs
+in its forked stage child). `sh_seq_op_at` gained kind 4 for a bare `&`,
+kept distinct from `&&`. No `^Z` / `fg` / `bg` — this kernel has no
+signals, so there's nothing to stop or continue.
+
+QEMU: `ls /bin | cat &` → `[1] <pid>` then `[1] done` next prompt;
+`false & wait` → `[2] exit 1`; `echo A | cat | cat & echo B | cat &
+wait` (two jobs, one line); `echod &` + `jobs` → `[N] running echod`;
+`echo x > /tmp/f &` rejected. Regression green (10 tests); sequencing +
+multi-stage (6/6) unaffected. Duo kernel builds clean, hw verification
+pending.
+
+---
+
 ## 2026-08-30 — shell: brace expansion
 
 Roadmap §2.5. `{a,b,c}` → three words, `pre{x,y}post` →

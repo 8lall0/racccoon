@@ -189,6 +189,12 @@ not bourne. Interleaved with §1/§2 rather than a phase of its own.
   globbing (`/bin/{c,l}*` → glob of each). No-comma / unmatched /
   quoted / escaped braces stay literal. `shell_brace_split` +
   `shell_brace_rec`, bounded.
+- **background jobs** — a trailing `&` (`a & b &` too) backgrounds a
+  pipeline into `g_jobs`; `shell_run_pipeline`'s `bg` flag spawns
+  without joining. `jobs` lists, `wait` joins all, and each prompt
+  reaps finished jobs (`[N] done | exit S`) via `proc_info` polling +
+  a non-blocking `join`. No `<` / `>` in a bg job; no `^Z` / `fg` /
+  `bg` (no signals in this kernel).
 - **`/bin/head`** — first stdin filter (`ls | head -n 3`); `head [-n N]`,
   reads stdin only, default 10 lines.
 - **multi-stage pipelines (`a | b | c`)** — up to `MAX_STAGES = 6`,
@@ -225,8 +231,8 @@ not bourne. Interleaved with §1/§2 rather than a phase of its own.
   their effect; they 127 in a pipeline.
 
 **Still to do:**
-- `&` background jobs, `^Z`/`jobs` — later.
-- `#!` scripts + `if`/`for`/`while` — much later.
+- `#!` scripts + `if` / `for` / `while` — the big structural one, much
+  later.
 
 ---
 
