@@ -10,10 +10,12 @@ import std::nolibc::mem;
 //
 //   wasm foo.wasm [args...]
 //
-// Milestones 1a-1c: decode + validate + interpret the integer core:
+// Milestones 1a-1d: decode + validate + interpret the integer core:
 // consts, locals/globals, calls, all i32/i64 arithmetic, linear memory,
-// and control flow (block/loop/if/br/br_table). Next: call_indirect,
-// more host imports, float ops.
+// control flow (block/loop/if/br/br_table), and — 1d — the table +
+// element + start sections, call_indirect, and the host imports
+// print_str / arg_count / arg / read_file / write_file / time / print_i64.
+// Next: float ops (§4 milestone 2).
 //
 // All working memory (the module bytes, the value/locals/frame stacks,
 // the section tables) comes from map_pages() (SYS_MAP) — userspace has
@@ -125,15 +127,22 @@ const int WPAGE = 65536;             // wasm linear-memory page size
 const int MEM_HARD_CAP_PAGES = 240;  // ~15 MiB — under HEAP_MAX_BYTES with room for the other allocs
 
 // host function ids (module "racccoon")
-const int HOST_PRINT_I32 = 0;
-const int HOST_PROC_EXIT = 1;
-const int HOST_COUNT     = 2;
+const int HOST_PRINT_I32  = 0;   // (i32)
+const int HOST_PROC_EXIT  = 1;   // (i32)
+const int HOST_PRINT_STR  = 2;   // (ptr:i32, len:i32)
+const int HOST_ARG_COUNT  = 3;   // () -> i32
+const int HOST_ARG        = 4;   // (i:i32, ptr:i32, cap:i32) -> i32  (bytes written, -1 if none)
+const int HOST_READ_FILE  = 5;   // (path:i32, plen:i32, buf:i32, cap:i32) -> i32
+const int HOST_WRITE_FILE = 6;   // (path:i32, plen:i32, buf:i32, len:i32) -> i32
+const int HOST_TIME       = 7;   // () -> i64
+const int HOST_PRINT_I64  = 8;   // (i64)
 
 // --- limits (grow as real modules need) -------------------------------
 const int TYPES_MAX    = 128;
 const int FUNCS_MAX    = 512;
 const int EXPORTS_MAX  = 128;
 const int GLOBALS_MAX  = 128;
+const int TABLE_MAX    = 4096;   // funcref table slots
 const int PARAMS_MAX   = 16;
 const int VSTACK_MAX   = 8192;   // 64 KiB
 const int LOCALS_MAX   = 8192;   // 64 KiB
@@ -218,6 +227,12 @@ bool    g_has_mem;
 
 WBlock* g_blocks;   int  g_nblocks;   // load-time block sidetable, ascending start_pc
 WCtl*   g_ctl;      int  g_ctop;
+
+int*    g_table;    int  g_table_len; // funcref table: slot -> funcidx (-1 = null)
+int     g_start_func = -1;            // SEC_START, run before _start
+
+// argv for the host `arg` import — set in main
+String[] g_args;
 
 // --- fatal-exit helper ------------------------------------------------
 fn void die(char* msg)
@@ -365,9 +380,25 @@ fn void read_limits(Cur* c)
 fn int resolve_host(char* mod, char* fld)
 {
     if (strcmp(mod, "racccoon") != 0) { return -1; }
-    if (strcmp(fld, "print_i32") == 0) { return HOST_PRINT_I32; }
-    if (strcmp(fld, "proc_exit") == 0) { return HOST_PROC_EXIT; }
+    if (strcmp(fld, "print_i32")  == 0) { return HOST_PRINT_I32; }
+    if (strcmp(fld, "print_i64")  == 0) { return HOST_PRINT_I64; }
+    if (strcmp(fld, "proc_exit")  == 0) { return HOST_PROC_EXIT; }
+    if (strcmp(fld, "print_str")  == 0) { return HOST_PRINT_STR; }
+    if (strcmp(fld, "arg_count")  == 0) { return HOST_ARG_COUNT; }
+    if (strcmp(fld, "arg")        == 0) { return HOST_ARG; }
+    if (strcmp(fld, "read_file")  == 0) { return HOST_READ_FILE; }
+    if (strcmp(fld, "write_file") == 0) { return HOST_WRITE_FILE; }
+    if (strcmp(fld, "time")       == 0) { return HOST_TIME; }
     return -1;
+}
+
+// bounds-checked linear-memory region -> returns a real pointer or dies
+fn char* mem_ptr(uint off, uint len)
+{
+    if (!g_has_mem) { die("host: no memory"); }
+    long lim = (long)g_mem_pages * WPAGE;
+    if ((long)off + (long)len > lim) { die("host: memory range out of bounds"); }
+    return &g_mem[off];
 }
 
 fn void decode_funcsec(Cur* c)
@@ -395,13 +426,69 @@ fn void decode_globals(Cur* c)
     {
         cur_byte(c);               // valtype
         cur_byte(c);               // mutability
-        // init expr — a single const opcode then END, this milestone
-        char op = cur_byte(c);
-        if (op == OP_I32_CONST) { g_globals[i] = (long)read_i32(c); }
-        else if (op == OP_I64_CONST) { g_globals[i] = read_i64(c); }
-        else { die("global init expr unsupported"); }
-        if (cur_byte(c) != OP_END) { die("global init not END-terminated"); }
+        g_globals[i] = read_const_expr(c);
     }
+}
+
+// a constant init expression: one const/global.get opcode then END
+fn long read_const_expr(Cur* c)
+{
+    long v = 0;
+    char op = cur_byte(c);
+    if (op == OP_I32_CONST) { v = (long)read_i32(c); }
+    else if (op == OP_I64_CONST) { v = read_i64(c); }
+    else if (op == OP_F32_CONST) { if (4 > c.end - c.p) { die("truncated f32"); } v = (long)(uint)*(uint*)&g_mod[c.p]; c.p += 4; }
+    else if (op == OP_F64_CONST) { if (8 > c.end - c.p) { die("truncated f64"); } v = *(long*)&g_mod[c.p]; c.p += 8; }
+    else if (op == OP_GLOBAL_GET)
+    {
+        uint gi = read_u32(c);
+        if ((int)gi >= g_nglobals) { die("const-expr global idx"); }
+        v = g_globals[gi];
+    }
+    else { die("const-expr: unsupported opcode"); }
+    if (cur_byte(c) != OP_END) { die("const-expr not END-terminated"); }
+    return v;
+}
+
+fn void decode_table(Cur* c)
+{
+    uint n = read_u32(c);
+    if (n == 0) { return; }
+    if (n > 1) { die("multi-table unsupported"); }
+    cur_byte(c);                       // elemtype (funcref)
+    char flag = cur_byte(c);
+    uint minc = read_u32(c);
+    if ((flag & 1) != 0) { read_u32(c); }   // max
+    if ((int)minc > TABLE_MAX) { die("table too large"); }
+    g_table_len = (int)minc;
+    for (int i = 0; i < g_table_len; i++) { g_table[i] = -1; }
+}
+
+fn void decode_elem(Cur* c)
+{
+    uint n = read_u32(c);
+    for (uint i = 0; i < n; i++)
+    {
+        uint mode = read_u32(c);
+        if (mode != 0) { die("non-active element segment unsupported"); }
+        long off = read_const_expr(c);   // table offset (i32)
+        uint cnt = read_u32(c);
+        for (uint k = 0; k < cnt; k++)
+        {
+            uint fidx = read_u32(c);
+            long slot = off + (long)k;
+            if (slot < 0 || slot >= g_table_len) { die("element out of table bounds"); }
+            if ((int)fidx >= g_nfuncs) { die("element funcidx"); }
+            g_table[slot] = (int)fidx;
+        }
+    }
+}
+
+fn void decode_start(Cur* c)
+{
+    uint fi = read_u32(c);
+    if ((int)fi >= g_nfuncs) { die("start funcidx"); }
+    g_start_func = (int)fi;
 }
 
 fn void decode_exports(Cur* c)
@@ -697,12 +784,12 @@ fn void decode_module()
                 case SEC_TYPE:   decode_types(&sc);
                 case SEC_IMPORT: decode_imports(&sc);
                 case SEC_FUNC:   decode_funcsec(&sc);
-                case SEC_TABLE:  break; // 1d
+                case SEC_TABLE:  decode_table(&sc);
                 case SEC_MEM:    decode_mem(&sc);
                 case SEC_GLOBAL: decode_globals(&sc);
                 case SEC_EXPORT: decode_exports(&sc);
-                case SEC_START:  break; // 1d
-                case SEC_ELEM:   break; // 1d
+                case SEC_START:  decode_start(&sc);
+                case SEC_ELEM:   decode_elem(&sc);
                 case SEC_CODE:   decode_code(&sc);
                 case SEC_DATA:   decode_data(&sc);
                 default: die("bad section id");
@@ -729,6 +816,19 @@ fn long vpop()
     return g_vstack[g_vtop];
 }
 
+// copy a (ptr,len) region of linear memory into `out` as a NUL-terminated
+// string, truncating to cap-1 bytes. dies if the region is out of bounds.
+fn void mem_cstr(uint off, uint len, char* out, int cap)
+{
+    char* p = mem_ptr(off, len);
+    int k = 0;
+    for (uint i = 0; i < len; i++)
+    {
+        if (k < cap - 1) { out[k] = p[i]; k++; }
+    }
+    out[k] = 0;
+}
+
 fn void host_call(int host_id)
 {
     switch (host_id)
@@ -737,11 +837,69 @@ fn void host_call(int host_id)
             int v = (int)vpop();
             print_int32(v);
             putchar('\n');
+        case HOST_PRINT_I64:
+            long lv = vpop();
+            if (lv < 0) { putchar('-'); print_uint64((ulong)(-lv)); }
+            else { print_uint64((ulong)lv); }
+            putchar('\n');
         case HOST_PROC_EXIT:
             exitcode((int)vpop());
+        case HOST_PRINT_STR:
+            uint slen = (uint)vpop();
+            uint soff = (uint)vpop();
+            char* sp = mem_ptr(soff, slen);
+            for (uint i = 0; i < slen; i++) { putchar(sp[i]); }
+        case HOST_ARG_COUNT:
+            vpush((long)g_args.len);
+        case HOST_ARG:
+            uint acap = (uint)vpop();
+            uint aoff = (uint)vpop();
+            int aidx = (int)vpop();
+            if (aidx < 0 || aidx >= (int)g_args.len) { vpush((long)(int)-1); }
+            else
+            {
+                char* a = g_args[aidx].ptr;
+                uint alen = 0;
+                while (a[alen] != 0) { alen++; }
+                char* dst = mem_ptr(aoff, alen < acap ? alen : acap);
+                uint n = alen < acap ? alen : acap;
+                for (uint i = 0; i < n; i++) { dst[i] = a[i]; }
+                vpush((long)(int)n);
+            }
+        case HOST_READ_FILE:
+            uint rcap  = (uint)vpop();
+            uint rbuf  = (uint)vpop();
+            uint rplen = (uint)vpop();
+            uint rpoff = (uint)vpop();
+            char[256] rpath @noinit;
+            mem_cstr(rpoff, rplen, &rpath[0], 256);
+            char* rdst = mem_ptr(rbuf, rcap);
+            int rgot = fs_read(&rpath[0], rdst, (int)rcap);
+            vpush((long)rgot);
+        case HOST_WRITE_FILE:
+            uint wlen  = (uint)vpop();
+            uint wbuf  = (uint)vpop();
+            uint wplen = (uint)vpop();
+            uint wpoff = (uint)vpop();
+            char[256] wpath @noinit;
+            mem_cstr(wpoff, wplen, &wpath[0], 256);
+            char* wsrc = mem_ptr(wbuf, wlen);
+            int wput = fs_write(&wpath[0], wsrc, (int)wlen);
+            vpush((long)wput);
+        case HOST_TIME:
+            vpush((long)rdtime());
         default:
             die("unresolved host import");
     }
+}
+
+fn void print_uint64(ulong n)
+{
+    char[24] buf @noinit;
+    int i = 24;
+    if (n == 0) { putchar('0'); return; }
+    while (n != 0) { i--; buf[i] = (char)('0' + (int)(n % 10)); n /= 10; }
+    while (i < 24) { putchar(buf[i]); i++; }
 }
 
 // signed-decimal print — user.c3 only has print_uint
@@ -908,6 +1066,16 @@ fn void interp()
                 if ((int)callee >= g_nfuncs) { die("call idx"); }
                 if (g_funcs[callee].is_import) { host_call(g_funcs[callee].host_id); }
                 else { push_frame((int)callee); }
+            case OP_CALL_INDIRECT:
+                uint ci_type = imm_u32(fr);
+                imm_u32(fr);                        // tableidx (only table 0)
+                int ci_slot = (int)vpop();
+                if (ci_slot < 0 || ci_slot >= g_table_len) { die("call_indirect: index out of table bounds"); }
+                int ci_fn = g_table[ci_slot];
+                if (ci_fn < 0 || ci_fn >= g_nfuncs) { die("call_indirect: null/invalid table entry"); }
+                if ((int)ci_type >= g_ntypes || g_funcs[ci_fn].type_idx != (int)ci_type) { die("call_indirect: signature mismatch"); }
+                if (g_funcs[ci_fn].is_import) { host_call(g_funcs[ci_fn].host_id); }
+                else { push_frame(ci_fn); }
             case OP_LOCAL_GET:
                 uint li = imm_u32(fr);
                 if ((int)li >= g_funcs[fr.func_idx].nlocals) { die("local idx"); }
@@ -1103,6 +1271,10 @@ fn void main(String[] args)
     g_frames   = (WFrame*)wasm_alloc((uint)(FRAMES_MAX * WFrame::size));
     g_blocks   = (WBlock*)wasm_alloc((uint)(BLOCKS_MAX * WBlock::size));
     g_ctl      = (WCtl*)wasm_alloc((uint)(CTL_MAX * WCtl::size));
+    g_table    = (int*)wasm_alloc((uint)(TABLE_MAX * 4));
+
+    // args after the .wasm path are the guest program's argv (host `arg`)
+    g_args = args[1..];
 
     // read the whole file
     uint total = 0;
@@ -1118,6 +1290,16 @@ fn void main(String[] args)
     if (total != fsize) { die("short read"); }
 
     decode_module();
+
+    // SEC_START: run the module's start function to completion first
+    if (g_start_func >= 0)
+    {
+        if (g_funcs[g_start_func].is_import) { die("start is an import"); }
+        if (g_types[g_funcs[g_start_func].type_idx].nparams != 0) { die("start takes params"); }
+        push_frame(g_start_func);
+        interp();
+        g_vtop = 0;
+    }
 
     int start = find_export_func("_start");
     if (start < 0) { start = find_export_func("main"); }

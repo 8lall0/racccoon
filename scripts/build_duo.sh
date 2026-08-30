@@ -2,7 +2,11 @@
 
 set -e
 
-LLVM_LLD=${LLVM_LLD:-/opt/riscv/bin/ld.lld}
+if [ -x /opt/riscv/bin/ld.lld ]; then
+  LLVM_LLD=${LLVM_LLD:-/opt/riscv/bin/ld.lld}
+else
+  LLVM_LLD=${LLVM_LLD:-ld.lld}
+fi
 LLC=${LLC:-llc}
 
 (

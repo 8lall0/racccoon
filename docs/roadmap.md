@@ -346,14 +346,22 @@ programs need more.
 
 ### Staging
 
-1. **Integer core** — decode; the i32/i64 arithmetic/bitwise/comparison
-   opcodes; `local`/`global`; `block`/`loop`/`br`/`br_if`/`br_table`;
-   `call`/`call_indirect`; linear memory (`load`/`store`/`memory.grow`);
-   a single exported `_start` or `main`. Host imports: `print`, `args`,
-   `exit`. Target: run a hand-written / hand-compiled integer program.
-2. **Float** — the `f32`/`f64` opcodes, once §3 lands (hardware FP makes
-   this free).
-3. **More host imports** — file I/O against `fsd`, env, time.
+1. **Integer core. DONE** — milestones 1a-1d (commits `800d313`,
+   `2b86a00`, `89e18d6`, + 1d). `/bin/wasm` (~1.1k lines) built on a new
+   `SYS_MAP` demand-page syscall: decode + structural validation; the
+   full i32/i64 arithmetic/bitwise/comparison/`div`/`rem`/`clz`/`ctz`/
+   `popcnt` set; `local`/`global`; `block`/`loop`/`if`/`else`/`br`/
+   `br_if`/`br_table` via a load-time block sidetable; `call`; linear
+   memory (all load/store widths + `memory.size`/`grow`); `call_indirect`
+   + table + element + start sections; exported `_start`/`main`. Host
+   module `racccoon` (not WASI): `print_i32`/`print_i64`/`print_str`,
+   `proc_exit`, `arg_count`/`arg`, `read_file`/`write_file`, `time`.
+   Fixtures `add`/`loop`/`mem`/`fac`/`start`/`echo` (hand-assembled by
+   `test/mkwasm.py`), QEMU-verified via `wasmtest`.
+2. **Float** — the `f32`/`f64` opcodes, now that §3 (hardware FP) has
+   landed. *(next)*
+3. **More host imports** — deeper `fsd` / env integration as real
+   programs need it.
 4. Multi-module / a table of importable host modules — later.
 
 ### Why

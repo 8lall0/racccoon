@@ -2,7 +2,13 @@
 
 set -e
 
-LLVM_LLD=${LLVM_LLD:-/opt/riscv/bin/ld.lld}
+# Prefer the /opt/riscv LLVM if it's installed, else fall back to the
+# system tools on PATH (an Arch host with llvm/lld packages, say).
+if [ -x /opt/riscv/bin/ld.lld ]; then
+  LLVM_LLD=${LLVM_LLD:-/opt/riscv/bin/ld.lld}
+else
+  LLVM_LLD=${LLVM_LLD:-ld.lld}
+fi
 LLC=${LLC:-llc}
 LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
 

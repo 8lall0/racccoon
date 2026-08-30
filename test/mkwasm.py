@@ -182,6 +182,67 @@ code = [body([], fac_body), body([], start_body)]
 fixtures["fac.wasm"] = module(t, imp, fn, exp, code)
 
 
+# --- echo.wasm : args + print_str + call_indirect -> "a b c\n" ---------
+# type 0: () -> ()            _start
+# type 1: () -> i32           racccoon.arg_count
+# type 2: (i32,i32,i32)->i32  racccoon.arg
+# type 3: (i32,i32) -> ()     racccoon.print_str  /  emit (table[0])
+t = [functype([], []), functype([], [I32]),
+     functype([I32, I32, I32], [I32]), functype([I32, I32], [])]
+imp = [import_func("racccoon", "arg_count", 1),   # funcidx 0
+       import_func("racccoon", "arg", 2),         # funcidx 1
+       import_func("racccoon", "print_str", 3)]   # funcidx 2
+fn_ = [3, 0]                                       # funcidx 3: emit(t3), 4: _start(t0)
+exp = [export_func("_start", 4)]
+mem = b"\x00" + uleb(1)
+table = b"\x70\x00" + uleb(1)                      # funcref, min 1
+elems = [uleb(0) + i32c(0) + END + vec([uleb(3)])] # active, offset 0, [funcidx 3]
+# data @ 256: ' ' '\n'
+data = [uleb(0) + i32c(256) + END + uleb(2) + bytes([0x20, 0x0a])]
+I32_GE_S = b"\x4e"
+CALL_IND = lambda ti: b"\x11" + uleb(ti) + b"\x00"
+emit_body = LG(0) + LG(1) + call(2)               # print_str(ptr,len)
+# locals: 0=i, 1=n, 2=count
+start_body = (
+    call(0) + LS(2) +                             # count = arg_count()
+    i32c(0) + LS(0) +                             # i = 0
+    BLOCK(BT_VOID) +
+      LOOP(BT_VOID) +
+        LG(0) + LG(2) + I32_GE_S + BR_IF(1) +     # i >= count -> break
+        LG(0) + i32c(0) + i32c(256) + call(1) + LS(1) +   # n = arg(i, 0, 256)
+        i32c(0) + LG(1) + i32c(0) + CALL_IND(3) + # emit(0, n) via table slot 0
+        LG(0) + i32c(1) + I32_ADD + LG(2) + I32_LT_S +
+        IF(BT_VOID) +
+          i32c(256) + i32c(1) + call(2) +         # print_str(" ", 1)
+        END +
+        LG(0) + i32c(1) + I32_ADD + LS(0) +       # i += 1
+        BR(0) +
+      END +
+    END +
+    i32c(257) + i32c(1) + call(2)                 # print_str("\n", 1)
+)
+code = [body([], emit_body), body([(3, I32)], start_body)]
+fixtures["echo.wasm"] = module(t, imp, fn_, exp, code,
+                               mem=mem, table=table, elems=elems, data=data)
+
+# --- start.wasm : SEC_START + mutable global + print_i64 -> "123" ------
+# type 0: () -> ()      startf / _start
+# type 1: (i64) -> ()   racccoon.print_i64
+t = [functype([], []), functype([I64], [])]
+imp = [import_func("racccoon", "print_i64", 1)]   # funcidx 0
+fn_ = [0, 0]                                       # funcidx 1: startf, 2: _start
+exp = [export_func("_start", 2)]
+# one mutable i64 global, init 0
+globals_ = [bytes([I64, 0x01]) + i64c(0) + END]
+I64_ADD = b"\x7c"
+GG = lambda n: b"\x23" + uleb(n)   # global.get
+GS = lambda n: b"\x24" + uleb(n)   # global.set
+startf_body = GG(0) + i64c(100) + I64_ADD + GS(0)          # g += 100  (runs first)
+start_body  = GG(0) + i64c(23) + I64_ADD + call(0)         # print_i64(g + 23) -> 123
+code = [body([], startf_body), body([], start_body)]
+fixtures["start.wasm"] = module(t, imp, fn_, exp, code, start=1, globals_=globals_)
+
+
 def main():
     outdir = sys.argv[1] if len(sys.argv) > 1 else "build/wasm"
     os.makedirs(outdir, exist_ok=True)

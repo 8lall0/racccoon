@@ -4,6 +4,57 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — wasm §4: /bin/wasm milestones 1b–1d (integer core done)
+
+Finished the integer subset of `/bin/wasm`. Milestone 1a landed the
+skeleton; 1b/1c/1d fill it out to "run a hand-written integer program".
+
+**1b (`2b86a00`) — full integer opcodes + linear memory.** Every
+i32/i64 arithmetic / bitwise / comparison op, `div`/`rem` (clean
+`wasm: … by zero` exit, not a trap), `clz`/`ctz`/`popcnt` (hand-rolled,
+no stdlib), `wrap`/`extend*`/`extendN_s`, `select`. Linear memory: all
+load/store widths + signedness, `memory.size`, `memory.grow` (extends
+the `SYS_MAP`'d region in place — nothing else `map_pages()` after
+decode, so the grow is contiguous). Shift counts masked `& 31`/`& 63`
+(wasm semantics; also dodges the `1 << 31` landmine). Fixture `mem.wasm`
+→ `142`.
+
+**1c (`89e18d6`) — control flow.** `block`/`loop`/`if`/`else`/`br`/
+`br_if`/`br_table` + `return`. A load-time linear scan per function
+builds a **block sidetable** (`start_pc → else_pc, end_pc, arity`),
+kept in ascending `start_pc` order for binary search; `br N` pops N+1
+control-stack entries and jumps to the (N+1)th's target (`loop` → its
+head, `block`/`if` → past its `end`). Explicit control stack, depth-
+capped. Fixtures `loop.wasm` → `55`, `fac.wasm` → `120` (recursion +
+`if`/`else`).
+
+**1d — indirect + host + the remaining sections.** `call_indirect` +
+`SEC_TABLE` + `SEC_ELEM` (active segments; funcref slots default −1) +
+`SEC_START` (run to completion before `_start`). A shared
+`read_const_expr` now handles global/elem/data init exprs
+(`i32/i64/f32/f64.const`, `global.get`). Host module grows to
+`print_i64`, `print_str(ptr,len)`, `arg_count()`/`arg(i,ptr,cap)`,
+`read_file`/`write_file` (path is a `(ptr,len)` region copied to a NUL-
+terminated buffer, then `fs_read`/`fs_write`), `time()` (`rdtime`). All
+linear-memory access from host calls goes through one bounds-checked
+`mem_ptr(off,len)`. Fixtures `start.wasm` → `123` (start fn + mutable
+i64 global + `print_i64`), `echo.wasm` → joins argv with spaces via a
+`call_indirect` through a 1-slot table + `print_str` + `arg`.
+
+`wasm.bin` is 96 KiB (of the 256 KiB `/bin` cap). `wasmtest` now runs
+all six fixtures. QEMU: `wasmtest: ok`, `runtest`/`argvtest`/`maptest`/
+`killtest`/`elftest` green (`bigreadtest` needs `launch64_dual`, n/a
+here). Duo kernel builds clean.
+
+**Toolchain note.** `/opt/riscv/bin/ld.lld` is gone on this host — the
+build scripts now prefer it if present, else fall back to `ld.lld` on
+`PATH` (system LLVM 22). `LLVM_LLD`/`LLC`/`LLVM_OBJCOPY`/`LLVM_MC` env
+overrides still win.
+
+Next: milestone 2 — `f32`/`f64` opcodes (hardware FP, §3 is done).
+
+---
+
 ## 2026-08-30 — wasm §4: SYS_MAP + /bin/wasm milestone 1a
 
 Started the WebAssembly interpreter (roadmap §4). Two commits.

@@ -4,7 +4,12 @@ set -e
 
 LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
 LLVM_MC=${LLVM_MC:-llvm-mc}
-LLVM_LLD=${LLVM_LLD:-/opt/riscv/bin/ld.lld}
+# /opt/riscv LLVM if present, else the system lld on PATH.
+if [ -x /opt/riscv/bin/ld.lld ]; then
+  LLVM_LLD=${LLVM_LLD:-/opt/riscv/bin/ld.lld}
+else
+  LLVM_LLD=${LLVM_LLD:-ld.lld}
+fi
 
 # std::nolibc::{mem,atomic,fmt,main_stub} — the freestanding pieces
 # every user-mode binary needs, adapted from the real c3 stdlib

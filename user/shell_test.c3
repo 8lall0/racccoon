@@ -1945,17 +1945,22 @@ fn void main() {
             // _start computes 2+3 and calls racccoon.print_i32 -> the
             // console shows "5"; _start has no result so it exits 0.
             int wt_ok = 0;
-            char*[4] wt_fx;
+            char*[6] wt_fx;
             wt_fx[0] = "add.wasm";     // -> "5"    (call + host import)
             wt_fx[1] = "mem.wasm";     // -> "142"  (linear memory + grow)
             wt_fx[2] = "loop.wasm";    // -> "55"   (block/loop/br/br_if)
             wt_fx[3] = "fac.wasm";     // -> "120"  (if/else + recursion)
-            for (int wf = 0; wf < 4; wf++) {
+            wt_fx[4] = "start.wasm";   // -> "123"  (SEC_START + mutable global + print_i64)
+            wt_fx[5] = "echo.wasm";    // -> "a b"  (table + call_indirect + print_str + arg)
+            for (int wf = 0; wf < 6; wf++) {
                 char* wt_arg = wt_fx[wf];
+                char*[3] wt_av;
+                wt_av[0] = wt_arg; wt_av[1] = "a"; wt_av[2] = "b";
+                int wt_ac = wf == 5 ? 3 : 1;
                 uint wt_gen = 0;
                 int wt_c = rfork(RFPROC, &wt_gen);
                 if (wt_c == 0) {
-                    exec("bin/wasm", &run_exec_buf, RUN_EXEC_BUF_MAX, 0, &wt_arg, 1);
+                    exec("bin/wasm", &run_exec_buf, RUN_EXEC_BUF_MAX, 0, &wt_av[0], wt_ac);
                     exitcode(127);
                 }
                 print("wasm "); print(wt_arg); print(" -> ");
