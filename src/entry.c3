@@ -221,6 +221,7 @@ macro write_csr(String $reg, value)
 
 const SIE_SEIE     = (1 << 9);  // sie: supervisor external interrupt enable
 const SSTATUS_SIE  = (1 << 1);  // sstatus: global supervisor interrupt enable
+const SSTATUS_SPP  = (1 << 8);  // sstatus: previous privilege — 0 = the trap came from U-mode, 1 = from S-mode
 
 // sstatus.FS (bits 14:13) — FP unit state: 0 Off, 1 Initial, 2 Clean,
 // 3 Dirty. Set to Initial once at boot (kernel.c3) so hardware FP is
@@ -633,6 +634,37 @@ fn void sys_rfork(Trap_frame* f) @noinline
 			// manage the child's table structure itself. Same walk
 			// shape as SYS_EXIT's free loop above (now 3 levels for
 			// Sv39, not 2), copy instead of free.
+
+			// Count the parent's PAGE_U leaves first, and bail with -1
+			// (not a kernel OOM panic) if there isn't enough free RAM
+			// for the child: 1 root table + ~35 kernel-identity-map
+			// intermediate tables + one fresh page per leaf + the
+			// child's own user-region intermediate tables (leaf/256 is
+			// a generous ceiling). The count walk allocates nothing;
+			// kernel code isn't preempted, so the count stays valid
+			// through the allocations below.
+			ulong* rf_pt2 = current_proc.page_table;
+			uint rf_leaves = 0;
+			for (uint rv2 = 0; rv2 < 512; rv2++)
+			{
+				if ((rf_pt2[rv2] & PAGE_V) == 0) continue;
+				ulong* rf_pt1 = (ulong*)pte_to_paddr(rf_pt2[rv2]);
+				for (uint rv1 = 0; rv1 < 512; rv1++)
+				{
+					if ((rf_pt1[rv1] & PAGE_V) == 0) continue;
+					ulong* rf_pt0 = (ulong*)pte_to_paddr(rf_pt1[rv1]);
+					for (uint rv0 = 0; rv0 < 512; rv0++)
+					{
+						if ((rf_pt0[rv0] & PAGE_V) != 0 && (rf_pt0[rv0] & PAGE_U) != 0) rf_leaves++;
+					}
+				}
+			}
+			if (free_page_count() < rf_leaves + rf_leaves / 256 + 40)
+			{
+				f.a0 = (ulong)(-1);
+				return;
+			}
+
 			ulong* child_table = (ulong*)alloc_pages(1);
 			for (uptr paddr = (uptr)&__kernel_map_base; paddr < (uptr)&__free_ram_end; paddr += PAGE_SIZE)
 			{
@@ -955,7 +987,7 @@ fn void sys_exec(Trap_frame* f) @noinline
 				{
 					if (exec_staged[spi] == 0)
 					{
-						uptr exec_seg_page = alloc_pages(1);
+						uptr exec_seg_page = try_alloc_pages(1);
 						if (exec_seg_page == 0)
 						{
 							exec_stage_ok = false;
@@ -1025,9 +1057,23 @@ fn void sys_exec(Trap_frame* f) @noinline
 			// blob at USER_BASE, mapped RWX uniformly, unchanged
 			// from before the ELF path above existed.
 			exec_page_count = (exec_image_size + PAGE_SIZE - 1) / PAGE_SIZE;
+			// Bail with -1 (not an OOM panic in the map loop after the
+			// old image is already gone) if the free pool can't cover
+			// the image + argv + their page-table overhead. The staging
+			// loops below have their own rollback for a mid-loop
+			// failure; this just keeps the common case off the panic
+			// path and the old image intact.
+			uint exec_argv_pages_est = (exec_argv_len + PAGE_SIZE - 1) / PAGE_SIZE;
+			uint exec_need = exec_page_count + exec_argv_pages_est
+				+ (exec_page_count + exec_argv_pages_est) / 256 + 6;
+			if (free_page_count() < exec_need)
+			{
+				f.a0 = (ulong)(-1);
+				return;
+			}
 			for (uint ep = 0; ep < exec_page_count; ep++)
 			{
-				uptr exec_page = alloc_pages(1);
+				uptr exec_page = try_alloc_pages(1);
 				if (exec_page == 0)
 				{
 					exec_stage_ok = false;
@@ -1058,7 +1104,7 @@ fn void sys_exec(Trap_frame* f) @noinline
 		bool argv_stage_ok = true;
 		for (uint ap = 0; ap < argv_page_count; ap++)
 		{
-			uptr argv_page = alloc_pages(1);
+			uptr argv_page = try_alloc_pages(1);
 			if (argv_page == 0)
 			{
 				argv_stage_ok = false;
@@ -2405,16 +2451,24 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			uint map_pages_n = (uint)((map_bytes + PAGE_SIZE - 1) / PAGE_SIZE);
 			uptr map_base = current_proc.heap_top;
+			// The free-page pre-check must also cover the L1/L0 page-table
+			// pages map_page() allocates as the mapped range crosses each
+			// 2 MiB / 1 GiB boundary — the old check only counted the leaf
+			// pages, so a large-enough SYS_MAP could still hit the OOM
+			// panic inside walk_to_leaf_table. `n/256 + 4` is a generous
+			// ceiling (one L0 table per 512 leaves, plus slack). The whole
+			// loop runs without preemption, so the count stays valid.
+			uint map_overhead = map_pages_n / 256 + 4;
 			if (map_base == 0
 				|| map_base + (uptr)map_pages_n * PAGE_SIZE - (uptr)USER_BASE > HEAP_MAX_BYTES
-				|| (uptr)free_page_count() < (uptr)map_pages_n)
+				|| (uptr)free_page_count() < (uptr)(map_pages_n + map_overhead))
 			{
 				f.a0 = (ulong)(-1);
 				break;
 			}
 			for (uint mp = 0; mp < map_pages_n; mp++)
 			{
-				uptr map_phys = alloc_pages(1); // pre-checked free — can't panic
+				uptr map_phys = alloc_pages(1); // free was pre-checked, incl. page-table overhead
 				map_page(current_proc.page_table, map_base + (uptr)mp * PAGE_SIZE, map_phys, PAGE_U | PAGE_R | PAGE_W);
 			}
 			current_proc.heap_top = map_base + (uptr)map_pages_n * PAGE_SIZE;
@@ -2955,6 +3009,24 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 	}
 	else
 	{
+		// Not an interrupt, not an ecall — a synchronous exception:
+		// a page fault, an illegal instruction, a misaligned access, a
+		// breakpoint. If it came from U-mode (sstatus.SPP == 0), it's a
+		// buggy user program — tear down just that process and move on,
+		// the same way SYS_EXIT / the watchdog do. Only an exception
+		// from S-mode is a genuine kernel bug worth a panic.
+		//
+		// This is also what lets a userspace interpreter (/bin/wasm)
+		// treat an out-of-bounds computed address as a clean process
+		// exit rather than needing to be provably perfect — see
+		// docs/roadmap.md §4.
+		if ((read_reg("sstatus") & SSTATUS_SPP) == 0 && current_proc.pid > 0)
+		{
+			io::printfn("user fault: pid=%d scause=%x stval=%x sepc=%x — killing the process\n",
+				current_proc.pid, scause, stval, user_pc);
+			proc_destroy(current_proc, -1);
+			yield();   // never returns: current_proc is PROC_UNUSED now
+		}
 		io::printfn("unexpected trap scause=%x, stval=%x, sepc=%x, current_pid=%d\n", scause, stval, user_pc, current_proc.pid);
 		panic::panic("it's a trap!");
 	}

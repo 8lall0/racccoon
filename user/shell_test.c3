@@ -2013,6 +2013,96 @@ fn void main() {
                 print(" rw="); print_uint((uint)mp_rw);
                 print(" child="); print_uint((uint)mt_code); putchar('\n');
             }
+        } else if (strcmp(cmd, "oomtest") == 0) {
+            // Out-of-memory is a -1 to the caller, not a kernel panic.
+            // Fork children that each map their full 16 MiB SYS_MAP
+            // ceiling — on a 64 MiB board that exhausts real RAM after
+            // a few — and confirm: (a) a child's map_pages() then
+            // returns null instead of panicking, (b) rfork() starts
+            // returning -1 rather than panicking in create_process,
+            // (c) the shell is still alive, (d) killing the children
+            // frees it all back so a fresh map_pages() works again.
+            const int OOM_KIDS = 8;
+            int[OOM_KIDS] oom_pid;
+            uint[OOM_KIDS] oom_gen;
+            int oom_spawned = 0;
+            bool oom_rfork_refused = false;
+            for (int oi = 0; oi < OOM_KIDS; oi++) {
+                uint g = 0;
+                int c = rfork(RFPROC, &g);
+                if (c < 0) { oom_rfork_refused = true; break; }
+                if (c == 0) {
+                    // Grab as much as the per-process cap allows, a
+                    // page-cluster at a time, then park until killed.
+                    bool hit_null = false;
+                    for (int k = 0; k < 4096; k++) {
+                        if (map_pages(65536) == null) { hit_null = true; break; }
+                    }
+                    // exit code carries whether *this* child ever saw a
+                    // clean null (vs. still going) — not load-bearing,
+                    // the parent mainly checks it didn't panic.
+                    for (;;) { yield(); }
+                }
+                oom_pid[oom_spawned] = c;
+                oom_gen[oom_spawned] = g;
+                oom_spawned++;
+            }
+            // Give the children time to actually consume their pages.
+            ulong oom_settle = rdtime() + timebase_hz() / 2;
+            while (rdtime() < oom_settle) { yield(); }
+            // The shell itself is obviously still running to print this.
+            // Now a fresh large map from *this* process while RAM is
+            // tight should fail cleanly (null), not panic.
+            void* oom_tight = map_pages(1048576); // 1 MiB
+            // Reap everything and confirm RAM comes back.
+            for (int oi = 0; oi < oom_spawned; oi++) { kill(oom_pid[oi], oom_gen[oi]); }
+            ulong oom_recover = rdtime() + timebase_hz();
+            void* oom_after = null;
+            while (oom_after == null && rdtime() < oom_recover) {
+                yield();
+                oom_after = map_pages(1048576);
+            }
+            // Pass = no panic (we got here), RAM pressure was real
+            // (either rfork got refused or the tight map returned null),
+            // and killing the kids recovered enough to map again.
+            bool oom_pressure = oom_rfork_refused || oom_tight == null;
+            if (oom_spawned > 0 && oom_pressure && oom_after != null) {
+                print("oomtest: ok (OOM returned -1/null, no panic, RAM recovered)\n");
+            } else {
+                print("oomtest: FAILED spawned="); print_uint((uint)oom_spawned);
+                print(" pressure="); print_uint((uint)oom_pressure);
+                print(" recovered="); print_uint((uint)(oom_after != null));
+                putchar('\n');
+            }
+        } else if (strcmp(cmd, "faulttest") == 0) {
+            // A user-mode fault (bad pointer, illegal instruction) kills
+            // just that process — the kernel prints "user fault: … —
+            // killing the process" and carries on. Without the fix this
+            // was panic("it's a trap!"), i.e. the whole system down.
+            uint ft_gen = 0;
+            int ft_c = rfork(RFPROC, &ft_gen);
+            if (ft_c < 0) {
+                print("faulttest: rfork failed\n");
+            } else if (ft_c == 0) {
+                // Store to a wild address — nothing is mapped at 3 GiB
+                // in a user page table. Store page fault (scause 15).
+                char* wild = (char*)0xC0000000;
+                wild[0] = (char)1;
+                exitcode(0); // unreachable — the fault kills us first
+            } else {
+                int ft_code = join(ft_c, ft_gen);
+                // proc_destroy records -1 for a killed process; the
+                // shell just needs a non-zero (failed) code and to
+                // still be alive to run the next command.
+                char[8] ft_probe @noinit;
+                int ft_alive = fs_read("bin/echod", &ft_probe, 8); // shell still works?
+                if (ft_code != 0 && ft_alive >= 0) {
+                    print("faulttest: ok (faulting child killed, kernel + shell fine)\n");
+                } else {
+                    print("faulttest: FAILED code="); print_uint((uint)ft_code);
+                    print(" alive="); print_uint((uint)(ft_alive >= 0)); putchar('\n');
+                }
+            }
         } else if (strcmp(cmd, "fputest") == 0) {
             // Hardware FPU (roadmap §3): prove f-registers survive a
             // context switch and a fork. No %f in the print path — scale

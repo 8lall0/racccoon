@@ -4,6 +4,49 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — survive OOM + a userspace crash (no swap)
+
+Two robustness holes closed. (User asked about swap — that's a poor fit:
+storage is behind the `sdd`/`diskd` userspace servers, the kernel can't
+make IPC calls, and demand paging on the C906 — no hw A/D bits — is
+fiddly. 64 MiB board; the Orange Pi RV has more RAM. The valuable,
+bounded version is graceful failure.)
+
+**OOM is a −1 now, not a kernel panic.** `alloc_pages` used to
+`panic("Out of memory")`, so any allocation failure killed everything.
+- Split it: `try_alloc_pages(n)` returns 0 on exhaustion;
+  `alloc_pages(n)` = that + panic (kept for the boot-time paths — six
+  servers, `setup_*_mappings` — where a failure means unbootable).
+- `SYS_MAP`: the free-page pre-check now also covers the L1/L0
+  page-table pages `map_page` allocates as the range crosses 2 MiB /
+  1 GiB (`n/256 + 4` ceiling) — the old check only counted leaves, so a
+  big enough `map_pages()` could still panic inside
+  `walk_to_leaf_table`.
+- `SYS_EXEC` (flat-binary path) + `SYS_RFORK`: a `free_page_count()`
+  pre-check against the computed need (image+argv / a leaf-count walk,
+  plus page-table overhead) returns −1 before allocating anything. The
+  staging loops' existing rollback (`try_alloc_pages` + free-what-we-got)
+  covers a mid-loop failure with the old image intact.
+
+So "out of RAM" now means "fork/exec failed" or a wasm program getting
+`die("out of memory")` and exiting — never a dead kernel.
+
+**A user-mode fault kills just that process.** `handle_trap`'s
+catch-all was `panic("it's a trap!")` for every non-interrupt,
+non-ecall exception — a page fault or illegal instruction in any `/bin`
+program took the whole system down. Now: if `sstatus.SPP == 0` (trap
+came from U-mode), `proc_destroy(current_proc, -1)` + `yield()` — same
+as SYS_EXIT / the watchdog. Only an exception from S-mode is still a
+panic (that's a real kernel bug). This also lifts the §4 "the wasm
+interpreter must be provably perfect or it panics the kernel"
+constraint.
+
+`oomtest` / `faulttest` in `shell_test.c3`. QEMU: both pass, full
+regression green (`user fault: pid=10 scause=f … — killing the
+process` prints, shell carries on). Duo builds clean.
+
+---
+
 ## 2026-08-30 — wasm §4: real compiled programs run (milestone 3, first cut)
 
 `/bin/wasm` runs actual compiler output, not just hand-assembled bytes.

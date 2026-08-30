@@ -47,11 +47,17 @@ fn uint free_page_count()
 }
 
 // Finds n consecutive free pages by scanning for a run of n clear bits,
-// marks them used, and returns the physical address of the first page.
+// marks them used, zero-fills them, and returns the first page's
+// physical address — or 0 if there's no run that long. The caller must
+// check: this is the fallible primitive behind alloc_pages(). Used
+// directly on the runtime allocation paths (SYS_MAP / SYS_RFORK /
+// SYS_EXEC) where "out of memory" has to be a −1 to the caller, not a
+// dead kernel.
+//
 // Addresses are uptr (pointer-sized), not uint: on RV64 a plain uint is
 // only 32 bits, too narrow to hold a real physical address once pointers
 // are 64-bit — see docs/devlog.md for the RV64 port this was widened for.
-fn uptr alloc_pages(uint n)
+fn uptr try_alloc_pages(uint n)
 {
 	uint run_start = 0;
 	uint run_len   = 0;
@@ -83,7 +89,18 @@ fn uptr alloc_pages(uint n)
 		}
 	}
 
-	panic::panic("Out of memory");
+	return 0;
+}
+
+// Infallible alloc — panics on exhaustion. For the boot-time paths
+// (create_process for the six servers, setup_*_mappings) where a
+// failure genuinely means the system can't run, so there's no caller
+// that could do anything useful with a null.
+fn uptr alloc_pages(uint n)
+{
+	uptr p = try_alloc_pages(n);
+	if (p == 0) { panic::panic("Out of memory"); }
+	return p;
 }
 
 fn void free_pages(uptr paddr, uint n)
