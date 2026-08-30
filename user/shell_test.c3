@@ -1906,9 +1906,15 @@ fn void main() {
             // comes back on its own and file reads work again — via the
             // healed namespace mount, without this process re-mounting
             // anything.
+            // Probe with a file that exists on every image — QEMU
+            // (build.sh) and the real Duo (populate_duo_bin.sh) both put
+            // `bin/echod` at the root. `hello.txt` is a QEMU-only
+            // fixture — reading it here made the test FAIL on the Duo
+            // for want of the file, not any respawn fault.
             char[64] fk_buf @noinit;
-            int fk_before = fs_read("hello.txt", &fk_buf, 64);
-            int fk_fsd = ns_resolve("hello.txt", null);
+            char* fk_probe = "bin/echod";
+            int fk_before = fs_read(fk_probe, &fk_buf, 64);
+            int fk_fsd = ns_resolve(fk_probe, null);
             int fk_killed = kill(fk_fsd, 0); // 0 = wildcard generation
             // Wait real wall-clock time (the supervisor ticks ~1/s from
             // the timer) and keep retrying the read. rdtime() the same
@@ -1917,9 +1923,9 @@ fn void main() {
             int fk_after = -1;
             while (fk_after < 0 && rdtime() < fk_deadline) {
                 yield();
-                fk_after = fs_read("hello.txt", &fk_buf, 64);
+                fk_after = fs_read(fk_probe, &fk_buf, 64);
             }
-            if (fk_before >= 0 && fk_killed == 0 && fk_after >= 0) {
+            if (fk_before >= 0 && fk_killed == 0 && fk_after == fk_before) {
                 print("fsdkilltest: ok (fsd killed, respawned, reads work)\n");
             } else {
                 print("fsdkilltest: FAILED\n");
@@ -1934,13 +1940,14 @@ fn void main() {
             int  sk_pid  = 0;
             int sk_info = fs_partition_info(&sk_part, null, &sk_pid);
             char[64] sk_buf @noinit;
-            int sk_before = fs_read("hello.txt", &sk_buf, 64);
+            char* sk_probe = "bin/echod";   // on every image (see fsdkilltest)
+            int sk_before = fs_read(sk_probe, &sk_buf, 64);
             int sk_killed = sk_pid > 0 ? kill(sk_pid, 0) : -1;
             ulong sk_deadline = rdtime() + timebase_hz() * 20; // 20s wall-clock, any board
             int sk_after = -1;
             while (sk_after < 0 && rdtime() < sk_deadline) {
                 yield();
-                sk_after = fs_read("hello.txt", &sk_buf, 64);
+                sk_after = fs_read(sk_probe, &sk_buf, 64);
             }
             if (sk_info == 0 && sk_pid > 0 && sk_before >= 0 && sk_killed == 0 && sk_after == sk_before) {
                 print("storagekilltest: ok (storage driver killed, respawned, reads work)\n");

@@ -46,16 +46,24 @@ were wrong; one fixed:
    `timebase_hz()`; every killtest deadline is now
    `rdtime() + timebase_hz() * 20` (20 s wall-clock, any board).
 
-2. Still failing after (1). `storagekilltest` shows a *double*
-   `svc: respawned sdd` with no "wedged" line — a respawned sdd is
-   **exiting** (silent panic), not being stall-killed. Yet with `loud`
-   on, a respawned sdd was watched enumerating the card cleanly every
-   time. So it's timing-dependent: under the load of a blocked fsd +
-   the test, enumeration's wall-clock command budgets get starved, or
-   the first post-respawn DMA read returns a bad status. Need the full
-   `loud; storagekilltest` output (the `sdd: DMA xfer status=…` line).
+2. **The real cause: the tests read `hello.txt`, which only exists on
+   the QEMU images** (`build.sh` seeds it; `populate_duo_bin.sh` does
+   not). `fs_read` returned −1 for want of the file, and the pass
+   condition needs `before >= 0` — so the tests failed on the Duo
+   before any respawn even mattered. `loud` proved it: a respawned fsd
+   printed `fsd: ext2 mounted, block_size=4096 …`, a respawned sdd
+   enumerated the card cleanly and reached "SDMA enabled" — both fully
+   healthy — and the tests *still* said FAILED. Fix: probe with
+   `bin/echod`, which every image has.
 
-§5.5 so far: usbd + gpiod respawn Duo-verified; fsd + sdd still open.
+3. Real fix found along the way anyway: `fsd`'s `diskd_rw` retry after
+   a storage-driver IPC failure was gated on `rr_pid != g_diskd_pid`,
+   which never fires when the supervisor respawns into the same slot
+   (same pid, bumped generation — the common case). Dropped that gate.
+   Latent on QEMU (fast respawn hits the live replacement first).
+
+§5.5: usbd + gpiod Duo-verified; fsd + sdd re-verify pending with the
+probe fix.
 
 ---
 

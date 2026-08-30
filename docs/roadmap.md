@@ -494,20 +494,18 @@ Generation counters back most of the stale-reference handling:
        IRQ-notify instead of the real request. Also: gpiod now has
        `watch_hangs = true` (its bring-up is 3 MMIO writes, not a slow
        bus reset) as a net.
-     - `fsdkilltest` / `storagekilltest` — **still FAIL on the Duo**
-       (both pass on QEMU). The killtest-deadline fix below was needed
-       (deadlines were QEMU-10MHz tick counts → ~1.2 s / ~4 s on the
-       Duo's 25 MHz clock) but wasn't the whole story. `storagekilltest`
-       still shows a *double* `svc: respawned sdd` with no "wedged"
-       line — so a respawned sdd is **exiting** (silent panic), not
-       being stall-killed. Yet with `loud` on, a respawned sdd was
-       watched enumerating the card *cleanly* (CMD0/CMD8/ACMD41/
-       CMD2/3/7/clock-raise all ok) — so it's timing-sensitive: under
-       the load of a blocked fsd + the test, either enumeration's
-       wall-clock command budgets get starved, or the first DMA read
-       after respawn returns a bad status. Need the full `loud;
-       storagekilltest` capture (the `sdd: DMA xfer status=…` /
-       `sdd: … TIMED OUT` line) to tell which. Not yet closed.
+     - `fsdkilltest` / `storagekilltest` — the Duo "failures" were the
+       tests reading `hello.txt`, a **QEMU-only fixture** (`build.sh`
+       seeds it; `populate_duo_bin.sh` doesn't). `fs_read` returned −1
+       for want of the file and the pass condition needs `before >= 0`.
+       `loud` proved the servers were fine — a respawned fsd printed
+       `fsd: ext2 mounted …`, a respawned sdd enumerated the card
+       cleanly. Fixed: probe with `bin/echod` (on every image).
+       Two real fixes made along the way: (a) the QEMU-10MHz killtest
+       deadlines (`SYS_TIMEBASE` / `timebase_hz()`); (b) `fsd`'s
+       `diskd_rw` retry was gated on `rr_pid != g_diskd_pid`, which
+       never fires on a same-slot respawn — dropped that gate.
+       Re-verify on the Duo pending.
      - `netdkilltest` — **N/A on Duo.** netd exits before `srv_post`
        (self-test needs DHCP + a carrier the Duo link never gets — see
        "Ethernet status"), so there's nothing to kill.
