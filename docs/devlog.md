@@ -4,6 +4,40 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — supervisor: usbd / ethd / netd / gpiod (§5)
+
+The last four unsupervised processes join. Every server and driver in
+the system is under the supervisor now.
+
+They're all `for(;;)` poll loops, so "exit" means a `panic()` — which
+now brings the driver back instead of leaving it dead. New
+`Service.watch_hangs` splits the hang watchdog from plain respawn:
+
+- **netd** — `watch_hangs = true`. Its respawn path is byte-for-byte
+  diskd's (virtio `DEVICE_STATUS = 0` reset, `setup_netd_mappings`,
+  PLIC self-heal), and now fault-tested: `netdkilltest` kills it,
+  waits for `svc: respawned netd`, and confirms the `/net/` reseat.
+  (netd gained a `srv_post("netd")` so the test has a handle — it had
+  no name and no pid global.)
+- **usbd / ethd / gpiod** — `watch_hangs = false`. A USB bus reset +
+  1s settle, or an Ethernet PHY train, legitimately doesn't touch the
+  driver's IPC poll for seconds, which would false-trip the
+  has_message stall check. Respawn-on-exit only. Duo-only + the Duo
+  runs the production shell, so no fault-test; re-init is idempotent
+  by inspection (`usbd_init` → DWC2 `CSFTRST`, `ethd` → DMA soft
+  reset).
+
+The `reseat` in `supervisor_spawn` already covers the dynamic
+`/mnt/usb/` and `/srv/gpiod/` mounts, and a respawned driver re-posts
+its own srv name. `SVC_MAX` was already 10 (QEMU registers 7, Duo 9).
+
+QEMU: `netdkilltest` + `hungservertest` + `storagekilltest` +
+`fsdkilltest` + full regression green. Duo builds clean.
+
+§5 gap #1 ("no supervision for servers") is now closed outright.
+
+---
+
 ## 2026-08-30 — supervisor: hang watchdog + envd crash policy (§5)
 
 Two of the "smaller §5 gaps."

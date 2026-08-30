@@ -378,9 +378,8 @@ Generation counters back most of the stale-reference handling:
 
 ### The gaps
 
-1. **No supervision / respawn for servers.** If `fsd`, `diskd`, `usbd`,
-   `envd`, … exit, nothing restarts them. The system limps on without
-   that capability.
+1. ~~**No supervision / respawn for servers.**~~ **Closed** — the
+   supervisor (§5.2 below) covers every server and driver now.
 2. **Clients block forever if a server dies mid-request.**
    `SYS_IPC_SEND` blocks on `while (!msg_acked) yield()` with no
    timeout. If the server crashes after `has_message = true` but before
@@ -432,19 +431,24 @@ Generation counters back most of the stale-reference handling:
    server, updates its `*_pid` global, and `reseat_namespace_mounts()`
    re-points every live process's mounts at the replacement. Restart
    cap 5. `fsdkilltest` / `storagekilltest` in `shell_test.c3`.
-   Covers **fsd, fsd2, echod, procd, envd, and the block-storage driver
-   (diskd / sdd)**. `Service.kind` (SVC_KIND_*) says which
+   Covers **every server and every device driver**: fsd, fsd2, echod,
+   procd, envd, the block-storage driver (diskd / sdd), and
+   usbd / ethd / netd / gpiod. `Service.kind` (SVC_KIND_*) says which
    `setup_*_mappings` to re-run after `create_process` — the MMIO + DMA
-   re-mapping the storage driver needs; its PLIC route self-heals
-   (`irq_route_register` overwrites in place). No more hardcoded pids:
-   the shell's `ping` resolves echod through `/srv/echo/`, and fsd
-   learns the storage pid from `SYS_FS_PARTITION_INFO` and re-queries it
-   on an IPC failure (`diskd_rw`).
-   - **Still unsupervised: usbd / ethd / netd / gpiod.** The `kind`
-     switch has slots for them; each needs its bring-up verified
-     idempotent on a respawn and a way to fault-test it (mostly
-     Duo-only). sdd's respawn also isn't yet exercised on real hardware
-     (same mechanism as diskd, which passes on QEMU).
+   re-mapping; PLIC routes self-heal (`irq_route_register` overwrites in
+   place). No more hardcoded pids: the shell's `ping` resolves echod
+   through `/srv/echo/`, fsd learns the storage pid from
+   `SYS_FS_PARTITION_INFO` and re-queries on an IPC failure, and the
+   `reseat` covers the dynamic `/mnt/usb/` / `/srv/gpiod/` mounts.
+   - `Service.watch_hangs` splits the hang watchdog from respawn:
+     usbd / ethd / gpiod get **respawn-on-exit only** (their bring-up
+     legitimately blocks their IPC poll for seconds — a USB bus reset,
+     a PHY train — which would false-trip the stall check).
+   - **Fault-tested**: fsd (`fsdkilltest`), storage (`storagekilltest`),
+     netd (`netdkilltest`), the hang watchdog (`hungservertest`).
+     **Not fault-tested**: sdd's respawn on real hardware, and
+     usbd/ethd/gpiod (Duo-only, production shell) — re-init idempotent
+     by inspection (DWC2 CSFTRST, DMA soft reset).
    - Kernel-side, not a userspace `/bin/init`: the servers' privileged
      setup (`setup_*_mappings`) is kernel-only, and the binaries are
      embedded in the kernel image, not on disk — a userspace init would
