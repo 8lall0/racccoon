@@ -4,6 +4,64 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-30 — hardware FPU (§3)
+
+Floats used to `panic()` — soft-float `rv64imac`, no compiler-rt linked,
+`softfloat_stubs.c3` = 23 tripwire stubs. The C906 and QEMU virt both have
+F+D. Now racccoon uses the FPU. QEMU-verified end to end; Duo pending.
+
+### Build
+
+- `c3c build … --riscv-abi=double` **and** `llc … -mattr=+m,+a,+c,+f,+d` —
+  both, because the kernel path is IR → `llc`; the c3c flag makes the module
+  flag `lp64d` (and the lp64d calling convention), `llc -mattr` selects the
+  hardware FP instructions. Same in `build_duo.sh` / `build_user.sh`.
+- **The embedded-binary wrappers broke the link.** `objcopy -Ibinary`
+  produces an ELF with `e_flags = 0` (soft-float ABI); once the kernel `.o`s
+  carried the double-float ABI flag, `ld.lld` refused to link the two
+  ("different floating-point ABI"). Fix: assemble the wrappers with
+  `llvm-mc … --target-abi=lp64d` over a `.incbin` stub — same
+  `_binary_<name>_bin_start/_end` symbols, matching `e_flags = 0x5`.
+- `softfloat_stubs.c3` deleted. One symbol survives: C3's `std::io` float
+  formatter has a lone `fptrunc fp128 to double` in its float-arg path, and
+  the C906 has no Q extension, so `__trunctfdf2` still lowers to a soft call
+  — kept as a one-line stub in `softfloat_f128_stubs.c3` (still unreachable;
+  `printfn` is `%s`/`%d`/`%x` only).
+
+### Kernel
+
+- `sstatus.FS = Initial` at boot (`kernel.c3`), field surgery not an OR,
+  with a read-back probe → clear "FPU unavailable" panic instead of a
+  mysterious `scause=2` later.
+- **Eager**, not lazy. `switch_context` is `@naked` (preserves no FP regs,
+  including callee-saved `fs0`–`fs11`) and `yield()` is its only caller, so
+  a full `f0`–`f31`+`fcsr` save/restore bracketing that one call covers
+  every context switch. `Process.fp_area` (`ulong[33]`), `fp_save` /
+  `fp_restore` / `fp_reset` `@naked` helpers. Cost is ~66 FP mem-ops per
+  `yield()`; the timer fires ~1 Hz and the frequent `yield()` callers
+  (driver poll loops) are integer-only. Lazy (trap `scause=2`, per-hart FP
+  owner) would need a new case in the illegal-instruction path — the
+  fragile trap-handler surface the project history says to avoid — for
+  negligible gain. A conditional save (skip when `FS != Dirty`) is the
+  optimisation to reach for only if a `yield()`/sec counter ever shows it.
+- `user_entry` sstatus `0x40020` → `0x42020` (FS=Initial). `create_process`
+  zeroes `fp_area`. `sys_rfork` snapshots the parent's live f-regs into the
+  child (fork copy semantics). `sys_exec` zeroes + `fp_reset()`s (new image,
+  clean rounding mode). `fork_entry` unchanged (its sstatus RMW keeps FS).
+
+### Verification
+
+QEMU boots clean (no FPU panic, no `scause=2`). New `fputest`: `double`
+arithmetic, a live `double` held in a parent register across `fork` + an
+IPC round-trip + `join` (two context switches), and FP-state inheritance to
+the child — passes repeatedly. Full regression + shell smoke (globbing,
+brace expansion, background jobs, pipelines) green. Duo kernel + user build
+clean; the one residual hardware risk is the stock vendor OpenSBI v0.9's
+handoff `mstatus.FS` — if the Duo panics with "FPU unavailable" or
+`scause=2`, reflash with `PATCH_OPENSBI=1`.
+
+---
+
 ## 2026-08-30 — supervisor: usbd / ethd / netd / gpiod (§5)
 
 The last four unsupervised processes join. Every server and driver in

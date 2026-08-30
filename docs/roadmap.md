@@ -9,11 +9,11 @@ workstreams, in dependency order:
 
 1. Plan 9 file structure
 2. Plan 9 user model
-3. Hardware FPU (unblocks float; small)
+3. Hardware FPU (unblocks float) — **DONE**
 4. WASM as a `/bin` program
 
-3 is independent and can land any time. 4 needs 3 for float. 1 → 2 →
-(shell work) is the spine.
+§3 is done — §4's `f32`/`f64` opcodes are now free. 1 → 2 → (shell work)
+is the spine; §5 (resiliency) is done.
 
 ---
 
@@ -236,9 +236,24 @@ not bourne. Interleaved with §1/§2 rather than a phase of its own.
 
 ---
 
-## 3. Hardware FPU / why floats panic today
+## 3. Hardware FPU — DONE (commit `675ccf8`)
 
-### The current situation
+Built `rv64imafdc` / `lp64d` (`c3c --riscv-abi=double` + `llc
+-mattr=+f,+d`); `sstatus.FS = Initial` at boot with a read-back probe;
+`f0`–`f31` + `fcsr` saved/restored **eagerly** in `yield()` around
+`switch_context` (which is `@naked` and preserves no FP regs, and is
+`yield()`'s only caller — so one spot covers every switch). `user_entry`
+starts processes with FS on; `sys_rfork` copies FP state to the child,
+`sys_exec` resets it. `softfloat_stubs.c3` gone — one `__trunctfdf2`
+stub remains (std::io's lone `fptrunc fp128` in an unreached path; no Q
+ext). Embedded-binary wrappers moved to `llvm-mc --target-abi=lp64d`
+`.incbin` (an `objcopy -Ibinary` wrapper's soft-float e_flags no longer
+link against the hard-float kernel). `fputest` (shell_test.c3) proves
+f-regs survive fork + context switches. QEMU verified; Duo pending (one
+risk: stock OpenSBI v0.9's handoff `mstatus.FS` — `PATCH_OPENSBI=1`
+reflash if it traps).
+
+<details><summary>Original problem statement (kept for reference)</summary>
 
 racccoon builds for **`rv64imac`** — no `F`/`D` extension. On a
 soft-float target LLVM lowers every float op into a compiler-rt runtime
@@ -306,6 +321,8 @@ board.)
   for `--target=riscv64-unknown-elf -march=rv64imac -mabi=lp64`.
 - Otherwise vendor GCC's `libgcc/soft-fp/` (or Berkeley SoftFloat) — the
   ~25 IEEE-754 ops — into `src/kernel/` and compile them for the target.
+
+</details>
 
 ---
 
