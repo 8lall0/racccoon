@@ -41,8 +41,8 @@ if [ -z "$OBJCOPY_RC" ]; then
 fi
 
 CFLAGS="-march=rv64imafdc -mabi=lp64d -mcmodel=medany -ffreestanding -fno-pic
-        -fno-stack-protector -fno-builtin -Os -Wall -Wextra -std=c11
-        -ffunction-sections -fdata-sections
+        -fno-stack-protector -fno-builtin -fno-asynchronous-unwind-tables
+        -Os -Wall -Wextra -std=c11
         -nostdinc -isystem $($CC_RC -print-file-name=include)
         -I lib/racccoon-libc/include"
 
@@ -53,16 +53,27 @@ LIBGCC_RC="${LIBGCC_RC:-$($CC_RC -print-libgcc-file-name 2>/dev/null)}"
 [ -e "$LIBGCC_RC" ] || LIBGCC_RC=""
 
 OUT="build/libc"
+# Clean obj/ every run — the test-program objects (compiled into the same
+# dir below) must never end up in libracccoon.a, and a stale one from a
+# previous build would.
+rm -rf "$OUT/obj"
 mkdir -p "$OUT/obj"
 
 echo "==> C libc: $CC_RC  ($($CC_RC -dumpversion))"
 
 # --- library ----------------------------------------------------------
+# .riscv.attributes / .comment are stripped from every object: TinyCC's
+# object loader (roadmap §7) mishandles a .riscv.attributes section whose
+# sh_link points at a section it didn't materialise, dereferencing a
+# dangling Section->link in tcc_write_elf_file. Nothing on racccoon reads
+# these sections anyway.
 for src in lib/racccoon-libc/src/*.c lib/racccoon-libc/src/*.S; do
   [ -e "$src" ] || continue
   name=$(basename "$src")
   name=${name%.*}
   $CC_RC $CFLAGS -c "$src" -o "$OUT/obj/$name.o"
+  $OBJCOPY_RC --remove-section=.riscv.attributes --remove-section=.comment \
+    "$OUT/obj/$name.o" 2>/dev/null || true
 done
 
 # crt0 (start.o) is linked explicitly by every program, not pulled from
@@ -81,7 +92,7 @@ for src in test/c-src/*.c; do
   [ -e "$src" ] || continue
   name=$(basename "$src" .c)
   $CC_RC $CFLAGS -c "$src" -o "$OUT/obj/$name.o"
-  $LD_RC --gc-sections -T lib/racccoon-libc/racccoon-libc.ld -o "$OUT/$name.elf" \
+  $LD_RC -T lib/racccoon-libc/racccoon-libc.ld -o "$OUT/$name.elf" \
     "$OUT/crt0.o" "$OUT/obj/$name.o" "$OUT/libracccoon.a" $LIBGCC_RC
   $OBJCOPY_RC --set-section-flags .bss=alloc,contents -O binary \
     "$OUT/$name.elf" "$OUT/$name.bin"
