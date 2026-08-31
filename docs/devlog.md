@@ -4,6 +4,43 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-31 — FAT32: kill the O(n²) in `fat32_create_file`
+
+Creating N files in one FAT32 directory was O(n²) in disk IPC. Two
+causes, both in the cluster-allocation path:
+
+- **`fat32_next_cluster` read a FAT sector from disk on every call** —
+  no cache. `fat32_alloc_cluster` scans the FAT from cluster 2 looking
+  for a free entry, one `fat32_next_cluster` per cluster, 128 entries
+  per 512-byte FAT sector → the same sector re-read ~128× per scan.
+- **`fat32_alloc_cluster` always restarted the scan at cluster 2**, so
+  each successive allocation walked past every cluster it had already
+  handed out.
+
+Fixes:
+
+- **Single-sector FAT cache** (`fat32_fat_sector()`): one fixed 512-byte
+  buffer holding the last-touched FAT sector. This is not the "general
+  directory/file cache" the file header rules out — it's the same
+  narrow, bounded-regardless-of-disk-size scoping as `fat32_read_at`'s
+  own exec-loop cache. `fat32_write_fat_entry` updates the buffer
+  in place when it writes copy 0 (keeps a mid-scan walk coherent);
+  `fat32_mount` invalidates it (stale across a respawn / remount).
+- **Allocation rover** (`fat32_alloc_hint`): `fat32_alloc_cluster`
+  scans from the hint, wraps to 2 once if it hits the end, and bumps
+  the hint past each cluster it allocates. `fat32_free_cluster_chain`
+  lowers the hint to the lowest freed cluster so reclaimed space is
+  reused. `fat32_mount` resets it to 2.
+
+`dirpacktest` on FAT32 (80 files + 6 subdirs + churn in one dir) →
+completes in a few seconds with no `svc: diskd wedged`; `fsck.vfat -n`
+on the run image is clean. Full regression sweep green on FAT32, ext2,
+and dual (dirpacktest, pagelisttest, cycletest, p9fstest, stage6/7,
+tcctest, wasmtest, lfntest, runtest, mounttest, storage/fsd/hung
+killtests). Duo kernel build clean.
+
+---
+
 ## 2026-08-31 — supervisor watchdog: don't kill a *busy* server
 
 `dirpacktest` on FAT32 (create 80 files in one directory back-to-back)

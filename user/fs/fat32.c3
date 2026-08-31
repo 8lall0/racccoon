@@ -119,6 +119,24 @@ uint fat32_total_clusters; // upper bound for fat32_alloc_cluster()'s scan
 uint fat32_fsinfo_sector; // partition-relative, same convention as fat32_fat_start_sector etc.
 uint fat32_free_count;    // kept in sync with every alloc/free (fat32_alloc_cluster/fat32_free_cluster_chain), written back to the FSInfo sector on each change — see fat32_write_free_count's own comment
 
+// Single-sector FAT cache. Not the "general directory/file cache" the
+// header comment rules out — one fixed 512-byte sector holding the hot
+// metadata every cluster-chain walk hits, the same narrow-scoping
+// principle fat32_read_at's own exec-loop cache follows. Without it,
+// fat32_alloc_cluster's scan re-reads FAT sector 0 once per cluster
+// (128 entries per sector, so ~128x per sector), making a
+// create-many-files workload O(n^2) in disk IPC. Every write path keeps
+// it coherent; fat32_mount() invalidates it.
+char[SECTOR_SIZE] fat32_fat_cache_buf @noinit;
+uint fat32_fat_cache_sector;
+bool fat32_fat_cache_valid;
+
+// Next cluster to try in fat32_alloc_cluster() — a rover, so sequential
+// allocation is O(1) amortised instead of always rescanning from 2. Not
+// a cache, just a hint: an alloc past the end wraps back to 2 once, and
+// a free lowers it so reclaimed clusters get reused.
+uint fat32_alloc_hint;
+
 // exec()'s own chunked-read fast path (user/user.c3's exec(), FS_READ_AT)
 // — same shape and reasoning as ext2's own ext2_cache_* (user/fs/ext2.c3,
 // see its own comment), plus a second piece FAT32 specifically needs:
@@ -157,16 +175,31 @@ fn uint fat32_cluster_to_sector(uint cluster)
 // A read failure is treated as end-of-chain rather than propagated: this
 // is a best-effort reader, not a filesystem that needs to distinguish
 // "corrupt" from "empty" for correctness anywhere it's used.
+// Reads FAT sector `fat_sector` (a copy-0 absolute sector) into the
+// single-sector FAT cache, returning a pointer to the cache buffer — or
+// null on a read failure. Every FAT walk goes through here.
+fn char* fat32_fat_sector(uint fat_sector)
+{
+	if (fat32_fat_cache_valid && fat32_fat_cache_sector == fat_sector)
+	{
+		return &fat32_fat_cache_buf[0];
+	}
+	if (!fs_read_sector(fat_sector, &fat32_fat_cache_buf)) { fat32_fat_cache_valid = false; return null; }
+	fat32_fat_cache_sector = fat_sector;
+	fat32_fat_cache_valid = true;
+	return &fat32_fat_cache_buf[0];
+}
+
 fn uint fat32_next_cluster(uint cluster)
 {
 	uint fat_byte_offset = cluster * 4;
 	uint fat_sector = fat32_fat_start_sector + (fat_byte_offset / SECTOR_SIZE);
 	uint entry_offset = fat_byte_offset % SECTOR_SIZE;
 
-	char[SECTOR_SIZE] sector_buf @noinit;
-	if (!fs_read_sector(fat_sector, &sector_buf)) return FAT32_EOC_MIN;
+	char* buf = fat32_fat_sector(fat_sector);
+	if (buf == null) return FAT32_EOC_MIN;
 
-	uint* entry = (uint*)&sector_buf[entry_offset];
+	uint* entry = (uint*)&buf[entry_offset];
 	return *entry & FAT32_ENTRY_MASK;
 }
 
@@ -925,6 +958,14 @@ fn bool fat32_write_fat_entry(uint cluster, uint value)
 		uint* entry = (uint*)&sector_buf[entry_offset];
 		*entry = (*entry & ~FAT32_ENTRY_MASK) | (value & FAT32_ENTRY_MASK);
 		if (!fs_write_sector(fat_sector, &sector_buf)) return false;
+
+		// Keep the read cache coherent: copy 0 is what fat32_next_cluster
+		// reads. Just wrote it — update the cache buffer in place rather
+		// than invalidate, so a scan that's mid-sector doesn't re-fault.
+		if (copy == 0 && fat32_fat_cache_valid && fat32_fat_cache_sector == fat_sector)
+		{
+			for (uint i = 0; i < SECTOR_SIZE; i++) fat32_fat_cache_buf[i] = sector_buf[i];
+		}
 	}
 	return true;
 }
@@ -986,14 +1027,27 @@ fn void fat32_reserve_protected(char* name)
 // singular (see fsd.c3's header comment), not duplicated per caller.
 fn uint fat32_alloc_cluster()
 {
-	for (uint cluster = 2; cluster < fat32_total_clusters + 2; cluster++)
+	uint end = fat32_total_clusters + 2;
+	uint start = fat32_alloc_hint;
+	if (start < 2 || start >= end) start = 2;
+
+	// Scan from the rover to the end, then wrap once and scan 2..start —
+	// so a burst of sequential allocs is O(1) each, and freed clusters
+	// (which lower the hint) still get found.
+	for (uint pass = 0; pass < 2; pass++)
 	{
-		if (fat32_next_cluster(cluster) == 0)
+		uint lo = pass == 0 ? start : 2;
+		uint hi = pass == 0 ? end : start;
+		for (uint cluster = lo; cluster < hi; cluster++)
 		{
-			if (!fat32_write_fat_entry(cluster, FAT32_EOC_MIN)) return 0;
-			fat32_free_count -= 1;
-			fat32_write_free_count(); // best-effort — see its own comment
-			return cluster;
+			if (fat32_next_cluster(cluster) == 0)
+			{
+				if (!fat32_write_fat_entry(cluster, FAT32_EOC_MIN)) return 0;
+				fat32_free_count -= 1;
+				fat32_write_free_count(); // best-effort — see its own comment
+				fat32_alloc_hint = cluster + 1;
+				return cluster;
+			}
 		}
 	}
 	return 0;
@@ -1625,6 +1679,7 @@ fn bool fat32_free_cluster_chain(uint first_cluster)
 	{
 		uint next = fat32_next_cluster(cluster);
 		if (!fat32_write_fat_entry(cluster, 0)) return false;
+		if (cluster < fat32_alloc_hint) fat32_alloc_hint = cluster; // reuse the freed space next
 		freed_count += 1;
 		cluster = next;
 	}
@@ -2279,6 +2334,9 @@ fn int fat32_rename(char* old_path, char* new_path)
 
 fn void fat32_mount()
 {
+	fat32_fat_cache_valid = false; // stale from a previous mount / respawn
+	fat32_alloc_hint = 2;
+
 	char[SECTOR_SIZE] boot_sector @noinit;
 	if (!fs_read_sector(0, &boot_sector))
 	{
