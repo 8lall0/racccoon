@@ -18,6 +18,11 @@
       "target":  "elf-riscv64",
       "type": "object-files",
       "sources": [ "boards/duo/**" ]
+    },
+    "racccoon-opi": {
+      "target":  "elf-riscv64",
+      "type": "object-files",
+      "sources": [ "boards/opi-rv/**" ]
     }
   },
   "cpu": "generic",

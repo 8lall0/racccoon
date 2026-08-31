@@ -4,6 +4,42 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-31 — Orange Pi RV (JH7110) port: Stage 0 scaffold (branch `opi-rv-port`)
+
+Preliminary work for a third hardware target — the Orange Pi RV, a
+StarFive JH7110 board (same SoC as VisionFive 2 / Star64 / Milk-V Mars:
+4× SiFive U74 + 1× S7 monitor core, DRAM at 0x40000000, stock SiFive
+PLIC at 0x0c000000, 4 MHz timebase). Board not in hand yet — this is
+scaffold + a staged bring-up plan, on its own branch.
+
+- `boards/opi-rv/board.c3` — the full `board` contract. PLIC / timebase
+  / SBI console filled from the JH7110 devicetree; every peripheral
+  flag `false`; SD / USB / GPIO / ETH addresses are `0` stubs (the same
+  honest convention `boards/qemu/board.c3` uses for its absent
+  hardware). Shaped to boot to the embedded shell with no filesystem,
+  the same first milestone the Duo port started from.
+- `boards/opi-rv/kernel.ld` — link at `0x40200000` (DRAM_BASE + 2 MiB,
+  clears OpenSBI's fw_dynamic reservation), flat 64 MiB `free_ram`.
+- `project.json` — `racccoon-opi` target. `scripts/build_opi.sh` —
+  builds `build/kernel_opi.elf` (+ `.bin`); no firmware packaging, load
+  from the vendor U-Boot with `bootelf`.
+- `docs/opi-rv-plan.md` — the staged plan (Stage 1 first boot → Stage 3
+  DW-MSHC SD driver unlocks the whole test battery → Ethernet / USB /
+  GPIO after).
+
+Why it should be *easier* than the Duo: the U74 is a plain RV64GC core
+with no T-Head MAEE PTE quirk — the single hardest Duo problem (the
+weak-order-MMIO PLIC storm) can't occur, and the SiFive PLIC math is
+reused from QEMU as-is. Why *harder*: multi-hart SoC (the S-mode PLIC
+context is `2*hartid`, so likely 2 not 1 — flagged as the #1 first-boot
+check), and every peripheral is a different controller than the Duo's.
+
+`build_opi.sh` builds clean (entry 0x40200000, 64 MiB window verified in
+the ELF); the QEMU and Duo builds are unaffected (`project.json` change
+is purely additive; QEMU boot + `dirpacktest` still green).
+
+---
+
 ## 2026-08-31 — Duo hardware verification of the ~17-commit arc
 
 Reflashed the CV1800B with the test shell (`DUO_TEST_SHELL=1
