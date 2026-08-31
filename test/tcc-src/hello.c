@@ -6,6 +6,11 @@
  *                                USER_BASE — lib/tcc/config.h + the
  *                                racccoon.patch set the defaults), then
  *   hello world                  run it
+ *
+ * Self-host (roadmap §7.8):
+ *   tcc -DONE_SOURCE=1 -DCONFIG_TCC_STATIC=1 -DCONFIG_TCC_SEMLOCK=0 \
+ *       -I/src/tcc /src/tcc/tcc.c -o /bin/tcc2
+ *   tcc2 /hello.c -o /bin/hw2 && hw2 world
  */
 #include <stdio.h>
 #include <stdlib.h>

@@ -727,7 +727,13 @@ flat-binary exec path like the c3 `/bin` commands.
    `ext2_free_data_and_indirect`; `bigwritetest`); libc `read()` loops
    for regular files; shell execs a `/`-containing command as a path.
    Duo run still pending.
-8. **TinyCC self-hosts** — `tcc` compiles its own source on racccoon.
+8. **TinyCC self-hosts. DONE** (2026-08-31) — `tcc /src/tcc/tcc.c -o
+   /bin/tcc2` on racccoon, then `tcc2 /hello.c -o /bin/hw2 && hw2` runs.
+   `/bin/tcc2` is 468 KiB, self-compiled; `e2fsck` clean. Needed
+   `<stdint.h>` (added to the libc — tcc ships none) and a no-op
+   `__clear_cache` (`lib/tcc/rvflush.c`, into `libtcc1.a`).
+   `build_tcc.sh` stages the ONE_SOURCE file subset into `build/tcc/src`
+   → `/src/tcc/` on the image.
 
 ### Not doing
 

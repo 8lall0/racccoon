@@ -4,6 +4,47 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-31 — §7.8 DONE: TinyCC self-hosts on racccoon
+
+```
+root / # tcc -DONE_SOURCE=1 -DCONFIG_TCC_STATIC=1 -DCONFIG_TCC_SEMLOCK=0 \
+             -I/src/tcc /src/tcc/tcc.c -o /bin/tcc2 && echo BUILD_OK
+BUILD_OK
+root / # tcc2 /hello.c -o /bin/hw2 && echo REBUILD_OK
+REBUILD_OK
+root / # hw2 selfhosted
+hello from tcc-compiled C on racccoon
+2 + 3 = 5
+strcat: abcdef (len 6)
+argv[1] = selfhosted, atoi = 0
+```
+
+tcc, running on racccoon, compiled its own ~55k-line source (`tcc.c`
+in ONE_SOURCE mode) into a working `/bin/tcc2` (468 KiB), which then
+compiled and linked `hello.c` into a running binary. Full self-hosting
+loop, in QEMU. `e2fsck` on the image is clean. **Roadmap §7 complete.**
+
+Two small pieces were missing:
+- **`<stdint.h>`** — tcc ships none (it expects the libc to provide it),
+  and racccoon's libc had leaned on gcc's freestanding copy for the
+  cross-build. Added `lib/racccoon-libc/include/stdint.h` (LP64 fixed-
+  width types + the `*_MAX` / `*_C` macros). `<inttypes.h>` pulls it.
+- **`__clear_cache`** — tcc emits calls to it from `tccrun.c`; gcc has
+  it as a builtin, and tcc's own `lib/armflush.c` can't be gcc-compiled
+  for riscv64 (its `__riscv` branch calls a *tcc* builtin). Added
+  `lib/tcc/rvflush.c` (a no-op — racccoon's tcc compiles to a file,
+  never `-run`; a real `fence.i` / C906 I-cache sync goes here if
+  on-device `-run` ever becomes a goal) into `libtcc1.a`.
+
+`scripts/build_tcc.sh` now also assembles the ONE_SOURCE file subset
+(22 files, ~1.3 MB) into `build/tcc/src/`, and `scripts/seed_tcc.sh`
+puts it at `/src/tcc/` on the image (with the patched `riscv64-link.c`,
+so `tcc2`'s own output loads at USER_BASE too).
+
+Regression green; Duo kernels build clean; Duo run pending.
+
+---
+
 ## 2026-08-31 — §7.7 DONE: `tcc hello.c -o hello && hello` on racccoon
 
 A TinyCC-compiled C program builds and runs on racccoon:

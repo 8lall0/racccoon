@@ -110,25 +110,45 @@ for o in crt0.o crt1.o crti.o crtn.o; do
   $OBJCOPY_RC --remove-section=.riscv.attributes --remove-section=.comment "$OUT/lib/$o" 2>/dev/null || true
 done
 
-# libtcc1.a — riscv64 runtime helpers (soft 128-bit float, __va_arg,
-# alloca, …). Built with the cross gcc rather than tcc itself for the
-# first bring-up; revisit once tcc runs on device.
-LT1="$OUT/lib_obj"; mkdir -p "$LT1"
+# libtcc1.a — the target runtime helpers (soft 128-bit float, __va_arg,
+# bounds of __divdi3 etc., alloca). Built with the cross gcc rather than
+# tcc itself: lib/lib-arm64.c (misnamed — it's the arm64/riscv64 soft-
+# float + varargs file) + libtcc1.c + a few small ones. armflush.c is
+# skipped (its __riscv branch calls a tcc builtin, __riscv64_clear_cache,
+# that gcc can't compile) — lib/tcc/rvflush.c provides __clear_cache
+# instead.
+LT1="$OUT/lib_obj"; mkdir -p "$LT1"; rm -f "$LT1"/*.o
 LT1_SRC="lib-arm64.c libtcc1.c stdatomic.c builtin.c dsohandle.c"
 ok=1
 for s in $LT1_SRC; do
   [ -f "$TCC_SRC/lib/$s" ] || continue
   $CC_RC $CFLAGS -c "$TCC_SRC/lib/$s" -o "$LT1/${s%.c}.o" 2>/dev/null || ok=0
 done
-for s in atomic.S armflush.S alloca.S alloca-bt.S; do
-  [ -f "$TCC_SRC/lib/$s" ] || continue
-  $CC_RC $CFLAGS -c "$TCC_SRC/lib/$s" -o "$LT1/${s%.S}.o" 2>/dev/null || true
+$CC_RC $CFLAGS -c "$ROOT/lib/tcc/rvflush.c" -o "$LT1/rvflush.o" || ok=0
+for o in "$LT1"/*.o; do
+  $OBJCOPY_RC --remove-section=.riscv.attributes --remove-section=.comment "$o" 2>/dev/null || true
 done
 if [ "$ok" = 1 ] && ls "$LT1"/*.o >/dev/null 2>&1; then
   $AR_RC rcs "$OUT/lib/libtcc1.a" "$LT1"/*.o
   echo "==> Done: $OUT/lib/libtcc1.a"
 else
-  echo "==> libtcc1.a: partial/failed (full 'tcc x.c -o x' link not ready yet)" >&2
+  echo "==> libtcc1.a: partial/failed" >&2
 fi
 
-echo "==> build/tcc/ ready. Seed onto an image: /bin/tcc + /lib/tcc/"
+# --- self-host source subset (roadmap §7.8) -----------------------
+# The files an ONE_SOURCE build of tcc.c #includes for the riscv64
+# target, plus the generated config.h / tccdefs_.h, so `tcc
+# /src/tcc/tcc.c ...` can rebuild tcc on racccoon itself. riscv64-link.c
+# is the patched copy (ELF_START_ADDR), so tcc2's own output also loads
+# at USER_BASE.
+SRC="$OUT/src"
+rm -rf "$SRC"; mkdir -p "$SRC"
+SELF_C="tcc.c libtcc.c tcctools.c tccpp.c tccgen.c tccdbg.c tccasm.c
+        tccelf.c tccrun.c riscv64-gen.c riscv64-link.c riscv64-asm.c"
+SELF_H="tcc.h libtcc.h elf.h stab.h stab.def dwarf.h tcctok.h riscv64-tok.h"
+for f in $SELF_C $SELF_H; do cp "$TCC_SRC/$f" "$SRC/"; done
+cp "$ROOT/lib/tcc/config.h" "$SRC/config.h"
+cp "$OUT/tccdefs_.h" "$SRC/tccdefs_.h"
+echo "==> Done: $SRC/  ($(ls "$SRC" | wc -l) files, $(du -sh "$SRC" | cut -f1))"
+
+echo "==> build/tcc/ ready. Seed onto an image: /bin/tcc + /lib/tcc/ + /src/tcc/"
