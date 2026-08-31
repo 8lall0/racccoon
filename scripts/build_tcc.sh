@@ -72,10 +72,13 @@ mkdir -p "$OUT/obj" "$OUT/lib/include"
 echo "==> TinyCC: $TCC_SRC  ($(cat "$TCC_SRC/VERSION" 2>/dev/null))"
 
 GCCINC="$($CC_RC -print-file-name=include)"
+# ONE_SOURCE / CONFIG_TCC_STATIC / CONFIG_TCC_SEMLOCK / TCC_GITHASH now
+# come from tcc.c's own default and lib/tcc/config.h — the same config a
+# self-host build on racccoon reads, so `tcc /src/tcc/tcc.c -o tcc2`
+# needs no -D flags.
 CFLAGS="-march=rv64imafdc -mabi=lp64d -mcmodel=medany -ffreestanding -fno-pic
  -fno-stack-protector -fno-builtin -Os -std=gnu11 -ffunction-sections -fdata-sections
- -nostdinc -isystem $GCCINC -I $LIBC/include -I $ROOT/lib/tcc
- -DTCC_GITHASH=\"racccoon\" -DONE_SOURCE=1 -DCONFIG_TCC_STATIC=1 -DCONFIG_TCC_SEMLOCK=0"
+ -nostdinc -isystem $GCCINC -I $LIBC/include -I $ROOT/lib/tcc"
 
 # --- tccdefs_.h (the built-in predefined macros), via the BUILD cc ----
 $HOSTCC -DC2STR "$TCC_SRC/conftest.c" -o "$OUT/c2str.exe"

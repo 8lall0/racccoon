@@ -18,13 +18,22 @@
  * PT_LOAD segments only — no PT_INTERP, no dynamic relocation — so tcc
  * must emit a static executable. The load address is set by the
  * ELF_START_ADDR patch in lib/tcc/racccoon.patch (USER_BASE), not a
- * -Wl,-Ttext switch. */
+ * -Wl,-Ttext switch.
+ *
+ * CONFIG_TCC_STATIC / CONFIG_TCC_SEMLOCK: tcc-on-racccoon is a static,
+ * single-threaded binary — no dlopen, no libc semaphores. Here rather
+ * than on the compile line so a self-host `tcc /src/tcc/tcc.c -o tcc2`
+ * needs no -D flags at all. */
 
 #define TCC_VERSION "0.9.28rc"
+#define TCC_GITHASH "racccoon"
 
 #define CC_NAME CC_gcc
 #define GCC_MAJOR 12
 #define GCC_MINOR 2
+
+#define CONFIG_TCC_STATIC 1
+#define CONFIG_TCC_SEMLOCK 0
 
 #if !(TCC_TARGET_I386 || TCC_TARGET_X86_64 || TCC_TARGET_ARM \
    || TCC_TARGET_ARM64 || TCC_TARGET_RISCV64 || TCC_TARGET_C67)

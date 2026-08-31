@@ -4,6 +4,28 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-31 — tcc polish: bare invocation, `tcctest`, the fixpoint
+
+Tightening the §7 result.
+
+- **`tcc /src/tcc/tcc.c -o /bin/tcc2` — no flags.** `CONFIG_TCC_STATIC`,
+  `CONFIG_TCC_SEMLOCK` and `TCC_GITHASH` moved from `build_tcc.sh`'s
+  compile line into `lib/tcc/config.h` (which is also what a self-host
+  build on racccoon reads); `ONE_SOURCE` was already tcc.c's own
+  default; and tcc searches the including file's own directory for
+  `"…"` includes, so `-I/src/tcc` isn't needed either. The self-host
+  command is now the same shape as any other compile.
+- **`tcctest`** — a shell_test builtin: `/bin/tcc /hello.c -o /tcctmp`,
+  run `/tcctmp`, expect exit 0; skips cleanly if `/bin/tcc` isn't on
+  the image. In the regression battery now.
+- **The fixpoint.** `tcc2 /src/tcc/tcc.c -o /bin/tcc3` on racccoon, then
+  `tcc3 /hello.c -o /bin/hw3 && hw3` runs — tcc2 and tcc3 byte-identical
+  (a stable self-hosting fixpoint, not just "compiles once").
+- `scripts/build.sh` reverts `lib/tcc/racccoon.patch` from the
+  submodule after seeding, so `git status` stays clean between builds.
+
+---
+
 ## 2026-08-31 — §7.8 DONE: TinyCC self-hosts on racccoon
 
 ```

@@ -7,10 +7,10 @@
  *                                racccoon.patch set the defaults), then
  *   hello world                  run it
  *
- * Self-host (roadmap §7.8):
- *   tcc -DONE_SOURCE=1 -DCONFIG_TCC_STATIC=1 -DCONFIG_TCC_SEMLOCK=0 \
- *       -I/src/tcc /src/tcc/tcc.c -o /bin/tcc2
+ * Self-host (roadmap §7.8) — no flags, config.h carries them:
+ *   tcc /src/tcc/tcc.c -o /bin/tcc2
  *   tcc2 /hello.c -o /bin/hw2 && hw2 world
+ *   tcc2 /src/tcc/tcc.c -o /bin/tcc3   (fixpoint: tcc3 == tcc2)
  */
 #include <stdio.h>
 #include <stdlib.h>

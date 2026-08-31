@@ -1990,6 +1990,38 @@ fn void main() {
                 if (wt_code != 0) { wt_ok = -1; }
             }
             print(wt_ok == 0 ? "wasmtest: ok\n" : "wasmtest: FAILED\n");
+        } else if (strcmp(cmd, "tcctest") == 0) {
+            // roadmap §7: /bin/tcc compiles + links /hello.c into a
+            // runnable binary. Skips cleanly if tcc isn't on this image
+            // (no third_party/tinycc submodule -> seed_tcc.sh no-op).
+            char*[3] tt_cc_av;
+            tt_cc_av[0] = "/hello.c"; tt_cc_av[1] = "-o"; tt_cc_av[2] = "/tcctmp";
+            uint tt_g1 = 0;
+            int tt_c1 = rfork(RFPROC, &tt_g1);
+            if (tt_c1 == 0) {
+                exec("bin/tcc", exec_buf(), RUN_EXEC_BUF_MAX, 0, &tt_cc_av[0], 3);
+                exitcode(127);
+            }
+            int tt_cc = join(tt_c1, tt_g1);
+            if (tt_cc == 127) {
+                print("tcctest: skipped (no /bin/tcc)\n");
+            } else if (tt_cc != 0) {
+                print("tcctest: FAILED (tcc exit ");
+                print_uint((uint)tt_cc);
+                print(")\n");
+            } else {
+                char*[1] tt_run_av;
+                tt_run_av[0] = "x";
+                uint tt_g2 = 0;
+                int tt_c2 = rfork(RFPROC, &tt_g2);
+                if (tt_c2 == 0) {
+                    exec("/tcctmp", exec_buf(), RUN_EXEC_BUF_MAX, 0, &tt_run_av[0], 1);
+                    exitcode(127);
+                }
+                int tt_run = join(tt_c2, tt_g2);
+                fs_delete("/tcctmp");
+                print(tt_run == 0 ? "tcctest: ok\n" : "tcctest: FAILED (compiled binary exit != 0)\n");
+            }
         } else if (strcmp(cmd, "maptest") == 0) {
             // SYS_MAP: fresh zero-filled RW pages past the image, bumping.
             char* mp1 = (char*)map_pages(100);      // -> 1 page
