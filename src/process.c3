@@ -382,6 +382,15 @@ struct Process
 	bool has_message;
 	int  msg_from;
 
+	// Monotonic count of IPC messages this process has actually consumed
+	// (ipc_recv / ipc_recv_gen / ipc_call reply / ipc_poll, and a
+	// driver's IRQ-notify via ipc_poll). The supervisor watchdog
+	// (src/supervisor.c3) samples it each tick: a server with has_message
+	// stuck true is only "wedged" if this hasn't advanced either — a
+	// driver hammered with thousands of requests between ticks is busy,
+	// not hung, even if it happens to have one unconsumed at the sample.
+	uint ipc_progress;
+
 	// Set to the peer's (pid, generation) while this process is blocked
 	// inside SYS_IPC_SEND / SYS_IPC_REPLY waiting on that peer — 0/stale
 	// the rest of the time (only read while ipc_wait_pid != 0). If the
@@ -1099,6 +1108,7 @@ fn Process* create_process(void* image, uint image_size)
 	// a stale request left by the instance the watchdog just killed and
 	// reply into a rendezvous nobody was waiting on — a deadlock.
 	proc.has_message = false;
+	proc.ipc_progress = 0; // watchdog progress counter — fresh slot, fresh count
 	proc.msg_acked = false;
 	proc.msg_from = 0;
 	// Same reused-slot hygiene sys_rfork already does: a slot whose

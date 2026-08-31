@@ -4,6 +4,35 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-31 — supervisor watchdog: don't kill a *busy* server
+
+`dirpacktest` on FAT32 (create 80 files in one directory back-to-back)
+reliably tripped `svc: diskd wedged (unconsumed IPC) — killing`. The
+watchdog counted a stall tick whenever a supervised server had
+`has_message` set at the sample, and killed it after 5 consecutive.
+Under a burst-heavy fs workload diskd is flying — thousands of requests
+between two 1-second ticks — but the sample can still catch one message
+queued-and-not-yet-consumed, so a genuinely healthy driver got two
+"stall" ticks in a row and eventually died. (`fat32_create_file` is
+O(n) disk reads per create for a growing directory, so a big FAT32
+directory op generates the burst; that O(n²) is a separate, smaller
+issue.)
+
+Fix: a monotonic `Process.ipc_progress`, bumped every time a process
+actually consumes a message (`ipc_recv` / `ipc_recv_gen` / the
+`ipc_call` reply / `ipc_poll`, and a driver's IRQ-notify via
+`ipc_poll`). The watchdog samples it each tick: `has_message` stuck
+true only counts as a stall tick if `ipc_progress` *also* hasn't moved
+since the last tick. A wedged server makes zero progress, so 5
+no-progress ticks with a stuck inbox still means wedged —
+`hungservertest` (deliberately wedges echod) still fires the kill.
+
+`dirpacktest` (now 80 files + 6 subdirs + churn) → ok on FAT32 with no
+false wedge, and on ext2 with `e2fsck` clean. Full killtest /
+supervisor battery green.
+
+---
+
 ## 2026-08-31 — ext2 directory dirent packing: many files per directory
 
 `ext2_create_file` / `ext2_mkdir` used to append a whole directory

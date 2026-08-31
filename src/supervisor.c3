@@ -92,9 +92,15 @@ struct Service
 	// Watchdog state. ever_ready gates it: a server that hasn't yet
 	// reached its ipc_recv loop even once (slow init, e.g. sdd on the
 	// Duo) is "still starting," not "wedged." stall_ticks counts
-	// consecutive ticks with a stuck inbox once it is ready.
+	// consecutive ticks with a stuck inbox once it is ready AND no IPC
+	// progress since the last tick — last_progress is the previous
+	// tick's Process.ipc_progress, so a server flying through thousands
+	// of requests between ticks never trips even if the sample catches
+	// one unconsumed (dirpacktest / any burst-heavy fs workload hit
+	// this — see docs/devlog.md).
 	bool  ever_ready;
 	int   stall_ticks;
+	uint  last_progress;
 }
 
 Service[SVC_MAX] services;
@@ -123,6 +129,7 @@ fn void supervisor_register(char* name, char* bin_start, char* bin_end,
 	s.used           = true;
 	s.ever_ready     = false;
 	s.stall_ticks    = 0;
+	s.last_progress  = proc.ipc_progress;
 }
 
 // Re-point every namespace mount that named (old_pid) at (new_pid,
@@ -178,6 +185,7 @@ fn void supervisor_spawn(Service* s)
 	s.restarts++;
 	s.ever_ready  = false;
 	s.stall_ticks = 0;
+	s.last_progress = p.ipc_progress;
 	if (s.pid_global != null) { *s.pid_global = p.pid; }
 
 	reseat_namespace_mounts(old_pid, p.pid, p.generation);
@@ -215,9 +223,18 @@ fn bool supervisor_tick()
 			{
 				s.ever_ready  = true;
 				s.stall_ticks = 0;
+				s.last_progress = live.ipc_progress;
 				continue;
 			}
 			if (!s.ever_ready) { continue; }   // still starting — not wedged
+			// has_message is set, but did the server consume anything
+			// since the last tick? If so it's busy, not wedged.
+			if (live.ipc_progress != s.last_progress)
+			{
+				s.last_progress = live.ipc_progress;
+				s.stall_ticks = 0;
+				continue;
+			}
 			s.stall_ticks++;
 			if (s.stall_ticks < SVC_STALL_LIMIT) { continue; }
 

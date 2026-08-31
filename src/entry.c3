@@ -738,6 +738,7 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		*(--child_sp) = (uptr)&fork_entry;
 
 		child.has_message = false;
+		child.ipc_progress = 0;
 		child.driver_irq_pending = false; // reused-slot hygiene (a driver's slot never actually gets rfork'd, but keep it clean)
 		// rfork(RFPROC) copies every PAGE_U leaf, so the child's mapped
 		// region — including any pages the parent SYS_MAP'd — matches the
@@ -1589,6 +1590,7 @@ fn void sys_ipc_call(Trap_frame* f) @noinline
 	mem::copy(call_buf, &current_proc.msg_data, (sz)call_buf_cap);
 	if (call_type_out != null) { *call_type_out = current_proc.msg_type; }
 	current_proc.has_message = false;
+	current_proc.ipc_progress++;
 	current_proc.in_call_reply_wait = false;
 	current_proc.ipc_wait_pid = 0;
 
@@ -1637,6 +1639,7 @@ fn void sys_ipc_recv(Trap_frame* f) @noinline
 				}
 				f.a0 = (ulong)current_proc.msg_from;
 				current_proc.has_message = false;
+				current_proc.ipc_progress++;
 
 				// Wake the sender: it's genuinely blocked (see
 				// SYS_IPC_SEND) waiting specifically for this ack,
@@ -1710,6 +1713,7 @@ fn void sys_ipc_recv_gen(Trap_frame* f) @noinline
 				}
 				f.a0 = (ulong)current_proc.msg_from;
 				current_proc.has_message = false;
+				current_proc.ipc_progress++;
 
 				Process* recv_gen_acked_sender = proc_by_pid(current_proc.msg_from);
 				if (recv_gen_acked_sender != null)
@@ -1783,6 +1787,7 @@ fn void sys_ipc_poll(Trap_frame* f) @noinline
 		if (current_proc.driver_irq_pending)
 		{
 			current_proc.driver_irq_pending = false;
+			current_proc.ipc_progress++; // a device completion is progress — see Process.ipc_progress
 			if (poll_type_out != null) { *poll_type_out = DISKD_IRQ_NOTIFY; }
 			f.a0 = 0;
 			return;
@@ -1807,6 +1812,7 @@ fn void sys_ipc_poll(Trap_frame* f) @noinline
 		}
 		f.a0 = (ulong)current_proc.msg_from;
 		current_proc.has_message = false;
+		current_proc.ipc_progress++;
 
 		// Same "wake the real sender" step as SYS_IPC_RECV — normally
 		// a no-op here, since diskd's only use of this is for the

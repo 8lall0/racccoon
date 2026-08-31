@@ -18,8 +18,8 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
-#define NF 30
-#define ND 3
+#define NF 80
+#define ND 6
 
 static int r_create(const char *p)
 {
@@ -75,13 +75,13 @@ int main(int argc, char **argv)
 		snprintf(p, sizeof p, "%s/f%03d", dir, i);
 		if (r_unlink(p) != 0) { printf("dirpacktest: FAILED (unlink %s)\n", p); return 1; }
 	}
-	for (int i = 0; i < 10; i++) {
+	for (int i = 0; i < 20; i++) {
 		snprintf(p, sizeof p, "%s/g%02d", dir, i);
 		if (r_create(p) != 0) { printf("dirpacktest: FAILED (recreate %s)\n", p); return 1; }
 	}
 
 	c = count_dir(dir);
-	int want = (NF - NF / 2) + ND + 10;
+	int want = (NF - NF / 2) + ND + 20;
 	if (c != want) { printf("dirpacktest: FAILED (post-churn count %d want %d)\n", c, want); return 1; }
 
 	struct stat sb;
