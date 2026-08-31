@@ -153,10 +153,19 @@ ssize_t read(int fd, void *buf, size_t count)
 	if (fd < 0 || fd >= FD_MAX || fdtab[fd].kind == K_FREE) { errno = EBADF; return -1; }
 	if (fdtab[fd].kind == K_CONSOLE) return console_read(buf, count);
 
-	long got = __rc_fs_read_at(fdtab[fd].path, buf, (long)count, fdtab[fd].off);
-	if (got < 0) { errno = EIO; return -1; }
-	fdtab[fd].off += (unsigned long)got;
-	return got;
+	/* fsd returns at most ~1 KiB per IPC — loop so a regular-file read()
+	 * fills the caller's buffer (short only at EOF), which is what
+	 * almost all callers expect. */
+	char *p = buf;
+	size_t done = 0;
+	while (done < count) {
+		long got = __rc_fs_read_at(fdtab[fd].path, p + done, (long)(count - done), fdtab[fd].off);
+		if (got < 0) { if (done) break; errno = EIO; return -1; }
+		if (got == 0) break;
+		fdtab[fd].off += (unsigned long)got;
+		done += (size_t)got;
+	}
+	return (ssize_t)done;
 }
 
 ssize_t write(int fd, const void *buf, size_t count)

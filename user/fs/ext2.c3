@@ -19,10 +19,15 @@ import std::nolibc::mem;
 //     back short, same "return however many bytes were actually
 //     reachable" discipline fat32_read_file uses for a broken chain, not
 //     an error.
-//   - Writing (ext2_write, below) stays direct-blocks-only (i_block[0..11]) —
-//     nothing in this project's own test suite writes a file bigger
-//     than 12 blocks, so single-indirect write support isn't attempted
-//     here; see its own "v1 write scope" note below.
+//   - Offset-aware writing (ext2_write_at / ext2_write_file_at) grows a
+//     file through the 12 direct pointers, then single-indirect
+//     (i_block[12]), then double-indirect (i_block[13]) — allocating the
+//     pointer blocks as it goes (ext2_ensure_block_for_write). That's
+//     ~64 MiB with 1 KiB blocks, past anything written here. Triple-
+//     indirect writes are still not implemented (a >64 MiB write can't
+//     happen on this hardware; the read path has all three levels). The
+//     legacy whole-file ext2_write() (FS_WRITE, ~1 KiB/message) stays
+//     direct-only — it can never reach even block 2.
 //   - Reading, updating, and allocating inodes/blocks all work across
 //     any block group, up to EXT2_MAX_GROUPS (see its own comment) —
 //     found a real need for this on actual hardware: a real Linux
@@ -53,8 +58,10 @@ import std::nolibc::mem;
 //     doesn't free the now-excess clusters" gap. Fails outright (no
 //     silent workaround) if the root directory's own 12 direct blocks
 //     are already all in use.
-//   - No indirect-block writes either, same 12-direct-block limit the
-//     read path already has.
+//   - A directory never grows past its own 12 direct blocks (a new file
+//     needs a free directory slot in one of those). File *data* writes
+//     go through single- and double-indirect blocks (above); only the
+//     directory-block append is still direct-only.
 
 // Superblock lives at a *fixed byte offset*, 1024, from the partition
 // start regardless of block size — sector 2 for this project's fixed
@@ -1148,6 +1155,60 @@ fn bool ext2_free_block(uint block)
 	return ext2_inc_free_blocks(group);
 }
 
+// Frees every block a file occupies: the 12 direct blocks, then — if
+// present — the single- and double-indirect data blocks AND the pointer
+// blocks that addressed them (ext2_ensure_block_for_write may have
+// allocated all of those when a write grew the file). Reads `inode`'s
+// in-memory copy (already loaded by the caller); doesn't touch the inode
+// record itself. Triple-indirect isn't walked — this driver never
+// writes one, so a file it created can't have one.
+fn bool ext2_free_data_and_indirect(Ext2_inode_info* inode)
+{
+	for (uint b = 0; b < 12; b++)
+	{
+		if (inode.block[b] == 0) continue;
+		if (!ext2_free_block(inode.block[b])) return false;
+	}
+
+	uint n = ext2_block_size / 4;
+
+	if (inode.indirect_block != 0)
+	{
+		char[EXT2_MAX_BLOCK_SIZE] ind_buf @noinit;
+		if (!ext2_read_block(inode.indirect_block, &ind_buf)) return false;
+		uint* ptrs = (uint*)&ind_buf;
+		for (uint i = 0; i < n; i++)
+		{
+			if (ptrs[i] == 0) continue;
+			if (!ext2_free_block(ptrs[i])) return false;
+		}
+		if (!ext2_free_block(inode.indirect_block)) return false;
+	}
+
+	if (inode.double_indirect_block != 0)
+	{
+		char[EXT2_MAX_BLOCK_SIZE] top_buf @noinit;
+		if (!ext2_read_block(inode.double_indirect_block, &top_buf)) return false;
+		uint* top_ptrs = (uint*)&top_buf;
+		for (uint t = 0; t < n; t++)
+		{
+			if (top_ptrs[t] == 0) continue;
+			char[EXT2_MAX_BLOCK_SIZE] mid_buf @noinit;
+			if (!ext2_read_block(top_ptrs[t], &mid_buf)) return false;
+			uint* mid_ptrs = (uint*)&mid_buf;
+			for (uint i = 0; i < n; i++)
+			{
+				if (mid_ptrs[i] == 0) continue;
+				if (!ext2_free_block(mid_ptrs[i])) return false;
+			}
+			if (!ext2_free_block(top_ptrs[t])) return false;
+		}
+		if (!ext2_free_block(inode.double_indirect_block)) return false;
+	}
+
+	return true;
+}
+
 // Inverse of ext2_alloc_inode() — same shape as ext2_free_block(),
 // against the inode bitmap.
 fn bool ext2_free_inode(uint inode_num)
@@ -1204,8 +1265,128 @@ fn bool ext2_write_inode(uint inode_num, Ext2_inode_info* info)
 	*blocks_field      = info.blocks;
 	uint* block_ptrs = (uint*)&inode_bytes[EXT2_INODE_BLOCK];
 	mem::copy(block_ptrs, &info.block, 48); // 12 uint (4 bytes each) direct block pointers
+	// i_block[12..14] — the single/double/triple indirect pointers. The
+	// read path (ext2_resolve_block) has always consumed these; the
+	// write path (ext2_ensure_block_for_write, below) now populates
+	// i_block[12]/[13] when a write grows a file past 12 direct blocks,
+	// so persist all three from `info` rather than leaving whatever was
+	// on disk. ext2_read_inode fills these in, so an
+	// unrelated-inode-write round-trips them unchanged.
+	block_ptrs[12] = info.indirect_block;
+	block_ptrs[13] = info.double_indirect_block;
+	block_ptrs[14] = info.triple_indirect_block;
 
 	return ext2_write_block(ext2_inode_table_blocks[group] + block_offset, &block_buf);
+}
+
+// Resolve logical block `b` of `inode` to a real on-disk block for a
+// WRITE, allocating whatever's missing along the way: the data block
+// itself, and — for b past the 12 direct pointers — the single/double
+// indirect pointer blocks that address it. Mutates
+// inode.block[]/inode.indirect_block/inode.double_indirect_block in
+// place; the caller writes the inode back afterward (same division of
+// responsibility as ext2_write_file). *new_blocks is incremented by the
+// number of blocks freshly allocated here (data AND metadata — real
+// ext2 counts indirect blocks in i_blocks), so the caller can bump
+// inode.blocks correctly.
+//
+// Returns 0 on allocation failure or for a `b` past double-indirect
+// reach (12 + n + n*n, n = ext2_block_size/4). Triple-indirect writes
+// aren't supported: with 1 KiB blocks double-indirect already reaches
+// ~64 MiB, past anything this project writes, and i_size is 32-bit.
+fn uint ext2_ensure_block_for_write(Ext2_inode_info* inode, uint b, uint* new_blocks, bool* data_new)
+{
+	*data_new = false;
+
+	if (b < 12)
+	{
+		if (inode.block[b] == 0)
+		{
+			uint nb = ext2_alloc_block();
+			if (nb == 0) return 0;
+			inode.block[b] = nb;
+			*new_blocks += 1;
+			*data_new = true;
+		}
+		return inode.block[b];
+	}
+
+	uint n = ext2_block_size / 4;
+	char[EXT2_MAX_BLOCK_SIZE] top_buf @noinit;
+	char[EXT2_MAX_BLOCK_SIZE] mid_buf @noinit;
+
+	// --- single indirect: i_block[12] -> one block of `n` pointers ---
+	if (b < 12 + n)
+	{
+		if (inode.indirect_block == 0)
+		{
+			uint ib = ext2_alloc_block();
+			if (ib == 0) return 0;
+			for (uint i = 0; i < ext2_block_size; i++) top_buf[i] = 0;
+			if (!ext2_write_block(ib, &top_buf)) return 0;
+			inode.indirect_block = ib;
+			*new_blocks += 1;
+		}
+		if (!ext2_read_block(inode.indirect_block, &top_buf)) return 0;
+		uint* ptrs = (uint*)&top_buf;
+		uint idx = b - 12;
+		if (ptrs[idx] == 0)
+		{
+			uint db = ext2_alloc_block();
+			if (db == 0) return 0;
+			ptrs[idx] = db;
+			if (!ext2_write_block(inode.indirect_block, &top_buf)) return 0;
+			*new_blocks += 1;
+			*data_new = true;
+			return db;
+		}
+		return ptrs[idx];
+	}
+
+	// --- double indirect: i_block[13] -> `n` blocks of `n` pointers ---
+	if (b < 12 + n + n * n)
+	{
+		if (inode.double_indirect_block == 0)
+		{
+			uint tb = ext2_alloc_block();
+			if (tb == 0) return 0;
+			for (uint i = 0; i < ext2_block_size; i++) top_buf[i] = 0;
+			if (!ext2_write_block(tb, &top_buf)) return 0;
+			inode.double_indirect_block = tb;
+			*new_blocks += 1;
+		}
+		if (!ext2_read_block(inode.double_indirect_block, &top_buf)) return 0;
+		uint* top_ptrs = (uint*)&top_buf;
+		uint rel = b - (12 + n);
+		uint top_idx = rel / n;
+		uint mid_block = top_ptrs[top_idx];
+		if (mid_block == 0)
+		{
+			mid_block = ext2_alloc_block();
+			if (mid_block == 0) return 0;
+			for (uint i = 0; i < ext2_block_size; i++) mid_buf[i] = 0;
+			if (!ext2_write_block(mid_block, &mid_buf)) return 0;
+			top_ptrs[top_idx] = mid_block;
+			if (!ext2_write_block(inode.double_indirect_block, &top_buf)) return 0;
+			*new_blocks += 1;
+		}
+		if (!ext2_read_block(mid_block, &mid_buf)) return 0;
+		uint* mid_ptrs = (uint*)&mid_buf;
+		uint leaf_idx = rel % n;
+		if (mid_ptrs[leaf_idx] == 0)
+		{
+			uint db = ext2_alloc_block();
+			if (db == 0) return 0;
+			mid_ptrs[leaf_idx] = db;
+			if (!ext2_write_block(mid_block, &mid_buf)) return 0;
+			*new_blocks += 1;
+			*data_new = true;
+			return db;
+		}
+		return mid_ptrs[leaf_idx];
+	}
+
+	return 0; // past double-indirect reach — see this function's own comment
 }
 
 // Zeroes a freshly allocated inode's ENTIRE on-disk record (all
@@ -1435,31 +1616,25 @@ fn uint ext2_write_file(Ext2_inode_info* inode, char* src, uint len)
 // new data, while inode.size claims they're valid content, would
 // silently corrupt every future read of this file. So offset >
 // inode.size is rejected outright (-1), same as offset already being
-// at/past this driver's own 12-direct-block cap (12 * ext2_block_size
-// — the same direct-block-only limit ext2_write_file already has).
+// at/past the double-indirect reach (12 + n + n*n blocks — see
+// ext2_ensure_block_for_write()).
 // That still covers both real pwrite use cases this project needs:
 // overwriting existing bytes anywhere in the file, and appending
 // exactly at the current end (offset == inode.size) to grow it.
 //
-// Same per-block allocation loop shape as ext2_write_file (allocate
-// via ext2_alloc_block() if inode.block[b] == 0, bump inode.blocks on
-// a genuinely new block), generalized with a starting block index and
-// in-block byte offset for the first block only — later blocks always
-// start at in-block offset 0. One correctness improvement over
-// ext2_write_file's own existing behavior (not touched there, only
-// built correctly here from the start): a partial write into a block
-// this call just freshly allocated zero-fills the buffer first,
-// rather than reading whatever stale content happens to already be on
-// disk at that block number — block == 0 before allocation is exactly
-// the signal that this block is new, so ext2_read_block's real
-// content there can't be trusted as "this file's own previous data".
-// A partial write into an already-existing block (a genuine mid-file
-// overwrite) still does the normal read-modify-write, preserving real
-// on-disk bytes outside the touched range.
+// Per logical block, ext2_ensure_block_for_write() returns the real
+// on-disk block, allocating the data block and any single/double
+// indirect pointer blocks needed to address it, and reports (via
+// data_new) whether the data block itself is fresh so a partial write
+// zero-fills rather than reading stale on-disk content. A partial write
+// into an already-existing block (a genuine mid-file overwrite) still
+// does the normal read-modify-write. new_blocks tallies every block
+// allocated (data + metadata) so inode.blocks is bumped once, at the
+// end, by the right amount.
 //
 // Returns bytes actually written (a short write, not an error, if len
-// would run past the 12-block cap — same convention ext2_write_file
-// already uses), or -1 for either invariant violation above. The
+// would run past the double-indirect ceiling), or -1 for either
+// invariant violation above. The
 // caller is responsible for growing inode.size (never shrinking it)
 // and writing the inode back — this function only ever touches
 // inode.block[]/inode.blocks, matching ext2_write_file's own division
@@ -1467,25 +1642,29 @@ fn uint ext2_write_file(Ext2_inode_info* inode, char* src, uint len)
 fn int ext2_write_file_at(Ext2_inode_info* inode, char* src, uint len, uint offset)
 {
 	if (offset > inode.size) return -1;
-	uint max_offset = 12 * ext2_block_size;
+
+	// Reach: 12 direct + single-indirect (n) + double-indirect (n*n)
+	// blocks, n = ext2_block_size/4. Computed in 64-bit and clamped to
+	// 0xFFFFFFFF — with a 4 KiB block n=1024 and the block count alone
+	// overflows uint32 at the double-indirect ceiling, well past i_size's
+	// own 32-bit range anyway. ext2_ensure_block_for_write() returns 0
+	// (a short write here, not an error) for anything past this.
+	uint n = ext2_block_size / 4;
+	ulong reach = ((ulong)12 + (ulong)n + (ulong)n * (ulong)n) * (ulong)ext2_block_size;
+	uint max_offset = reach > 0xFFFFFFFF ? 0xFFFFFFFF : (uint)reach;
 	if (offset >= max_offset) return -1;
 
 	uint bytes_written = 0;
 	uint pos = offset;
+	uint new_blocks = 0;
 	while (bytes_written < len && pos < max_offset)
 	{
 		uint b = pos / ext2_block_size;
 		uint boff = pos % ext2_block_size;
 
-		uint block = inode.block[b];
-		bool is_new_block = block == 0;
-		if (is_new_block)
-		{
-			block = ext2_alloc_block();
-			if (block == 0) break;
-			inode.block[b] = block;
-			inode.blocks += ext2_block_size / SECTOR_SIZE;
-		}
+		bool data_new = false;
+		uint block = ext2_ensure_block_for_write(inode, b, &new_blocks, &data_new);
+		if (block == 0) break;
 
 		uint chunk = len - bytes_written;
 		if (chunk > ext2_block_size - boff) chunk = ext2_block_size - boff;
@@ -1493,7 +1672,7 @@ fn int ext2_write_file_at(Ext2_inode_info* inode, char* src, uint len, uint offs
 		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
 		if (boff != 0 || chunk < ext2_block_size)
 		{
-			if (is_new_block)
+			if (data_new)
 			{
 				for (uint i = 0; i < EXT2_MAX_BLOCK_SIZE; i++) block_buf[i] = 0;
 			}
@@ -1508,6 +1687,10 @@ fn int ext2_write_file_at(Ext2_inode_info* inode, char* src, uint len, uint offs
 		bytes_written += chunk;
 		pos += chunk;
 	}
+	// i_blocks counts every 512-byte sector the file occupies, data and
+	// indirect metadata alike — ext2_ensure_block_for_write() tallied
+	// both into new_blocks.
+	inode.blocks += new_blocks * (ext2_block_size / SECTOR_SIZE);
 	return (int)bytes_written;
 }
 
@@ -1833,11 +2016,7 @@ fn int ext2_delete_resolved(uint dir_inode, uint inode_num, uint entry_sector, u
 
 	if (!ext2_zero_inode(inode_num)) return -1;
 
-	for (uint b = 0; b < 12; b++)
-	{
-		if (inode.block[b] == 0) continue;
-		if (!ext2_free_block(inode.block[b])) return -1;
-	}
+	if (!ext2_free_data_and_indirect(&inode)) return -1;
 	if (!ext2_free_inode(inode_num)) return -1;
 
 	return 0;
@@ -1930,11 +2109,7 @@ fn bool ext2_delete_dir_contents(uint dir_inode_num, int depth, uint requester_u
 					}
 
 					if (!ext2_zero_inode(child_inode_num)) return false;
-					for (uint cb = 0; cb < 12; cb++)
-					{
-						if (child.block[cb] == 0) continue;
-						if (!ext2_free_block(child.block[cb])) return false;
-					}
+					if (!ext2_free_data_and_indirect(&child)) return false;
 					if (!ext2_free_inode(child_inode_num)) return false;
 
 					*entry_inode = 0;
@@ -2012,11 +2187,7 @@ fn int ext2_delete_recursive(char* name, uint requester_uid)
 
 	if (!ext2_zero_inode(inode_num)) return -1;
 
-	for (uint b = 0; b < 12; b++)
-	{
-		if (inode.block[b] == 0) continue;
-		if (!ext2_free_block(inode.block[b])) return -1;
-	}
+	if (!ext2_free_data_and_indirect(&inode)) return -1;
 	if (!ext2_free_inode(inode_num)) return -1;
 
 	return 0;
