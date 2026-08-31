@@ -39,6 +39,12 @@ Four tests reported FAILED/SKIPPED, **none a regression**:
   root mount (400 KiB round trip, read included) and *does* pass on the
   board.
 
+`tcctest` printed `skipped` (exit 127) — `/bin/tcc` and its
+`/lib/tcc/` + `/src/tcc/` + `/hello.c` payload were never seeded onto
+the card (`populate_duo_bin.sh` didn't know about TinyCC).
+`populate_duo_bin.sh` now seeds the same tcc tree `scripts/seed_tcc.sh`
+puts on the QEMU images. Duo tcc run pending a re-seed + reboot.
+
 ---
 
 ## 2026-08-31 — FAT32: kill the O(n²) in `fat32_create_file`

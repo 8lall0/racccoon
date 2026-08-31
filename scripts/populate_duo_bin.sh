@@ -113,10 +113,25 @@ rm -f "$MNT/.tiny.$$"
 if ls build/wasm/*.wasm >/dev/null 2>&1; then
   for w in build/wasm/*.wasm; do cp "$w" "$MNT/$(basename "$w")"; done
 fi
+
+# TinyCC payload (roadmap §7.7/§7.8) — same tree scripts/seed_tcc.sh puts
+# on the QEMU images: /bin/tcc, /lib/tcc/ (headers + crt + libc.a +
+# libtcc1.a), /src/tcc/ (the ONE_SOURCE subset for self-hosting), and
+# the /hello.c smoke source. Lets tcctest and `tcc /src/tcc/tcc.c` run
+# on real hardware. Only if the tcc build produced output.
+if [ -f build/tcc/tcc.bin ]; then
+  echo "==> Seeding TinyCC (/bin/tcc, /lib/tcc/, /src/tcc/, /hello.c)..."
+  cp build/tcc/tcc.bin "$MNT/bin/tcc"
+  rm -rf "$MNT/lib/tcc" "$MNT/src/tcc"
+  mkdir -p "$MNT/lib/tcc" "$MNT/src"
+  cp -r build/tcc/lib/. "$MNT/lib/tcc/"
+  cp -r build/tcc/src "$MNT/src/tcc"
+  [ -f test/tcc-src/hello.c ] && cp test/tcc-src/hello.c "$MNT/hello.c"
+fi
 sync
 
 echo "==> Unmounting..."
 umount "$MNT"
 rmdir "$MNT"
 
-echo "==> Done. bin/ on the real Duo's root filesystem now matches build/user/, plus the QEMU-image test fixtures."
+echo "==> Done. bin/ on the real Duo's root filesystem now matches build/user/, plus the QEMU-image test fixtures + TinyCC payload."
