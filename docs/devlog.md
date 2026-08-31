@@ -43,7 +43,13 @@ Four tests reported FAILED/SKIPPED, **none a regression**:
 `/lib/tcc/` + `/src/tcc/` + `/hello.c` payload were never seeded onto
 the card (`populate_duo_bin.sh` didn't know about TinyCC).
 `populate_duo_bin.sh` now seeds the same tcc tree `scripts/seed_tcc.sh`
-puts on the QEMU images. Duo tcc run pending a re-seed + reboot.
+puts on the QEMU images.
+
+**Follow-up, same day — tcc verified on the Duo.** After the re-seed:
+`tcctest` ok, `tcc /hello.c -o /bin/hello && hello` runs, and the
+self-host fixpoint `tcc /src/tcc/tcc.c -o /bin/tcc2` → `tcc2` compiles
+and runs a program — all on the real CV1800B. **Roadmap §1–§7 are now
+fully hardware-verified**, not just QEMU.
 
 ---
 
