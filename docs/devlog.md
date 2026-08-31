@@ -4,6 +4,43 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-31 — Duo hardware verification of the ~17-commit arc
+
+Reflashed the CV1800B with the test shell (`DUO_TEST_SHELL=1
+reflash_duo.sh`) + refreshed `/bin` (`populate_duo_bin.sh`) and ran the
+battery on real hardware. **Everything that exercises the arc's code
+passed:**
+
+- `dirpacktest` ok — ext2 dirent packing + FS_LIST pagination + the
+  `ipc_progress` busy-server watchdog under burst, no false wedge.
+- `bigwritetest` ok — ext2 single/double-indirect writes, 400 KiB.
+- `stage6test` / `stage7test` ok — libc process layer + compiler surface.
+- `maptest` ok, wasm `fac`→120 `fib`→6765 `echo` `float`/`float2`
+  `upper`→HI all correct — `SYS_MAP` + the interpreter.
+- `runtest` / `elftest` / `argvtest` ok — exec path, 1 MiB exec cap,
+  the rewritten malloc.
+- all five killtests + `hungservertest` ok — supervisor respawn + the
+  new watchdog. `oomtest` / `faulttest` ok.
+- `cycletest` / `fsneg` / `p9fswritetest` ok.
+
+Four tests reported FAILED/SKIPPED, **none a regression**:
+
+- `p9fstest`, `pagelisttest`, `wasmtest` — fixture gaps.
+  `populate_duo_bin.sh` seeded only `/bin`, not the data files
+  `build.sh` puts on the QEMU images. Fixed by teaching it to seed the
+  same set (`hello.txt`, `subdir/`, `nestdir/`, `manyfiles/`,
+  `build/wasm/*.wasm`); after the re-seed all three pass on the board
+  (`wasm add.wasm -> 5`, `pagelisttest: ok (60 entries across 2
+  pages)`, `p9fstest: ok`).
+- `bigreadtest` — **N/A on the Duo, like `netdkilltest`.** It reads
+  `/mnt/fs2/bigfile.bin`, i.e. the second simultaneous mount, which the
+  Duo doesn't have (`board::HAS_SECOND_FS_PARTITION = false`).
+  `bigwritetest` covers the same ext2 double-indirect block path on the
+  root mount (400 KiB round trip, read included) and *does* pass on the
+  board.
+
+---
+
 ## 2026-08-31 — FAT32: kill the O(n²) in `fat32_create_file`
 
 Creating N files in one FAT32 directory was O(n²) in disk IPC. Two

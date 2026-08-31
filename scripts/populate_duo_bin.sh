@@ -87,10 +87,36 @@ for c in build/libc/*.bin; do
   echo "==> Copying $c -> $MNT/bin/$(basename "$c" .bin)..."
   cp "$c" "$MNT/bin/$(basename "$c" .bin)"
 done
+
+# Test fixtures — the same data files scripts/build.sh seeds onto the
+# QEMU ext2 images, so the fixture-backed tests (p9fstest, pagelisttest,
+# wasmtest) pass on real hardware instead of failing "file not found".
+# All harmless extra root-level files on a production card. Only copied
+# if the repo/build actually has them. (bigreadtest is NOT here — it
+# reads /mnt/fs2/, the second mount, which the Duo doesn't have
+# [board::HAS_SECOND_FS_PARTITION = false]; bigwritetest covers the same
+# double-indirect path on the root mount and does run on the Duo.)
+echo "==> Seeding test fixtures (hello.txt, subdir/, nestdir/, manyfiles/, *.wasm)..."
+[ -f disk-ext2/hello.txt ] && cp disk-ext2/hello.txt "$MNT/hello.txt"
+if [ -f disk-ext2/subdir/nested.txt ]; then
+  mkdir -p "$MNT/subdir" "$MNT/nestdir/innerdir"
+  cp disk-ext2/subdir/nested.txt "$MNT/subdir/nested.txt"
+  cp disk-ext2/subdir/nested.txt "$MNT/nestdir/inner.txt"
+  cp disk-ext2/subdir/nested.txt "$MNT/nestdir/innerdir/inner2.txt"
+fi
+# manyfiles/ — 60 one-line files in one dir, past FS_LIST's per-reply cap (pagelisttest).
+mkdir -p "$MNT/manyfiles"
+printf 'x\n' > "$MNT/.tiny.$$"
+for i in $(seq -w 0 59); do cp "$MNT/.tiny.$$" "$MNT/manyfiles/e$i"; done
+rm -f "$MNT/.tiny.$$"
+# wasm fixtures (wasmtest).
+if ls build/wasm/*.wasm >/dev/null 2>&1; then
+  for w in build/wasm/*.wasm; do cp "$w" "$MNT/$(basename "$w")"; done
+fi
 sync
 
 echo "==> Unmounting..."
 umount "$MNT"
 rmdir "$MNT"
 
-echo "==> Done. bin/ on the real Duo's root filesystem now matches build/user/."
+echo "==> Done. bin/ on the real Duo's root filesystem now matches build/user/, plus the QEMU-image test fixtures."
