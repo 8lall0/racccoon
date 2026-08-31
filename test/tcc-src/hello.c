@@ -1,7 +1,11 @@
-/* On-device TinyCC smoke test (roadmap §7.7).
- *   tcc -E /hello.c            preprocessor only
- *   tcc -c /hello.c -o /h.o    riscv64 codegen + ELF object
- *   tcc /hello.c -o /hello     full compile + link, then run /hello
+/* On-device TinyCC smoke test (roadmap §7.7). Seeded to /hello.c by
+ * scripts/seed_tcc.sh.
+ *   tcc -E /hello.c              preprocessor only
+ *   tcc -c /hello.c -o /x.o      riscv64 codegen + ELF object
+ *   tcc /hello.c -o /bin/hello   full compile + link (static, at
+ *                                USER_BASE — lib/tcc/config.h + the
+ *                                racccoon.patch set the defaults), then
+ *   hello world                  run it
  */
 #include <stdio.h>
 #include <stdlib.h>

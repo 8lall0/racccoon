@@ -708,24 +708,25 @@ flat-binary exec path like the c3 `/bin` commands.
    first), then an optional `0x02` marker + env; the crt0 tells this
    apart from a c3 `exec()`'s plain blob (which still gets a synthesised
    argv[0]). `stage6test` (+ `test/c-src/exiter.c`) → ok.
-7. **TinyCC cross-build** — `tcc` for `riscv64-racccoon` against
-   stages 2–6; `tcc hello.c -o hello` on racccoon → a runnable binary.
-   **Groundwork done** (2026-08-31): tcc 0.9.28rc compiles + links clean
-   against the libc (no undefined symbols); ~640 KiB flat image. Closed
-   the libc gaps it needs (`<math.h>` `<time.h>` `<strings.h>`
-   `<inttypes.h>`, ~25 str/stdlib/posix fns, `strerror`) — "stage 6.5",
-   `stage7test`. Kernel `EXEC_MAX_IMAGE_SIZE` 256 KiB → 1 MiB (staging
-   tables moved off the kernel stack); shell exec buffer `SYS_MAP`'d.
-   `scripts/build_tcc.sh` + `lib/tcc/` + the `third_party/tinycc`
-   submodule; `scripts/seed_tcc.sh` puts `/bin/tcc` + `/lib/tcc/` on an
-   image. **On device: `tcc -E` works, `tcc -c` and the link run to
-   completion.** Fixed en route: a `.riscv.attributes` null-deref in
-   tcc's loader (stripped now), and the K&R `src/malloc.c` corrupting
-   under tcc's allocation pattern (rewritten as a segregated-free-list
-   + bump allocator, no coalescing). **Blocker:** fsd's ext2 backend
-   only write-extends into the 12 direct blocks (12 KiB) — no indirect
-   block on the write path — so tcc's >12 KiB output is truncated. Next
-   step is that fsd fix, then `tcc x.c -o x && x` on the Duo.
+7. **TinyCC cross-build. DONE** (2026-08-31) — `tcc /hello.c -o /bin/hw
+   && hw world` runs on racccoon in QEMU: preprocess → riscv64 codegen →
+   integrated link → static ELF to disk → the kernel ELF loader →
+   correct output. `e2fsck` clean afterward. `third_party/tinycc`
+   submodule (mob 0.9.28rc); `scripts/build_tcc.sh` cross-builds it
+   against the libc, `scripts/seed_tcc.sh` seeds `/bin/tcc` + `/lib/tcc/`
+   (headers, `crt1.o`, `libc.a`, `libtcc1.a`), `scripts/build.sh` wires
+   both. `lib/tcc/config.h` + `lib/tcc/racccoon.patch` (`ELF_START_ADDR`
+   → USER_BASE) + `CONFIG_TCC_SWITCHES "-static"` give a plain
+   `tcc x.c -o x`. Landed along the way: stage 6.5 libc (`<math.h>`
+   `<time.h>` `<strings.h>` `<inttypes.h>`, ~25 fns, `strerror`;
+   `stage7test`); `EXEC_MAX_IMAGE_SIZE` 256 KiB → 1 MiB; the shell exec
+   buffer `SYS_MAP`'d; `src/malloc.c` rewritten (K&R free list corrupted
+   under tcc — now segregated-list + bump, no coalescing); a
+   `.riscv.attributes` strip for tcc's object loader; **fsd ext2 single
+   + double indirect block writes** (`ext2_ensure_block_for_write` /
+   `ext2_free_data_and_indirect`; `bigwritetest`); libc `read()` loops
+   for regular files; shell execs a `/`-containing command as a path.
+   Duo run still pending.
 8. **TinyCC self-hosts** — `tcc` compiles its own source on racccoon.
 
 ### Not doing

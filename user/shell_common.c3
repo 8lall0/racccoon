@@ -527,13 +527,24 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
 // several children, wire their pipe ends, then join them all.
 fn int shell_spawn(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out)
 {
+            // A command with a '/' in it (absolute "/bin/foo", or
+            // relative "./foo" / "sub/foo") is a path — exec() resolves
+            // it, cwd-relative if it doesn't start with '/'. A bare name
+            // ("ls") is looked up under /bin/, as before.
+            bool cmd_is_path = false;
+            for (int ci = 0; cmd[ci] != 0; ci++) { if (cmd[ci] == '/') { cmd_is_path = true; break; } }
+
             char[100] bin_path @noinit;
-            int bp_i = 0;
-            char* prefix = "/bin/";
-            while (prefix[bp_i] != 0) { bin_path[bp_i] = prefix[bp_i]; bp_i++; }
-            int bp_j = 0;
-            while (cmd[bp_j] != 0 && bp_i < 99) { bin_path[bp_i] = cmd[bp_j]; bp_i++; bp_j++; }
-            bin_path[bp_i] = 0;
+            char* exec_target = cmd;
+            if (!cmd_is_path) {
+                int bp_i = 0;
+                char* prefix = "/bin/";
+                while (prefix[bp_i] != 0) { bin_path[bp_i] = prefix[bp_i]; bp_i++; }
+                int bp_j = 0;
+                while (cmd[bp_j] != 0 && bp_i < 99) { bin_path[bp_i] = cmd[bp_j]; bp_i++; bp_j++; }
+                bin_path[bp_i] = 0;
+                exec_target = &bin_path;
+            }
 
             *gen_out = 0;
             int sh_r = rfork(RFPROC, gen_out);
@@ -542,7 +553,7 @@ fn int shell_spawn(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out)
                 return -1;
             }
             if (sh_r == 0) {
-                exec(&bin_path, exec_buf(), RUN_EXEC_BUF_MAX, 0, cmd_argv, cmd_argc);
+                exec(exec_target, exec_buf(), RUN_EXEC_BUF_MAX, 0, cmd_argv, cmd_argc);
                 print(cmd);
                 print(": command not found\n");
                 exitcode(127);

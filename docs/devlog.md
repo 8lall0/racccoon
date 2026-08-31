@@ -4,6 +4,67 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-31 — §7.7 DONE: `tcc hello.c -o hello && hello` on racccoon
+
+A TinyCC-compiled C program builds and runs on racccoon:
+
+```
+root / # tcc /hello.c -o /bin/hw && echo LINK_OK
+LINK_OK
+root / # hw world
+hello from tcc-compiled C on racccoon
+2 + 3 = 5
+strcat: abcdef (len 6)
+argv[1] = world, atoi = 0
+```
+
+Full path: preprocess → riscv64 codegen → integrated link → a static
+ELF written to disk → the kernel's ELF loader → execution, with argv,
+`printf`, `strcat`, `atoi` all correct. `e2fsck -fn` on the image
+afterward is clean.
+
+**fsd ext2: single + double indirect block writes** (the blocker from
+the previous entry). `ext2_ensure_block_for_write()` resolves a logical
+block for a write, allocating the data block and any single/double
+indirect pointer blocks to address it, tallying every allocation (data
+AND metadata) so `inode.blocks` stays right. `ext2_write_inode()` now
+persists `i_block[12..14]` (it only ever wrote the 12 direct pointers
+before). `ext2_free_data_and_indirect()` walks and frees the whole
+tree on delete — three near-identical direct-only free loops collapsed
+into it. Double-indirect reach is ~64 MiB at 1 KiB blocks; triple is
+still read-only (a >64 MiB write can't happen here). `bigwritetest` —
+a 400 KiB pattern write / verify / delete through double-indirect —
+passes, fsck-clean. The legacy whole-file `ext2_write()` (FS_WRITE,
+~1 KiB/msg) stays direct-only; it can't reach block 2 anyway.
+
+**libc `read()`** now loops to fill the caller's buffer for a regular
+file (fsd returns ~1 KiB/IPC) — short only at EOF, which is what
+almost everything expects. `fread`/stdio already looped; raw `read()`
+didn't.
+
+**TinyCC defaults, so a plain `tcc x.c -o x` works:**
+- `lib/tcc/racccoon.patch` (applied by `build_tcc.sh`, idempotent):
+  `ELF_START_ADDR` 0x10000 → 0x1000000 (USER_BASE), so the linked ELF
+  loads where racccoon runs it.
+- `CONFIG_TCC_SWITCHES "-static"` in `lib/tcc/config.h` — racccoon's
+  loader maps PT_LOAD only (no interp, no dynamic relocs).
+- `/lib/tcc/` carries `crt1.o` (self-maps its stack), empty `crti.o`/
+  `crtn.o`, `libc.a`, `libtcc1.a` at the paths tcc's default link
+  searches (CRTPREFIX / LIBPATHS = `/lib/tcc`).
+
+**Shell** now execs a command containing `/` as a path (`/bin/foo`,
+`./foo`, `sub/foo`) instead of always prepending `/bin/` — so a tcc
+output anywhere is runnable, not just under `/bin`.
+
+Regression: FS + stage3–7 + malloc + wasm + exec + supervisor
+killtests green on QEMU. Duo kernels build clean. Duo run pending.
+
+Next: §7.8 — point tcc at its own source and have it rebuild tcc.
+(`libtcc1.a` is currently gcc-cross-built; self-host may want it
+tcc-compiled.)
+
+---
+
 ## 2026-08-31 — §7.7: TinyCC runs on racccoon (compile works; output write blocked)
 
 TinyCC is now on the disk (`/bin/tcc`, 643 KiB) and **runs on racccoon**.

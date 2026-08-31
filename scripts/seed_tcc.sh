@@ -52,4 +52,4 @@ fat32)
   echo "seed_tcc.sh: mode must be 'ext2' or 'fat32'" >&2; exit 1 ;;
 esac
 
-echo "==> seeded tcc onto $(basename "$IMG")"
+echo "==> seeded tcc onto $(basename "$IMG")  —  on device: tcc /hello.c -o /bin/hello && hello world"

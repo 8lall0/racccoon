@@ -1,0 +1,13 @@
+diff --git a/riscv64-link.c b/riscv64-link.c
+index 48ae785c..46f86eb0 100644
+--- a/riscv64-link.c
++++ b/riscv64-link.c
+@@ -11,7 +11,7 @@
+ 
+ #define R_NUM      R_RISCV_NUM
+ 
+-#define ELF_START_ADDR 0x00010000
++#define ELF_START_ADDR 0x01000000 /* racccoon USER_BASE (roadmap §7.7) */
+ #define ELF_PAGE_SIZE 0x1000
+ 
+ #define PCRELATIVE_DLLPLT 1

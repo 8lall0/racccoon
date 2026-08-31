@@ -12,7 +12,13 @@
  *
  * Deliberately absent vs. a stock config: CONFIG_OS_RELEASE (drags in
  * sscanf, only used for BSD notes) and CONFIG_TRIPLET (makes tcc hunt
- * for riscv64-linux-gnu/ subdirs we don't have). */
+ * for riscv64-linux-gnu/ subdirs we don't have).
+ *
+ * CONFIG_TCC_SWITCHES "-static": racccoon's kernel ELF loader maps
+ * PT_LOAD segments only — no PT_INTERP, no dynamic relocation — so tcc
+ * must emit a static executable. The load address is set by the
+ * ELF_START_ADDR patch in lib/tcc/racccoon.patch (USER_BASE), not a
+ * -Wl,-Ttext switch. */
 
 #define TCC_VERSION "0.9.28rc"
 
@@ -29,6 +35,7 @@
 #define CONFIG_TCC_LIBPATHS "/lib/tcc:/lib"
 #define CONFIG_TCC_CRTPREFIX "/lib/tcc"
 #define CONFIG_TCC_ELFINTERP "-"
+#define CONFIG_TCC_SWITCHES "-static"
 #endif
 
 #ifndef CONFIG_TCCDIR

@@ -33,6 +33,21 @@ if [ -z "$TCC_SRC" ] || [ ! -f "$TCC_SRC/tcc.c" ]; then
 fi
 TCC_SRC="$(cd "$TCC_SRC" && pwd)"
 
+# lib/tcc/racccoon.patch: ELF_START_ADDR -> USER_BASE (see the patch and
+# lib/tcc/config.h). Applied idempotently — skipped if already in.
+PATCH="$ROOT/lib/tcc/racccoon.patch"
+if [ -f "$PATCH" ] && [ -e "$TCC_SRC/.git" ]; then   # .git is a file for a submodule
+  if git -C "$TCC_SRC" apply --reverse --check "$PATCH" 2>/dev/null; then
+    echo "==> lib/tcc/racccoon.patch already applied"
+  elif git -C "$TCC_SRC" apply --check "$PATCH" 2>/dev/null; then
+    git -C "$TCC_SRC" apply "$PATCH"
+    echo "==> applied lib/tcc/racccoon.patch"
+  else
+    echo "scripts/build_tcc.sh: lib/tcc/racccoon.patch does not apply cleanly to $TCC_SRC" >&2
+    exit 1
+  fi
+fi
+
 CC_RC="${CC_RC:-}"
 if [ -z "$CC_RC" ]; then
   for c in riscv64-unknown-elf-gcc riscv64-elf-gcc riscv64-linux-gnu-gcc; do
