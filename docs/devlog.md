@@ -4,6 +4,35 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-31 — ext2 directory dirent packing: many files per directory
+
+`ext2_create_file` / `ext2_mkdir` used to append a whole directory
+block per new entry, so a racccoon-created directory held at most ~11
+files (block 0 is `.`/`..`, blocks 1-11 one entry each). Now:
+
+- **`ext2_place_dirent()`** — the standard technique: find a block whose
+  trailing rec_len slack (shrink the entry it lands after to its ideal
+  `8+name_len` rounded to 4) or a deleted entry (inode 0) has room, and
+  pack the new dirent there. A fresh block is appended only when no
+  block has room. `ext2_dirent_ideal()` helper. Still 12 direct
+  directory blocks max — but that's now hundreds of small entries.
+- **`ext2_zero_dirent()`** — clearing a dirent (delete / rename) is now
+  block-granular. Packed dirents can straddle a 512-byte sector, and
+  the old `fs_read_sector` + `sector_buf[entry_offset + …]` would read
+  or write past the sector buffer. Replaced 3 sector-granular sites.
+- `ext2_find_or_reuse_dir_slot` (the old "reuse a fully-empty block"
+  half-measure) removed — `ext2_place_dirent`'s deleted-entry path
+  covers it and more.
+- `dirpacktest` — creates 90 files + 5 subdirs in one directory, lists
+  them all, deletes 45, creates 20 more (reusing the freed slots),
+  re-lists, `stat`s survivors, cleans up. **`e2fsck -fn` on the image
+  is clean**, including with `/dpt` left on disk holding 70 packed
+  entries with churn holes.
+
+Regression green on ext2 / FAT32. Duo kernels build clean.
+
+---
+
 ## 2026-08-31 — FS_LIST pagination: `ls` / readdir stop truncating
 
 A directory with more entries than fit in one fsd reply
