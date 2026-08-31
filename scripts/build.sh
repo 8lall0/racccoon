@@ -23,6 +23,11 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # userspace doesn't depend on it. Produces build/libc/*.bin.
   bash lib/racccoon-libc/build.sh
 
+  # TinyCC, cross-built against that libc (roadmap §7.7). No-ops unless
+  # the third_party/tinycc submodule is checked out. Produces
+  # build/tcc/tcc.bin + build/tcc/lib/ (the CONFIG_TCCDIR payload).
+  bash scripts/build_tcc.sh
+
   # Hand-built .wasm test fixtures for /bin/wasm (no wat2wasm on this
   # host — the bytes are assembled by the Python script). Seeded onto
   # every disk image below next to /bin. Cleaned first so a renamed or
@@ -121,6 +126,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   for w in build/wasm/*.wasm; do mcopy -i build/disk.img "$w" "::$(basename "$w")"; done
   # C test programs (roadmap §7), if the C libc build produced any.
   for c in build/libc/*.bin; do [ -e "$c" ] && mcopy -i build/disk.img "$c" "::bin/$(basename "$c" .bin)"; done
+  bash scripts/seed_tcc.sh fat32 build/disk.img
 
   # bigfile.bin — deterministic byte[i] = i % 256 pattern, 300000 bytes,
   # genuinely past ext2's own single-indirect reach even at the smallest
@@ -188,6 +194,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_ext2.img > /dev/null
   done
   for c in build/libc/*.bin; do [ -e "$c" ] && debugfs -w -R "write $c bin/$(basename "$c" .bin)" build/disk_ext2.img > /dev/null; done
+  bash scripts/seed_tcc.sh ext2 build/disk_ext2.img
   for w in build/wasm/*.wasm; do debugfs -w -R "write $w $(basename "$w")" build/disk_ext2.img > /dev/null; done
   debugfs -w -R "write build/bigfile_fixture.bin bigfile.bin" build/disk_ext2.img > /dev/null
 

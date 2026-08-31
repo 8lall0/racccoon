@@ -716,10 +716,16 @@ flat-binary exec path like the c3 `/bin` commands.
    `<inttypes.h>`, ~25 str/stdlib/posix fns, `strerror`) — "stage 6.5",
    `stage7test`. Kernel `EXEC_MAX_IMAGE_SIZE` 256 KiB → 1 MiB (staging
    tables moved off the kernel stack); shell exec buffer `SYS_MAP`'d.
-   `scripts/build_tcc.sh` + `lib/tcc/` build it from a `TCC_SRC` checkout
-   (TinyCC not vendored). Remaining: `libtcc1.a` (tcc-compiled),
-   `CONFIG_TCCDIR` payload on an image, then the on-device ladder
-   `tcc -E` → `tcc -c` → `tcc x.c -o x`.
+   `scripts/build_tcc.sh` + `lib/tcc/` + the `third_party/tinycc`
+   submodule; `scripts/seed_tcc.sh` puts `/bin/tcc` + `/lib/tcc/` on an
+   image. **On device: `tcc -E` works, `tcc -c` and the link run to
+   completion.** Fixed en route: a `.riscv.attributes` null-deref in
+   tcc's loader (stripped now), and the K&R `src/malloc.c` corrupting
+   under tcc's allocation pattern (rewritten as a segregated-free-list
+   + bump allocator, no coalescing). **Blocker:** fsd's ext2 backend
+   only write-extends into the 12 direct blocks (12 KiB) — no indirect
+   block on the write path — so tcc's >12 KiB output is truncated. Next
+   step is that fsd fix, then `tcc x.c -o x && x` on the Duo.
 8. **TinyCC self-hosts** — `tcc` compiles its own source on racccoon.
 
 ### Not doing

@@ -4,6 +4,63 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-31 — §7.7: TinyCC runs on racccoon (compile works; output write blocked)
+
+TinyCC is now on the disk (`/bin/tcc`, 643 KiB) and **runs on racccoon**.
+Third-party source is a submodule (`third_party/tinycc`, mob 0.9.28rc);
+`scripts/build_tcc.sh` cross-builds it against `lib/racccoon-libc`,
+`scripts/seed_tcc.sh` puts `/bin/tcc` + the `/lib/tcc/` payload (headers,
+`crt1.o`, `libtcc1.a`, `libc.a`) onto an image, and `scripts/build.sh`
+wires both in (no-ops without the submodule).
+
+**On-device bring-up ladder:**
+- `tcc -E /hello.c` — **works.** Full preprocessor: resolves
+  `#include <stdio.h>` etc. from `/lib/tcc/include`, emits line markers.
+- `tcc -c /hello.c -o x.o` — **runs to completion** (riscv64 codegen +
+  ELF object writer), exits 0.
+- `tcc -nostdlib -Wl,-Ttext=1000000 -B/lib/tcc /lib/tcc/crt1.o
+  /hello.c -lc -ltcc1 -o /hello` — **the link runs to completion**,
+  exits 0.
+
+**Two bugs found and fixed along the way:**
+
+1. **`.riscv.attributes` → tcc null-deref.** TinyCC's object loader
+   leaves `Section->link` dangling for a `.riscv.attributes` section
+   whose `sh_link` points at a section it didn't materialise, then
+   `tcc_write_elf_file` dereferences it. `lib/racccoon-libc/build.sh`
+   now strips `.riscv.attributes` / `.comment` from every object
+   (nothing on racccoon reads them). Also dropped `-ffunction-sections`
+   (483 tiny sections stressed tcc's loader) and fixed a stale-object
+   bug: `build/libc/obj/` wasn't cleaned between runs, so the test
+   programs' objects (each with its own `main`) leaked into
+   `libracccoon.a`.
+
+2. **The K&R malloc corrupted under tcc's allocation pattern.**
+   `src/malloc.c` (TCPL §8.7 circular first-fit + coalescing free list)
+   faulted during tcc's link — a bump-allocator swap made it disappear,
+   isolating it to the free list. Replaced with a **segregated-free-list
+   + bump allocator** (`src/malloc.c`, rewritten): a bump pointer over
+   `SYS_MAP` for fresh blocks, per-16-byte-size-class LIFO free lists
+   for reuse, an 8-byte size header, **no coalescing and no boundary
+   tags** — so none of the coalescing-free-list failure modes exist.
+   `malloctest` (20 000-churn) + stages 3–7 + wasm + exec tests all
+   still green. `crt0` split: `_start` stays in `src/start.c`,
+   `__libc_start`/`_exit`/`environ` move to `src/libc_start.c` (in the
+   archive) so `lib/tcc/crt1.c` — a `_start` that `SYS_MAP`s its own
+   stack, since a tcc-linked binary has no linker-script `__stack_top`
+   — can share them.
+
+**The remaining blocker: fsd ext2 write-extend stops at 12 KiB.** The
+ext2 backend allocates only the 12 **direct** blocks when a write grows
+a file — no single/double-indirect block on the write path (reads
+already handle indirect, cf. `bigreadtest`). tcc's linked output is
+bigger than 12 KiB, so `-o /hello` currently writes a truncated file.
+This is an fsd task, not a tcc or libc one — the next step for §7.7.
+
+Duo kernels build clean. QEMU-verified (FAT32 + ext2); Duo run pending.
+
+---
+
 ## 2026-08-31 — §7.7 groundwork: TinyCC cross-compiles clean; libc + exec cap
 
 Spiked the TinyCC port (roadmap §7.7). Cross-compiled tcc 0.9.28rc

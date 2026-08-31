@@ -76,11 +76,24 @@ echo "==> Done: $OUT/tcc.bin  ($(stat -c%s "$OUT/tcc.bin") bytes)"
 
 # --- CONFIG_TCCDIR payload -----------------------------------------
 # tcc's own headers (stddef/stdarg/float/varargs/tccdefs …) + ours, so a
-# compiled program can #include the standard set. Plus libtcc1.a for the
-# full compile+link path.
+# compiled program can #include the standard set. Plus the crt + libs a
+# tcc-linked binary needs.
 cp "$TCC_SRC"/include/*.h "$OUT/lib/include/" 2>/dev/null || true
 cp "$LIBC"/include/*.h "$OUT/lib/include/" 2>/dev/null || true
 cp -r "$LIBC"/include/sys "$LIBC"/include/racccoon "$OUT/lib/include/" 2>/dev/null || true
+
+# crt1.o (self-maps its stack — lib/tcc/crt1.c), empty crti/crtn (our
+# runtime doesn't use _init/_fini), and libracccoon.a under the name
+# tcc's default `-lc` looks for.
+$CC_RC $CFLAGS -c "$ROOT/lib/tcc/crt1.c" -o "$OUT/lib/crt1.o"
+: | $CC_RC -x c -march=rv64imafdc -mabi=lp64d -mcmodel=medany -c - -o "$OUT/lib/crti.o"
+: | $CC_RC -x c -march=rv64imafdc -mabi=lp64d -mcmodel=medany -c - -o "$OUT/lib/crtn.o"
+cp build/libc/libracccoon.a "$OUT/lib/libc.a"
+cp build/libc/crt0.o "$OUT/lib/crt0.o"
+# same .riscv.attributes strip as the library objects (see build.sh)
+for o in crt0.o crt1.o crti.o crtn.o; do
+  $OBJCOPY_RC --remove-section=.riscv.attributes --remove-section=.comment "$OUT/lib/$o" 2>/dev/null || true
+done
 
 # libtcc1.a — riscv64 runtime helpers (soft 128-bit float, __va_arg,
 # alloca, …). Built with the cross gcc rather than tcc itself for the
