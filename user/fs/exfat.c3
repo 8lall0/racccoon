@@ -733,7 +733,9 @@ fn bool exfat_stat(char* name, uint* out_size, int* out_type)
 // fat32_list, minus the "." / ".." skip — exFAT has no pseudo-entries for
 // self/parent at all (there's simply nothing to point back at a parent
 // directory in this format), so there's nothing to filter out here.
-fn bool exfat_list(char* path, char* out_buf, int max_entries, int* out_count)
+// Paged like ext2_list — skips the first `start` real entries, fills up
+// to max_entries after them. See ext2_list's own header comment.
+fn bool exfat_list(char* path, char* out_buf, int max_entries, uint start, int* out_count)
 {
 	uint dir_cluster; bool dir_no_fat_chain;
 	if (path[0] == 0)
@@ -760,6 +762,7 @@ fn bool exfat_list(char* path, char* out_buf, int max_entries, int* out_count)
 	exfat_cursor_init(&cur, dir_cluster, dir_no_fat_chain);
 
 	int count = 0;
+	uint seen = 0;
 	Char16[EXFAT_NAME_MAX] name_buf @noinit;
 
 	while (count < max_entries)
@@ -775,22 +778,26 @@ fn bool exfat_list(char* path, char* out_buf, int max_entries, int* out_count)
 		bool valid = exfat_read_entry_set(&cur, entry, &attr, &first_cluster, &data_length, &no_fat_chain, &name_buf, &name_len, null);
 		if (!valid) continue;
 
-		// Truncated to FS_LIST_NAME_MAX-1 for display, same precedent
-		// fat32_list's own LFN handling uses (user.c3's own comment).
-		// Non-ASCII code units are shown as '?' in this capped display
-		// buffer only — exfat_read/exfat_read_at never round-trip through
-		// it, they resolve names from the caller's own path directly.
-		char* rec = &out_buf[(uint)count * FS_LIST_ENTRY_SIZE];
-		int ni = 0;
-		while (ni < (int)FS_LIST_NAME_MAX - 1 && ni < name_len)
+		if (seen >= start)
 		{
-			Char16 c = name_buf[ni];
-			rec[ni] = ((uint)c < 0x80) ? (char)c : '?';
-			ni++;
+			// Truncated to FS_LIST_NAME_MAX-1 for display, same precedent
+			// fat32_list's own LFN handling uses (user.c3's own comment).
+			// Non-ASCII code units are shown as '?' in this capped display
+			// buffer only — exfat_read/exfat_read_at never round-trip through
+			// it, they resolve names from the caller's own path directly.
+			char* rec = &out_buf[(uint)count * FS_LIST_ENTRY_SIZE];
+			int ni = 0;
+			while (ni < (int)FS_LIST_NAME_MAX - 1 && ni < name_len)
+			{
+				Char16 c = name_buf[ni];
+				rec[ni] = ((uint)c < 0x80) ? (char)c : '?';
+				ni++;
+			}
+			rec[ni] = 0;
+			rec[FS_LIST_NAME_MAX] = (((uint)attr & EXFAT_ATTR_DIRECTORY) != 0) ? (char)1 : (char)0;
+			count++;
 		}
-		rec[ni] = 0;
-		rec[FS_LIST_NAME_MAX] = (((uint)attr & EXFAT_ATTR_DIRECTORY) != 0) ? (char)1 : (char)0;
-		count++;
+		seen++;
 	}
 	*out_count = count;
 	return true;

@@ -186,7 +186,7 @@ fn int fat32_op_write(Fs_req* r)    { return fat32_write(r.name, r.data, r.len);
 fn int fat32_op_write_at(Fs_req* r) { return fat32_write_at(r.name, r.data, r.len, r.offset); }
 fn int fat32_op_stat(Fs_req* r)     { return fat32_stat(r.name, &r.out_size, &r.out_type) ? 0 : -1; }
 fn int fat32_op_remove(Fs_req* r)   { return r.recursive ? fat32_delete_recursive(r.name) : fat32_delete(r.name); }
-fn int fat32_op_list(Fs_req* r)     { int c = -1; if (!fat32_list(r.name, &r.buf[4], fs_list_max(), &c)) c = -1; return c; }
+fn int fat32_op_list(Fs_req* r)     { int c = -1; if (!fat32_list(r.name, &r.buf[4], fs_list_max(), r.offset, &c)) c = -1; return c; }
 fn int fat32_op_mkdir(Fs_req* r)    { return fat32_mkdir(r.name); }
 fn int fat32_op_rename(Fs_req* r)   { return fat32_rename(r.name, r.name2); }
 
@@ -199,7 +199,7 @@ fn int ext2_op_write(Fs_req* r)    { return ext2_write(r.name, r.data, r.len, r.
 fn int ext2_op_write_at(Fs_req* r) { return ext2_write_at(r.name, r.data, r.len, r.offset, r.uid); }
 fn int ext2_op_stat(Fs_req* r)     { return ext2_may_read(r.name, r.uid) && ext2_stat(r.name, &r.out_size, &r.out_type) ? 0 : -1; }
 fn int ext2_op_remove(Fs_req* r)   { return r.recursive ? ext2_delete_recursive(r.name, r.uid) : ext2_delete(r.name, r.uid); }
-fn int ext2_op_list(Fs_req* r)     { if (!ext2_may_read(r.name, r.uid)) return -1; int c = -1; if (!ext2_list(r.name, &r.buf[4], fs_list_max(), &c)) c = -1; return c; }
+fn int ext2_op_list(Fs_req* r)     { if (!ext2_may_read(r.name, r.uid)) return -1; int c = -1; if (!ext2_list(r.name, &r.buf[4], fs_list_max(), r.offset, &c)) c = -1; return c; }
 fn int ext2_op_mkdir(Fs_req* r)    { return ext2_mkdir(r.name, r.uid); }
 fn int ext2_op_rename(Fs_req* r)   { return ext2_rename(r.name, r.name2, r.uid); }
 
@@ -209,7 +209,7 @@ fn int exfat_op_write(Fs_req* r)    { return exfat_write(r.name, r.data, r.len);
 fn int exfat_op_write_at(Fs_req* r) { return exfat_write_at(r.name, r.data, r.len, r.offset); }
 fn int exfat_op_stat(Fs_req* r)     { return exfat_stat(r.name, &r.out_size, &r.out_type) ? 0 : -1; }
 fn int exfat_op_remove(Fs_req* r)   { return r.recursive ? exfat_delete_recursive(r.name) : exfat_delete(r.name); }
-fn int exfat_op_list(Fs_req* r)     { int c = -1; if (!exfat_list(r.name, &r.buf[4], fs_list_max(), &c)) c = -1; return c; }
+fn int exfat_op_list(Fs_req* r)     { int c = -1; if (!exfat_list(r.name, &r.buf[4], fs_list_max(), r.offset, &c)) c = -1; return c; }
 fn int exfat_op_mkdir(Fs_req* r)    { return exfat_mkdir(r.name); }
 fn int exfat_op_rename(Fs_req* r)   { return exfat_rename(r.name, r.name2); }
 

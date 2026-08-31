@@ -11,8 +11,8 @@ import std::nolibc::main_stub;
 fn void main(String[] args) {
     char* path = args.len > 0 ? args[0].ptr : "";
 
-    char[576] listbuf @noinit; // FS_LIST_ENTRY_SIZE * 16 entries
-    int count = fs_list(path, &listbuf, 16);
+    char[36 * 256] listbuf @noinit; // FS_LIST_ENTRY_SIZE * 256 entries — fs_list pages fsd for us
+    int count = fs_list(path, &listbuf, 256);
     if (count < 0) {
         print("ls: ");
         print(path);

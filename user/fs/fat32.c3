@@ -1910,7 +1910,9 @@ fn int fat32_delete_recursive(char* name)
 // inverse of fat32_name_to_8_3, needed here specifically because a
 // listing is the one place this driver ever hands a raw on-disk name
 // back to a caller instead of just matching against one.
-fn bool fat32_list(char* path, char* out_buf, int max_entries, int* out_count)
+// Paged like ext2_list — skips the first `start` real entries, fills up
+// to max_entries after them. See ext2_list's own header comment.
+fn bool fat32_list(char* path, char* out_buf, int max_entries, uint start, int* out_count)
 {
 	uint dir_cluster;
 	if (path[0] == 0)
@@ -1939,6 +1941,7 @@ fn bool fat32_list(char* path, char* out_buf, int max_entries, int* out_count)
 	}
 
 	int count = 0;
+	uint seen = 0;
 	uint cluster = dir_cluster;
 	char[SECTOR_SIZE] sector_buf @noinit;
 	// LFN accumulation, same shape as fat32_resolve_name11's own scan —
@@ -1976,18 +1979,22 @@ fn bool fat32_list(char* path, char* out_buf, int max_entries, int* out_count)
 				bool is_dotdot = entry[FAT32_DIRENT_NAME] == '.' && entry[FAT32_DIRENT_NAME + 1] == '.' && entry[FAT32_DIRENT_NAME + 2] == ' ';
 				if (is_dot || is_dotdot) continue;
 
-				// Truncated to FS_LIST_NAME_MAX-1 for display — this
-				// wire-format record is shared with ext2.c3/envd.c3,
-				// which already truncate real names longer than this
-				// the same way (see FS_LIST_NAME_MAX's own comment,
-				// user.c3) — the real, full name is still reachable via
-				// fs_read/fs_write/etc directly, only listing is capped.
-				char* rec = &out_buf[(uint)count * FS_LIST_ENTRY_SIZE];
-				int ni = 0;
-				while (ni < (int)FS_LIST_NAME_MAX - 1 && display[ni] != 0) { rec[ni] = display[ni]; ni++; }
-				rec[ni] = 0;
-				rec[FS_LIST_NAME_MAX] = ((attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0) ? (char)1 : (char)0;
-				count++;
+				if (seen >= start && count < max_entries)
+				{
+					// Truncated to FS_LIST_NAME_MAX-1 for display — this
+					// wire-format record is shared with ext2.c3/envd.c3,
+					// which already truncate real names longer than this
+					// the same way (see FS_LIST_NAME_MAX's own comment,
+					// user.c3) — the real, full name is still reachable via
+					// fs_read/fs_write/etc directly, only listing is capped.
+					char* rec = &out_buf[(uint)count * FS_LIST_ENTRY_SIZE];
+					int ni = 0;
+					while (ni < (int)FS_LIST_NAME_MAX - 1 && display[ni] != 0) { rec[ni] = display[ni]; ni++; }
+					rec[ni] = 0;
+					rec[FS_LIST_NAME_MAX] = ((attr & FAT32_DIRENT_ATTR_DIRECTORY) != 0) ? (char)1 : (char)0;
+					count++;
+				}
+				seen++;
 			}
 		}
 		cluster = fat32_next_cluster(cluster);

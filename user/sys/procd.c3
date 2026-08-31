@@ -88,6 +88,9 @@ fn void main() {
 
         if (verb == FS_LIST)
         {
+            // fsd's fs_list pages via a start index at wire byte 104.
+            uint list_start = *(uint*)&buf[104];
+            uint list_seen = 0;
             int* count_field = (int*)&buf;
             int count = 0;
             if (path[0] == 0)
@@ -99,6 +102,7 @@ fn void main() {
                     uint gen = 0;
                     if (proc_info(pid, &state, &gen, null) == 0)
                     {
+                        if (list_seen++ < list_start) continue;
                         char* rec = &buf[4 + count * 36];
                         int n = fmt::format_uint((uint)pid, rec);
                         rec[n] = 0;

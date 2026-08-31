@@ -1295,6 +1295,11 @@ const uint FS_MSG_MAX = 1128;
 // a hard failure).
 const uint FS_LIST_NAME_MAX   = 32;
 const uint FS_LIST_ENTRY_SIZE = 36;
+// Records that fit in one FS_LIST reply. A directory with more entries
+// than this is paged: fs_list() re-requests with byte 104 = the running
+// start index until a short page comes back. Must match fsd.c3's
+// fs_list_max().
+const int FS_LIST_PAGE_MAX = (int)((FS_MSG_MAX - 4) / FS_LIST_ENTRY_SIZE);
 
 fn int fs_read(char* filename, char* buf, int len) @export("fs_read") {
     char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
@@ -1533,27 +1538,36 @@ fn int fs_list(char* dirname, char* out_buf, int max_entries) @export("fs_list")
     if (fsd_pid < 0) return -1;
     char* stripped = &dirname[prefix_len];
 
-    char[FS_MSG_MAX] req @noinit;
-    int i = 0;
-    while (stripped[i] != 0 && i < 99) {
-        req[i] = stripped[i];
-        i++;
-    }
-    req[i] = 0;
+    int total = 0;
+    for (;;) {
+        // One IPC per page, each carrying the running start index at
+        // byte 104 (the same wire slot FS_READ_AT's offset uses — every
+        // other verb ignores it). fsd fills up to FS_LIST_PAGE_MAX
+        // records; a short page means we've reached the end.
+        char[FS_MSG_MAX] req @noinit;
+        int i = 0;
+        while (stripped[i] != 0 && i < 99) { req[i] = stripped[i]; i++; }
+        req[i] = 0;
+        uint* start_field = (uint*)&req[104];
+        *start_field = (uint)total;
 
-    uint reply_verb = 0;
-    int from = p9_call(fsd_pid, FS_LIST, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
-    if (from <= 0 || reply_verb != FS_LIST) return -1;
+        uint reply_verb = 0;
+        int from = p9_call(fsd_pid, FS_LIST, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
+        if (from <= 0 || reply_verb != FS_LIST) return total > 0 ? total : -1;
 
-    int* result_count_field = (int*)&req;
-    int result_count = *result_count_field;
-    if (result_count < 0) return result_count;
-    if (result_count > max_entries) result_count = max_entries;
-    int total_bytes = result_count * (int)FS_LIST_ENTRY_SIZE;
-    for (int j = 0; j < total_bytes; j++) {
-        out_buf[j] = req[4 + j];
+        int page = *(int*)&req;
+        if (page < 0) return total > 0 ? total : page;
+
+        int room = max_entries - total;
+        int take = page < room ? page : room;
+        for (int j = 0; j < take * (int)FS_LIST_ENTRY_SIZE; j++) {
+            out_buf[total * (int)FS_LIST_ENTRY_SIZE + j] = req[4 + j];
+        }
+        total += take;
+
+        if (page < FS_LIST_PAGE_MAX || total >= max_entries) break;
     }
-    return result_count;
+    return total;
 }
 
 // Creates an empty directory at `dirname` — refuses if anything

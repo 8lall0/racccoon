@@ -242,6 +242,11 @@ fn void main() {
 
         if (verb == FS_LIST)
         {
+            // fsd's fs_list pages via a start index at wire byte 104 —
+            // honour it so a caller with > 31 vars doesn't re-fetch the
+            // same page forever (see user.c3's fs_list).
+            uint list_start = *(uint*)&buf[104];
+            uint list_seen = 0;
             int* count_field = (int*)&buf;
             int count = 0;
             for (int i = 0; i < ENV_MAX && count < 31; i++)
@@ -249,6 +254,7 @@ fn void main() {
                 if (env_table[i].pid != from) continue;
                 if (env_table[i].generation != from_gen) continue;
                 if (env_table[i].name[0] == '.') continue; // reserved names, e.g. ENV_INHERITED_MARKER, never shown
+                if (list_seen++ < list_start) continue;
                 char* rec = &buf[4 + count * 36];
                 int n = 0;
                 while (env_table[i].name[n] != 0)

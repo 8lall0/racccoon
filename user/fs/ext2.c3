@@ -2200,7 +2200,14 @@ fn int ext2_delete_recursive(char* name, uint requester_uid)
 // FS_LIST_NAME_MAX (a real ext2 name can be longer; this driver has no
 // long-name support to round-trip through on the read side either, so
 // this matches the rest of it).
-fn bool ext2_list(char* path, char* out_buf, int max_entries, int* out_count)
+// One page of a directory listing: skips the first `start` real entries
+// (not `.`/`..`) and fills out_buf with up to max_entries records after
+// them. The caller (fsd -> user.c3's fs_list / the libc's __rc_fs_list)
+// pages by re-calling with start += the previous page's count until a
+// short page comes back. Concurrent directory modification between
+// pages can skip or repeat an entry — acceptable for `ls`/`readdir`
+// here, same as most simple readdir implementations.
+fn bool ext2_list(char* path, char* out_buf, int max_entries, uint start, int* out_count)
 {
 	uint dir_inode;
 	if (path[0] == 0)
@@ -2225,6 +2232,7 @@ fn bool ext2_list(char* path, char* out_buf, int max_entries, int* out_count)
 	if (!ext2_read_inode(dir_inode, &dir)) return false;
 
 	int count = 0;
+	uint seen = 0;
 	for (uint b = 0; b < 12 && count < max_entries; b++)
 	{
 		uint block = dir.block[b];
@@ -2251,16 +2259,20 @@ fn bool ext2_list(char* path, char* out_buf, int max_entries, int* out_count)
 				bool is_dotdot = entry_name_len == 2 && entry[EXT2_DIRENT_NAME] == '.' && entry[EXT2_DIRENT_NAME + 1] == '.';
 				if (!is_dot && !is_dotdot)
 				{
-					Ext2_inode_info child;
-					if (!ext2_read_inode(*entry_inode, &child)) return false;
+					if (seen >= start && count < max_entries)
+					{
+						Ext2_inode_info child;
+						if (!ext2_read_inode(*entry_inode, &child)) return false;
 
-					char* rec = &out_buf[(uint)count * FS_LIST_ENTRY_SIZE];
-					uint copy_len = entry_name_len;
-					if (copy_len > FS_LIST_NAME_MAX - 1) copy_len = FS_LIST_NAME_MAX - 1;
-					for (uint k = 0; k < copy_len; k++) rec[k] = entry[EXT2_DIRENT_NAME + k];
-					rec[copy_len] = 0;
-					rec[FS_LIST_NAME_MAX] = ((child.mode & EXT2_S_IFDIR) != 0) ? (char)1 : (char)0;
-					count++;
+						char* rec = &out_buf[(uint)count * FS_LIST_ENTRY_SIZE];
+						uint copy_len = entry_name_len;
+						if (copy_len > FS_LIST_NAME_MAX - 1) copy_len = FS_LIST_NAME_MAX - 1;
+						for (uint k = 0; k < copy_len; k++) rec[k] = entry[EXT2_DIRENT_NAME + k];
+						rec[copy_len] = 0;
+						rec[FS_LIST_NAME_MAX] = ((child.mode & EXT2_S_IFDIR) != 0) ? (char)1 : (char)0;
+						count++;
+					}
+					seen++;
 				}
 			}
 

@@ -172,22 +172,43 @@ int __rc_fs_stat(const char *path, unsigned long *size_out, int *type_out)
 	return 0;
 }
 
+#define RC_FS_LIST_PAGE_MAX ((RC_FS_MSG_MAX - 4) / RC_FS_LIST_ENTRY_SIZE)
+
 int __rc_fs_list(const char *path, void *out, int max_entries)
 {
 	char ap[128]; __rc_abspath(path, ap);
-	char req[RC_FS_MSG_MAX];
-	int pid = resolve_stripped(ap, req);
+	char stripped[100];
+	int pid = resolve_stripped(ap, stripped);
 	if (pid < 0) return -1;
 
-	unsigned rv = 0;
-	int from = rc_fsd_call(pid, RC_FS_LIST, req, RC_FS_MSG_MAX, &rv);
-	if (from <= 0 || rv != RC_FS_LIST) return -1;
+	char req[RC_FS_MSG_MAX];
+	char *dst = out;
+	int total = 0;
+	for (;;) {
+		/* the buffer is reused for the reply, so rebuild the request
+		 * each page: path at [0..99], running start index at byte 104
+		 * (fsd pages the listing there, mirroring FS_READ_AT's offset). */
+		int i = 0;
+		while (stripped[i] && i < 99) { req[i] = stripped[i]; i++; }
+		req[i] = 0;
+		*(unsigned *)(req + 104) = (unsigned)total;
 
-	int count = *(int *)req;
-	if (count < 0) return count;
-	if (count > max_entries) count = max_entries;
-	memcpy(out, req + 4, (size_t)count * RC_FS_LIST_ENTRY_SIZE);
-	return count;
+		unsigned rv = 0;
+		int from = rc_fsd_call(pid, RC_FS_LIST, req, RC_FS_MSG_MAX, &rv);
+		if (from <= 0 || rv != RC_FS_LIST) return total > 0 ? total : -1;
+
+		int page = *(int *)req;
+		if (page < 0) return total > 0 ? total : page;
+
+		int take = page;
+		if (take > max_entries - total) take = max_entries - total;
+		memcpy(dst + (size_t)total * RC_FS_LIST_ENTRY_SIZE,
+		       req + 4, (size_t)take * RC_FS_LIST_ENTRY_SIZE);
+		total += take;
+
+		if (page < RC_FS_LIST_PAGE_MAX || total >= max_entries) break;
+	}
+	return total;
 }
 
 static int simple_verb(const char *path, unsigned verb, unsigned aux_at_100)

@@ -4,6 +4,41 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-08-31 — FS_LIST pagination: `ls` / readdir stop truncating
+
+A directory with more entries than fit in one fsd reply
+(`(FS_MSG_MAX-4)/36` = 31) used to have the rest silently dropped —
+and `ls` asked for only 16. Now paged.
+
+- **Wire**: FS_LIST request byte 104 (the slot FS_READ_AT's offset
+  uses; every other verb ignores it) carries a running start index.
+  The backend fills up to 31 records *after* skipping that many real
+  entries; a short page means the end.
+- **Backends** — `ext2_list` / `fat32_list` / `exfat_list` gain a
+  `uint start` param: a `seen` counter ticks for every emittable entry,
+  the record is only written once `seen >= start`. `envd` and `procd`
+  (which also answer FS_LIST) honour it too, so a caller with >31 env
+  vars / pids can't loop forever re-fetching page 0.
+- **Clients** — `fs_list` (user.c3) and `__rc_fs_list` (rc_fs.c) loop:
+  one IPC per page, `start += count`, accumulate into the caller's
+  buffer, stop on a short page or a full buffer. Transparent — a
+  caller just passes its real buffer capacity as `max_entries`.
+  `ls.c3` now asks for 256 (was 16); `opendir` already had 512.
+- `pagelisttest` (reads `/manyfiles`, 60 entries seeded by build.sh)
+  → ok on ext2 and FAT32, 2 pages.
+
+Regression green on ext2 / FAT32 / dual (the exfat image's
+`p9fstest`/`lfntest` were already failing on this host — `mk_exfat_
+image.sh` fixture seeding — unrelated). Duo kernels build clean.
+
+**Adjacent limit, not touched:** `ext2_create_file` still appends a
+whole directory block per file, so racccoon can only *create* ~11
+files in one directory (block 0 is `.`/`..`, blocks 1-11 one file
+each). Packing new dirents into existing blocks' rec_len slack is the
+next fs job — `/manyfiles` is debugfs-seeded to sidestep it for now.
+
+---
+
 ## 2026-08-31 — tcc polish: bare invocation, `tcctest`, the fixpoint
 
 Tightening the §7 result.

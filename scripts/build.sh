@@ -128,6 +128,12 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   for c in build/libc/*.bin; do [ -e "$c" ] && mcopy -i build/disk.img "$c" "::bin/$(basename "$c" .bin)"; done
   bash scripts/seed_tcc.sh fat32 build/disk.img
 
+  # manyfiles/ — 60 entries, past FS_LIST's 31-per-reply cap (see the
+  # matching block on the ext2 image below). test/c-src/pagelisttest.c.
+  printf 'x\n' > build/tiny_fixture
+  mmd -i build/disk.img ::manyfiles 2>/dev/null || true
+  for i in $(seq -w 0 59); do mcopy -o -i build/disk.img build/tiny_fixture "::manyfiles/e$i"; done
+
   # bigfile.bin — deterministic byte[i] = i % 256 pattern, 300000 bytes,
   # genuinely past ext2's own single-indirect reach even at the smallest
   # 1024-byte block size used below (12 + 256 = 268 blocks = 268KB) —
@@ -197,6 +203,17 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   bash scripts/seed_tcc.sh ext2 build/disk_ext2.img
   for w in build/wasm/*.wasm; do debugfs -w -R "write $w $(basename "$w")" build/disk_ext2.img > /dev/null; done
   debugfs -w -R "write build/bigfile_fixture.bin bigfile.bin" build/disk_ext2.img > /dev/null
+
+  # manyfiles/ — 60 entries in one directory, past FS_LIST's 31-per-reply
+  # cap, so `ls` / readdir pagination (user.c3 fs_list / rc_fs.c) is
+  # actually exercised across pages. Seeded with debugfs (racccoon's own
+  # ext2_create_file still appends a whole dir block per file — a
+  # separate limit; see ext2.c3's header). test/c-src/pagelisttest.c.
+  printf 'x\n' > build/tiny_fixture
+  debugfs -w -R "mkdir manyfiles" build/disk_ext2.img > /dev/null
+  for i in $(seq -w 0 59); do
+    debugfs -w -R "write build/tiny_fixture manyfiles/e$i" build/disk_ext2.img > /dev/null
+  done
 
   echo "==> Building disk image (dual ext2+ext2, for scripts/launch64_dual.sh)..."
   # Third test image — exercises fsd/fsd2 mounting two filesystems at once
