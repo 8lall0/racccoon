@@ -769,15 +769,23 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		child.ipc_peer_died = false;
 		child.in_call_reply_wait = false;
 		child.is_boot_server = false; // an rfork child is user work, not a boot server
-		// a2 (optional, RFPROC only): wire the child's stdout to this pipe
-		// id atomically, as part of the fork — a caller whose runtime may
-		// yield between rfork and a follow-up SYS_PIPE_SETOUT (Go's does;
-		// the c3 shell's loop never does, so it keeps the two-step) can't
-		// otherwise guarantee the child hasn't already run. pipe_valid
-		// rejects anything that isn't a live pipe id (the c3 rfork()
-		// wrapper passes -1; threadcreate leaves a stale value in a2, hence
-		// the RFMEM exclusion too). -1 / invalid = plain console.
+		// a2 / a4 (optional, RFPROC only): wire the child's stdout / stdin
+		// to these pipe ids atomically, as part of the fork. Both the c3
+		// shell (`|`, `>`, `<`) and Go's os/exec use this. A follow-up
+		// SYS_PIPE_SETOUT/SETIN has a race window the caller can't close:
+		// Go's runtime yields at the first safepoint after rfork, and the
+		// c3 shell — despite the "cooperative, doesn't yield until the
+		// pump" note it used to carry — is timer-preemptible at every
+		// tick (the SCAUSE_SUPERVISOR_TIMER handler yield()s whenever
+		// current_proc.pid > 0), so a tick landing between the fork and
+		// the setout lets a fast child (/bin/echo) run and exit with its
+		// output still on the console. Rare (a ~µs window per ~10 ms
+		// tick) but real. pipe_valid rejects anything that isn't a live
+		// pipe id (rfork()/rfork_io() pass -1 when unused; threadcreate
+		// leaves stale values here, hence the RFMEM exclusion). -1 /
+		// invalid = plain console.
 		int rfork_stdout_pipe = (int)f.a2;
+		int rfork_stdin_pipe  = (int)f.a4;
 		if ((rfork_flags & RFMEM) == 0 && rfork_stdout_pipe >= 0 && pipe_valid(rfork_stdout_pipe))
 		{
 			child.stdout_pipe = rfork_stdout_pipe;
@@ -785,9 +793,17 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		}
 		else
 		{
-			child.stdout_pipe = -1; // console until the shell wires a pipe end
+			child.stdout_pipe = -1; // console until a pipe end is wired
 		}
-		child.stdin_pipe = -1;
+		if ((rfork_flags & RFMEM) == 0 && rfork_stdin_pipe >= 0 && pipe_valid(rfork_stdin_pipe))
+		{
+			child.stdin_pipe = rfork_stdin_pipe;
+			pipes[rfork_stdin_pipe].readers++;
+		}
+		else
+		{
+			child.stdin_pipe = -1;
+		}
 		child.pid   = child_i + 1;
 		child.generation++;
 		child.sp    = (uptr)child_sp;

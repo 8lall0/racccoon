@@ -97,11 +97,18 @@ fn void exitcode(int code) @noreturn @export("exitcode") {
 // pid got reused by something unrelated" (see src/process.c3's
 // Process.generation and SYS_JOIN's case in src/entry.c3).
 fn int rfork(int flags, uint* generation_out) @export("rfork") {
-    // a2 = -1: no stdout-pipe wiring (see SYS_RFORK's case — a2 >= 0 is an
-    // optional pipe id to attach to the child's stdout as part of the
-    // fork, for a caller whose runtime can't be trusted not to yield
-    // between rfork and a follow-up SYS_PIPE_SETOUT).
-    return syscall(SYS_RFORK, flags, (long)generation_out, -1);
+    return rfork_io(flags, generation_out, -1, -1);
+}
+
+// rfork() plus atomic stdout/stdin pipe wiring: SYS_RFORK's a2 / a4 are
+// optional pipe ids to attach to the child's stdout / stdin *as part of
+// the fork*, closing the window a follow-up SYS_PIPE_SETOUT/SETIN leaves
+// open (the child can be scheduled — timer preemption, or a forking
+// runtime that yields — before the caller gets to the second call).
+// -1 for either = leave that stream on the console. The shell's `|` /
+// `>` / `<` path uses this; see src/entry.c3's SYS_RFORK case.
+fn int rfork_io(int flags, uint* generation_out, int stdout_pipe, int stdin_pipe) @export("rfork_io") {
+    return syscall4(SYS_RFORK, flags, (long)generation_out, stdout_pipe, stdin_pipe);
 }
 
 // Real exec(): replaces THIS process's own image in place — same pid,

@@ -531,7 +531,11 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
 // that back through join() for `&&` / `||`). -1 = rfork failed.
 // Split out of shell_exec_external so shell_run_pipeline can start
 // several children, wire their pipe ends, then join them all.
-fn int shell_spawn(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out)
+// stdout_pipe / stdin_pipe (-1 = console): wired into the child
+// atomically by rfork_io — a follow-up SYS_PIPE_SETOUT/SETIN loses a
+// race to a timer-preempted shell (the child can run, and exit, in the
+// window between the fork and the second call).
+fn int shell_spawn(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out, int stdout_pipe, int stdin_pipe)
 {
             // A command with a '/' in it (absolute "/bin/foo", or
             // relative "./foo" / "sub/foo") is a path — exec() resolves
@@ -553,7 +557,7 @@ fn int shell_spawn(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out)
             }
 
             *gen_out = 0;
-            int sh_r = rfork(RFPROC, gen_out);
+            int sh_r = rfork_io(RFPROC, gen_out, stdout_pipe, stdin_pipe);
             if (sh_r < 0) {
                 print("rfork failed\n");
                 return -1;
@@ -590,13 +594,13 @@ fn bool shell_builtin_pipeable(char* cmd)
 // command, just in a child that then exits. Everything else is an
 // ordinary /bin spawn. Returns the child pid (generation in *gen_out),
 // or -1 on rfork failure — same contract as shell_spawn.
-fn int shell_spawn_stage(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out)
+fn int shell_spawn_stage(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out, int stdout_pipe, int stdin_pipe)
 {
     if (!shell_builtin_pipeable(cmd)) {
-        return shell_spawn(cmd, cmd_argv, cmd_argc, gen_out);
+        return shell_spawn(cmd, cmd_argv, cmd_argc, gen_out, stdout_pipe, stdin_pipe);
     }
     *gen_out = 0;
-    int r = rfork(RFPROC, gen_out);
+    int r = rfork_io(RFPROC, gen_out, stdout_pipe, stdin_pipe);
     if (r < 0) { print("rfork failed\n"); return -1; }
     if (r == 0) {
         shell_dispatch_common(cmd, cmd_argv, cmd_argc);
@@ -611,7 +615,7 @@ fn int shell_spawn_stage(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out
 fn int shell_exec_external(char* cmd, char** cmd_argv, int cmd_argc)
 {
             uint sh_gen = 0;
-            int sh_r = shell_spawn(cmd, cmd_argv, cmd_argc, &sh_gen);
+            int sh_r = shell_spawn(cmd, cmd_argv, cmd_argc, &sh_gen, -1, -1);
             if (sh_r <= 0) { return 127; }
             return join(sh_r, sh_gen);
 }
@@ -829,16 +833,22 @@ fn int shell_run_pipeline(char* seg, int seg_len, bool bg)
     if (in_pipe  >= 0) { pipe_hold(in_pipe, 1, 1); }   // shell writes the file in
     if (out_pipe >= 0) { pipe_hold(out_pipe, 0, 1); }  // shell drains it to the file
 
-    // Spawn every stage, then wire its ends — before any child runs
-    // (cooperative sched, the shell doesn't yield until the feed / pump
-    // / join below). On a spawn failure, kill what started and bail.
+    // Spawn every stage with its pipe ends already wired *atomically by
+    // the fork* (rfork_io / SYS_RFORK a2+a4). The old code did an
+    // rfork then a separate SYS_PIPE_SETOUT/SETIN, on the assumption
+    // the shell is never preempted in between — but the timer can fire
+    // in that window, letting a fast child (`/bin/echo`) run and exit
+    // before its output was ever redirected. On a spawn failure, kill
+    // what started and bail.
     int[MAX_STAGES]  spid @noinit;
     uint[MAX_STAGES] sgen @noinit;
     int spawned = 0;
     for (int s = 0; s < nstages; s++) {
         char** argv = &stage_words[stage_off[s] + 1];
         int    argc = stage_n[s] - 1;
-        spid[s] = shell_spawn_stage(stage_words[stage_off[s]], argv, argc, &sgen[s]);
+        int stdin_p  = s == 0           ? in_pipe  : mpipe[s - 1];
+        int stdout_p = s == nstages - 1 ? out_pipe : mpipe[s];
+        spid[s] = shell_spawn_stage(stage_words[stage_off[s]], argv, argc, &sgen[s], stdout_p, stdin_p);
         if (spid[s] < 0) {
             for (int k = 0; k < spawned; k++) { kill(spid[k], sgen[k]); }
             if (in_pipe  >= 0) { pipe_hold(in_pipe, 1, -1); }
@@ -846,10 +856,6 @@ fn int shell_run_pipeline(char* seg, int seg_len, bool bg)
             return 2;
         }
         spawned++;
-        int stdin_p  = s == 0           ? in_pipe  : mpipe[s - 1];
-        int stdout_p = s == nstages - 1 ? out_pipe : mpipe[s];
-        if (stdin_p  >= 0) { pipe_setin(spid[s], stdin_p); }
-        if (stdout_p >= 0) { pipe_setout(spid[s], stdout_p); }
     }
 
     // Background: hand the whole pipeline to the job table and return

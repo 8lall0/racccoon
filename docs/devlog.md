@@ -4,6 +4,49 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-01 — rfork: atomic stdout/stdin pipe wiring (a2 / a4)
+
+Follow-up to the previous entry, and a **correction** to its closing
+note. That note claimed the c3 shell's `>` redirection "intermittently
+fails" — that was a misread of test output: `echo M > f` followed by
+`cat f` prints `M` (from `cat`), and with the intervening command line
+filtered out it looked like `echo` writing to the console. Redirection
+was working. Sorry.
+
+But the race it pointed at **is real**, just rare. After `rfork` returns
+to the shell, the timer-interrupt handler `yield()`s on *every* tick for
+any `pid > 0` (`SCAUSE_SUPERVISOR_TIMER` in `handle_trap` — "real
+preemption, not just when a process yields on its own"). So a tick
+landing in the ~µs window between the fork and the shell's follow-up
+`SYS_PIPE_SETOUT` lets a fast child (`/bin/echo`) exec, write to the
+still-unredirected console, and exit before the shell wires it. ~1 in
+10⁴ per redirect — I never actually caught it, but the window is there,
+and the "cooperative sched, the shell doesn't yield until the pump"
+comment in `shell_run_pipeline` was simply wrong.
+
+Fix: close the window on the c3 side the same way the Go side already
+does. `SYS_RFORK` grew an `a4` (stdin pipe) alongside 113f8ec's `a2`
+(stdout pipe); `rfork_io(flags, gen, stdout_pipe, stdin_pipe)` wraps the
+4-arg form and plain `rfork()` calls it with `-1, -1`. `shell_spawn` /
+`shell_spawn_stage` take the two pipe ids and pass them through;
+`shell_run_pipeline` computes each stage's ends *before* the spawn and
+drops the post-spawn `pipe_setout`/`pipe_setin` entirely. The kernel
+wires `child.stdout_pipe`/`stdin_pipe` and bumps the pipe's
+writer/reader count as part of building the child, before it's
+schedulable. `pipe_valid`-gated, RFMEM-excluded (`threadcreate` leaves
+stale values in a2/a4).
+
+`pipe_setout`/`pipe_setin` (kernel cases + user wrappers) now have no
+callers — left in place, a mid-stream redirect is a legitimate future
+use.
+
+Verified `-m 2G` and `-m 1G`: `echo x > f; cat f`, `a | cat | cat`,
+`cat < f`, gostage42test / 41test / gotest / gostage35test / rforktest /
+chmodtest / oomtest / wasmtest / fsdkilltest / storagekilltest green.
+Duo kernel builds clean.
+
+---
+
 ## 2026-09-01 — Go Stage 4.1 follow-up: os/exec output capture
 
 `exec.Cmd.Output` / `CombinedOutput` / a `bytes.Buffer` `Stdout` now
@@ -49,19 +92,13 @@ adds `os/pipe_tamago.go`, `syscall.PipeGoos` + `goosPipeFile`, the
 `StartProcess` capID resolution, `runtime/goos` Capture* + the `Spawn`
 signature).
 
-**Pre-existing bug noticed while chasing the setout race** (NOT caused
-by this change — reproduces identically on a clean `1c1305d` build):
-the c3 shell's `>` file redirection intermittently fails to wire the
-child — `echo foo > /tmp/x` prints `foo` to the console and leaves
-`/tmp/x` empty. `echo a | cat` (stage→stage pipes) is unaffected; only
-the `pipe_hold` + shell-pumps-`pipe_read`→`fs_write` path for `>`/`<`.
-Under a non-interactive `printf | qemu` feed it fails most runs;
-interactively it's rarer. Same class of race as the one the Go side
-just designed around — the shell's `SYS_PIPE_SETOUT` after
-`shell_spawn` losing to a fast `/bin/echo` child — but the shell should
-be able to win it (no safepoints), so something else is off. Left for
-its own fix; `SYS_RFORK`'s new `a2` is the obvious lever (thread the
-redirect pipe id through `shell_spawn`).
+**Note added while chasing the setout race — later corrected.** This
+originally claimed the c3 shell's `>` redirection "intermittently
+fails". It doesn't — that was a misread of filtered test output (`cat`'s
+output of the redirected file looked like `echo` writing to the
+console). See the 2026-09-01 "rfork: atomic stdout/stdin pipe wiring"
+entry above: the underlying timer-preemption race is real but rare, and
+that entry closes it on the c3 side via `SYS_RFORK` a2/a4.
 
 ---
 
