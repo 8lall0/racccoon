@@ -229,10 +229,30 @@ unknowns. Staged:
   on QEMU); the shell exec buffer is now eagerly `SYS_MAP`'d at 32 MiB
   per exec (the rover keeps it O(n), but a right-sized map or a
   bulk-read verb would help). The JH7110 board gets the same bump.
-- **4.1 — `os/exec`.** `syscall.forkExec` / `StartProcess` →
-  `rfork(RFPROC)` + `SYS_EXEC` (Go can't `fork` safely — use the
-  async-signal-safe child path). Needed for the `go` command's
-  subprocess model, and generally useful. Add to `lib/go/racccoon.patch`.
+- **4.1 — `os/exec` — DONE (first cut).** Much simpler than a Linux
+  `clone`+`execve` port: `GOOS=tamago`'s `syscall` already stubs
+  `StartProcess` / `Wait4` / `WaitStatus` (`syscall_tamago.go` —
+  "not supported, just enough for package os"), so the patch just
+  fills them in. `runtime/goos.Spawn` / `Wait` (`go/goos/racccoon_exec.go`):
+  the parent reads the target binary and packs argv into one buffer
+  (all allocation / fs I/O before the fork), `rfork(RFPROC)`, and the
+  child does exactly one or two NOSPLIT ecalls (optional `SYS_CHDIR`,
+  then `SYS_EXEC`) before its image is replaced — no Go allocation or
+  scheduler interaction in the child window. `Wait` → `SYS_JOIN`.
+  `/dev/null` handled in the fs backend (a reserved handle: reads EOF,
+  writes discarded). `go/cmd/gostage41` + `gostage41test`: runs
+  `/bin/echo`, `/bin/false` (exit code propagates), a missing command
+  (clean error), and **another Go binary** (`/bin/go-hello` spawned by
+  a Go program, runs correctly). Verdict bit off by one on the first
+  run (`WaitStatus` used a made-up `0x100` "exited" bit instead of the
+  standard `low-7-bits == 0`) — fixed.
+  - **Not yet**: `ProcAttr.Files` pipe redirection — the child inherits
+    the parent's console, so `cmd.Stdout = os.Stdout` works but
+    `cmd.Output()` (capture into a buffer) doesn't. racccoon has
+    `SYS_PIPE` + `SYS_PIPE_SETOUT`/`_SETIN`; wiring those into `Spawn`
+    is the follow-up the `go` command will need.
+  - **Not yet**: argv[0] — packed plain, so a spawned Go child's
+    `os.Args[0]` is the synthetic `"go"`, real args at `[1:]`.
 - **4.2 — `go tool compile` on racccoon — DONE**, first try, no fixes
   needed. `build_go.sh cmd/compile` cross-builds it (self-installing
   fsd backend, no wrapper needed — a stdlib command can't blank-import

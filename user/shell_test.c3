@@ -2061,7 +2061,7 @@ fn void main() {
                 if (wt_code != 0) { wt_ok = -1; }
             }
             print(wt_ok == 0 ? "wasmtest: ok\n" : "wasmtest: FAILED\n");
-        } else if (strcmp(cmd, "gotest") == 0 || strcmp(cmd, "gostage2test") == 0 || strcmp(cmd, "gostage3test") == 0 || strcmp(cmd, "gostage35test") == 0) {
+        } else if (strcmp(cmd, "gotest") == 0 || strcmp(cmd, "gostage2test") == 0 || strcmp(cmd, "gostage3test") == 0 || strcmp(cmd, "gostage35test") == 0 || strcmp(cmd, "gostage41test") == 0) {
             // Go on racccoon (docs/go-port-plan.md). /bin/go-* are
             // GOOS=tamago static riscv64 binaries built by
             // scripts/build_go.sh from go/cmd/*, loaded through
@@ -2097,6 +2097,13 @@ fn void main() {
             //                  runtime/goos.FS — the go/racccoon blank
             //                  import + lib/go/racccoon.patch. e2fsck
             //                  clean after.
+            //   gostage41test — go/cmd/gostage41: os/exec (rfork+SYS_EXEC
+            //                  + SYS_JOIN via runtime/goos.Spawn/Wait) —
+            //                  runs /bin/echo, /bin/false (exit code
+            //                  propagates), a missing command, and
+            //                  another Go binary spawned from Go. First
+            //                  cut: child inherits the console, no pipe
+            //                  capture yet.
             //
             // The program prints to the console directly (goos.Printk ->
             // SYS_PUTCHAR) so its output shows inline above the verdict.
@@ -2108,6 +2115,8 @@ fn void main() {
                 gt_path = "bin/go-gostage3"; gt_name = "gostage3test";
             } else if (strcmp(cmd, "gostage35test") == 0) {
                 gt_path = "bin/go-gostage35"; gt_name = "gostage35test";
+            } else if (strcmp(cmd, "gostage41test") == 0) {
+                gt_path = "bin/go-gostage41"; gt_name = "gostage41test";
             } else {
                 gt_path = "bin/go-hello"; gt_name = "gotest";
             }

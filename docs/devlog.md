@@ -4,6 +4,49 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-01 — Go Stage 4.1: os/exec
+
+`os/exec` works on racccoon (first cut). `go/cmd/gostage41` +
+`gostage41test`: runs `/bin/echo` and `/bin/false` (exit codes
+propagate), a missing command (clean error), and **another Go binary
+spawned from a Go program** (`/bin/go-hello`, runs correctly).
+
+Much smaller than a Linux `clone`+`execve` port: `GOOS=tamago`'s
+`syscall` already stubs `StartProcess` / `Wait4` / `WaitStatus`
+("not supported, just enough for package os"), so `lib/go/racccoon.patch`
+just fills them in via two `runtime/goos` hooks (`Spawn` / `Wait`,
+`go/goos/racccoon_exec.go`): the parent reads the target binary and
+packs argv into one buffer (all allocation + fs I/O *before* the fork),
+`rfork(RFPROC)`, then the child does exactly one or two NOSPLIT ecalls
+(optional `SYS_CHDIR`, then `SYS_EXEC`) before its image is replaced —
+no Go allocation or scheduler interaction in the child window. `Wait`
+→ `SYS_JOIN`. `/dev/null` is a reserved fs-backend handle (reads EOF,
+writes discarded) so a `Cmd` with a nil Stdout doesn't fail on open.
+
+First run: the mechanism worked (both commands *ran*, output correct),
+but `cmd.Run()` returned a spurious error for successful commands —
+`WaitStatus` used a made-up `0x100` "exited" bit instead of `wait(2)`'s
+`(status & 0x7f) == 0`, so `ExitStatus()` returned 1 for exit 0. Fixed
+to the standard bit layout.
+
+Not yet: `ProcAttr.Files` pipe redirection — the child inherits the
+parent's console, so `cmd.Stdout = os.Stdout` works but `cmd.Output()`
+(capture into a buffer) doesn't; racccoon has `SYS_PIPE` +
+`SYS_PIPE_SETOUT`/`_SETIN` to wire in. And a spawned Go child's
+`os.Args[0]` is the synthetic `"go"` (argv packed plain).
+
+Regressions green (gostage41test, gotest, gostage35test, chmodtest,
+wasmtest). Duo builds clean.
+
+`gostage41test` is fast (a ~1.4 MiB binary) so it *is* in the quick
+sweep, unlike `gotoolchaintest`.
+
+Also confirmed (host): `cmd/go` builds for `GOOS=tamago GOARCH=riscv64`
+(13.7 MiB) — Stage 4.4's remaining unknown is getting `$GOROOT/src` (the
+stdlib source, for package discovery) onto the disk.
+
+---
+
 ## 2026-09-01 — Go Stage 4.3: the self-hosting loop is closed
 
 racccoon's own `go tool compile` + `go tool link`, running natively on

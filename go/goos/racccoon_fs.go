@@ -296,9 +296,17 @@ func freeHandle(h uintptr) {
 
 type fsdBackend struct{}
 
+// hNull is the reserved handle for /dev/null — reads EOF, writes are
+// discarded. os/exec opens it for a Cmd whose Stdin/Stdout/Stderr is
+// nil, and the go command uses it liberally.
+const hNull = ^uintptr(0)
+
 func (fsdBackend) Open(path string, flags int, perm uint32) (uintptr, bool, int64, int) {
 	const oCREATE, oEXCL, oTRUNC = 0100, 0200, 01000
 	ap := abspath(path)
+	if ap == "/dev/null" {
+		return hNull, false, 0, eOK
+	}
 	size, isDir, e := statPath(ap)
 	exists := e == eOK
 	if !exists {
@@ -324,11 +332,16 @@ func (fsdBackend) Open(path string, flags int, perm uint32) (uintptr, bool, int6
 }
 
 func (fsdBackend) Close(h uintptr) int {
-	freeHandle(h)
+	if h != hNull {
+		freeHandle(h)
+	}
 	return eOK
 }
 
 func (fsdBackend) Pread(h uintptr, b []byte, off int64) (int, int) {
+	if h == hNull {
+		return 0, eOK // EOF
+	}
 	p, ok := handlePath(h)
 	if !ok {
 		return 0, eBADF
@@ -337,6 +350,9 @@ func (fsdBackend) Pread(h uintptr, b []byte, off int64) (int, int) {
 }
 
 func (fsdBackend) Pwrite(h uintptr, b []byte, off int64) (int, int) {
+	if h == hNull {
+		return len(b), eOK // discard
+	}
 	p, ok := handlePath(h)
 	if !ok {
 		return 0, eBADF
@@ -345,6 +361,9 @@ func (fsdBackend) Pwrite(h uintptr, b []byte, off int64) (int, int) {
 }
 
 func (fsdBackend) Fstat(h uintptr) (int64, bool, int) {
+	if h == hNull {
+		return 0, false, eOK
+	}
 	p, ok := handlePath(h)
 	if !ok {
 		return 0, false, eBADF

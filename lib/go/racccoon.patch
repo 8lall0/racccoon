@@ -1,8 +1,8 @@
 diff --git a/src/runtime/goos/linux_user.go b/src/runtime/goos/linux_user.go
-index fac5dfe1..796cac43 100644
+index fac5dfe1..e675e03a 100644
 --- a/src/runtime/goos/linux_user.go
 +++ b/src/runtime/goos/linux_user.go
-@@ -58,6 +58,39 @@ var (
+@@ -58,6 +58,46 @@ var (
  	Nanotime = sys_clock_gettime
  )
  
@@ -17,6 +17,13 @@ index fac5dfe1..796cac43 100644
 +// vector for os.Args (the runtime's goargs() otherwise hardcodes
 +// {"tamago"}). Keep in sync with go/goos/racccoon_user.go.
 +var Args func() []string
++
++// Spawn / Wait are the os/exec bridge (syscall.StartProcess / Wait4,
++// lib/go/racccoon.patch). A GOOSPKG provider replaces this whole file,
++// so these stubs only apply to a vanilla GOOS=tamago build, where
++// process creation stays unsupported.
++func Spawn(path string, argv []string, dir string) int { return -38 }
++func Wait(pid int) int                                 { return -38 }
 +
 +// FSHook is the contract a host filesystem backend implements. Handles
 +// are opaque tokens the backend hands back from Open and gets back on
@@ -356,7 +363,7 @@ index 55aea4cc..c8362213 100644
  	return chdir(path)
  }
 diff --git a/src/syscall/syscall_tamago.go b/src/syscall/syscall_tamago.go
-index d7ab81f1..ce808a93 100644
+index d7ab81f1..0ba5b548 100644
 --- a/src/syscall/syscall_tamago.go
 +++ b/src/syscall/syscall_tamago.go
 @@ -10,6 +10,7 @@ import (
@@ -367,7 +374,23 @@ index d7ab81f1..ce808a93 100644
  	"sync"
  	"unsafe"
  )
-@@ -284,7 +285,13 @@ func Sysctl(key string) (string, error) {
+@@ -239,8 +240,13 @@ var ForkLock sync.RWMutex
+ 
+ type WaitStatus uint32
+ 
+-func (w WaitStatus) Exited() bool       { return false }
+-func (w WaitStatus) ExitStatus() int    { return 0 }
++func (w WaitStatus) Exited() bool       { return w&0x7f == 0 }
++func (w WaitStatus) ExitStatus() int {
++	if w&0x7f != 0 {
++		return -1
++	}
++	return int(w>>8) & 0xff
++}
+ func (w WaitStatus) Signaled() bool     { return false }
+ func (w WaitStatus) Signal() Signal     { return 0 }
+ func (w WaitStatus) CoreDump() bool     { return false }
+@@ -284,7 +290,13 @@ func Sysctl(key string) (string, error) {
  
  const ImplementsGetwd = false
  
@@ -382,3 +405,31 @@ index d7ab81f1..ce808a93 100644
  func Getegid() int                      { return 1 }
  func Geteuid() int                      { return 1 }
  func Getgid() int                       { return 1 }
+@@ -298,10 +310,25 @@ func Sendfile(outfd int, infd int, offset *int64, count int) (written int, err e
+ 	return 0, ENOSYS
+ }
+ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle uintptr, err error) {
+-	return 0, 0, ENOSYS
++	dir := ""
++	if attr != nil {
++		dir = attr.Dir
++	}
++	p := goos.Spawn(argv0, argv, dir)
++	if p < 0 {
++		return 0, 0, goosErrno(-p)
++	}
++	return p, 0, nil
+ }
+ func Wait4(pid int, wstatus *WaitStatus, options int, rusage *Rusage) (wpid int, err error) {
+-	return 0, ENOSYS
++	rc := goos.Wait(pid)
++	if rc < 0 {
++		return 0, goosErrno(-rc)
++	}
++	if wstatus != nil {
++		*wstatus = WaitStatus((uint32(rc) & 0xff) << 8)
++	}
++	return pid, nil
+ }
+ func RouteRIB(facility, param int) ([]byte, error)                { return nil, ENOSYS }
+ func ParseRoutingMessage(b []byte) ([]RoutingMessage, error)      { return nil, ENOSYS }

@@ -13,6 +13,9 @@
 #define SYS_PUTCHAR      1
 #define SYS_EXIT         3
 #define SYS_NS_RESOLVE   8
+#define SYS_RFORK        11
+#define SYS_JOIN         13
+#define SYS_EXEC         24
 #define SYS_YIELD        27
 #define SYS_IPC_CALL     34
 #define SYS_CHDIR        37
@@ -136,4 +139,46 @@ TEXT ·sysChdir(SB),NOSPLIT,$0-16
 	MOV	$SYS_CHDIR, A3
 	ECALL
 	MOV	A0, ret+8(FP)
+	RET
+
+// --- os/exec bridge ecalls (racccoon_exec.go) --------------------
+// racccoon's fork+exec model: rfork(RFPROC) then the child SYS_EXECs a
+// blob (image bytes + packed argv) prepared by the parent — so the
+// child does exactly one ecall between fork and exec, no allocation.
+
+// func sysRfork(flags int64, genOut *uint32) int64
+TEXT ·sysRfork(SB),NOSPLIT,$0-24
+	MOV	flags+0(FP), A0
+	MOV	genOut+8(FP), A1
+	MOV	$SYS_RFORK, A3
+	ECALL
+	MOV	A0, ret+16(FP)
+	RET
+
+// func sysExecRaw(buf *byte, imgLen, argvLen, argc int64) int64
+// (only returns on failure — on success the image is replaced)
+TEXT ·sysExecRaw(SB),NOSPLIT,$0-40
+	MOV	buf+0(FP), A0
+	MOV	imgLen+8(FP), A1
+	MOV	argvLen+16(FP), A2
+	MOV	argc+24(FP), A4
+	MOV	$SYS_EXEC, A3
+	ECALL
+	MOV	A0, ret+32(FP)
+	RET
+
+// func sysJoin(pid, gen int64) int64
+TEXT ·sysJoin(SB),NOSPLIT,$0-24
+	MOV	pid+0(FP), A0
+	MOV	gen+8(FP), A1
+	MOV	$SYS_JOIN, A3
+	ECALL
+	MOV	A0, ret+16(FP)
+	RET
+
+// func sysExitCode(code int64)  — child bail-out after a failed exec
+TEXT ·sysExitCode(SB),NOSPLIT,$0-8
+	MOV	code+0(FP), A0
+	MOV	$SYS_EXIT, A3
+	ECALL
 	RET

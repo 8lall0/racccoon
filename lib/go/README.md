@@ -7,33 +7,42 @@
 
 ## What the patch does
 
-`GOOS=tamago`'s `syscall` package backs `package os` onto an in-memory
-filesystem (`src/syscall/fs_tamago.go`). The patch adds an optional
-`runtime/goos.FS` hook: when a `FSHook` is installed (the racccoon
-tree's `go/racccoon` package does this in its `init`), every path-based
-filesystem syscall — `Open`, `Read`/`Write`/`Seek`, `Stat`, `Mkdir`,
-`Unlink`, `Rename`, `ReadDirent`, `Getwd`, `Chdir` — routes to that
-backend instead. `nil` FS keeps stock tamago behaviour, so the patch is
-inert for non-racccoon builds.
+Three things, all inert for a non-racccoon `GOOS=tamago` build (the
+racccoon side is supplied by the GOOSPKG overlay in `go/goos/`).
 
-It also wires `os.Args`: `runtime/goos.Args` (a `func() []string` a
-provider fills from the host exec ABI); a tiny `os_tamago.go` `init()`
-refreshes `runtime.argslice` from it before package `os` reads
-`os.Args` (the runtime's `goargs()` hardcodes `{"tamago"}` too early to
-use a provider).
+**1. Filesystem.** `GOOS=tamago`'s `syscall` backs `package os` onto an
+in-memory fs (`fs_tamago.go`). The patch adds an optional
+`runtime/goos.FS` `FSHook`; when set (the overlay's `racccoon_fs.go`
+installs it), every path-based syscall — `Open`, `Read`/`Write`/`Seek`,
+`Stat`, `Mkdir`, `Unlink`, `Rename`, `ReadDirent`, `Getwd`, `Chdir` —
+routes there instead. `FSHook` uses errno ints, not `error`
+(`runtime/goos` can't import `errors`); `fs_racccoon.go` maps them to
+`syscall.Errno`.
+
+**2. `os.Args`.** `runtime/goos.Args` (`func() []string`, filled from
+the host exec ABI); a tiny `os_tamago.go` `init()` refreshes
+`runtime.argslice` from it before `os` reads `os.Args` (the runtime's
+`goargs()` hardcodes `{"tamago"}` too early to use a provider).
+
+**3. `os/exec`.** `syscall_tamago.go`'s `StartProcess` / `Wait4` /
+`WaitStatus` stubs (labelled "not supported, just enough for package
+os") get real bodies via `runtime/goos.Spawn` / `Wait` — racccoon's
+`rfork(RFPROC)` + `SYS_EXEC` + `SYS_JOIN`. `WaitStatus` uses the
+standard `wait(2)` bit layout (exit code in bits 8..15). First cut: the
+child inherits the console (`cmd.Stdout = os.Stdout` works, pipe
+capture doesn't); `/dev/null` is a reserved fs-backend handle.
 
 Files touched:
 
-- `src/runtime/goos/linux_user.go` — the `FSHook` interface + `var FS`
-  + `var Args` (kept in sync with `go/goos/racccoon_user.go`, the
-  GOOSPKG overlay).
+- `src/runtime/goos/linux_user.go` — `FSHook` + `var FS` + `var Args` +
+  `Spawn`/`Wait` stubs (kept in sync with `go/goos/racccoon_user.go`).
 - `src/runtime/os_tamago.go` — the `init()` that refreshes `argslice`.
-- `src/syscall/fs_racccoon.go` (new) — the `goosFile` `fileImpl` and the
-  `goos.FS` call sites' helpers, incl. synthesising fixed-size dirent
-  records for `os.ReadDir`.
-- `src/syscall/fs_tamago.go` — one `if goos.FS != nil { … }` guard at
-  the top of each entry point.
-- `src/syscall/syscall_tamago.go` — `Getwd()` uses the hook.
+- `src/syscall/fs_racccoon.go` (new) — the `goosFile` `fileImpl`, the
+  `goos.FS` call-site helpers + dirent synthesis, errno→`Errno`.
+- `src/syscall/fs_tamago.go` — one `if goos.FS != nil { … }` guard per
+  entry point.
+- `src/syscall/syscall_tamago.go` — `Getwd` uses the hook;
+  `StartProcess`/`Wait4`/`WaitStatus` real bodies.
 
 ## Bumping the Go version
 
