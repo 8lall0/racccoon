@@ -255,20 +255,49 @@ unknowns. Staged:
     running under `GOMAXPROCS=1` on racccoon's cooperative scheduler,
     `os.Create`/`Write` on the output — with no host-assumption fixes
     needed anywhere.
-- **4.3 — `go tool link`** → a runnable racccoon ELF from `compile`'s
-  output. Needs `runtime.a` and the other stdlib archives cross-built
-  and reachable (an `importcfg`) — real setup work, unlike 4.2's
-  single-file case. Then `compile` + `link` by hand build a `hello.go`
-  entirely on racccoon.
+- **4.3 — `go tool link` — DONE. The self-hosting loop is closed.**
+  `board::EXEC_MAX_IMAGE_SIZE` was never the constraint that mattered
+  here — the QEMU ext2 image was: grown 16 → **256 MiB**
+  (`scripts/build.sh`; 262144×1 KiB blocks / 8192-per-group = 32
+  groups, nowhere near `ext2.c3`'s `EXT2_MAX_GROUPS` 2048 ceiling).
+  `scripts/build_go_toolchain.sh` cross-builds `cmd/link` and captures
+  the real dependency closure a `go build` of `go/cmd/hello` needs
+  (`go build -a -work`: 28 packages, `runtime` + its transitive
+  `internal/*`, ~15 MiB total) — rewriting the closure's `importcfg`/
+  `importcfg.link` to racccoon's on-device paths (`/lib/go/pkg/*.a`).
+  This is the same bootstrapping shape as `lib/tcc`'s prebuilt
+  `crt1.o`/`libtcc1.a`: cross-built support objects, not something
+  racccoon's own compiler needs to produce from scratch — Stage 4.3's
+  job was proving `link` itself works, not rebuilding the whole stdlib
+  on-device (that's optional, later, tier-3 self-host territory).
+
+  On racccoon, in one shell session, against `go/cmd/hello`'s **real**
+  source (seeded as `/hello.go`):
+  ```
+  go-compile -o /tmp/hello.o -p main -complete -importcfg /lib/go/importcfg /hello.go
+  go-link -o /tmp/hello.elf -importcfg /lib/go/importcfg.link -buildmode=exe -T 0x1010000 -R 0x1000 /tmp/hello.o
+  /tmp/hello.elf
+  ```
+  All three steps exit 0. The resulting binary's output matches Stage
+  1's host-cross-compiled `/bin/go-hello` **byte for byte** — println,
+  hardware-FP math, slice `append`, `map`, `defer`, `panic`/`recover`
+  all correct. `e2fsck -fn` clean after. Formalised as the
+  `gotoolchaintest` shell builtin (slow — minutes — so not part of the
+  quick regression sweep, run on demand). One shell-side fix along the
+  way: the interactive line buffer is 128 bytes, so a hand-typed
+  compile/link invocation with every flag overflows it — trimmed to
+  the flags that actually matter (`-lang`/`-goversion`/`-c=1`/
+  `-nolocalimports` are all safe to omit for this case); the builtin
+  itself passes argv directly so it isn't affected.
+
+  A racccoon binary, compiled and linked by racccoon's own toolchain,
+  running on racccoon, byte-identical to the cross-compiled version.
+  Nothing needed fixing to get there.
 - **4.4 — the `go` command** orchestrating it (`go build`), with the
   build cache, `$GOROOT/src` stdlib reads, module handling, and 4.1's
-  `os/exec` to invoke `compile`/`link` as subprocesses. The largest
-  piece; wants the JH7110's 2 GiB, `GOMAXPROCS=1`.
-- **Disk sizing** — the committed QEMU ext2 image (16 MiB) can't hold
-  `compile` (22 MiB) or a stdlib source tree. Before 4.3 lands for
-  real, either grow the QEMU image (build-time cost) or accept this
-  stage is JH7110/real-hardware-only (the Duo's 57 GB ext2 partition
-  and the JH7110's SD card both dwarf this easily).
+  `os/exec` to invoke `compile`/`link` as subprocesses instead of by
+  hand. The largest remaining piece; wants the JH7110's 2 GiB,
+  `GOMAXPROCS=1`.
 
 Likely wants the `GOOS=racccoon` rename around 4.3–4.4 (own identity,
 room for `os`/`syscall` to diverge further) — apply tamago's patchset

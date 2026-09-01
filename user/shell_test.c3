@@ -2144,6 +2144,93 @@ fn void main() {
                     print(")\n");
                 }
             }
+        } else if (strcmp(cmd, "gotoolchaintest") == 0) {
+            // Stage 4.3 (docs/go-port-plan.md) — racccoon's OWN go tool
+            // compile + go tool link, running natively on racccoon,
+            // build go/cmd/hello's real source (importing "runtime" and
+            // its ~27 transitive internal/* deps — a real stdlib closure,
+            // not the import-free case gotest's binary already covers)
+            // into a working ELF, then run it. Closes the self-hosting
+            // loop: a binary racccoon's own toolchain produced, running
+            // on racccoon, whose output must match Stage 1's
+            // host-cross-compiled /bin/go-hello byte for byte.
+            //
+            // Needs /lib/go/{importcfg,importcfg.link,pkg/*.a} + /hello.go
+            // (build_go_toolchain.sh, seeded onto disk_ext2.img by
+            // build.sh — gated on TAMAGO like the rest of the Go port,
+            // and only on the 256 MiB ext2 image: go-compile (~22 MiB) +
+            // go-link (~6 MiB) + the ~15 MiB closure don't fit the small
+            // FAT32/dual images). Skips cleanly if they're not there.
+            // Slow (minutes — a fresh QEMU boot, ~30 MB of toolchain
+            // binary loaded off fsd 1124 bytes/IPC-RTT, twice, plus the
+            // ~15 MiB closure at link time) — not part of the quick
+            // regression sweep, run on demand.
+            uint gtc_size = 0; int gtc_type = 0;
+            if (fs_stat("/lib/go/importcfg", &gtc_size, &gtc_type) < 0) {
+                print("gotoolchaintest: skipped (no /lib/go/importcfg — build with TAMAGO set)\n");
+            } else {
+                fs_delete("/tmp/hello.o");
+                fs_delete("/tmp/hello.elf");
+
+                char*[8] gtc_cc_av;
+                gtc_cc_av[0] = "-o"; gtc_cc_av[1] = "/tmp/hello.o"; gtc_cc_av[2] = "-p"; gtc_cc_av[3] = "main";
+                gtc_cc_av[4] = "-complete"; gtc_cc_av[5] = "-importcfg"; gtc_cc_av[6] = "/lib/go/importcfg";
+                gtc_cc_av[7] = "-pack"; // archive format — matches what importcfg.link expects a packagefile to be
+                // "/hello.go" itself is a 9th arg the fixed-size array
+                // above doesn't have room for cleanly — appended via a
+                // second exec() argv slot instead, so the array stays a
+                // single literal.
+                char*[9] gtc_cc_full;
+                for (int gi = 0; gi < 8; gi++) { gtc_cc_full[gi] = gtc_cc_av[gi]; }
+                gtc_cc_full[8] = "/hello.go";
+
+                uint gtc_g1 = 0;
+                int gtc_c1 = rfork(RFPROC, &gtc_g1);
+                if (gtc_c1 == 0) {
+                    exec("bin/go-compile", exec_buf(), exec_buf_max(), 0, &gtc_cc_full[0], 9);
+                    exitcode(127);
+                }
+                int gtc_compile_rc = join(gtc_c1, gtc_g1);
+
+                if (gtc_compile_rc != 0) {
+                    print("gotoolchaintest: FAILED (go-compile exit "); print_uint((uint)gtc_compile_rc); print(")\n");
+                } else {
+                    // -T/-R match scripts/build_go.sh's own link flags —
+                    // every PT_LOAD must land inside [USER_BASE,
+                    // USER_BASE+EXEC_MAX_IMAGE_SIZE); go-link's default
+                    // link address is nowhere near there.
+                    char*[9] gtc_ln_av;
+                    gtc_ln_av[0] = "-o"; gtc_ln_av[1] = "/tmp/hello.elf"; gtc_ln_av[2] = "-importcfg";
+                    gtc_ln_av[3] = "/lib/go/importcfg.link"; gtc_ln_av[4] = "-buildmode=exe";
+                    gtc_ln_av[5] = "-T"; gtc_ln_av[6] = "0x1010000"; gtc_ln_av[7] = "-R";
+                    gtc_ln_av[8] = "0x1000";
+                    char*[10] gtc_ln_full;
+                    for (int gj = 0; gj < 9; gj++) { gtc_ln_full[gj] = gtc_ln_av[gj]; }
+                    gtc_ln_full[9] = "/tmp/hello.o";
+                    uint gtc_g2 = 0;
+                    int gtc_c2 = rfork(RFPROC, &gtc_g2);
+                    if (gtc_c2 == 0) {
+                        exec("bin/go-link", exec_buf(), exec_buf_max(), 0, &gtc_ln_full[0], 10);
+                        exitcode(127);
+                    }
+                    int gtc_link_rc = join(gtc_c2, gtc_g2);
+
+                    if (gtc_link_rc != 0) {
+                        print("gotoolchaintest: FAILED (go-link exit "); print_uint((uint)gtc_link_rc); print(")\n");
+                    } else {
+                        uint gtc_g3 = 0;
+                        int gtc_c3 = rfork(RFPROC, &gtc_g3);
+                        if (gtc_c3 == 0) {
+                            exec("/tmp/hello.elf", exec_buf(), exec_buf_max(), 0, null, 0);
+                            exitcode(127);
+                        }
+                        int gtc_run_rc = join(gtc_c3, gtc_g3);
+                        print(gtc_run_rc == 0 ? "gotoolchaintest: ok\n" : "gotoolchaintest: FAILED (linked binary exit != 0)\n");
+                    }
+                }
+                fs_delete("/tmp/hello.o");
+                fs_delete("/tmp/hello.elf");
+            }
         } else if (strcmp(cmd, "tcctest") == 0) {
             // roadmap §7: /bin/tcc compiles + links /hello.c into a
             // runnable binary. Skips cleanly if tcc isn't on this image

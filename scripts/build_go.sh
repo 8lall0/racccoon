@@ -25,9 +25,11 @@ fi
 # (cmd/compile, cmd/link, cmd/asm, cmd/go — for Stage 4's on-device
 # toolchain). Stdlib commands still get the fsd backend + os.Args:
 # racccoon_fs.go's init in the GOOSPKG overlay installs runtime/goos.FS
-# for every binary.
+# for every binary. NAME is bare either way (build.sh's own seed loops
+# add the "go-" /bin prefix — cmd/compile -> bin/go-compile, not
+# bin/go-go-compile).
 case "$1" in
-  cmd/*) PKG="$1"; NAME="go-$(basename "$1")" ;;
+  cmd/*) PKG="$1"; NAME="$(basename "$1")" ;;
   *)     PKG="./cmd/$1"; NAME="$1" ;;
 esac
 [ -n "$1" ] || { echo "usage: build_go.sh <cmd-name | cmd/stdlib-path>"; exit 2; }

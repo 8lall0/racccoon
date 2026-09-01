@@ -4,6 +4,56 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-01 — Go Stage 4.3: the self-hosting loop is closed
+
+racccoon's own `go tool compile` + `go tool link`, running natively on
+racccoon, compile and link `go/cmd/hello`'s real source (importing
+`runtime` and its ~27 transitive `internal/*` packages — a real stdlib
+closure) into a working ELF, which then **runs** and produces output
+byte-identical to Stage 1's host-cross-compiled `/bin/go-hello`. A
+racccoon binary, built by racccoon's own toolchain, on racccoon.
+Nothing needed fixing to get there — the whole chain worked once the
+inputs were in place.
+
+- **Disk**: the QEMU ext2 test image grew 16 → 256 MiB
+  (`scripts/build.sh`) — `go-compile` alone is 22 MiB (stripped),
+  `go-link` 6 MiB, the stdlib closure ~15 MiB. 262144 × 1 KiB blocks /
+  8192-per-group = 32 groups, far under `ext2.c3`'s `EXT2_MAX_GROUPS`
+  (2048). The FAT32 + dual images stay small — `build.sh` now skips the
+  big `compile`/`link` binaries for those (they're ext2-only, next to
+  the closure).
+- **`scripts/build_go_toolchain.sh`**: cross-builds `cmd/link`, then
+  captures the exact dependency closure a `go build -a -work` of
+  `go/cmd/hello` produces (28 `packagefile` entries) and rewrites its
+  `importcfg` / `importcfg.link` to racccoon on-device paths
+  (`/lib/go/pkg/*.a`). Same bootstrapping shape as `lib/tcc`'s prebuilt
+  `crt1.o` / `libtcc1.a` — cross-built support objects, not something
+  racccoon's compiler rebuilds from scratch. `build.sh` seeds
+  `/lib/go/{importcfg,importcfg.link,pkg/*.a}` + `/hello.go` onto the
+  ext2 image (gated on `$TAMAGO` like the rest of the port).
+- **`gotoolchaintest`** (shell_test.c3): the exact validated sequence —
+  `go-compile -o /tmp/hello.o -p main -complete -importcfg
+  /lib/go/importcfg -pack /hello.go`, then `go-link -o /tmp/hello.elf
+  -importcfg /lib/go/importcfg.link -buildmode=exe -T 0x1010000 -R
+  0x1000 /tmp/hello.o`, then run it. Passes; ~2–3 min (a QEMU boot +
+  loading ~30 MB of toolchain off fsd 1124 bytes/RTT + the closure) —
+  not in the quick regression sweep, run on demand.
+  - Two shell-side notes surfaced: the interactive line buffer is 128
+    bytes (a fully-flagged hand-typed compile invocation overflows it —
+    the non-essential flags are safe to drop; the builtin passes argv
+    directly so it's unaffected), and `go-compile` needs `-pack` for
+    the output to be the archive format `link`'s `importcfg` expects.
+- **Also probed** (host, not yet run on racccoon): `cmd/go` — the `go`
+  command itself — **builds** for `GOOS=tamago GOARCH=riscv64` with the
+  racccoon overlay, 13.7 MiB stripped. Its whole module/build-cache
+  dependency graph satisfies. Stage 4.4's real gate is `os/exec`
+  (4.1) — `cmd/go` invokes `compile`/`link` as subprocesses.
+  `os/exec` compiles for tamago too but `SYS_CLONE`/`SYS_EXECVE` land
+  in `os_tamago.go`'s `syscall()` dispatcher which only handles
+  `SYS_WRITE` — 4.1 is translating those to `rfork`+`SYS_EXEC` there.
+
+---
+
 ## 2026-09-01 — Go on racccoon: research + Stage 0 plan (branch `go-port`)
 
 Scoped what it takes to run Go on racccoon. **Verdict: tractable on the

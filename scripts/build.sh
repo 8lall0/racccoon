@@ -63,6 +63,15 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
       [ -e "$gd" ] || continue
       bash scripts/build_go.sh "$(basename "$gd")" || true
     done
+
+    # Stage 4 (docs/go-port-plan.md): racccoon's own go tool compile /
+    # go tool link, plus the stdlib object closure they need to link a
+    # real program (build_go_toolchain.sh — cross-built on the host,
+    # same bootstrapping idea as lib/tcc's prebuilt crt1.o/libtcc1.a).
+    # Seeded below under /lib/go/ and /bin/go-{compile,link}.
+    bash scripts/build_go.sh cmd/compile || true
+    bash scripts/build_go.sh cmd/link || true
+    bash scripts/build_go_toolchain.sh || true
   fi
 
   # The disk images built below are pristine masters — every one is
@@ -130,7 +139,13 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # replacement for bin/echod — elftest execs this one specifically,
   # runtest/argvtest/pathtest keep using the flat binary unchanged.
   mcopy -i build/disk.img build/user/echod.elf ::bin/echod.elf
-  for g in build/go/*.elf; do [ -e "$g" ] && mcopy -i build/disk.img "$g" "::bin/go-$(basename "$g" .elf)"; done
+  # Stage 4's go-compile / go-link are too big for this small FAT32
+  # image (and only meaningfully testable next to the toolchain
+  # closure seeded onto disk_ext2.img) — skip them here.
+  for g in build/go/*.elf; do
+    case "$(basename "$g")" in compile.elf|link.elf) continue ;; esac
+    [ -e "$g" ] && mcopy -i build/disk.img "$g" "::bin/go-$(basename "$g" .elf)"
+  done
   # bin/{cat,ls,write,rm,mkdir,mv} — the real, argv-taking utilities
   # shell.c3's own /bin/ fallback branch execs (see docs/devlog.md),
   # replacing what used to be hardcoded shell builtins.
@@ -171,12 +186,18 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # (part of e2fsprogs) rather than a loop-mount, so this needs no root
   # either. `-b 1024` keeps the block size comfortably under
   # user/fs/ext2.c3's own EXT2_MAX_BLOCK_SIZE — not required for
-  # correctness on a small image (mke2fs would pick 1024 by default
-  # here anyway), just explicit. Reuses the name "hello.txt" (with
-  # distinct content from disk/hello.txt) so the shell's existing
-  # readfile command exercises either filesystem unchanged.
+  # correctness (mke2fs would pick 1024 by default here anyway), just
+  # explicit. Reuses the name "hello.txt" (with distinct content from
+  # disk/hello.txt) so the shell's existing readfile command exercises
+  # either filesystem unchanged.
+  #
+  # 256 MiB, not the original 16 — the go-port Stage 4 toolchain
+  # binaries (go-compile ~22 MiB, go-link ~6 MiB) plus their stdlib
+  # object closure (~15 MiB, seeded below) no longer fit in 16 MiB.
+  # 262144 1-KiB blocks / 8192 blocks-per-group = 32 groups, nowhere
+  # near ext2.c3's own EXT2_MAX_GROUPS (2048) ceiling.
   rm -f build/disk_ext2.img
-  dd if=/dev/zero of=build/disk_ext2.img bs=1M count=16 status=none
+  dd if=/dev/zero of=build/disk_ext2.img bs=1M count=256 status=none
   mke2fs -q -F -b 1024 build/disk_ext2.img
   debugfs -w -R "write disk-ext2/hello.txt hello.txt" build/disk_ext2.img > /dev/null
   # disk-ext2/subdir/ exercises ext2.c3's read-only subdirectory support
@@ -211,6 +232,20 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_ext2.img > /dev/null
   for g in build/go/*.elf; do [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_ext2.img > /dev/null; done
+  # Stage 4 (docs/go-port-plan.md): the stdlib object closure + importcfg
+  # go-compile/go-link need to build+link go/cmd/hello entirely on-device
+  # (build_go_toolchain.sh). /lib/go/pkg/*.a, /lib/go/importcfg{,.link},
+  # /hello.go. No-op (dir doesn't exist) without TAMAGO.
+  if [ -d build/go/toolchain ]; then
+    debugfs -w -R "mkdir lib/go" build/disk_ext2.img > /dev/null
+    debugfs -w -R "mkdir lib/go/pkg" build/disk_ext2.img > /dev/null
+    for a in build/go/toolchain/pkg/*.a; do
+      [ -e "$a" ] && debugfs -w -R "write $a lib/go/pkg/$(basename "$a")" build/disk_ext2.img > /dev/null
+    done
+    debugfs -w -R "write build/go/toolchain/importcfg lib/go/importcfg" build/disk_ext2.img > /dev/null
+    debugfs -w -R "write build/go/toolchain/importcfg.link lib/go/importcfg.link" build/disk_ext2.img > /dev/null
+    debugfs -w -R "write build/go/toolchain/hello.go hello.go" build/disk_ext2.img > /dev/null
+  fi
   for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_ext2.img > /dev/null
   done
@@ -281,7 +316,11 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "write build/adm_users_fixture adm/users" build/disk_dual_root_part.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_root_part.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_root_part.img > /dev/null
-  for g in build/go/*.elf; do [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_dual_root_part.img > /dev/null; done
+  # Same exclusion as the FAT32 image above — too big for this partition.
+  for g in build/go/*.elf; do
+    case "$(basename "$g")" in compile.elf|link.elf) continue ;; esac
+    [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_dual_root_part.img > /dev/null
+  done
   for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_root_part.img > /dev/null
   done
@@ -305,7 +344,11 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "mkdir bin" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_ext2_part.img > /dev/null
-  for g in build/go/*.elf; do [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_dual_ext2_part.img > /dev/null; done
+  # Same exclusion as the FAT32 image above — too big for this partition.
+  for g in build/go/*.elf; do
+    case "$(basename "$g")" in compile.elf|link.elf) continue ;; esac
+    [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_dual_ext2_part.img > /dev/null
+  done
   for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_ext2_part.img > /dev/null
   done
