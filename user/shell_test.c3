@@ -2061,40 +2061,55 @@ fn void main() {
                 if (wt_code != 0) { wt_ok = -1; }
             }
             print(wt_ok == 0 ? "wasmtest: ok\n" : "wasmtest: FAILED\n");
-        } else if (strcmp(cmd, "gotest") == 0) {
-            // Go on racccoon (docs/go-port-plan.md): /bin/gohello is a
-            // GOOS=tamago static riscv64 binary built by
-            // scripts/build_go.sh from go/cmd/hello, loaded through
-            // SYS_EXEC's ELF path. Same rfork -> exec -> join(code)
-            // shape as wasmtest; skips cleanly (exit 127) if the binary
-            // isn't on this image — it only exists when TAMAGO was set
-            // at build time, same as tcctest without /bin/tcc.
+        } else if (strcmp(cmd, "gotest") == 0 || strcmp(cmd, "gostage2test") == 0) {
+            // Go on racccoon (docs/go-port-plan.md). /bin/go-hello and
+            // /bin/go-gostage2 are GOOS=tamago static riscv64 binaries
+            // built by scripts/build_go.sh from go/cmd/*, loaded through
+            // SYS_EXEC's ELF path. Same rfork -> exec -> join(code) shape
+            // as wasmtest; skip cleanly (exit 127) if the binary isn't on
+            // this image — they only exist when TAMAGO was set at build
+            // time, same as tcctest without /bin/tcc.
             //
-            // A clean exit 0 means the whole Go runtime came up on the
-            // racccoon goos provider (go/goos/): SYS_MAP heap arena +
-            // stack (CPUInit), the scheduler, GC-managed map/slice
-            // allocation, defer + panic/recover, and goos.Exit ->
-            // SYS_EXIT. The program prints to the console directly
-            // (goos.Printk -> SYS_PUTCHAR) so its output shows inline
-            // above this line.
+            //   gotest       — go/cmd/hello: println, int/float math,
+            //                  slice+append, map, defer, panic/recover.
+            //                  A clean exit 0 means the whole Go runtime
+            //                  came up on the racccoon goos provider
+            //                  (go/goos/): SYS_MAP heap arena + stack
+            //                  (CPUInit), the scheduler, GC-managed
+            //                  allocation, and goos.Exit -> SYS_EXIT.
+            //   gostage2test — go/cmd/gostage2: the runtime under load —
+            //                  the GC cycling through ~48 MiB of garbage,
+            //                  200 goroutines + channels + WaitGroup +
+            //                  mutex, and the timer path (time.Sleep /
+            //                  Ticker). Slow (spin-idle scheduler + real
+            //                  GC on emulated hw).
+            //
+            // The program prints to the console directly (goos.Printk ->
+            // SYS_PUTCHAR) so its output shows inline above the verdict.
+            bool gt_s2 = strcmp(cmd, "gostage2test") == 0;
+            char* gt_path = gt_s2 ? "bin/go-gostage2" : "bin/go-hello";
+            char* gt_name = gt_s2 ? "gostage2test" : "gotest";
             uint gt_gen = 0;
             int gt_c = rfork(RFPROC, &gt_gen);
             if (gt_c < 0) {
                 print("rfork failed\n");
             } else if (gt_c == 0) {
-                exec("bin/gohello", exec_buf(), exec_buf_max(), 0, null, 0);
+                exec(gt_path, exec_buf(), exec_buf_max(), 0, null, 0);
                 exitcode(127);
             } else {
                 int gt_code = join(gt_c, gt_gen);
+                print(gt_name);
                 if (gt_code == 127) {
-                    print("gotest: skipped (no /bin/gohello — build with TAMAGO set)\n");
+                    print(": skipped (no ");
+                    print(gt_path);
+                    print(" — build with TAMAGO set)\n");
                 } else if (gt_code == 0) {
-                    print("gotest: ok\n");
+                    print(": ok\n");
                 } else {
                     char[16] gt_cs @noinit;
                     int gt_d = fmt::format_uint((uint)gt_code, &gt_cs[0]);
                     gt_cs[gt_d] = 0;
-                    print("gotest: FAILED (exit ");
+                    print(": FAILED (exit ");
                     print(&gt_cs[0]);
                     print(")\n");
                 }

@@ -39,14 +39,14 @@ var (
 	// bytes at startup and writes the returned base into RamStart and
 	// Bloc before the Go world starts.
 	RamStart uint
-	// RamSize must fit under the kernel's per-process SYS_MAP ceiling
-	// (board::HEAP_MAX_BYTES: 64 MiB on QEMU/JH7110) minus this binary's
-	// own image, and SYS_MAP is eager — every page is really allocated.
-	// 48 MiB is comfortable for Go hello-world on QEMU; the JH7110 with
-	// GiBs can take far more. On a board too small to honour it (the
-	// Duo) SYS_MAP fails and the first stack store faults — a retry-with-
-	// smaller loop in CPUInit is a follow-up.
-	RamSize        uint = 48 << 20
+	// RamSize is the SYS_MAP region for the whole Go heap + g0 stack.
+	// SYS_MAP is eager (every page really allocated + zeroed at startup),
+	// so this trades startup cost for GC headroom. 64 MiB is plenty —
+	// the gostage2 GC test's working set is well under 10 MiB — and
+	// keeps `gohello` startup quick even on emulated hardware. Fits
+	// under QEMU's board::HEAP_MAX_BYTES (512 MiB); the JH7110 (2 GiB)
+	// can take far more. CPUInit falls back to 8 MiB if a board refuses.
+	RamSize        uint = 64 << 20
 	RamStackOffset uint = 0x1000
 
 	// Bloc redefines the heap start (osinit picks it up). Set from asm

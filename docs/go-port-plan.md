@@ -117,24 +117,43 @@ What it took:
 Not yet exercised: GC under real pressure, goroutines, `time.Sleep`
 (that's Stage 2).
 
-### Stage 2 — GC + goroutines under memory pressure
+### Stage 2 — GC + goroutines + timers — **DONE**
 
-- Force a GC (allocate megabytes), confirm the `sbrk`/`bloc` region +
-  `memclrNoHeapPointers` behave and the arena doesn't collide with the
-  g0 stack.
-- Goroutines: `go func()`, channels, `sync.WaitGroup`, `select`. All
-  cooperative on one M — confirm `gopark`/`goready` + the `semasleep`
-  idle loop yield correctly through `SYS_YIELD`.
-- Optional: racccoon *does* have the thread primitives — `rfork(RFPROC|
-  RFMEM)` shares an address space and `SYS_FUTEX_WAIT`/`_WAKE` are
-  keyed on `(addr, page_table)`. A real `goos.Task` (RFMEM rfork) +
-  `semasleep` via futex would give multi-M cooperative scheduling on
-  the one hart. Not needed for correctness; revisit if `GOMAXPROCS=1`
-  latency bites.
-- `time.Sleep` / `time.After` — needs the `wakeG` timer path
-  (`sys_tamago_riscv64.s`) wired to racccoon's timebase.
-- Real memory sizing: `goos.RamSize` from the board's RAM (JH7110
-  variant) — raise `SYS_MAP`'s reach on that board.
+`go/cmd/gostage2` (`gostage2test` in `shell_test.c3`) — all checks pass
+on racccoon in QEMU:
+- **GC**: churns ~48 MiB of garbage in 24 KiB bites with forced
+  `runtime.GC()`, `NumGC` climbs, `HeapAlloc` stays bounded, the ~2 MiB
+  live set survives every cycle. The `sbrk`/`bloc` region behaves.
+- **Goroutines**: 200-way fan-out/fan-in over a buffered channel +
+  `WaitGroup`, `close`+`range`, `select` with `time.After`, a
+  100-goroutine mutex-guarded counter — all correct. Cooperative on one
+  M (`GOMAXPROCS=1`); `gopark`/`goready` + the `semasleep` idle loop
+  yield through `SYS_YIELD`.
+- **Timers**: `time.Sleep(20ms)` advances `time.Now()` in bounds,
+  `time.NewTicker(10ms)` fires 2–20× in 80 ms — the `wakeG` timer path
+  + `nanotime` (`rdtime`) + the spin-idle scheduler.
+
+Slow (spin-idle scheduler + real GC on emulated hardware — tens of
+seconds), but correct.
+
+Kernel RAM raised for this (QEMU only, board-gated):
+- `scripts/launch64*.sh` now pass `-m 1G`; `src/kernel.ld` `__free_ram`
+  → 768 MiB (must match `src/allocation.c3`'s `RAM_SIZE`).
+- `board::HEAP_MAX_BYTES` → 512 MiB; provider `RamSize` → 128 MiB
+  (eager, with a CPUInit 8 MiB fallback if a board refuses it).
+
+**Known blocker for JH7110**: racccoon does not boot with `-m >= 2G`
+(no output at all, fails before BSS clear — an early-boot / FDT-
+placement / kernel-identity-map issue; the map only covers
+`[__kernel_map_base, __free_ram_end)` and QEMU puts the FDT near the
+top of RAM). The Orange Pi RV has 2 GB, so this must be fixed before
+that bring-up — likely the same early-MMU work `docs/opi-rv-plan.md`
+already anticipates for first boot. Not needed for the QEMU stages.
+
+Optional later: racccoon *has* the thread primitives — `rfork(RFPROC|
+RFMEM)` + `SYS_FUTEX_WAIT`/`_WAKE` keyed on `(addr, page_table)`. A real
+`goos.Task` (RFMEM rfork) + futex `semasleep` would give multi-M
+cooperative scheduling on one hart. Not needed for correctness.
 
 ### Stage 3 — `os` / file I/O against fsd (this is where Step B pays off)
 

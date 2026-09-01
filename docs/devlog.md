@@ -101,8 +101,41 @@ What it took:
   stack store just below USER_BASE because `SYS_MAP` failed and
   `CPUInit`'s `base(-1) + RamSize` wrapped.
 
-Next (Stage 2): GC under real allocation pressure, goroutines +
-channels, `time.Sleep` (the `wakeG` timer path).
+**Stage 2 — the Go runtime under load.** `go/cmd/gostage2`
+(`gostage2test`) passes on racccoon in QEMU:
+- **GC** churns ~48 MiB of garbage in 24 KiB bites with forced
+  `runtime.GC()` — `NumGC` climbs, `HeapAlloc` stays bounded, the
+  ~2 MiB live set survives every cycle.
+- **Goroutines**: 200-way fan-out/fan-in over a buffered channel +
+  `WaitGroup` + `close`/`range`, `select` with `time.After`, a
+  100-goroutine mutex-guarded counter — all correct, cooperative on one
+  M.
+- **Timers**: `time.Sleep(20ms)` advances `time.Now()` in bounds,
+  `time.NewTicker(10ms)` fires 2–20× in 80 ms — the `wakeG` path +
+  `rdtime` `nanotime` + the spin-idle scheduler.
+
+Slow on emulated hardware (spin-idle scheduler + real GC — tens of
+seconds) but correct.
+
+Kernel RAM raised for it (QEMU only, board-gated — the Duo is
+untouched): `scripts/launch64*.sh` pass `-m 1G`; `src/kernel.ld`
+`__free_ram` 112 → 768 MiB (+ `src/allocation.c3` `RAM_SIZE` to match —
+the page bitmap is 24 KiB at that size); `board::HEAP_MAX_BYTES` 64 →
+512 MiB; provider `RamSize` 48 → 128 MiB (eager, with an 8 MiB CPUInit
+fallback). Regressions green (gotest / gostage2test / chmodtest /
+tcctest / wasmtest / oomtest / runtest). Duo kernel builds clean.
+
+**Found a JH7110 blocker along the way**: racccoon does not boot with
+`-m >= 2G` — no output at all, dies before BSS clear. `-m 1G` and below
+are fine. Almost certainly the kernel identity map only covering
+`[__kernel_map_base, __free_ram_end)` while QEMU/OpenSBI place the FDT
+(and their reservations) near the top of RAM. The Orange Pi RV has
+2 GB, so this has to be fixed before that bring-up; noted in
+`docs/go-port-plan.md`, likely folds into the early-MMU work
+`docs/opi-rv-plan.md` already expects.
+
+Next (Stage 3): `os` / file I/O against `fsd`, and the `GOOS=racccoon`
+rename.
 
 ---
 

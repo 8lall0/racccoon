@@ -23,22 +23,31 @@
 //
 // Runs before the Go world starts: no allocation, no g.
 TEXT ·CPUInit(SB),NOSPLIT|NOFRAME,$0
-	// SYS_MAP(RamSize) -> base vaddr (or -1)
+	// SYS_MAP(RamSize) -> base vaddr, or -1 if the board's per-process
+	// HEAP_MAX_BYTES can't honour it. On failure fall back to 8 MiB so
+	// the runtime still starts (and OOMs cleanly) rather than running
+	// with a wrapped-around stack pointer.
 	MOV	·RamSize(SB), A0
 	MOV	$SYS_MAP, A3
 	ECALL
+	MOV	$-1, T0
+	BNE	A0, T0, mapped
+	MOV	$(8*1024*1024), A0
+	MOV	A0, ·RamSize(SB)
+	MOV	$SYS_MAP, A3
+	ECALL
 
-	// A0 = region base
+mapped:
 	MOV	A0, ·RamStart(SB)
 	MOV	A0, ·Bloc(SB)
 
 	// stack pointer = base + RamSize - RamStackOffset (stack at the top;
 	// rt0 sets g0.stack.lo to SP-64KiB, the rest of the region is heap)
+	MOV	A0, X2
 	MOV	·RamSize(SB), T1
+	ADD	T1, X2
 	MOV	·RamStackOffset(SB), T2
-	ADD	A0, T1
-	SUB	T2, T1
-	MOV	T1, X2
+	SUB	T2, X2
 
 	JMP	runtime·rt0_riscv64_tamago(SB)
 

@@ -189,11 +189,12 @@ const ulong TIMEBASE_HZ = 10000000;
 // way. The Duo keeps 1 MiB (boards/duo/board.c3) — 64 MiB, no Go.
 const EXEC_MAX_IMAGE_SIZE = 4194304;
 
-// Per-process SYS_MAP ceiling (src/entry.c3's HEAP_MAX_BYTES). 64 MiB on
-// QEMU — the free_ram window is 112 MiB (src/kernel.ld), and a Go
-// process eagerly SYS_MAPs a ~48 MiB heap arena (docs/go-port-plan.md).
-// The Duo keeps 16 MiB (boards/duo/board.c3) — 64 MiB DRAM total.
-const uptr HEAP_MAX_BYTES = 64 * 1024 * 1024;
+// Per-process SYS_MAP ceiling (src/entry.c3's HEAP_MAX_BYTES). 512 MiB
+// on QEMU — the free_ram window is 768 MiB (src/kernel.ld, -m 1G), and a
+// Go process eagerly SYS_MAPs a ~128 MiB heap arena with room for the GC
+// to cycle (docs/go-port-plan.md). The Duo keeps 16 MiB
+// (boards/duo/board.c3) — 64 MiB DRAM total.
+const uptr HEAP_MAX_BYTES = 512 * 1024 * 1024;
 
 fn void plic_init()
 {

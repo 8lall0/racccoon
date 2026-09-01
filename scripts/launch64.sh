@@ -15,6 +15,7 @@ cp ../build/disk.img ../build/disk.run.img
 
 qemu-system-riscv64 \
   -machine virt \
+  -m 1G \
   -bios default \
   -nographic \
   -serial mon:stdio \

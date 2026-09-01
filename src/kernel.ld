@@ -53,13 +53,19 @@ SECTIONS {
 
     . = ALIGN(4096);
     __free_ram = .;
-    . += 112 * 1024 * 1024; /* 112MB — QEMU virt defaults to 128MB of DRAM
-                               (query-memory-size-summary), kernel links at
-                               DRAM_BASE+2MB, so ~126MB is available. Was
-                               64MB; raised so a Go process can eagerly
-                               SYS_MAP its ~48MB heap arena (SYS_MAP is not
-                               lazy) alongside the servers — docs/go-port-plan.md.
+    . += 768 * 1024 * 1024; /* 768MB. QEMU virt is launched with -m 1G
+                               (scripts/launch64*.sh); kernel links at
+                               DRAM_BASE+2MB, and QEMU/OpenSBI keep the FDT
+                               and their own reservations near the top of
+                               RAM, so 768MB leaves clear margin under 1GB.
+                               Was 64MB; raised so a Go process can eagerly
+                               SYS_MAP a large heap arena (SYS_MAP is not
+                               lazy) with GC headroom — docs/go-port-plan.md.
+                               Must match src/allocation.c3's RAM_SIZE.
                                boards/duo/kernel.ld stays sized to the Duo's
-                               real 64MB DRAM. */
+                               real 64MB DRAM. NOTE: racccoon does not yet
+                               boot with -m >= 2G (early-boot/FDT-placement
+                               issue — a JH7110 bring-up blocker, its board
+                               has 2GB); see docs/go-port-plan.md. */
     __free_ram_end = .;
 }
