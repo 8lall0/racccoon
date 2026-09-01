@@ -192,6 +192,38 @@ docs/go-port-plan.md; the `GOOS=racccoon` rename probably lands by 4.2.
 
 ---
 
+## 2026-09-01 — Go: self-installing fsd backend + Stage 4.0 exec headroom
+
+Stage 3.5's fsd backend moved out of `go/racccoon` (a blank import) and
+into `runtime/goos` itself (`go/goos/racccoon_fs.go`, the GOOSPKG
+overlay), where an `init()` installs it. So **every** racccoon Go
+binary now gets `os.*` on the real filesystem with no import of its
+own — which is what `cmd/compile` / `cmd/link` need for Stage 4 (a
+stdlib command can't blank-import a repo module). The `FSHook` contract
+became errno ints instead of `error` (`runtime/goos` is imported by
+`runtime` and must not pull in `errors`); `fs_racccoon.go` maps them to
+`syscall.Errno`. The handle table lost its `sync.Mutex` (no `sync` from
+`runtime/goos`; GOMAXPROCS=1 means nothing yields mid-op). `lib/go/
+racccoon.patch` is now 5 files. `go/racccoon` is a thin typed layer
+over `os` (kept for `gostage3`). `gostage35` dropped its blank import
+entirely — nothing racccoon-specific in it now.
+
+**Stage 4.0 (QEMU):** `board::EXEC_MAX_IMAGE_SIZE` 4 → 32 MiB — a
+stripped `GOOS=tamago cmd/compile` is **23 MiB** (it *builds* for
+tamago/riscv64, ET_EXEC, 3 PT_LOAD, the existing racccoon ELF loader
+takes it structurally). The staging arrays it sizes grow to ~96 KiB
+BSS; `gotest` still passes with the bigger cap. The JH7110 board gets
+the same bump. Not yet done: the `exec()` fsd read loop is 1124
+bytes/IPC RTT, so reading a 23 MiB binary is ~20k round trips (tens of
+seconds on QEMU) — a bulk-read verb or right-sized exec buffer is the
+next optimisation.
+
+`build_go.sh` now also builds stdlib command paths (`build_go.sh
+cmd/compile`) and links with `-s -w` to keep the big binaries under the
+cap. Regressions + the go tests still green.
+
+---
+
 ## 2026-09-01 — `chmod` / `chown` (roadmap §2 closeout)
 
 Closes the last non-"much later" item of the Plan 9 user model: files

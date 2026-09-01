@@ -183,11 +183,12 @@ const uint IRQ_ETH       = 0;
 const ulong TIMEBASE_HZ = 10000000;
 
 // Largest image SYS_EXEC will install (src/entry.c3's EXEC_MAX_IMAGE_SIZE
-// and the staging arrays it sizes). 4 MiB on QEMU — RAM is plentiful and
-// this unblocks the Go port (a GOOS=tamago static binary is 1-4 MiB —
-// docs/go-port-plan.md); the C toolchain (~640 KiB TinyCC) fits either
-// way. The Duo keeps 1 MiB (boards/duo/board.c3) — 64 MiB, no Go.
-const EXEC_MAX_IMAGE_SIZE = 4194304;
+// and the ~96 KiB staging arrays it sizes at this value). 32 MiB on QEMU
+// — RAM is plentiful (768 MiB free_ram) and Stage 4 of the Go port runs
+// `go tool compile`, a ~20 MiB GOOS=tamago binary (docs/go-port-plan.md).
+// Ordinary Go programs are 1.5-2 MiB, the C toolchain ~640 KiB. The Duo
+// keeps 1 MiB (boards/duo/board.c3) — 64 MiB DRAM, no Go.
+const EXEC_MAX_IMAGE_SIZE = 33554432;
 
 // Per-process SYS_MAP ceiling (src/entry.c3's HEAP_MAX_BYTES). 512 MiB
 // on QEMU — the free_ram window is 768 MiB (src/kernel.ld, -m 1G), and a

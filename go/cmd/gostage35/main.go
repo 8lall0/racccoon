@@ -1,19 +1,16 @@
 package main
 
 // Stage 3.5 for Go on racccoon (docs/go-port-plan.md): the *standard*
-// os package, operating on fsd. The only racccoon-specific line is the
-// blank import below — it installs the fsd backend into runtime/goos.FS
-// (via a small toolchain patch, lib/go/racccoon.patch), after which
-// os.Open / os.ReadFile / os.ReadDir / os.Getwd / os.Create ... all
-// hit the real filesystem. Exits 0 only if every check passes; e2fsck
-// on the image afterward must be clean.
+// os package, operating on fsd. Nothing racccoon-specific here at all —
+// the fsd backend installs itself from runtime/goos (racccoon_fs.go,
+// via lib/go/racccoon.patch), so os.Open / os.ReadFile / os.ReadDir /
+// os.Getwd / os.Create ... just work. Exits 0 only if every check
+// passes; e2fsck on the image afterward must be clean.
 
 import (
 	"bytes"
 	"io"
 	"os"
-
-	_ "racccoon.local/goport/racccoon"
 )
 
 var failed bool

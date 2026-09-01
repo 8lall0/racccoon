@@ -21,14 +21,23 @@ if [ -z "$TAMAGO" ] || [ ! -x "$TAMAGO" ]; then
   exit 0
 fi
 
-NAME="${1:?usage: build_go.sh <cmd-name>   (a package under go/cmd/)}"
+# A local main package (go/cmd/<name>) or a stdlib command path
+# (cmd/compile, cmd/link, cmd/asm, cmd/go — for Stage 4's on-device
+# toolchain). Stdlib commands still get the fsd backend + os.Args:
+# racccoon_fs.go's init in the GOOSPKG overlay installs runtime/goos.FS
+# for every binary.
+case "$1" in
+  cmd/*) PKG="$1"; NAME="go-$(basename "$1")" ;;
+  *)     PKG="./cmd/$1"; NAME="$1" ;;
+esac
+[ -n "$1" ] || { echo "usage: build_go.sh <cmd-name | cmd/stdlib-path>"; exit 2; }
+
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${2:-$REPO/build/go/$NAME.elf}"
 mkdir -p "$(dirname "$OUT")"
 
-# The os <-> fsd bridge (go/racccoon) needs runtime/goos.FSHook, added by
-# lib/go/racccoon.patch. Warn if $TAMAGO's tree is unpatched — cmd/gostage35
-# and anything importing go/racccoon for os.* won't build otherwise.
+# The os <-> fsd bridge needs runtime/goos.FSHook, added by
+# lib/go/racccoon.patch. Warn if $TAMAGO's tree is unpatched.
 GOROOT_SRC="$("$TAMAGO" env GOROOT 2>/dev/null)/src"
 if [ -f "$GOROOT_SRC/runtime/goos/linux_user.go" ] && \
    ! grep -q "FSHook" "$GOROOT_SRC/runtime/goos/linux_user.go" 2>/dev/null; then
@@ -36,12 +45,13 @@ if [ -f "$GOROOT_SRC/runtime/goos/linux_user.go" ] && \
   echo "  (os.* -> fsd won't work; run scripts/setup_tamago.sh). Building anyway."
 fi
 
+# -s -w keeps the big Stage-4 binaries (compile ~23 MiB) under the exec cap.
 cd "$REPO/go"
 GOOS=tamago GOARCH=riscv64 CGO_ENABLED=0 \
-GOOSPKG=racccoon.local/goport \
+GOOSPKG=racccoon.local/goport GOFLAGS=-mod=mod \
   "$TAMAGO" build \
-  -ldflags "-T 0x1010000 -R 0x1000" \
+  -ldflags "-T 0x1010000 -R 0x1000 -s -w" \
   -o "$OUT" \
-  "./cmd/$NAME"
+  "$PKG"
 
 echo "==> $OUT ($(stat -c%s "$OUT") bytes)"

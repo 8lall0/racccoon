@@ -10,11 +10,15 @@
 
 #include "textflag.h"
 
-#define SYS_PUTCHAR   1
-#define SYS_EXIT      3
-#define SYS_YIELD     27
-#define SYS_MAP       47
-#define SYS_TIMEBASE  49
+#define SYS_PUTCHAR      1
+#define SYS_EXIT         3
+#define SYS_NS_RESOLVE   8
+#define SYS_YIELD        27
+#define SYS_IPC_CALL     34
+#define SYS_CHDIR        37
+#define SYS_GETCWD       38
+#define SYS_MAP          47
+#define SYS_TIMEBASE     49
 
 // CPUInit is the provider entry point _rt0_riscv64_tamago jumps to. It
 // carves the runtime's RAM out of a fresh SYS_MAP region, sets the
@@ -91,4 +95,45 @@ TEXT ·sys_timebase(SB),NOSPLIT,$0-8
 TEXT ·rdtime(SB),NOSPLIT,$0-8
 	RDTIME	A0
 	MOV	A0, ret+0(FP)
+	RET
+
+// --- fsd bridge ecalls (racccoon_fs.go) --------------------------
+
+// func nsResolve(path *byte, prefixOut *uint32) int64
+TEXT ·nsResolve(SB),NOSPLIT,$0-24
+	MOV	path+0(FP), A0
+	MOV	prefixOut+8(FP), A1
+	MOV	$0, A2
+	MOV	$SYS_NS_RESOLVE, A3
+	ECALL
+	MOV	A0, ret+16(FP)
+	RET
+
+// func ipcCall(pid, verb int64, buf *byte, packed int64, verbOut *uint32) int64
+TEXT ·ipcCall(SB),NOSPLIT,$0-48
+	MOV	pid+0(FP), A0
+	MOV	verb+8(FP), A1
+	MOV	buf+16(FP), A2
+	MOV	packed+24(FP), A4
+	MOV	verbOut+32(FP), A5
+	MOV	$SYS_IPC_CALL, A3
+	ECALL
+	MOV	A0, ret+40(FP)
+	RET
+
+// func sysGetcwd(buf *byte, cap int64) int64
+TEXT ·sysGetcwd(SB),NOSPLIT,$0-24
+	MOV	buf+0(FP), A0
+	MOV	cap+8(FP), A1
+	MOV	$SYS_GETCWD, A3
+	ECALL
+	MOV	A0, ret+16(FP)
+	RET
+
+// func sysChdir(path *byte) int64
+TEXT ·sysChdir(SB),NOSPLIT,$0-16
+	MOV	path+0(FP), A0
+	MOV	$SYS_CHDIR, A3
+	ECALL
+	MOV	A0, ret+8(FP)
 	RET

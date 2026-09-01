@@ -1,8 +1,8 @@
 diff --git a/src/runtime/goos/linux_user.go b/src/runtime/goos/linux_user.go
-index fac5dfe1..f278da8f 100644
+index fac5dfe1..796cac43 100644
 --- a/src/runtime/goos/linux_user.go
 +++ b/src/runtime/goos/linux_user.go
-@@ -58,6 +58,41 @@ var (
+@@ -58,6 +58,39 @@ var (
  	Nanotime = sys_clock_gettime
  )
  
@@ -24,21 +24,19 @@ index fac5dfe1..f278da8f 100644
 +// paths are already absolute (package os / syscall resolves cwd first
 +// via Getwd).
 +type FSHook interface {
-+	Open(path string, flags int, perm uint32) (h uintptr, isDir bool, size int64, err error)
-+	Close(h uintptr) error
-+	Pread(h uintptr, b []byte, off int64) (int, error)
-+	Pwrite(h uintptr, b []byte, off int64) (int, error)
-+	Fstat(h uintptr) (size int64, isDir bool, err error)
-+	// Dirents returns the full listing of the directory h refers to:
-+	// entry names and, per name, whether it is itself a directory.
-+	Dirents(h uintptr) (names []string, isDir []bool, err error)
-+	Stat(path string) (size int64, isDir bool, err error)
-+	Mkdir(path string, perm uint32) error
-+	Remove(path string, dir bool) error
-+	Rename(from, to string) error
-+	Truncate(path string, size int64) error
-+	Getwd() (string, error)
-+	Chdir(path string) error
++	Open(path string, flags int, perm uint32) (h uintptr, isDir bool, size int64, errno int)
++	Close(h uintptr) int
++	Pread(h uintptr, b []byte, off int64) (n int, errno int)
++	Pwrite(h uintptr, b []byte, off int64) (n int, errno int)
++	Fstat(h uintptr) (size int64, isDir bool, errno int)
++	Dirents(h uintptr) (names []string, isDir []bool, errno int)
++	Stat(path string) (size int64, isDir bool, errno int)
++	Mkdir(path string, perm uint32) int
++	Remove(path string, dir bool) int
++	Rename(from, to string) int
++	Truncate(path string, size int64) int
++	Getwd() (string, int)
++	Chdir(path string) int
 +}
 +
  // defined in linux_user*.s
@@ -69,50 +67,42 @@ index 6d57f5f9..7060f5da 100644
  func msigrestore(sigmask sigset)     {}
 diff --git a/src/syscall/fs_racccoon.go b/src/syscall/fs_racccoon.go
 new file mode 100644
-index 00000000..544af83b
+index 00000000..fee15d86
 --- /dev/null
 +++ b/src/syscall/fs_racccoon.go
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,185 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
 +
 +//go:build tamago
 +
-+// When runtime/goos.FS is set (by a GOOSPKG provider — the racccoon
-+// tree's go/racccoon package), every path-based filesystem syscall
-+// below routes to that host backend instead of fs_tamago.go's in-memory
-+// filesystem. nil FS keeps the in-memory behaviour unchanged. See
-+// docs/go-port-plan.md in the racccoon tree.
++// When runtime/goos.FS is set (racccoon_fs.go's init installs it for
++// GOARCH=riscv64), every path-based filesystem syscall below routes to
++// that host backend instead of fs_tamago.go's in-memory filesystem.
++// nil FS keeps the in-memory behaviour unchanged. See docs/go-port-plan.md
++// in the racccoon tree.
 +
 +package syscall
 +
 +import "runtime/goos"
 +
-+// goosFile is the fileImpl for an fd opened through goos.FS.
-+type goosFile struct {
-+	defaultFileImpl
-+	h     uintptr
-+	off   int64
-+	isDir bool
-+	// directory listing, fetched from the backend on first readDirent
-+	dents  []string
-+	dentsD []bool
-+	dpos   int
-+}
-+
-+// goosErr maps a backend error onto a syscall.Errno so package os's
-+// IsNotExist / IsPermission mostly work. racccoon's fsd protocol only
-+// carries a bare failure, so an unclassified error becomes ENOENT (the
-+// common case) unless the backend already returned an Errno.
-+func goosErr(err error) error {
-+	if err == nil {
++// goosErrno maps a backend errno onto a syscall.Errno.
++func goosErrno(e int) error {
++	switch e {
++	case 0:
 +		return nil
++	case 2:
++		return ENOENT
++	case 9:
++		return EBADF
++	case 17:
++		return EEXIST
++	case 38:
++		return ENOSYS
++	default:
++		return EIO
 +	}
-+	if e, ok := err.(Errno); ok {
-+		return e
-+	}
-+	return ENOENT
 +}
 +
 +func goosFillStat(st *Stat_t, size int64, isDir bool) {
@@ -124,10 +114,21 @@ index 00000000..544af83b
 +	}
 +}
 +
++// goosFile is the fileImpl for an fd opened through goos.FS.
++type goosFile struct {
++	defaultFileImpl
++	h     uintptr
++	off   int64
++	isDir bool
++	dents  []string
++	dentsD []bool
++	dpos   int
++}
++
 +func goosOpen(path string, openmode int, perm uint32) (int, error) {
-+	h, isDir, size, err := goos.FS.Open(path, openmode, perm)
-+	if err != nil {
-+		return -1, goosErr(err)
++	h, isDir, size, e := goos.FS.Open(path, openmode, perm)
++	if e != 0 {
++		return -1, goosErrno(e)
 +	}
 +	f := &goosFile{h: h, isDir: isDir}
 +	if openmode&O_APPEND != 0 {
@@ -137,9 +138,9 @@ index 00000000..544af83b
 +}
 +
 +func goosStat(path string, st *Stat_t) error {
-+	size, isDir, err := goos.FS.Stat(path)
-+	if err != nil {
-+		return goosErr(err)
++	size, isDir, e := goos.FS.Stat(path)
++	if e != 0 {
++		return goosErrno(e)
 +	}
 +	goosFillStat(st, size, isDir)
 +	return nil
@@ -155,9 +156,9 @@ index 00000000..544af83b
 +}
 +
 +func (f *goosFile) stat(st *Stat_t) error {
-+	size, isDir, err := goos.FS.Fstat(f.h)
-+	if err != nil {
-+		return goosErr(err)
++	size, isDir, e := goos.FS.Fstat(f.h)
++	if e != 0 {
++		return goosErrno(e)
 +	}
 +	goosFillStat(st, size, isDir)
 +	return nil
@@ -167,35 +168,35 @@ index 00000000..544af83b
 +	if f.isDir {
 +		return 0, EISDIR
 +	}
-+	n, err := goos.FS.Pread(f.h, b, f.off)
++	n, e := goos.FS.Pread(f.h, b, f.off)
 +	f.off += int64(n)
-+	if err != nil {
-+		return n, goosErr(err)
++	if e != 0 {
++		return n, goosErrno(e)
 +	}
 +	return n, nil
 +}
 +
 +func (f *goosFile) pread(b []byte, off int64) (int, error) {
-+	n, err := goos.FS.Pread(f.h, b, off)
-+	if err != nil {
-+		return n, goosErr(err)
++	n, e := goos.FS.Pread(f.h, b, off)
++	if e != 0 {
++		return n, goosErrno(e)
 +	}
 +	return n, nil
 +}
 +
 +func (f *goosFile) write(b []byte) (int, error) {
-+	n, err := goos.FS.Pwrite(f.h, b, f.off)
++	n, e := goos.FS.Pwrite(f.h, b, f.off)
 +	f.off += int64(n)
-+	if err != nil {
-+		return n, goosErr(err)
++	if e != 0 {
++		return n, goosErrno(e)
 +	}
 +	return n, nil
 +}
 +
 +func (f *goosFile) pwrite(b []byte, off int64) (int, error) {
-+	n, err := goos.FS.Pwrite(f.h, b, off)
-+	if err != nil {
-+		return n, goosErr(err)
++	n, e := goos.FS.Pwrite(f.h, b, off)
++	if e != 0 {
++		return n, goosErrno(e)
 +	}
 +	return n, nil
 +}
@@ -205,9 +206,9 @@ index 00000000..544af83b
 +	case 1:
 +		offset += f.off
 +	case 2:
-+		size, _, err := goos.FS.Fstat(f.h)
-+		if err != nil {
-+			return 0, goosErr(err)
++		size, _, e := goos.FS.Fstat(f.h)
++		if e != 0 {
++			return 0, goosErrno(e)
 +		}
 +		offset += size
 +	}
@@ -219,7 +220,7 @@ index 00000000..544af83b
 +}
 +
 +func (f *goosFile) close() error {
-+	return goosErr(goos.FS.Close(f.h))
++	return goosErrno(goos.FS.Close(f.h))
 +}
 +
 +func goosPutDirent(rec []byte, ino int64, name string) {
@@ -230,7 +231,6 @@ index 00000000..544af83b
 +	for i := 0; i < 8; i++ {
 +		rec[i] = byte(u >> (8 * i))
 +	}
-+	// rec[8:16] = Off — package os ignores it here
 +	rec[16] = byte(direntSize & 0xff)
 +	rec[17] = byte((direntSize >> 8) & 0xff)
 +	copy(rec[18:direntSize], name)
@@ -238,9 +238,9 @@ index 00000000..544af83b
 +
 +func (f *goosFile) readDirent(buf []byte) (int, error) {
 +	if f.dents == nil {
-+		names, isDir, err := goos.FS.Dirents(f.h)
-+		if err != nil {
-+			return 0, goosErr(err)
++		names, isDir, e := goos.FS.Dirents(f.h)
++		if e != 0 {
++			return 0, goosErrno(e)
 +		}
 +		if names == nil {
 +			names = []string{}
@@ -257,7 +257,7 @@ index 00000000..544af83b
 +	return n, nil
 +}
 diff --git a/src/syscall/fs_tamago.go b/src/syscall/fs_tamago.go
-index 55aea4cc..67a22ad3 100644
+index 55aea4cc..c8362213 100644
 --- a/src/syscall/fs_tamago.go
 +++ b/src/syscall/fs_tamago.go
 @@ -368,6 +368,9 @@ func (f *fsysFile) read(b []byte) (int, error) {
@@ -285,7 +285,7 @@ index 55aea4cc..67a22ad3 100644
  
  func Mkdir(path string, perm uint32) error {
 +	if goos.FS != nil {
-+		return goosErr(goos.FS.Mkdir(path, perm))
++		return goosErrno(goos.FS.Mkdir(path, perm))
 +	}
  	fs.mu.Lock()
  	defer fs.mu.Unlock()
@@ -296,8 +296,8 @@ index 55aea4cc..67a22ad3 100644
  func Getcwd(buf []byte) (n int, err error) {
 +	if goos.FS != nil {
 +		wd, e := goos.FS.Getwd()
-+		if e != nil {
-+			return 0, goosErr(e)
++		if e != 0 {
++			return 0, goosErrno(e)
 +		}
 +		if len(wd) >= len(buf) {
 +			return 0, ERANGE
@@ -320,7 +320,7 @@ index 55aea4cc..67a22ad3 100644
  
  func unlink(path string, isdir bool) error {
 +	if goos.FS != nil {
-+		return goosErr(goos.FS.Remove(path, isdir))
++		return goosErrno(goos.FS.Remove(path, isdir))
 +	}
  	fsinit()
  	fs.mu.Lock()
@@ -330,7 +330,7 @@ index 55aea4cc..67a22ad3 100644
  
  func Rename(from, to string) error {
 +	if goos.FS != nil {
-+		return goosErr(goos.FS.Rename(from, to))
++		return goosErrno(goos.FS.Rename(from, to))
 +	}
  	fsinit()
  	fs.mu.Lock()
@@ -340,7 +340,7 @@ index 55aea4cc..67a22ad3 100644
  
  func Truncate(path string, length int64) error {
 +	if goos.FS != nil {
-+		return goosErr(goos.FS.Truncate(path, length))
++		return goosErrno(goos.FS.Truncate(path, length))
 +	}
  	fsinit()
  	fs.mu.Lock()
@@ -350,13 +350,13 @@ index 55aea4cc..67a22ad3 100644
  
  func Chdir(path string) error {
 +	if goos.FS != nil {
-+		return goosErr(goos.FS.Chdir(path))
++		return goosErrno(goos.FS.Chdir(path))
 +	}
  	fsinit()
  	return chdir(path)
  }
 diff --git a/src/syscall/syscall_tamago.go b/src/syscall/syscall_tamago.go
-index d7ab81f1..179f8511 100644
+index d7ab81f1..ce808a93 100644
 --- a/src/syscall/syscall_tamago.go
 +++ b/src/syscall/syscall_tamago.go
 @@ -10,6 +10,7 @@ import (
@@ -375,7 +375,7 @@ index d7ab81f1..179f8511 100644
 +func Getwd() (wd string, err error) {
 +	if goos.FS != nil {
 +		wd, e := goos.FS.Getwd()
-+		return wd, goosErr(e)
++		return wd, goosErrno(e)
 +	}
 +	return "", ENOSYS
 +}

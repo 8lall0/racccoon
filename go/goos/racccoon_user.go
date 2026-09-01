@@ -118,12 +118,13 @@ func GetRandomData(b []byte) {
 	}
 }
 
-// FS, when set (by the go/racccoon package's init), routes package os's
-// filesystem operations to racccoon's fsd server instead of
-// GOOS=tamago's in-memory fs. nil keeps the in-memory behaviour. The
-// syscall-side hooks that read this are a small toolchain patch
-// (lib/go/racccoon.patch); keep this type in sync with that patch's
-// copy in src/runtime/goos/linux_user.go. See docs/go-port-plan.md.
+// FS routes package os's filesystem operations to racccoon's fsd server
+// instead of GOOS=tamago's in-memory fs. It is installed by
+// racccoon_fs.go's init(), so every racccoon Go binary gets real
+// filesystem access with no import of its own. The syscall-side call
+// sites are a small toolchain patch (lib/go/racccoon.patch); keep this
+// type in sync with that patch's copy in
+// src/runtime/goos/linux_user.go. See docs/go-port-plan.md.
 var FS FSHook
 
 // rcArgc / rcArgvBlob are filled by CPUInit (asm) from racccoon's exec
@@ -158,18 +159,22 @@ var Args = func() []string {
 // FSHook is the host filesystem backend contract. Handles are opaque
 // tokens Open hands back and every later call passes in. Paths are
 // already absolute (the syscall layer resolves cwd first via Getwd).
+// Results carry an errno int, not an error — runtime/goos is imported
+// by runtime and syscall and must not pull in the errors package;
+// fs_racccoon.go (lib/go/racccoon.patch) maps these to syscall.Errno.
+// 0 = ok, 2 = ENOENT, 5 = EIO, 9 = EBADF, 17 = EEXIST, 38 = ENOSYS.
 type FSHook interface {
-	Open(path string, flags int, perm uint32) (h uintptr, isDir bool, size int64, err error)
-	Close(h uintptr) error
-	Pread(h uintptr, b []byte, off int64) (int, error)
-	Pwrite(h uintptr, b []byte, off int64) (int, error)
-	Fstat(h uintptr) (size int64, isDir bool, err error)
-	Dirents(h uintptr) (names []string, isDir []bool, err error)
-	Stat(path string) (size int64, isDir bool, err error)
-	Mkdir(path string, perm uint32) error
-	Remove(path string, dir bool) error
-	Rename(from, to string) error
-	Truncate(path string, size int64) error
-	Getwd() (string, error)
-	Chdir(path string) error
+	Open(path string, flags int, perm uint32) (h uintptr, isDir bool, size int64, errno int)
+	Close(h uintptr) int
+	Pread(h uintptr, b []byte, off int64) (n int, errno int)
+	Pwrite(h uintptr, b []byte, off int64) (n int, errno int)
+	Fstat(h uintptr) (size int64, isDir bool, errno int)
+	Dirents(h uintptr) (names []string, isDir []bool, errno int)
+	Stat(path string) (size int64, isDir bool, errno int)
+	Mkdir(path string, perm uint32) int
+	Remove(path string, dir bool) int
+	Rename(from, to string) int
+	Truncate(path string, size int64) int
+	Getwd() (string, int)
+	Chdir(path string) int
 }

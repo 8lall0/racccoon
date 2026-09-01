@@ -176,30 +176,34 @@ QEMU; `e2fsck -fn` clean afterward.
 
 ### Stage 3.5 — Go's own `os` package on fsd — **DONE**
 
-The standard library `os` now operates on racccoon's filesystem. The
-only racccoon-specific line in a program is a blank import:
-`import _ "racccoon.local/goport/racccoon"`.
+The standard library `os` operates on racccoon's filesystem, for
+**every** racccoon Go binary — no import needed. `os.Open`,
+`os.ReadFile`, `os.ReadDir`, `os.Create`, `os.Getwd`, `os.Args` etc.
+just work (including the Stage-4 toolchain binaries).
 
-- **`lib/go/racccoon.patch`** (4 files, ~255 lines, applied to the
-  tamago-go tree by `scripts/setup_tamago.sh`, carried in-repo like
-  `lib/tcc/racccoon.patch`): adds an optional `runtime/goos.FS`
-  `FSHook`. When set, `syscall`'s `Open`/`Read`/`Write`/`Seek`/`Stat`/
-  `Mkdir`/`Unlink`/`Rename`/`ReadDirent`/`Getwd`/`Chdir` route to it
-  instead of `fs_tamago.go`'s in-memory fs. `nil` FS = stock tamago, so
-  the patch is inert for non-racccoon builds. A new `fs_racccoon.go`
-  holds the `goosFile` `fileImpl` + synthesises fixed-size dirent
-  records for `os.ReadDir`.
-- **`go/racccoon/osbridge.go`** installs the fsd backend (`goos.FS =
-  fsdBackend{}`) in its `init`, mapping the hook onto the Stage-3
-  bridge; handles are a small path table (fsd has no server-side fds).
-  Error mapping is best-effort — a failed resolve → `ENOENT` (so
-  `os.IsNotExist` works), everything else → `EIO`.
+- **The fsd backend lives in `runtime/goos`** (`go/goos/racccoon_fs.go`,
+  the GOOSPKG overlay): the full FS_* protocol over `SYS_NS_RESOLVE` +
+  `SYS_IPC_CALL`, plus a fixed 64-slot handle table (no `sync` — the
+  package is imported by `runtime`; GOMAXPROCS=1 means nothing yields
+  mid-op). Its `init()` installs itself into `goos.FS`.
+- **`lib/go/racccoon.patch`** (5 files, applied to the tamago-go tree by
+  `scripts/setup_tamago.sh`, carried in-repo like `lib/tcc/racccoon.patch`):
+  an optional `runtime/goos.FS` `FSHook` (errno ints, not `error` — the
+  package can't pull in `errors`). When set, `syscall`'s
+  `Open`/`Read`/`Write`/`Seek`/`Stat`/`Mkdir`/`Unlink`/`Rename`/
+  `ReadDirent`/`Getwd`/`Chdir` route to it instead of `fs_tamago.go`'s
+  in-memory fs; a new `fs_racccoon.go` holds the `goosFile` `fileImpl`
+  + synthesises fixed-size dirent records for `os.ReadDir` and maps the
+  errno ints to `syscall.Errno` (`ENOENT` for a failed resolve so
+  `os.IsNotExist` works). `nil` FS = stock tamago — inert for
+  non-racccoon builds.
 - **`os.Args`** — `CPUInit` (asm) stashes the exec-ABI `a0`/`a1` (argc,
-  the NUL-separated argv blob); `go/goos`'s `init` parses them and,
-  via `//go:linkname`, replaces the runtime's hardcoded `{"tamago"}`
-  `argslice` before `os` init reads it. `os.Args[0]` is a synthetic
-  `"go"`, real args at `[1:]` (racccoon's c3 exec ABI carries no
-  argv[0]).
+  the NUL-separated argv blob); a tiny `os_tamago.go` `init()` refreshes
+  the runtime's hardcoded `{"tamago"}` `argslice` from `goos.Args`
+  before `os` init reads it. `os.Args[0]` is a synthetic `"go"`, real
+  args at `[1:]` (racccoon's c3 exec ABI carries no argv[0]).
+- **`go/racccoon`** is now a thin typed convenience layer over `os`
+  (kept for `go/cmd/gostage3`).
 
 `go/cmd/gostage35` + `gostage35test`: `os.ReadFile` / `os.Stat` /
 `os.Open`+`io.ReadAll` / `Seek`+`Read` / `ReadAt`, `os.IsNotExist`,
@@ -208,7 +212,7 @@ only racccoon-specific line in a program is a blank import:
 `os.RemoveAll`, `os.Getwd`, `os.Args`. 26/26 checks pass on racccoon in
 QEMU; `e2fsck -fn` clean.
 
-Not done: `os/exec` (Stage 4), `os.Getenv`→`/env` (small, on demand).
+Not done: `os/exec` (Stage 4.1), `os.Getenv`→`/env` (small, on demand).
 
 ### Stage 4 — run the Go toolchain on racccoon
 
@@ -216,13 +220,15 @@ The self-host milestone, mirroring §7's tcc arc — but the Go toolchain
 is ~10× tcc's size, so this is a multi-session effort with real
 unknowns. Staged:
 
-- **4.0 — exec headroom.** `go tool compile` cross-built for
-  `GOOS=tamago` is ~15–25 MiB (vs the current 4 MiB
-  `board::EXEC_MAX_IMAGE_SIZE`). Raise it to ~32 MiB on the JH7110
-  board (and its `EXEC_MAX_IMAGE_PAGES`, and the shell's exec buffer),
-  and speed up `exec()`'s fsd read loop (currently 1020 bytes/RTT — a
-  20 MiB binary is ~20k round trips). QEMU can carry it too now
-  (`HEAP_MAX_BYTES` 512 MiB, `__free_ram` 768 MiB).
+- **4.0 — exec headroom.** *Done for QEMU.* `board::EXEC_MAX_IMAGE_SIZE`
+  4 → **32 MiB** on QEMU (a stripped `GOOS=tamago cmd/compile` is
+  **23 MiB**, ET_EXEC, 3 PT_LOAD — the existing ELF loader takes it;
+  the staging arrays it sizes grow to ~96 KiB BSS). `gotest` still
+  passes. Still to do: speed up `exec()`'s fsd read loop (1124
+  bytes/IPC RTT → a 23 MiB binary is ~20k round trips, tens of seconds
+  on QEMU); the shell exec buffer is now eagerly `SYS_MAP`'d at 32 MiB
+  per exec (the rover keeps it O(n), but a right-sized map or a
+  bulk-read verb would help). The JH7110 board gets the same bump.
 - **4.1 — `os/exec`.** `syscall.forkExec` / `StartProcess` →
   `rfork(RFPROC)` + `SYS_EXEC` (Go can't `fork` safely — use the
   async-signal-safe child path). Needed for the `go` command's
