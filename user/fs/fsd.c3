@@ -73,7 +73,7 @@ import std::nolibc::mem;
 // --- diskd's own protocol (user/diskd.c3) — unrelated to FS_READ/WRITE
 // above, just the client side of it. Shared by every backend, via
 // fs_read_sector/fs_write_sector below. Deliberately >100, clear of both
-// the P9_* verb range (3..10) and the FS_* range (20..28): if a diskd
+// the P9_* verb range (3..10) and the FS_* range (20..30): if a diskd
 // reply ever lands in fsd's inbox unconsumed (a completion-IRQ delivery
 // race — see docs/devlog.md), fsd's main-loop recv picks it up as a
 // bogus request. With a colliding number (DISKD_READ was 10 == P9_REMOVE)
@@ -167,6 +167,8 @@ struct Fs_ops
 	FsVerbFn list;
 	FsVerbFn mkdir;
 	FsVerbFn rename;
+	FsVerbFn chmod;    // FS_CHMOD — ext2 only; FAT32/exFAT reply -1
+	FsVerbFn chown;    // FS_CHOWN — ext2 only; FAT32/exFAT reply -1
 }
 
 // Set by fs_mount() alongside fs_type; null until a backend mounts (the
@@ -190,6 +192,12 @@ fn int fat32_op_list(Fs_req* r)     { int c = -1; if (!fat32_list(r.name, &r.buf
 fn int fat32_op_mkdir(Fs_req* r)    { return fat32_mkdir(r.name); }
 fn int fat32_op_rename(Fs_req* r)   { return fat32_rename(r.name, r.name2); }
 
+// FAT32 and exFAT keep no i_mode / i_uid on disk — FS_CHMOD / FS_CHOWN
+// against a non-ext2 mount is a clean -1, not a crash (same "reject
+// cleanly" shape as the unmounted-second-instance path). r.len carries
+// the mode/uid arg (wire bytes 100..103), r.uid the requester.
+fn int fs_op_chattr_unsupported(Fs_req* r) { return -1; }
+
 // r.uid is the requester's uid for reads too now (fsd's dispatch sets
 // it); ext2_may_read denies a non-root user a file it has no read bit
 // for. Root (uid 0) and every FAT32/exFAT path are unaffected.
@@ -202,6 +210,11 @@ fn int ext2_op_remove(Fs_req* r)   { return r.recursive ? ext2_delete_recursive(
 fn int ext2_op_list(Fs_req* r)     { if (!ext2_may_read(r.name, r.uid)) return -1; int c = -1; if (!ext2_list(r.name, &r.buf[4], fs_list_max(), r.offset, &c)) c = -1; return c; }
 fn int ext2_op_mkdir(Fs_req* r)    { return ext2_mkdir(r.name, r.uid); }
 fn int ext2_op_rename(Fs_req* r)   { return ext2_rename(r.name, r.name2, r.uid); }
+// r.len is the mode (FS_CHMOD) or owner uid (FS_CHOWN) from wire bytes
+// 100..103; r.uid is the requester. Ownership policy lives in the ext2
+// functions (chmod: owner-or-root; chown: root-only).
+fn int ext2_op_chmod(Fs_req* r)    { return ext2_chmod(r.name, r.len, r.uid); }
+fn int ext2_op_chown(Fs_req* r)    { return ext2_chown(r.name, r.len, r.uid); }
 
 fn int exfat_op_read(Fs_req* r)     { return exfat_read(r.name, &r.buf[4], r.len); }
 fn int exfat_op_read_at(Fs_req* r)  { return exfat_read_at(r.name, &r.buf[4], r.len, r.offset); }
@@ -218,18 +231,21 @@ const Fs_ops FAT32_OPS = {
 	.write = &fat32_op_write, .write_at = &fat32_op_write_at,
 	.stat = &fat32_op_stat, .remove = &fat32_op_remove,
 	.list = &fat32_op_list, .mkdir = &fat32_op_mkdir, .rename = &fat32_op_rename,
+	.chmod = &fs_op_chattr_unsupported, .chown = &fs_op_chattr_unsupported,
 };
 const Fs_ops EXT2_OPS = {
 	.read = &ext2_op_read, .read_at = &ext2_op_read_at,
 	.write = &ext2_op_write, .write_at = &ext2_op_write_at,
 	.stat = &ext2_op_stat, .remove = &ext2_op_remove,
 	.list = &ext2_op_list, .mkdir = &ext2_op_mkdir, .rename = &ext2_op_rename,
+	.chmod = &ext2_op_chmod, .chown = &ext2_op_chown,
 };
 const Fs_ops EXFAT_OPS = {
 	.read = &exfat_op_read, .read_at = &exfat_op_read_at,
 	.write = &exfat_op_write, .write_at = &exfat_op_write_at,
 	.stat = &exfat_op_stat, .remove = &exfat_op_remove,
 	.list = &exfat_op_list, .mkdir = &exfat_op_mkdir, .rename = &exfat_op_rename,
+	.chmod = &fs_op_chattr_unsupported, .chown = &fs_op_chattr_unsupported,
 };
 
 // Real 9P (read-only), against ext2 only — see docs/devlog.md. No new
@@ -1065,7 +1081,7 @@ fn void main(String[] args)
 			continue;
 		}
 
-		if (verb != FS_READ && verb != FS_READ_AT && verb != FS_WRITE && verb != FS_WRITE_AT && verb != FS_STAT && verb != FS_DELETE && verb != FS_LIST && verb != FS_MKDIR && verb != FS_RENAME) continue;
+		if (verb != FS_READ && verb != FS_READ_AT && verb != FS_WRITE && verb != FS_WRITE_AT && verb != FS_STAT && verb != FS_DELETE && verb != FS_LIST && verb != FS_MKDIR && verb != FS_RENAME && verb != FS_CHMOD && verb != FS_CHOWN) continue;
 
 		int* result_len_field = (int*)&buf;
 
@@ -1260,6 +1276,31 @@ fn void main(String[] args)
 				{
 					r.uid = fsd_requester_uid(from);
 					result = fs_ops.rename(&r);
+				}
+			}
+			case FS_CHMOD:
+			{
+				// Wire byte 100..103 = the new mode (FS_CHMOD) — reuse
+				// r.len, the field already parsed from those bytes. Same
+				// protected-name + fs_write_disabled gates as the write
+				// verbs (chmod is a metadata write to disk); the ext2
+				// backend enforces owner-or-root.
+				r.len = (uint)req_len;
+				if (!fs_write_disabled && !fs_is_protected_name(&filename))
+				{
+					r.uid = fsd_requester_uid(from);
+					result = fs_ops.chmod(&r);
+				}
+			}
+			case FS_CHOWN:
+			{
+				// Wire byte 100..103 = the new owner uid. Same gates;
+				// the ext2 backend enforces root-only.
+				r.len = (uint)req_len;
+				if (!fs_write_disabled && !fs_is_protected_name(&filename))
+				{
+					r.uid = fsd_requester_uid(from);
+					result = fs_ops.chown(&r);
 				}
 			}
 		}

@@ -1920,6 +1920,69 @@ fn bool ext2_stat(char* name, uint* out_size, int* out_type)
 	return true;
 }
 
+// i_mode's format nibble (S_IFREG / S_IFDIR / …) — the bits ext2_chmod
+// must preserve while it replaces the permission + setuid/setgid/sticky
+// bits underneath.
+const uint EXT2_S_IFMT = 0xF000;
+
+// Entry point dispatched from fsd.c3 for FS_CHMOD — replace `name`'s
+// permission bits (i_mode's low 12) with `mode`'s, keeping the format
+// nibble. Gate: root, or the file's own owner (POSIX — a non-owner may
+// not chmod). Works on directories too. FAT32/exFAT have no i_mode on
+// disk, so this is ext2-only (their fsd adapters reply -1). Same
+// resolve/find shape as ext2_stat; fsd's dispatch has already applied
+// the protected-name and fs_write_disabled gates, and the
+// fs_is_protected_entry() call here is the same string-independent
+// backstop ext2_write uses. See docs/roadmap.md §2.
+fn int ext2_chmod(char* name, uint mode, uint requester_uid)
+{
+	ext2_cache_valid = false; // see ext2_cache_path's own comment
+	uint dir_inode;
+	if (!ext2_resolve_dir(name, &dir_inode)) return -1;
+	char* leaf = ext2_leaf_name(name);
+	if (leaf[0] == 0) return -1; // "" / trailing slash — no entry of its own
+
+	uint inode_num; uint es; uint eo; uint fmode;
+	if (!ext2_find_in_dir(dir_inode, leaf, &inode_num, &es, &eo, &fmode)) return -1;
+	if (fs_is_protected_entry(es, eo)) return -1;
+
+	Ext2_inode_info inode;
+	if (!ext2_read_inode(inode_num, &inode)) return -1;
+
+	if (requester_uid != 0 && requester_uid != inode.uid) return -1;
+
+	inode.mode = (inode.mode & EXT2_S_IFMT) | (mode & 0x0FFF);
+	if (!ext2_write_inode(inode_num, &inode)) return -1;
+	return 0;
+}
+
+// Entry point dispatched from fsd.c3 for FS_CHOWN — set `name`'s owner
+// uid to `uid`. Gate: root only (POSIX — you cannot give a file away,
+// and racccoon's uid model is one-way-drop so a non-root caller can
+// never restore an ownership it hands out). ext2-only, same as
+// ext2_chmod. See docs/roadmap.md §2.
+fn int ext2_chown(char* name, uint uid, uint requester_uid)
+{
+	ext2_cache_valid = false; // see ext2_cache_path's own comment
+	if (requester_uid != 0) return -1;
+
+	uint dir_inode;
+	if (!ext2_resolve_dir(name, &dir_inode)) return -1;
+	char* leaf = ext2_leaf_name(name);
+	if (leaf[0] == 0) return -1;
+
+	uint inode_num; uint es; uint eo; uint fmode;
+	if (!ext2_find_in_dir(dir_inode, leaf, &inode_num, &es, &eo, &fmode)) return -1;
+	if (fs_is_protected_entry(es, eo)) return -1;
+
+	Ext2_inode_info inode;
+	if (!ext2_read_inode(inode_num, &inode)) return -1;
+
+	inode.uid = uid;
+	if (!ext2_write_inode(inode_num, &inode)) return -1;
+	return 0;
+}
+
 // Checks whether a directory's own data blocks contain any real entry
 // besides "." and ".." (every subdirectory's own two self/parent
 // entries — ext2 names aren't space-padded like FAT32's, so these are

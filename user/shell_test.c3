@@ -1762,6 +1762,77 @@ fn void main() {
                     print("fspermtest: FAILED\n");
                 }
             }
+        } else if (strcmp(cmd, "chmodtest") == 0) {
+            // FS_CHMOD / FS_CHOWN against the ext2 root (user/fs/ext2.c3
+            // ext2_chmod/ext2_chown, docs/roadmap.md §2). Root creates a
+            // file, hands it to uid 42 with chown, then tightens it with
+            // chmod; a uid-42 child proves owner-chmod works and that a
+            // non-root chown is refused; a uid-43 child proves the
+            // permission bits chmod wrote to disk are actually honored
+            // by ext2_write_allowed (denied at 0600, allowed once root
+            // opens it to 0666). Bare root paths, same reasoning as
+            // fspermtest — "" always resolves to ext2.
+            fs_write("cht.txt", "root", 4);
+            int cm_own = fs_chown("cht.txt", 42);      // root: give it to 42
+            int cm_mod = fs_chmod("cht.txt", 0o600);   // root: owner-only rw
+
+            bool child42_ok = false;
+            uint cm_g1 = 0;
+            int cm_c1 = rfork(RFPROC, &cm_g1);
+            if (cm_c1 == 0) {
+                setuid(42);
+                int w = fs_write("cht.txt", "mine!", 5);          // owns it, S_IWUSR -> ok
+                int md = fs_chmod("cht.txt", 0o644);              // owner may chmod -> ok
+                int ow = fs_chown("cht.txt", 99);                // non-root chown -> denied
+                print("chmodtest: owner write "); print(w >= 0 ? "ok\n" : "FAILED\n");
+                print("chmodtest: owner chmod "); print(md == 0 ? "ok\n" : "FAILED\n");
+                print("chmodtest: non-root chown "); print(ow < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
+                exit();
+            } else if (cm_c1 > 0) {
+                join(cm_c1, cm_g1);
+                child42_ok = true;
+            }
+
+            fs_chmod("cht.txt", 0o600); // root: back to owner-only
+
+            bool child43_denied = false;
+            uint cm_g2 = 0;
+            int cm_c2 = rfork(RFPROC, &cm_g2);
+            if (cm_c2 == 0) {
+                setuid(43);
+                int w = fs_write("cht.txt", "hax", 3);            // not owner, no other-write -> denied
+                int md = fs_chmod("cht.txt", 0o777);             // not owner -> denied
+                print("chmodtest: other write at 0600 "); print(w < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
+                print("chmodtest: non-owner chmod "); print(md < 0 ? "correctly denied\n" : "WRONGLY succeeded\n");
+                exit();
+            } else if (cm_c2 > 0) {
+                join(cm_c2, cm_g2);
+                child43_denied = true;
+            }
+
+            int cm_open = fs_chmod("cht.txt", 0o666); // root: allow other-write
+
+            bool child43_allowed = false;
+            uint cm_g3 = 0;
+            int cm_c3 = rfork(RFPROC, &cm_g3);
+            if (cm_c3 == 0) {
+                setuid(43);
+                int w = fs_write("cht.txt", "otherok", 7);        // other-write bit now set -> ok
+                print("chmodtest: other write at 0666 "); print(w >= 0 ? "ok\n" : "FAILED\n");
+                exit();
+            } else if (cm_c3 > 0) {
+                join(cm_c3, cm_g3);
+                child43_allowed = true;
+            }
+
+            int cm_del = fs_delete("cht.txt"); // root cleanup
+
+            if (cm_own == 0 && cm_mod == 0 && cm_open == 0 && cm_del >= 0
+                && child42_ok && child43_denied && child43_allowed) {
+                print("chmodtest: ok\n");
+            } else {
+                print("chmodtest: FAILED\n");
+            }
         } else if (strcmp(cmd, "bigreadtest") == 0) {
             // Exercises ext2's double-indirect block support
             // (user/fs/ext2.c3's ext2_resolve_block/ext2_resolve_leaf):

@@ -4,6 +4,61 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-01 — `chmod` / `chown` (roadmap §2 closeout)
+
+Closes the last non-"much later" item of the Plan 9 user model: files
+had ownership + mode bits on disk (ext2 `i_uid` / `i_mode`) and `fsd`
+enforced them on every write/read, but nothing could *change* them.
+
+- **`FS_CHMOD` (29) / `FS_CHOWN` (30)** — two new path-based verbs, wire
+  shape identical to `FS_MKDIR` plus a `uint` arg at bytes 100..103 (the
+  new mode, or the new owner uid). They go through the same `Fs_ops`
+  function-pointer table as the other nine FS_* verbs — one adapter per
+  backend, no `fs_type` `if` triple. `fsd`'s dispatch applies the same
+  protected-name + `fs_write_disabled` gates the write verbs use.
+- **ext2 backend** (`user/fs/ext2.c3`):
+  - `ext2_chmod(name, mode, requester_uid)` — `inode.mode =
+    (inode.mode & 0xF000) | (mode & 0x0FFF)`: replaces the permission /
+    setuid / setgid / sticky bits, keeps the format nibble. Gate:
+    **owner-or-root** (POSIX — a non-owner may not chmod). Works on
+    directories too.
+  - `ext2_chown(name, uid, requester_uid)` — sets `inode.uid`. Gate:
+    **root only** (POSIX — you can't give a file away; and racccoon's
+    uid model is one-way-drop, so a non-root caller could never undo
+    it). `ext2_write_inode` already persisted both fields, so this is
+    just a guarded read-modify-write + cache invalidation.
+  - `fs_is_protected_entry()` backstop on both, same as `ext2_write` —
+    `fip.bin` can't be chmod/chown'd.
+- **FAT32 / exFAT** — no `i_mode`/`i_uid` on disk, so both verbs reply
+  -1 via one shared `fs_op_chattr_unsupported` adapter (clean refusal,
+  not a crash — same shape as the unmounted-second-instance path).
+- **Wrappers + front-ends** — `fs_chmod` / `fs_chown` in `user.c3` (one
+  `fs_chattr` helper drives both); `/bin/chmod <octal-mode> <path>`
+  (octal only, like real chmod's numeric form) and `/bin/chown
+  <uid|name> <path>` (decimal uid or a `/adm/users` name via
+  `user_uid_by_name`). Wired into `build_user.sh`, `build.sh`'s four
+  image-seed loops, and `populate_duo_bin.sh`.
+- **`chmodtest`** (`shell_test.c3`) — root creates a file, `chown`s it
+  to uid 42, `chmod 0600`; a uid-42 child confirms owner-write + owner-
+  chmod work and that its `chown` is refused; a uid-43 child confirms
+  the bits chmod wrote to disk are honoured by `ext2_write_allowed`
+  (write denied at 0600, allowed after root opens it to 0666) and that
+  a non-owner chmod is refused.
+
+**Verified, QEMU ext2** (`launch64_ext2.sh` equivalent): `chmodtest` ok
+(idempotent across repeated runs), `fspermtest` / `fsneg` / `p9fstest` /
+`p9fswritetest` / `cycletest` / `stage6test` / `dirpacktest` all still
+ok, `e2fsck -fn` clean. FAT32: `chmod` on a bare path correctly fails
+("ext2 only"). Duo test-shell kernel (`DUO_TEST_SHELL=1 build_duo.sh`)
+builds clean; **real-hardware run still pending** (needs a reflash +
+`populate_duo_bin.sh` re-seed for `/bin/chmod` + `/bin/chown`).
+
+Roadmap §2 is now down to the "much later" items only (boot `login`
+already done in §2.5, plus `$user` in `/env` and a password/`auth`
+server).
+
+---
+
 ## 2026-08-31 — Duo hardware verification of the ~17-commit arc
 
 Reflashed the CV1800B with the test shell (`DUO_TEST_SHELL=1

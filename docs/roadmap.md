@@ -126,8 +126,16 @@ More than you'd expect:
    bypasses. `65534:none` is in `/adm/users`; a `newns`/`sandbox`
    helper that does `su none` + a namespace trim (generalising
    `sandboxtest`) is still to do.
-4. **Still to do:** `chmod`/`chown` verbs (ext2 only) + `/bin`
-   front-ends; a boot-time `login`; `$user` in `/env`; a password
+4. **`chmod`/`chown`. DONE** — `FS_CHMOD` (29) / `FS_CHOWN` (30) verbs
+   through the `Fs_ops` table; `ext2_chmod` (owner-or-root, keeps
+   i_mode's format nibble) / `ext2_chown` (root-only — POSIX, and the
+   uid model only drops); FAT32/exFAT reply -1. `fs_chmod`/`fs_chown`
+   wrappers + `/bin/chmod` (octal) / `/bin/chown` (uid or `/adm/users`
+   name). `chmodtest` — owner-chmod, non-root-chown-denied,
+   non-owner-chmod-denied, and the bits chmod writes are honoured by
+   `ext2_write_allowed` (0600 denies other, 0666 allows). QEMU
+   ext2-verified, `e2fsck` clean.
+5. **Still to do:** a boot-time `login`; `$user` in `/env`; a password
    check + `auth` server (much later).
 
 ### The Plan 9 stance to keep in mind

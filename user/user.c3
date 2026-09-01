@@ -1275,6 +1275,14 @@ const uint FS_WRITE_AT = 27;
 // -1 (nothing resolves there), byte 4..7 = uint size (0 for a
 // directory), byte 8 = type (0 = file, 1 = directory).
 const uint FS_STAT = 28;
+// FS_CHMOD / FS_CHOWN: byte 0..99 = path, byte 100..103 = uint arg (the
+// new mode's low 12 bits for FS_CHMOD, the new owner uid for FS_CHOWN).
+// Reply: byte 0..3 = 0 or -1, same as FS_MKDIR/FS_DELETE. ext2 only —
+// FAT32/exFAT have no i_mode/i_uid on disk and reply -1. FS_CHMOD is
+// owner-or-root; FS_CHOWN is root-only (POSIX semantics — you cannot
+// give your file away). See docs/roadmap.md §2.
+const uint FS_CHMOD = 29;
+const uint FS_CHOWN = 30;
 // Sentinel offset for FS_WRITE_AT meaning "append at the file's current
 // end" — fsd resolves it per-backend before dispatching.
 const uint FS_OFFSET_APPEND = 0xFFFFFFFF;
@@ -1596,6 +1604,43 @@ fn int fs_mkdir(char* dirname) @export("fs_mkdir") {
 
     int* result_field = (int*)&req;
     return *result_field;
+}
+
+// FS_CHMOD / FS_CHOWN share one wire shape (path at 0..99, one uint arg
+// at 100..103) and one reply shape (0/-1 at 0..3), so one helper drives
+// both. ext2-only on the fsd side; a FAT32/exFAT mount replies -1. See
+// FS_CHMOD's own wire-format comment and docs/roadmap.md §2.
+fn int fs_chattr(char* path, uint verb, uint arg) {
+    char[100] _ap @noinit; fs_abspath(path, &_ap[0]); path = &_ap[0]; // cwd-relative -> absolute
+    uint prefix_len = 0;
+    int fsd_pid = ns_resolve(path, &prefix_len);
+    if (fsd_pid < 0) return -1;
+    char* stripped = &path[prefix_len];
+
+    char[FS_MSG_MAX] req @noinit;
+    int i = 0;
+    while (stripped[i] != 0 && i < 99) {
+        req[i] = stripped[i];
+        i++;
+    }
+    req[i] = 0;
+    uint* arg_field = (uint*)&req[100];
+    *arg_field = arg;
+
+    uint reply_verb = 0;
+    int from = p9_call(fsd_pid, verb, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
+    if (from <= 0 || reply_verb != verb) return -1;
+
+    int* result_field = (int*)&req;
+    return *result_field;
+}
+
+fn int fs_chmod(char* path, uint mode) @export("fs_chmod") {
+    return fs_chattr(path, FS_CHMOD, mode);
+}
+
+fn int fs_chown(char* path, uint uid) @export("fs_chown") {
+    return fs_chattr(path, FS_CHOWN, uid);
 }
 
 // Renames/moves old_path to new_path — see FS_RENAME's own wire-format
