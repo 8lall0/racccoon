@@ -4,6 +4,53 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-01 — Go Stage 4.4 spike: `cmd/go` runs, needs a GOROOT
+
+Scoping spike, no commit (like the 4.2 spike). `scripts/build_go.sh
+cmd/go` cross-builds the `go` command for tamago/riscv64 — **13.7 MiB**,
+`e_type` 2, text span 0xd4b008, comfortably inside the 32 MiB QEMU
+`EXEC_MAX_IMAGE_SIZE`. Seeded as `/bin/go-go` on a throwaway ext2 image
+and run on racccoon in QEMU:
+
+```
+root / # /bin/go-go version
+can't start telemetry child process: exec: "tamago": executable file not found in $PATH
+go: cannot find GOROOT directory: /tmp/.../scratchpad/tamago-go
+root / # echo V=$status
+V=2
+```
+
+The binary **loads and runs** — `os.Args`, flag parsing, error paths all
+work; it gets far enough to look for its GOROOT and print a real
+diagnostic. Two concrete blockers, both predicted:
+
+1. **GOROOT resolution.** `runtime.defaultGOROOT` is baked at
+   toolchain-build time to the host scratchpad path, which doesn't
+   exist on racccoon. `go` needs `$GOROOT` pointed at an on-device tree
+   holding `pkg/tool/tamago_riscv64/{compile,link,asm}`, `VERSION`, and
+   `src/` (the stdlib source — `go build` reads it to compile the
+   import closure). Options: (a) `GOROOT` env var routed through
+   `envd`/`/env` — cheapest if `os.Getenv` already resolves there;
+   (b) a `go env -w` config file; (c) re-bake `defaultGOROOT` in the
+   patch. (a) or (c) preferred.
+2. **Telemetry child spawn.** `go` tries to `os/exec` a `tamago`
+   helper for telemetry upload; our `Spawn` correctly returns
+   not-found and `go` continues (non-fatal) — but it's noise. Set
+   `GOTELEMETRY=off` / disable the telemetry package in the patch.
+
+Not yet measured: the `$GOROOT/src` seeding cost (~60 MB of stdlib
+source = thousands of small fsd writes, likely minutes on the emulated
+disk), the build-cache `flock` (fsd has no locking — probably needs a
+no-op shim), and module-mode pinning (`GO111MODULE`, `GOPROXY=off`,
+`GOFLAGS=-mod=mod`).
+
+**Bottom line:** Stage 4.4 is mechanically reachable — the `go` binary
+itself is fine. What's left is environment plumbing + a bulk GOROOT
+seed, not a runtime port. The self-hosting *compiler* already works
+(4.3); 4.4 is the ergonomic `go build` wrapper on top.
+
+---
+
 ## 2026-09-01 — Go Stage 4.1: os/exec
 
 `os/exec` works on racccoon (first cut). `go/cmd/gostage41` +

@@ -319,6 +319,27 @@ unknowns. Staged:
   hand. The largest remaining piece; wants the JH7110's 2 GiB,
   `GOMAXPROCS=1`.
 
+  **Spike (2026-09-01, no commit):** `build_go.sh cmd/go` →
+  13.7 MiB tamago/riscv64 ELF, fits the 32 MiB cap. Loads and runs on
+  racccoon; `os.Args` + flag parsing work; reaches GOROOT lookup and
+  prints a real diagnostic. Two blockers, both predicted:
+  1. `runtime.defaultGOROOT` is baked to the host toolchain path.
+     Need `$GOROOT` → an on-device tree with
+     `pkg/tool/tamago_riscv64/{compile,link,asm}`, `VERSION`, `src/`.
+     Fix via `GOROOT` env through `envd` **or** re-baking
+     `defaultGOROOT` in `lib/go/racccoon.patch`.
+  2. `go` `os/exec`s a `tamago` telemetry helper — `Spawn` returns
+     not-found, `go` continues (non-fatal). Disable with
+     `GOTELEMETRY=off` / patch out the telemetry package.
+
+  Unmeasured: `$GOROOT/src` seed (~60 MB stdlib source, thousands of
+  fsd writes — minutes on emulated disk), build-cache `flock` (fsd has
+  none — likely a no-op shim), module pinning (`GO111MODULE`,
+  `GOPROXY=off`, `GOFLAGS=-mod=mod`). It's env plumbing + a bulk seed,
+  not a runtime port — the self-hosting compiler already works (4.3).
+  A first target smaller than full `go build`: `go env` / `go version`
+  green (only needs blockers 1+2, no stdlib tree).
+
 Likely wants the `GOOS=racccoon` rename around 4.3–4.4 (own identity,
 room for `os`/`syscall` to diverge further) — apply tamago's patchset
 to a Go tree, `sed` `tamago`→`racccoon` across the GOOS plumbing (~15
