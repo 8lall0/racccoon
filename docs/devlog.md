@@ -41,10 +41,28 @@ idle-hook loop wants exactly a `SYS_YIELD`, and there are no threads.
 
 Stage 0 this branch: `docs/go-port-plan.md` (staged plan, Stage 1 boot →
 Stage 3 fsd I/O → Stage 4 toolchain self-host on racccoon → Stage 5
-net). Toolchain build + provider module + kernel cap bump come next,
-pending review of the plan. No kernel changes yet; QEMU + Duo builds
-untouched. This is a JH7110 goal — the Duo can host at most a Stage-1
+net). This is a JH7110 goal — the Duo can host at most a Stage-1
 hello-world (GC + compiler need the gigabytes).
+
+**Stage 1, part 1 — exec size caps are now board-specific.** A
+`GOOS=tamago` static riscv64 binary is 1.6 MiB (1.0 MiB stripped), over
+the old flat 1 MiB `EXEC_MAX_IMAGE_SIZE`. Now
+`board::EXEC_MAX_IMAGE_SIZE`: 4 MiB on QEMU/JH7110, unchanged 1 MiB on
+the Duo (64 MiB board, no Go). New `SYS_EXEC_MAX` (51) returns it so the
+shell sizes its own `exec()` receive buffer per-board (`exec_max()` /
+`exec_buf_max()`) instead of the hardcoded `RUN_EXEC_BUF_MAX` — that
+buffer is SYS_MAP'd transiently in the rfork'd child that's about to
+exec(), so the bigger size costs nothing at rest. `src/entry.c3`'s
+`EXEC_MAX_IMAGE_SIZE` and the staging arrays it sizes now come from the
+board. QEMU + Duo build clean; regressions green on both the single-ext2
+and dual images (runtest / elftest / elftest2 / tcctest / wasmtest /
+mounttest / dirpacktest / chmodtest / killtest).
+
+Also confirmed for later stages: userspace `rdtime` already works
+(`user.c3`'s `rdtime()` does `csrr t0, time`) so `goos.Nanotime` needs
+no new syscall; and racccoon *has* thread primitives (`rfork(RFMEM)` +
+`SYS_FUTEX_WAIT`/`_WAKE` keyed on `(addr, page_table)`) — the plan's
+"single-threaded" is a Stage-1 simplification, not a hard limit.
 
 ---
 

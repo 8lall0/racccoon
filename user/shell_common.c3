@@ -1,20 +1,26 @@
 module user;
 
 // exec()'s own receive buffer — caller-owned per exec()'s header comment
-// (user.c3). Sized to src/entry.c3's EXEC_MAX_IMAGE_SIZE (the kernel cap
-// this must be at least as large as), which is now 1 MiB for the C
-// toolchain track (a native TinyCC is ~640 KiB). That's too big to carry
-// as a static array in every shell (.bss is materialised into the flat
-// binary, which is then embedded in the kernel), so it's SYS_MAP'd on
-// first use instead — only a process that actually exec()s a child pays
-// for it, and only then. exec_buf() is always called from the rfork'd
-// child, just before it exec()s, so the mapping lives for microseconds.
-const int RUN_EXEC_BUF_MAX = 1048576;
+// (user.c3). Sized to the board's EXEC_MAX_IMAGE_SIZE via SYS_EXEC_MAX
+// (exec_max(), user.c3) — 1 MiB on the Duo, 4 MiB on QEMU/JH7110 for the
+// Go port (docs/go-port-plan.md) — rather than a hardcoded constant that
+// would be wrong on some board. Too big to carry as a static array in
+// every shell (.bss is materialised into the flat binary, which is then
+// embedded in the kernel), so it's SYS_MAP'd on first use — only a
+// process that actually exec()s a child pays for it, and only then.
+// exec_buf() is always called from the rfork'd child, just before it
+// exec()s, so the mapping lives for microseconds.
+uint run_exec_buf_max = 0;
 char* run_exec_buf_ptr = null;
+
+fn uint exec_buf_max() {
+    if (run_exec_buf_max == 0) run_exec_buf_max = exec_max();
+    return run_exec_buf_max;
+}
 
 fn char* exec_buf() {
     if (run_exec_buf_ptr == null) {
-        run_exec_buf_ptr = (char*)map_pages(RUN_EXEC_BUF_MAX);
+        run_exec_buf_ptr = (char*)map_pages(exec_buf_max());
     }
     return run_exec_buf_ptr; // null on map failure -> exec() returns -1 -> "command not found"
 }
@@ -398,7 +404,7 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
             if (mountusb_child < 0) {
                 print("mountusb: rfork failed (no free process slot)\n");
             } else if (mountusb_child == 0) {
-                exec_path("fsd", exec_buf(), RUN_EXEC_BUF_MAX, 0, &mountusb_fsd_argv[0], 1);
+                exec_path("fsd", exec_buf(), exec_buf_max(), 0, &mountusb_fsd_argv[0], 1);
                 print("mountusb: failed to exec fsd\n");
                 exit();
             } else if (ns_mount_wait("/mnt/usb/", "usbfs", (ulong)MOUNTUSB_WAIT_ATTEMPTS) < 0) {
@@ -553,7 +559,7 @@ fn int shell_spawn(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out)
                 return -1;
             }
             if (sh_r == 0) {
-                exec(exec_target, exec_buf(), RUN_EXEC_BUF_MAX, 0, cmd_argv, cmd_argc);
+                exec(exec_target, exec_buf(), exec_buf_max(), 0, cmd_argv, cmd_argc);
                 print(cmd);
                 print(": command not found\n");
                 exitcode(127);

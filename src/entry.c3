@@ -99,6 +99,7 @@ const SYS_MAP           = 47; // map a0 bytes (rounded up to pages) of fresh zer
 const SYS_STDIN_ISATTY  = 48; // 1 if the caller's stdin is the console, 0 if a pipe — a poor-man's isatty(0) for the stdin-reading filters (/bin/head, /bin/cat)
 const SYS_TIMEBASE      = 49; // board::TIMEBASE_HZ — the `time` CSR's tick rate, so userspace can turn an rdtime() delta into wall-clock seconds (QEMU 10MHz vs Duo 25MHz)
 const SYS_GETPID        = 50; // the caller's own pid — a c3 program gets its children's pids from rfork() but never its own; the C libc's getpid() needs it (temp-file names, etc.)
+const SYS_EXEC_MAX      = 51; // board::EXEC_MAX_IMAGE_SIZE — the shell reads this to size its own exec() receive buffer per-board instead of hardcoding a constant
 
 // Per-process SYS_MAP ceiling: the bump pointer can't grow more than this
 // past USER_BASE. 16 MiB is generous for a wasm linear memory and keeps
@@ -110,14 +111,16 @@ const uptr HEAP_MAX_BYTES = 16 * 1024 * 1024;
 // dropped — keeps late server init chatter off the prompt.
 bool g_boot_quiet = false;
 
-// Cap on the image SYS_EXEC will install. racccoon's own binaries
-// (build/user/*.bin) run 70-105KB, but the C toolchain track (roadmap
-// §7 — a native TinyCC) produces ~450KB images, so this is 1 MiB. The
+// Cap on the image SYS_EXEC will install — board-specific
+// (board::EXEC_MAX_IMAGE_SIZE). racccoon's own binaries (build/user/*.bin)
+// run 70-105KB and a native TinyCC (roadmap §7) is ~640KB, so the Duo
+// keeps this at 1 MiB; QEMU/JH7110 raise it to 4 MiB for the Go port
+// (a GOOS=tamago static binary is 1-4 MiB — docs/go-port-plan.md). The
 // staging arrays it sizes (g_exec_staged / g_exec_seg_perm, below) are
 // file-scope, not on the kernel stack — see their comment. user/user.c3's
-// exec() wrapper and lib/racccoon-libc's execve() both enforce the same
-// bound on their own read-into-buffer loop before reaching this syscall.
-const EXEC_MAX_IMAGE_SIZE  = 1048576;
+// exec() wrapper and lib/racccoon-libc's execve() take their bound from
+// the caller-provided buffer size; the shell's is SYS_EXEC_MAX-driven.
+const EXEC_MAX_IMAGE_SIZE  = board::EXEC_MAX_IMAGE_SIZE;
 const EXEC_MAX_IMAGE_PAGES = EXEC_MAX_IMAGE_SIZE / PAGE_SIZE;
 
 // argv blob cap (user/user.c3's exec() / the libc execve(), NUL-separated
@@ -2734,6 +2737,13 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// learns its children's pids from rfork() but has no way
 			// to ask for its own — the C libc's getpid() needs it.
 			f.a0 = (ulong)(uint)current_proc.pid;
+		case SYS_EXEC_MAX:
+			// board::EXEC_MAX_IMAGE_SIZE — the largest image SYS_EXEC
+			// will install on this board. The shell reads this to size
+			// its own exec() receive buffer (1 MiB on the Duo, 4 MiB on
+			// QEMU/JH7110 for the Go port) rather than baking in a
+			// constant that would be wrong somewhere. Always succeeds.
+			f.a0 = (ulong)EXEC_MAX_IMAGE_SIZE;
 		case SYS_CHDIR:
 			// a0 = the new cwd, already made absolute + normalised by
 			// the caller (user.c3's cd path logic). The kernel just

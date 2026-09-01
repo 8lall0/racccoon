@@ -61,6 +61,8 @@ const int SYS_NS_BIND       = 46; // Plan 9 `bind` — see src/entry.c3's case
 const int SYS_MAP           = 47; // map fresh zero-filled RW pages, returns base vaddr or -1 — see src/entry.c3's case
 const int SYS_STDIN_ISATTY  = 48; // 1 = console, 0 = pipe — see src/entry.c3's case
 const int SYS_TIMEBASE      = 49; // the `time` CSR tick rate (Hz) — see src/entry.c3's case
+const int SYS_GETPID        = 50; // the caller's own pid — see src/entry.c3's case
+const int SYS_EXEC_MAX      = 51; // board::EXEC_MAX_IMAGE_SIZE — the largest image SYS_EXEC will install (varies by board: 1 MiB Duo, 4 MiB QEMU/JH7110) — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -1126,6 +1128,14 @@ fn ulong rdtime() @export("rdtime") {
 // seconds from now, on any board.
 fn ulong timebase_hz() @export("timebase_hz") {
     return (ulong)syscall(SYS_TIMEBASE, 0, 0, 0);
+}
+
+// The largest image SYS_EXEC will install on this board
+// (board::EXEC_MAX_IMAGE_SIZE — 1 MiB on the Duo, 4 MiB on QEMU/JH7110).
+// A caller sizing its own exec() receive buffer (the shell) reads this
+// instead of hardcoding a constant that would be wrong on some board.
+fn uint exec_max() @export("exec_max") {
+    return (uint)syscall(SYS_EXEC_MAX, 0, 0, 0);
 }
 
 fn void putchar(char ch) @export("putchar") {

@@ -106,6 +106,13 @@ const bool INTERRUPT_DRIVEN_SD = true;
 // interrupts/arm_timer).
 const ulong TIMEBASE_HZ = 25000000;
 
+// Largest image SYS_EXEC will install (src/entry.c3's EXEC_MAX_IMAGE_SIZE
+// and the staging arrays it sizes). 1 MiB on the Duo — racccoon's own
+// binaries are 70-105 KiB and a native TinyCC (roadmap §7) is ~640 KiB,
+// so 1 MiB covers everything this 64 MiB board runs. QEMU/JH7110 raise
+// it to 4 MiB for the Go port (boards/qemu/board.c3).
+const EXEC_MAX_IMAGE_SIZE = 1048576;
+
 // One-time SD pad/power/clock bring-up (see user/sdd.c3's sdd_init) needs
 // three more, separate MMIO pages besides SD_MMIO_BASE itself — none of
 // them adjacent to it or to each other, so all three (plus SD_MMIO_BASE)

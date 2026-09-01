@@ -182,6 +182,13 @@ const uint IRQ_ETH       = 0;
 // used for kernel-side.
 const ulong TIMEBASE_HZ = 10000000;
 
+// Largest image SYS_EXEC will install (src/entry.c3's EXEC_MAX_IMAGE_SIZE
+// and the staging arrays it sizes). 4 MiB on QEMU — RAM is plentiful and
+// this unblocks the Go port (a GOOS=tamago static binary is 1-4 MiB —
+// docs/go-port-plan.md); the C toolchain (~640 KiB TinyCC) fits either
+// way. The Duo keeps 1 MiB (boards/duo/board.c3) — 64 MiB, no Go.
+const EXEC_MAX_IMAGE_SIZE = 4194304;
+
 fn void plic_init()
 {
 	// Priority must be > 0 for the PLIC to ever forward the interrupt at

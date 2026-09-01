@@ -1199,7 +1199,7 @@ fn void main() {
                 char[16] run_sync_buf @noinit;
                 int run_parent = ipc_recv(&run_sync_buf, 16);
                 ipc_send(run_parent, 0, "ack", 4);
-                exec("bin/echod", exec_buf(), RUN_EXEC_BUF_MAX, run_parent, null, 0);
+                exec("bin/echod", exec_buf(), exec_buf_max(), run_parent, null, 0);
                 // exec() only ever returns on failure — success means
                 // this process is now running echod's own code, not
                 // this line, and exec() already sent "ready" itself
@@ -1252,7 +1252,7 @@ fn void main() {
                 char[16] rt2_sync_buf @noinit;
                 int rt2_parent = ipc_recv(&rt2_sync_buf, 16);
                 ipc_send(rt2_parent, 0, "ack", 4);
-                exec("/mnt/fs2/bin/echod", exec_buf(), RUN_EXEC_BUF_MAX, rt2_parent, null, 0);
+                exec("/mnt/fs2/bin/echod", exec_buf(), exec_buf_max(), rt2_parent, null, 0);
                 ipc_send(rt2_parent, 0, "failed", 7);
                 exit();
             } else {
@@ -1297,7 +1297,7 @@ fn void main() {
                 char[16] el_sync_buf @noinit;
                 int el_parent = ipc_recv(&el_sync_buf, 16);
                 ipc_send(el_parent, 0, "ack", 4);
-                exec("bin/echod.elf", exec_buf(), RUN_EXEC_BUF_MAX, el_parent, null, 0);
+                exec("bin/echod.elf", exec_buf(), exec_buf_max(), el_parent, null, 0);
                 ipc_send(el_parent, 0, "failed", 7);
                 exit();
             } else {
@@ -1334,7 +1334,7 @@ fn void main() {
                 char[16] el2_sync_buf @noinit;
                 int el2_parent = ipc_recv(&el2_sync_buf, 16);
                 ipc_send(el2_parent, 0, "ack", 4);
-                exec("/mnt/fs2/bin/echod.elf", exec_buf(), RUN_EXEC_BUF_MAX, el2_parent, null, 0);
+                exec("/mnt/fs2/bin/echod.elf", exec_buf(), exec_buf_max(), el2_parent, null, 0);
                 ipc_send(el2_parent, 0, "failed", 7);
                 exit();
             } else {
@@ -1379,7 +1379,7 @@ fn void main() {
                 char[16] av_sync_buf @noinit;
                 int av_parent = ipc_recv(&av_sync_buf, 16);
                 ipc_send(av_parent, 0, "ack", 4);
-                exec("bin/echod", exec_buf(), RUN_EXEC_BUF_MAX, av_parent, &av_arg, 1);
+                exec("bin/echod", exec_buf(), exec_buf_max(), av_parent, &av_arg, 1);
                 ipc_send(av_parent, 0, "failed", 7);
                 exit();
             } else {
@@ -1418,7 +1418,7 @@ fn void main() {
                 char[16] av2_sync_buf @noinit;
                 int av2_parent = ipc_recv(&av2_sync_buf, 16);
                 ipc_send(av2_parent, 0, "ack", 4);
-                exec("/mnt/fs2/bin/echod", exec_buf(), RUN_EXEC_BUF_MAX, av2_parent, &av2_arg, 1);
+                exec("/mnt/fs2/bin/echod", exec_buf(), exec_buf_max(), av2_parent, &av2_arg, 1);
                 ipc_send(av2_parent, 0, "failed", 7);
                 exit();
             } else {
@@ -1465,7 +1465,7 @@ fn void main() {
                 char[16] pt_sync_buf @noinit;
                 int pt_parent = ipc_recv(&pt_sync_buf, 16);
                 ipc_send(pt_parent, 0, "ack", 4);
-                exec_path("echod", exec_buf(), RUN_EXEC_BUF_MAX, pt_parent, null, 0);
+                exec_path("echod", exec_buf(), exec_buf_max(), pt_parent, null, 0);
                 ipc_send(pt_parent, 0, "failed", 7);
                 exit();
             } else {
@@ -1508,7 +1508,7 @@ fn void main() {
                 char[16] pt2_sync_buf @noinit;
                 int pt2_parent = ipc_recv(&pt2_sync_buf, 16);
                 ipc_send(pt2_parent, 0, "ack", 4);
-                exec_path("echod", exec_buf(), RUN_EXEC_BUF_MAX, pt2_parent, null, 0);
+                exec_path("echod", exec_buf(), exec_buf_max(), pt2_parent, null, 0);
                 ipc_send(pt2_parent, 0, "failed", 7);
                 exit();
             } else {
@@ -2053,7 +2053,7 @@ fn void main() {
                 uint wt_gen = 0;
                 int wt_c = rfork(RFPROC, &wt_gen);
                 if (wt_c == 0) {
-                    exec("bin/wasm", exec_buf(), RUN_EXEC_BUF_MAX, 0, &wt_av[0], wt_ac);
+                    exec("bin/wasm", exec_buf(), exec_buf_max(), 0, &wt_av[0], wt_ac);
                     exitcode(127);
                 }
                 print("wasm "); print(wt_arg); print(" -> ");
@@ -2070,7 +2070,7 @@ fn void main() {
             uint tt_g1 = 0;
             int tt_c1 = rfork(RFPROC, &tt_g1);
             if (tt_c1 == 0) {
-                exec("bin/tcc", exec_buf(), RUN_EXEC_BUF_MAX, 0, &tt_cc_av[0], 3);
+                exec("bin/tcc", exec_buf(), exec_buf_max(), 0, &tt_cc_av[0], 3);
                 exitcode(127);
             }
             int tt_cc = join(tt_c1, tt_g1);
@@ -2086,7 +2086,7 @@ fn void main() {
                 uint tt_g2 = 0;
                 int tt_c2 = rfork(RFPROC, &tt_g2);
                 if (tt_c2 == 0) {
-                    exec("/tcctmp", exec_buf(), RUN_EXEC_BUF_MAX, 0, &tt_run_av[0], 1);
+                    exec("/tcctmp", exec_buf(), exec_buf_max(), 0, &tt_run_av[0], 1);
                     exitcode(127);
                 }
                 int tt_run = join(tt_c2, tt_g2);

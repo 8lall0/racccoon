@@ -67,11 +67,11 @@ port and every racccoon feature.
 
 | Area | racccoon today | Needed |
 |---|---|---|
-| Exec size caps | `EXEC_MAX_IMAGE_SIZE` 1 MiB, `EXEC_MAX_IMAGE_PAGES` 256 | `hello.go` = **1.6 MiB** unstripped, **1.0 MiB** with `-ldflags "-s -w"` — real programs bigger. Raise to ~4 MiB / 1024 pages (JH7110-only, gate on board) |
+| Exec size caps | ~~`EXEC_MAX_IMAGE_SIZE` 1 MiB~~ **DONE** | Now `board::EXEC_MAX_IMAGE_SIZE` — 4 MiB on QEMU/JH7110, 1 MiB on the Duo. New `SYS_EXEC_MAX` (51) so the shell sizes its exec buffer per-board (`exec_max()` / `exec_buf_max()`). `hello.go` = 1.6 MiB unstripped, 1.0 MiB with `-ldflags "-s -w"`. |
 | ELF segments | `EXEC_MAX_ELF_SEGMENTS` 8 | **Fine as-is** — a `GOOS=tamago` riscv64 binary has 6 phdrs, only **3 PT_LOAD** (R-E text @ `0x10000`, R rodata, RW data with `.bss` gap). No INTERP, no PT_TLS (Go keeps `g` in a register on riscv64) |
 | Entry / stack ABI | flat blob or ELF, `sepc` → `e_entry`, no auxv/argv-on-stack | tamago's `CPUinit` sets SP itself + jumps `rt0_*_tamago` — no Linux stack layout needed; `os.Args` empty until the provider fills it. Default link base is `0x10000`; relink at `USER_BASE` with `-ldflags "-T 0x1000000"` |
 | Heap region | `SYS_MAP` returns contiguous zeroed anon pages from `heap_top` | `CPUinit` calls `SYS_MAP` for a big arena, sets `goos.RamStart`/`RamSize`/`Bloc` from the return (dynamic, cleaner than tamago's fixed `0x80000000`) |
-| Time | `SYS_TIMEBASE` (tick Hz) + `time` CSR | `goos.Nanotime` = read `time` CSR, scale by timebase — one asm helper |
+| Time | `SYS_TIMEBASE` (tick Hz) + userspace `rdtime` **already works** (`user.c3`'s `rdtime()` does `csrr t0, time` — the kernel sets `scounteren.TM`) | `goos.Nanotime` = `rdtime()` scaled by `timebase_hz()` — pure userspace, no new syscall |
 | Random | none | Stage 1: stub (fixed seed). Later: a `SYS_RANDOM` (JH7110 has a TRNG) |
 | Console | `SYS_PUTCHAR` / `SYS_GETCHAR` (byte at a time) | `goos.Printk` = `SYS_PUTCHAR`. A batched `write` syscall would help throughput |
 | Exit | `SYS_EXIT` / `exitcode` | `goos.Exit` = `SYS_EXIT` |
@@ -93,24 +93,31 @@ port and every racccoon feature.
 Target: `GOOS=tamago GOARCH=riscv64 GOOSPKG=<go/ module> tamago-go build
 hello.go` → static ELF → runs on racccoon in QEMU, prints, exits 0.
 
-- Build the tamago-go toolchain on the host (branch `tamago1.27.0`,
-  matches the installed Go 1.27.0). *Done in the research pass* — it
-  builds clean and `GOOS=tamago GOARCH=riscv64 go build hello.go`
-  already emits a static riscv64 ELF (the in-tree `runtime/goos/
-  linux_user*` supplies the hooks against the Linux ABI; the racccoon
-  provider swaps that for `ecall`).
-- Provider: `Printk`→`SYS_PUTCHAR`, `Nanotime`→`time` CSR, `Exit`→
-  `SYS_EXIT`, `Idle`→`SYS_YIELD`, `CPUinit`→`SYS_MAP` arena + SP + jump
-  `rt0`. `GetRandomData` stubbed. No `Task` (single-threaded).
-- Kernel: raise the exec caps behind a `board::` flag (JH7110/QEMU
-  only — not the Duo). Confirm the ELF loader eats a Go binary
-  (segment count, `p_vaddr`, `.bss` zeroing).
-- Link the binary at `USER_BASE` (`-ldflags "-T 0x1000000"` or a
-  linker script).
-- Success = `hello`, a `for` loop, integer/float math, `defer`,
-  `panic`/`recover`, a slice + `append`, a `map` — all run. GC may not
-  trigger yet.
-- `gotest` builtin in `shell_test.c3`; a `test/go-src/` fixture set.
+- ~~Build the tamago-go toolchain~~ **DONE** (research pass) — builds
+  clean, `GOOS=tamago GOARCH=riscv64 go build hello.go` emits a static
+  riscv64 ELF (the in-tree `runtime/goos/linux_user*` supplies the
+  hooks against the Linux ABI; the racccoon provider swaps that for
+  `ecall`).
+- ~~Kernel: raise the exec caps behind a `board::` flag~~ **DONE**
+  (commit below) — `board::EXEC_MAX_IMAGE_SIZE` (4 MiB QEMU, 1 MiB
+  Duo) + `SYS_EXEC_MAX` for the shell's buffer. Regressions green
+  (runtest / elftest / tcctest / wasmtest / mounttest / chmodtest).
+- Provider — finish `go/goos/`: `Nanotime` = `rdtime()` × `timebase_hz`
+  (both already work from userspace), `CPUInit` `SYS_MAP` arena + SP +
+  jump `rt0`. `GetRandomData` stubbed, no `Task`.
+- Confirm the racccoon ELF loader eats a Go binary (3 PT_LOAD, the
+  inter-segment gaps, `.bss` `p_memsz > p_filesz` zeroing). Link at
+  `USER_BASE` (`-ldflags "-T 0x1000000"`).
+- Nail the `GOOSPKG` / `go.work` invocation in `scripts/build_go.sh`.
+- Success = `hello`, a `for` loop, int/float math, `defer`,
+  `panic`/`recover`, a slice + `append`, a `map`. GC may not trigger.
+- `gotest` builtin in `shell_test.c3`; `test/go-src/` fixtures; seed
+  `build/go/*.elf` onto the images (`build.sh`).
+
+Note on RAM: the QEMU kernel's `__free_ram` window is a fixed 64 MiB
+(`src/kernel.ld`), independent of `-m`. A single Go process (≈2 MiB
+image + a ~16 MiB arena) fits; if it turns out tight, the lever is
+that linker-script number, not the QEMU `-m` flag.
 
 ### Stage 2 — GC + goroutines under memory pressure
 
@@ -120,6 +127,12 @@ hello.go` → static ELF → runs on racccoon in QEMU, prints, exits 0.
 - Goroutines: `go func()`, channels, `sync.WaitGroup`, `select`. All
   cooperative on one M — confirm `gopark`/`goready` + the `semasleep`
   idle loop yield correctly through `SYS_YIELD`.
+- Optional: racccoon *does* have the thread primitives — `rfork(RFPROC|
+  RFMEM)` shares an address space and `SYS_FUTEX_WAIT`/`_WAKE` are
+  keyed on `(addr, page_table)`. A real `goos.Task` (RFMEM rfork) +
+  `semasleep` via futex would give multi-M cooperative scheduling on
+  the one hart. Not needed for correctness; revisit if `GOMAXPROCS=1`
+  latency bites.
 - `time.Sleep` / `time.After` — needs the `wakeG` timer path
   (`sys_tamago_riscv64.s`) wired to racccoon's timebase.
 - Real memory sizing: `goos.RamSize` from the board's RAM (JH7110
