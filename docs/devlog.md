@@ -4,6 +4,50 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-01 — Go on racccoon: research + Stage 0 plan (branch `go-port`)
+
+Scoped what it takes to run Go on racccoon. **Verdict: tractable on the
+JH7110, via tamago.**
+
+Unlike LLVM (own devlog discussion — off the table: needs a C++
+toolchain + runtime racccoon can't host, and hosts a compiler bigger
+than the OS), the Go toolchain has *no external dependency* — `gc` /
+asm / `cmd/link` are pure Go, output is static, `linux/riscv64` is
+first-class. The only hard part is the runtime↔OS contract, and
+**tamago** (`usbarmory/tamago-go`) already did that surgery:
+`GOOS=tamago` is a freestanding runtime — `newosproc`→`goos.Task` (nil ⇒
+single-threaded), no futex (`semasleep` spins with a `goos.Idle` hook),
+no signals (`preemptMSupported = false`, cooperative preemption), no
+mmap (Plan 9 `sbrk` over a flat `bloc` region). All OS interaction is
+externalised to a ~10-hook `runtime/goos` package, pointed at an
+out-of-tree module by the `GOOSPKG` build setting. tamago even ships a
+`linux_user` provider that runs a `GOOS=tamago` binary as an ordinary
+Linux userspace process via raw syscalls — **racccoon is just another
+host for that pattern**, swapping the Linux ABI for racccoon's `ecall`.
+
+racccoon's cooperative userspace scheduler is a good match: tamago's
+idle-hook loop wants exactly a `SYS_YIELD`, and there are no threads.
+
+- `tamago1.27.0` branch matches the installed Go 1.27.0 exactly.
+- Approach: **A)** reuse `GOOS=tamago` + a `GOOSPKG=racccoon` provider
+  module (fastest to first-boot); **B)** later rename to
+  `GOOS=racccoon` and diverge `os`/`syscall` toward real fsd-backed
+  file I/O.
+- Known racccoon gaps, all Stage-1 line items: raise the exec size caps
+  (`EXEC_MAX_IMAGE_SIZE` 1 MiB → ~4 MiB, JH7110-only — a Go static
+  binary is 2–4 MiB), check the ELF loader's 8-segment limit against a
+  Go binary, `goos` provider = `SYS_PUTCHAR`/`SYS_TIMEBASE`/`SYS_EXIT`/
+  `SYS_YIELD`/`SYS_MAP`-arena.
+
+Stage 0 this branch: `docs/go-port-plan.md` (staged plan, Stage 1 boot →
+Stage 3 fsd I/O → Stage 4 toolchain self-host on racccoon → Stage 5
+net). Toolchain build + provider module + kernel cap bump come next,
+pending review of the plan. No kernel changes yet; QEMU + Duo builds
+untouched. This is a JH7110 goal — the Duo can host at most a Stage-1
+hello-world (GC + compiler need the gigabytes).
+
+---
+
 ## 2026-09-01 — `chmod` / `chown` (roadmap §2 closeout)
 
 Closes the last non-"much later" item of the Plan 9 user model: files
