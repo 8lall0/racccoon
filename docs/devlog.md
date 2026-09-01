@@ -222,6 +222,35 @@ next optimisation.
 cmd/compile`) and links with `-s -w` to keep the big binaries under the
 cap. Regressions + the go tests still green.
 
+**Stage 4.2 — `go tool compile` runs on racccoon, first try.** Cross-built
+(`build_go.sh cmd/compile`, no wrapper — the self-installing backend
+means a stdlib command gets `os.*` for free) to a 22 MiB stripped
+binary. On a one-off bigger scratch ext2 image (the committed QEMU
+image is only 16 MiB — real disk sizing is a 4.3+ decision):
+
+- `/bin/go-compile` with no args printed the compiler's actual `-h`
+  usage text (~200 real flags) — the 22 MiB binary loads, the runtime
+  + GC + heap arena come up, `os.Args`/flag parsing works.
+- `/bin/go-compile -p p -o /p.o -lang=go1.24 -nolocalimports -complete
+  /tp.go` against a real two-function `.go` file → **exit 0**, ~30–40 s
+  wall (mostly fixed compiler-startup cost). Pulled `/p.o` off the
+  image and inspected it on the host: a genuine `go object tamago
+  riscv64 go1.27.0` archive with correct `gclocals`/`arginfo`/type
+  metadata. `e2fsck -fn` clean.
+
+No host-assumption fixes were needed anywhere in the chain —
+`os.Open`/`ReadFile` on the source, the full parser/type-checker/SSA/
+codegen running under `GOMAXPROCS=1` on the cooperative scheduler,
+`os.Create`/`Write` on the output all just worked. This was expected to
+be where Stage 4's real debugging starts; instead it validated the
+whole 3.5/4.0 foundation end to end on the first attempt.
+
+Next: 4.3 `go tool link` (needs `runtime.a` + the other stdlib archives
+cross-built and an `importcfg` — real setup, unlike 4.2's single file),
+then 4.1's `os/exec` and 4.4 the `go` command. Real disk sizing (the
+16 MiB QEMU image can't hold `compile` + a stdlib tree) is a decision
+point before 4.3 lands for real — likely JH7110/real-hardware territory.
+
 ---
 
 ## 2026-09-01 — `chmod` / `chown` (roadmap §2 closeout)

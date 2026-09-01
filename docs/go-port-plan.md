@@ -233,20 +233,46 @@ unknowns. Staged:
   `rfork(RFPROC)` + `SYS_EXEC` (Go can't `fork` safely — use the
   async-signal-safe child path). Needed for the `go` command's
   subprocess model, and generally useful. Add to `lib/go/racccoon.patch`.
-- **4.2 — `go tool compile hello.go`** on racccoon → a `.o` object
-  file. `compile` is one Go binary, no subprocesses; it needs
-  `os.Args` (done), `os.*` (done), a working `runtime` (done), temp
-  files, and `runtime.NumCPU`/`GOMAXPROCS=1`. This is the first real
-  proof and the place the compiler's host assumptions surface.
-- **4.3 — `go tool link`** → a runnable racccoon ELF. Then
-  `compile` + `link` by hand build `hello.go` on racccoon.
+- **4.2 — `go tool compile` on racccoon — DONE**, first try, no fixes
+  needed. `build_go.sh cmd/compile` cross-builds it (self-installing
+  fsd backend, no wrapper needed — a stdlib command can't blank-import
+  a repo module, which is exactly why the backend had to move into
+  `runtime/goos`). On a one-off bigger scratch ext2 image (the
+  committed QEMU image is 16 MiB; `compile` alone is 22 MiB — sizing
+  the real image is a 4.3+ decision):
+  - `/bin/go-compile` (no args) → the compiler's real `-h` usage text,
+    ~200 flags, printed correctly. Confirms the 22 MiB binary loads,
+    the Go runtime + GC + heap arena come up, `os.Args`/flag parsing
+    works, bulk stdout works.
+  - `/bin/go-compile -p p -o /p.o -lang=go1.24 -nolocalimports
+    -complete /tp.go` on a real two-line Go source → **exit 0**, ~30–40 s
+    wall (mostly fixed compiler-startup cost, not file size). `/p.o` is
+    a genuine `go object tamago riscv64 go1.27.0` archive with correct
+    metadata (`gclocals`, `arginfo`, `type:int`) — verified by pulling
+    it off the image and inspecting it on the host. `e2fsck -fn` clean.
+  - This validates the whole chain end to end: `os.Open`/`ReadFile` on
+    the source, the full compiler (parser, type-checker, SSA, codegen)
+    running under `GOMAXPROCS=1` on racccoon's cooperative scheduler,
+    `os.Create`/`Write` on the output — with no host-assumption fixes
+    needed anywhere.
+- **4.3 — `go tool link`** → a runnable racccoon ELF from `compile`'s
+  output. Needs `runtime.a` and the other stdlib archives cross-built
+  and reachable (an `importcfg`) — real setup work, unlike 4.2's
+  single-file case. Then `compile` + `link` by hand build a `hello.go`
+  entirely on racccoon.
 - **4.4 — the `go` command** orchestrating it (`go build`), with the
-  build cache, `$GOROOT/src` stdlib reads, module handling. The
-  largest piece; JH7110 with 2 GiB, `GOMAXPROCS=1`.
+  build cache, `$GOROOT/src` stdlib reads, module handling, and 4.1's
+  `os/exec` to invoke `compile`/`link` as subprocesses. The largest
+  piece; wants the JH7110's 2 GiB, `GOMAXPROCS=1`.
+- **Disk sizing** — the committed QEMU ext2 image (16 MiB) can't hold
+  `compile` (22 MiB) or a stdlib source tree. Before 4.3 lands for
+  real, either grow the QEMU image (build-time cost) or accept this
+  stage is JH7110/real-hardware-only (the Duo's 57 GB ext2 partition
+  and the JH7110's SD card both dwarf this easily).
 
-Likely wants the `GOOS=racccoon` rename by 4.2 (own identity, room for
-`os`/`syscall` to diverge further) — apply tamago's patchset to a Go
-tree, `sed` `tamago`→`racccoon` across the GOOS plumbing (~15
+Likely wants the `GOOS=racccoon` rename around 4.3–4.4 (own identity,
+room for `os`/`syscall` to diverge further) — apply tamago's patchset
+to a Go tree, `sed` `tamago`→`racccoon` across the GOOS plumbing (~15
 substantive files, ~130 mechanical `testdata_*` renames), fold in
 `lib/go/racccoon.patch`.
 
