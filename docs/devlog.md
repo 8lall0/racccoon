@@ -134,8 +134,31 @@ are fine. Almost certainly the kernel identity map only covering
 `docs/go-port-plan.md`, likely folds into the early-MMU work
 `docs/opi-rv-plan.md` already expects.
 
-Next (Stage 3): `os` / file I/O against `fsd`, and the `GOOS=racccoon`
-rename.
+**Stage 3 — Go does real file I/O against fsd.** `go/racccoon` — a
+package Go programs import for persistent I/O against whatever racccoon
+has mounted, over `SYS_NS_RESOLVE` + `SYS_IPC_CALL` and the `FS_*`
+verbs, mirroring `lib/racccoon-libc/src/rc_fs.c`: `ReadFile` / `WriteFile`
+(both chunked), `Stat`, `ReadDir` (follows FS_LIST pagination), `Mkdir`,
+`Remove`/`RemoveAll`, `Rename`, `Getwd`, `Chdir`. `go/racccoon/
+sys_riscv64.s` has the `nsResolve` / `ipcCall` (5-arg) / `sysGetcwd` /
+`sysChdir` ecalls.
+
+`go/cmd/gostage3` (`gostage3test`) — reads `/hello.txt`, walks `/`,
+`/subdir`, and the 60-entry `/manyfiles` (pagination), writes a 4.8 KB
+file under `/tmp` + reads it back, renames it, makes a directory tree,
+removes everything. 21/21 checks pass on racccoon in QEMU; `e2fsck -fn`
+clean afterward. Regressions green (gotest / gostage3test / chmodtest /
+wasmtest / tcctest / dirpacktest / fspermtest / oomtest /
+storagekilltest). Duo kernel builds clean.
+
+Deferred to a Stage 3.5: wiring `go/racccoon` into Go's own `os`
+package (`GOOS=tamago`'s `os`/`syscall` back onto an in-memory fs —
+making `os.Open` hit fsd needs a `fs_tamago.go` patch or the
+`GOOS=racccoon` rename), plus `os.Args` and `os/exec`. The bridge
+already unblocks Go programs that do filesystem work.
+
+Next: Stage 3.5 (`os.*` transparency) or Stage 4 (the Go toolchain
+self-hosting on the JH7110).
 
 ---
 

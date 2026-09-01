@@ -2061,10 +2061,10 @@ fn void main() {
                 if (wt_code != 0) { wt_ok = -1; }
             }
             print(wt_ok == 0 ? "wasmtest: ok\n" : "wasmtest: FAILED\n");
-        } else if (strcmp(cmd, "gotest") == 0 || strcmp(cmd, "gostage2test") == 0) {
-            // Go on racccoon (docs/go-port-plan.md). /bin/go-hello and
-            // /bin/go-gostage2 are GOOS=tamago static riscv64 binaries
-            // built by scripts/build_go.sh from go/cmd/*, loaded through
+        } else if (strcmp(cmd, "gotest") == 0 || strcmp(cmd, "gostage2test") == 0 || strcmp(cmd, "gostage3test") == 0) {
+            // Go on racccoon (docs/go-port-plan.md). /bin/go-* are
+            // GOOS=tamago static riscv64 binaries built by
+            // scripts/build_go.sh from go/cmd/*, loaded through
             // SYS_EXEC's ELF path. Same rfork -> exec -> join(code) shape
             // as wasmtest; skip cleanly (exit 127) if the binary isn't on
             // this image — they only exist when TAMAGO was set at build
@@ -2083,12 +2083,25 @@ fn void main() {
             //                  mutex, and the timer path (time.Sleep /
             //                  Ticker). Slow (spin-idle scheduler + real
             //                  GC on emulated hw).
+            //   gostage3test — go/cmd/gostage3: real file I/O against fsd
+            //                  via the go/racccoon package (SYS_NS_RESOLVE
+            //                  + SYS_IPC_CALL, the FS_* verbs) — read a
+            //                  fixture, walk a paginated directory, write
+            //                  + read back + rename + remove under /tmp,
+            //                  build a directory tree. e2fsck must be
+            //                  clean after.
             //
             // The program prints to the console directly (goos.Printk ->
             // SYS_PUTCHAR) so its output shows inline above the verdict.
-            bool gt_s2 = strcmp(cmd, "gostage2test") == 0;
-            char* gt_path = gt_s2 ? "bin/go-gostage2" : "bin/go-hello";
-            char* gt_name = gt_s2 ? "gostage2test" : "gotest";
+            char* gt_path;
+            char* gt_name;
+            if (strcmp(cmd, "gostage2test") == 0) {
+                gt_path = "bin/go-gostage2"; gt_name = "gostage2test";
+            } else if (strcmp(cmd, "gostage3test") == 0) {
+                gt_path = "bin/go-gostage3"; gt_name = "gostage3test";
+            } else {
+                gt_path = "bin/go-hello"; gt_name = "gotest";
+            }
             uint gt_gen = 0;
             int gt_c = rfork(RFPROC, &gt_gen);
             if (gt_c < 0) {

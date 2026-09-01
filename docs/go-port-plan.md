@@ -155,20 +155,35 @@ RFMEM)` + `SYS_FUTEX_WAIT`/`_WAKE` keyed on `(addr, page_table)`. A real
 `goos.Task` (RFMEM rfork) + futex `semasleep` would give multi-M
 cooperative scheduling on one hart. Not needed for correctness.
 
-### Stage 3 — `os` / file I/O against fsd (this is where Step B pays off)
+### Stage 3 — file I/O against fsd — **DONE** (the bridge; `os.*` wiring is 3.5)
 
-Rename to `GOOS=racccoon`, then implement the `syscall` package's
-file ops against racccoon's path-based `fsd` — mirroring what
-`lib/racccoon-libc/src/rc_posix.c` already does in C (a userspace fd
-table → `SYS_NS_RESOLVE` + `FS_*` IPC):
+`go/racccoon` — a package Go programs import for real, persistent I/O
+against whatever racccoon has mounted, over `SYS_NS_RESOLVE` +
+`SYS_IPC_CALL` and the `FS_*` verbs, mirroring
+`lib/racccoon-libc/src/rc_fs.c` byte for byte:
 
-- `open`/`read`/`write`/`close`/`lseek`/`fstat`/`readdir` → `fsd`.
-- `os.Open`, `os.ReadFile`, `os.Args` (provider fills from the exec
-  ABI), `os.Getenv` → `/env`.
-- `os/exec` → `rfork` + `SYS_EXEC` (Go can't `fork` safely; use the
-  careful `syscall.forkExec` shape).
-- Success = a Go program reads `/hello.txt`, walks a directory, writes
-  a file; `e2fsck` clean.
+- `ReadFile` (chunked), `WriteFile` (chunked), `Stat`, `ReadDir`
+  (follows FS_LIST pagination), `Mkdir`, `Remove`/`RemoveAll`,
+  `Rename`, `Getwd`, `Chdir`.
+- `go/racccoon/sys_riscv64.s` — `nsResolve` / `ipcCall` (5-arg) /
+  `sysGetcwd` / `sysChdir` raw ecalls.
+
+`go/cmd/gostage3` + `gostage3test`: reads `/hello.txt`, walks `/`,
+`/subdir`, and the 60-entry `/manyfiles` (pagination), writes a
+4.8 KB file under `/tmp` and reads it back, renames it, makes a
+directory tree, removes everything. 21/21 checks pass on racccoon in
+QEMU; `e2fsck -fn` clean afterward.
+
+**Stage 3.5 (deferred)** — wire `go/racccoon` into Go's own `os`:
+`GOOS=tamago`'s `os`/`syscall` back onto an in-memory fs
+(`src/syscall/fs_tamago.go`, ~970 lines). Making `os.Open` /
+`os.ReadFile` transparently hit fsd means either a small toolchain
+patch (a delegate hook in `fs_tamago.go`, carried in-repo like
+`lib/tcc/racccoon.patch`) or the full `GOOS=racccoon` rename. Plus
+`os.Args` (the provider must capture the exec ABI's `a0`/`a1` at
+entry) and `os/exec` → `rfork`+`SYS_EXEC`. Real value, but the bridge
+above already unblocks Go programs that do filesystem work — do 3.5
+when a concrete program needs `os.*` specifically.
 
 ### Stage 4 — run the Go toolchain on racccoon
 

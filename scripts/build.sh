@@ -55,7 +55,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # Go programs for racccoon (go/cmd/*, via the GOOS=tamago toolchain).
   # No-op unless TAMAGO points at a tamago-go/bin/go — build_go.sh says
   # so and exits 0. Seeded as /bin/go-<name> onto the images below;
-  # gotest / gostage2test (shell_test.c3) skip cleanly if the binary
+  # gotest / gostage{2,3}test (shell_test.c3) skip cleanly if the binary
   # isn't there, same as tcctest without /bin/tcc. See docs/go-port-plan.md.
   rm -rf build/go
   if [ -n "${TAMAGO:-}" ]; then
