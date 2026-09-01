@@ -4,6 +4,66 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-02 — Go Stage 4.4: argv[0] in the exec ABI, and `go build` groundwork
+
+**`SYS_EXEC` now carries `argv[0]`.** The racccoon exec ABI packed only
+the real arguments; the goos layer synthesised `os.Args[0] = "go"` for
+every spawned Go binary, so `go tool compile -V=full` reported its name
+as `go` and `cmd/go`'s toolID parser rejected the mismatch. Fixed
+properly (the user picked "carry argv[0] through SYS_EXEC" over
+relaxing the check):
+
+- `user/user.c3` `exec()` packs the resolved program path as blob
+  string 0, then the args; the `SYS_EXEC` count (a4) includes it. The
+  kernel is unchanged — it never parses the blob, just stages it.
+- c3c fork `_nolibc/main_stub.c3` `@main_args` peels string 0 back off
+  as `main_stub_argv0` and hands `main(String[] args)` strings 1.., so
+  every existing c3 command still indexes `args[0]` as its first real
+  argument (runtest / argvtest / pathtest / elftest green).
+- `go/goos/` — `Spawn` packs argv[0], `Args` reads the whole blob as
+  `os.Args`. gostage35's `os.Args` count check still passes.
+
+Now `compile -V=full` says `compile version go1.27.0` and the toolID
+probe passes. `go build` then drove `compile`/`asm`/`link` as
+subprocesses and got most of the way through the stdlib closure before
+each of a run of blockers:
+
+- `pathcache.LookPath` on the tool paths always failed — tamago's
+  `lp_tamago.go` stubs LookPath to "no executables at all". Patched to
+  do the real slash-path `findExecutable` check.
+- fsd files reported mode `0644` (no exec bit) → `findExecutable`
+  rejected the tools → fsd backend now reports regular files `0755`
+  (racccoon has no per-file exec permission).
+- `.s` files `#include "textflag.h"` / `cgo/abi_riscv64.h` — seed
+  `$GOROOT/pkg/include/*.h` and `$GOROOT/src/runtime/cgo/*.h`.
+- compiling package `runtime` OOM'd the on-device `compile` at ~50 MiB
+  in use — the 64 MiB Go arena is too small. Added a build-tag
+  (`racccoon_bigheap`, `racccoon_heap_{small,big}.go`) that gives
+  `cmd/compile` / `cmd/link` a 448 MiB arena; `go` / `asm` / programs
+  stay at 64 MiB (bumping `go` too made `rfork` fail — forking a
+  448 MiB parent needs more RAM than the pool has; the real fix is a
+  lazy `SYS_MAP`).
+
+**Where it stands:** `go build` compiles `internal/*`, drives all three
+tools, gets ~20 packages in, and is currently stuck compiling package
+`runtime` — `preempt.go:351: asyncPreempt is defined as ABIInternal`,
+i.e. `preempt_riscv64.s` isn't reaching the `asm -gensymabis` pass (the
+`.s` file is on the image; something in the runtime asm pipeline —
+`go_asm.h` generation, `-I` paths — isn't right). Next: either fix that
+pipeline, or prepopulate `/gocache` from a host build so the stdlib
+closure is all cache hits and only the link runs on-device (the Stage
+4.3 bootstrapping pattern — being tried now on a throwaway image).
+
+`go version` / `go env` (4.4 part 1) unaffected. Regressions green
+(runtest / argvtest / pathtest / elftest / gostage35 / gostage41 /
+gostage42 / gotest / goversiontest / chmodtest / oomtest). Duo kernel
+builds clean; patch inert for vanilla `GOOS=tamago`. `racccoon.patch`
+→ 702 lines. **The `main_stub.c3` change is in the local `8lall0/c3c`
+fork checkout (`feat-racccoon-support`), committed but not pushed —
+`scripts/build_user.sh` uses that checkout by path.**
+
+---
+
 ## 2026-09-01 — Go Stage 4.4 part 1: `go version` / `go env` on racccoon
 
 The `go` command itself runs on racccoon. `go version` →

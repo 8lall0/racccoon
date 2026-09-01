@@ -53,14 +53,21 @@ fi
 # detection fails (it does on racccoon), and cfg.findGOROOT returns it;
 # then $GOROOT/go.env supplies GOFLAGS / GOPROXY / GOCACHE / etc.
 EXTRA_LDFLAGS=""
-if [ "$1" = "cmd/go" ]; then
-  EXTRA_LDFLAGS="-X runtime.defaultGOROOT=/goroot"
-fi
+BUILD_TAGS=""
+case "$1" in
+  cmd/go)
+    EXTRA_LDFLAGS="-X runtime.defaultGOROOT=/goroot" ;;
+  cmd/compile|cmd/link)
+    # these peak far past the default 64 MiB Go arena compiling package
+    # runtime on-device (racccoon_heap_big.go). go/asm stay small.
+    BUILD_TAGS="racccoon_bigheap" ;;
+esac
 
 cd "$REPO/go"
 GOOS=tamago GOARCH=riscv64 CGO_ENABLED=0 \
 GOOSPKG=racccoon.local/goport GOFLAGS=-mod=mod \
   "$TAMAGO" build \
+  ${BUILD_TAGS:+-tags "$BUILD_TAGS"} \
   -ldflags "-T 0x1010000 -R 0x1000 -s -w $EXTRA_LDFLAGS" \
   -o "$OUT" \
   "$PKG"

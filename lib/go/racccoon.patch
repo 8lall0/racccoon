@@ -69,6 +69,58 @@ index 0673be56..cdcb353b 100644
 +	runtime.GOOS == "tamago" || // racccoon (lib/go/racccoon.patch): no telemetry child / config dir
  	runtime.GOOS == "plan9" || // https://github.com/golang/go/issues/57540#issuecomment-1470766639
  	runtime.GOARCH == "mips" || runtime.GOARCH == "mipsle" // mips lacks cross-process 64-bit atomics
+diff --git a/src/os/exec/lp_tamago.go b/src/os/exec/lp_tamago.go
+index cf7ac99e..e0e0b043 100644
+--- a/src/os/exec/lp_tamago.go
++++ b/src/os/exec/lp_tamago.go
+@@ -8,17 +8,45 @@ package exec
+ 
+ import (
+ 	"errors"
++	"io/fs"
++	"os"
++	"strings"
++	"syscall"
+ )
+ 
+ // ErrNotFound is the error resulting if a path search failed to find an executable file.
+ var ErrNotFound = errors.New("executable file not found in $PATH")
+ 
++func findExecutable(file string) error {
++	d, err := os.Stat(file)
++	if err != nil {
++		return err
++	}
++	m := d.Mode()
++	if m.IsDir() {
++		return syscall.EISDIR
++	}
++	if m&0111 != 0 {
++		return nil
++	}
++	return fs.ErrPermission
++}
++
+ // LookPath searches for an executable named file in the
+ // directories named by the PATH environment variable.
+ // If file contains a slash, it is tried directly and the PATH is not consulted.
+-// The result may be an absolute path or a path relative to the current directory.
++//
++// racccoon (lib/go/racccoon.patch): the stock tamago stub always fails
++// ("tamago can not execute processes"), which it now can. There is no
++// PATH, so only a path containing a slash resolves — which is all
++// cmd/go ever passes for its own tools.
+ func lookPath(file string) (string, error) {
+-	// tamago can not execute processes, so act as if there are no executables at all.
++	if strings.Contains(file, "/") {
++		if err := findExecutable(file); err != nil {
++			return "", &Error{file, err}
++		}
++		return file, nil
++	}
+ 	return "", &Error{file, ErrNotFound}
+ }
+ 
 diff --git a/src/os/pipe_tamago.go b/src/os/pipe_tamago.go
 index 442f0cdf..0d0635f2 100644
 --- a/src/os/pipe_tamago.go
@@ -176,10 +228,10 @@ index 6d57f5f9..7060f5da 100644
  func msigrestore(sigmask sigset)     {}
 diff --git a/src/syscall/fs_racccoon.go b/src/syscall/fs_racccoon.go
 new file mode 100644
-index 00000000..41f1cc12
+index 00000000..2ca776e2
 --- /dev/null
 +++ b/src/syscall/fs_racccoon.go
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,263 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -219,7 +271,11 @@ index 00000000..41f1cc12
 +	if isDir {
 +		st.Mode = S_IFDIR | 0755
 +	} else {
-+		st.Mode = S_IFREG | 0644
++		// 0755, not 0644: racccoon's fsd exposes no per-file exec
++		// permission (exec() runs any readable file), and `go build`'s
++		// pathcache.LookPath rejects a tool binary whose mode has no
++		// execute bit ("executable file not found").
++		st.Mode = S_IFREG | 0755
 +	}
 +}
 +

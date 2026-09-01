@@ -176,7 +176,25 @@ fn int exec(char* path, char* buf, uint buf_max, int notify_pid, char** argv, in
     }
     if (total == 0) return -1; // empty/nonexistent file — nothing to run
 
+    // Blob string 0 is always argv[0] = the program path (the racccoon
+    // exec ABI carries it now — nolibc main_stub's @main_args peels it
+    // back off, so a c3 `main(String[] args)` still sees only the real
+    // arguments; a Go binary's runtime/goos reads the whole blob as
+    // os.Args). Then the `argc` real arguments. SYS_EXEC's count (a4)
+    // includes string 0.
     uint argv_len = 0;
+    {
+        uint j = 0;
+        while (path[j] != 0) {
+            if (total + argv_len >= buf_max) return -1;
+            buf[total + argv_len] = path[j];
+            argv_len++;
+            j++;
+        }
+        if (total + argv_len >= buf_max) return -1;
+        buf[total + argv_len] = 0;
+        argv_len++;
+    }
     for (int i = 0; i < argc; i++) {
         char* arg = argv[i];
         uint j = 0;
@@ -194,7 +212,7 @@ fn int exec(char* path, char* buf, uint buf_max, int notify_pid, char** argv, in
     if (notify_pid > 0) {
         ipc_send(notify_pid, 0, "ready", 6);
     }
-    return syscall4(SYS_EXEC, (long)buf, (long)total, (long)argv_len, (long)argc);
+    return syscall4(SYS_EXEC, (long)buf, (long)total, (long)argv_len, (long)(argc + 1));
 }
 
 // exec(), but resolves `name` against a real search list instead of

@@ -41,12 +41,16 @@ var (
 	RamStart uint
 	// RamSize is the SYS_MAP region for the whole Go heap + g0 stack.
 	// SYS_MAP is eager (every page really allocated + zeroed at startup),
-	// so this trades startup cost for GC headroom. 64 MiB is plenty —
-	// the gostage2 GC test's working set is well under 10 MiB — and
-	// keeps `gohello` startup quick even on emulated hardware. Fits
-	// under QEMU's board::HEAP_MAX_BYTES (512 MiB); the JH7110 (2 GiB)
-	// can take far more. CPUInit falls back to 8 MiB if a board refuses.
-	RamSize        uint = 64 << 20
+	// so this trades startup cost for GC headroom. Initialised from
+	// ramSizeBytes — a build-tag-selected const (racccoon_heap_*.go), so
+	// its slot in .data is set at link time and CPUInit (which runs
+	// before any Go init) reads the right value. Default 64 MiB is
+	// plenty for programs and the `go` command; `-tags racccoon_bigheap`
+	// picks 448 MiB for cmd/compile / cmd/link, which peak far past
+	// 64 MiB compiling package runtime. Fits under QEMU's
+	// board::HEAP_MAX_BYTES (512 MiB). CPUInit falls back to 8 MiB if a
+	// board refuses the map.
+	RamSize        uint = ramSizeBytes
 	RamStackOffset uint = 0x1000
 
 	// Bloc redefines the heap start (osinit picks it up). Set from asm
@@ -136,14 +140,14 @@ var (
 
 // Args returns os.Args, parsed from the exec-ABI blob CPUInit stashed.
 // The runtime reaches it via goosArgs() (lib/go/racccoon.patch).
-// racccoon's c3 exec() ABI carries only the real arguments (no argv[0]),
-// so a synthetic "go" is prepended — same convention the libc crt0
-// uses — leaving the real args at os.Args[1:].
+// racccoon's exec() ABI now packs argv[0] (the program path) as blob
+// string 0, so the blob is os.Args directly. A blank exec (nothing
+// packed) still gets a synthetic "go" so os.Args is never empty.
 var Args = func() []string {
-	out := []string{"go"}
 	if rcArgc <= 0 || rcArgvBlob == nil {
-		return out
+		return []string{"go"}
 	}
+	out := make([]string, 0, rcArgc)
 	p := unsafe.Pointer(rcArgvBlob)
 	for i := 0; i < rcArgc; i++ {
 		n := 0

@@ -148,14 +148,17 @@ func Spawn(path string, argv []string, dir string, capID int) int {
 		return -eIO
 	}
 
-	// argv blob: real args (argv[1:]) NUL-terminated, packed after the
-	// image. argc is the count of those.
-	real := argv
-	if len(real) > 0 {
-		real = real[1:]
+	// argv blob: the racccoon exec ABI packs argv[0] (the program path)
+	// as blob string 0, then the rest of argv, all NUL-terminated after
+	// the image. `argc` counts every string, argv[0] included. os/exec
+	// already puts the command path at argv[0]; fall back to the resolved
+	// path when the caller passed no argv at all.
+	blob := argv
+	if len(blob) == 0 {
+		blob = []string{ap}
 	}
 	argvLen := 0
-	for _, a := range real {
+	for _, a := range blob {
 		argvLen += len(a) + 1
 	}
 
@@ -165,7 +168,7 @@ func Spawn(path string, argv []string, dir string, capID int) int {
 		return -eIO
 	}
 	off := int(size)
-	for _, a := range real {
+	for _, a := range blob {
 		copy(buf[off:], a)
 		off += len(a)
 		buf[off] = 0
@@ -209,7 +212,7 @@ func Spawn(path string, argv []string, dir string, capID int) int {
 		if haveDir {
 			sysChdir(&dirBuf[0])
 		}
-		sysExecRaw(&buf[0], size, int64(argvLen), int64(len(real)))
+		sysExecRaw(&buf[0], size, int64(argvLen), int64(len(blob)))
 		sysExitCode(127) // exec failed
 	}
 
