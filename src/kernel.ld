@@ -61,11 +61,16 @@ SECTIONS {
                                Was 64MB; raised so a Go process can eagerly
                                SYS_MAP a large heap arena (SYS_MAP is not
                                lazy) with GC headroom — docs/go-port-plan.md.
-                               Must match src/allocation.c3's RAM_SIZE.
-                               boards/duo/kernel.ld stays sized to the Duo's
-                               real 64MB DRAM. NOTE: racccoon does not yet
-                               boot with -m >= 2G (early-boot/FDT-placement
-                               issue — a JH7110 bring-up blocker, its board
-                               has 2GB); see docs/go-port-plan.md. */
+                               Must be <= src/allocation.c3's RAM_SIZE (the
+                               page-bitmap ceiling, 1920MB); the two need
+                               not be equal — ram_page_count() caps the
+                               allocator to whichever is smaller. The Duo's
+                               boards/duo/kernel.ld pins its own to the real
+                               64MB DRAM; the JH7110 / Orange Pi RV board
+                               reserves close to the 1920MB ceiling out of
+                               its 2GB. The kernel boots fine at QEMU -m 2G
+                               / 4G / 8G — the old "-m >= 2G won't boot"
+                               blocker cleared with the Stage 2 allocator
+                               rework; see docs/go-port-plan.md. */
     __free_ram_end = .;
 }

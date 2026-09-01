@@ -4,16 +4,26 @@ import panic;
 
 const PAGE_SIZE = 4096;
 
-// Must match kernel.ld's `__free_ram` reservation (`. += 768 * 1024 * 1024;`).
-// __free_ram/__free_ram_end are linker symbols — only their *addresses* are
-// known, and only at link time — so the bitmap's size can't be derived from
-// them directly; it needs its own compile-time-constant mirror of the same
-// number. This is the QEMU ceiling; boards/duo/kernel.ld pins its real
-// __free_ram_end far below (~59 MiB) and ram_page_count() caps to that, so
-// the Duo just leaves the bitmap's tail words unused (the bitmap is
-// 24 KiB of BSS at 768 MiB — negligible even on the 64 MiB Duo, and the
-// alternative (board::RAM_SIZE) would circular-import board <-> kernel).
-const RAM_SIZE = 768 * 1024 * 1024;
+// The page bitmap's ceiling — it must be >= the largest `__free_ram`
+// reservation any board's kernel.ld makes, NOT necessarily equal to any
+// one of them. __free_ram/__free_ram_end are linker symbols — only their
+// *addresses* are known, and only at link time — so the bitmap's size
+// can't be derived from them directly; it needs its own compile-time
+// constant, and it's one binary's constant shared by every board (a
+// per-board `board::RAM_SIZE` would circular-import board <-> kernel).
+// ram_page_count() caps the allocator to each board's *real* linker span,
+// so a board whose pool is smaller than this just leaves the bitmap's
+// tail words unused: QEMU's src/kernel.ld reserves 768 MiB, the Duo's
+// ~59 MiB, the JH7110 / Orange Pi RV up to this ceiling out of its 2 GiB
+// DRAM (docs/opi-rv-plan.md, docs/go-port-plan.md — Go's toolchain wants
+// the headroom). 1920 MiB / 4 KiB / 8 = 60 KiB of BSS, negligible even on
+// the 64 MiB Duo. The medany code model the kernel is built with
+// (scripts/build.sh, llc -code-model=medium) sets this ceiling: every
+// global reference must land within +/-2 GiB of the kernel text PC, so
+// __free_ram_end can't run much past ~1.9 GiB from a kernel linked at
+// DRAM_BASE + 2 MiB regardless of how much DRAM the board has. Kept just
+// under 2^31 so the constant stays a plain 32-bit int.
+const RAM_SIZE = 1920 * 1024 * 1024;
 
 const BITS_PER_WORD = 32;
 const TOTAL_PAGES   = RAM_SIZE / PAGE_SIZE;
@@ -25,11 +35,11 @@ uint[TOTAL_PAGES / BITS_PER_WORD] bitmap;
 
 // The actual number of allocatable pages: the real distance between the
 // linker's __free_ram and __free_ram_end, in pages, capped at
-// TOTAL_PAGES (the bitmap's size). On QEMU src/kernel.ld makes that
-// span exactly RAM_SIZE; on the Duo boards/duo/kernel.ld pins
-// __free_ram_end to the real 64 MiB DRAM window minus the kernel image,
-// the stack, and the reserved top 768 KiB — ~59 MiB, ~1280 pages short
-// of TOTAL_PAGES. Scanning past this hands out addresses beyond
+// TOTAL_PAGES (the bitmap's size). QEMU's src/kernel.ld reserves 768 MiB,
+// well under TOTAL_PAGES, so the bitmap's tail words go unused there; the
+// Duo's boards/duo/kernel.ld pins __free_ram_end to the real 64 MiB DRAM
+// window minus the kernel image, the stack, and the reserved top 768 KiB
+// — ~59 MiB. Scanning past the real span hands out addresses beyond
 // physical DRAM; the zero-fill in try_alloc_pages then faults → panic.
 // Only ever hit by something that genuinely exhausts RAM (oomtest).
 fn uint ram_page_count()

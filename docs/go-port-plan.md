@@ -138,17 +138,38 @@ seconds), but correct.
 
 Kernel RAM raised for this (QEMU only, board-gated):
 - `scripts/launch64*.sh` now pass `-m 1G`; `src/kernel.ld` `__free_ram`
-  → 768 MiB (must match `src/allocation.c3`'s `RAM_SIZE`).
+  → 768 MiB.
 - `board::HEAP_MAX_BYTES` → 512 MiB; provider `RamSize` → 128 MiB
   (eager, with a CPUInit 8 MiB fallback if a board refuses it).
 
-**Known blocker for JH7110**: racccoon does not boot with `-m >= 2G`
-(no output at all, fails before BSS clear — an early-boot / FDT-
-placement / kernel-identity-map issue; the map only covers
-`[__kernel_map_base, __free_ram_end)` and QEMU puts the FDT near the
-top of RAM). The Orange Pi RV has 2 GB, so this must be fixed before
-that bring-up — likely the same early-MMU work `docs/opi-rv-plan.md`
-already anticipates for first boot. Not needed for the QEMU stages.
+**JH7110 2 GiB — cleared (2026-09-01).** The old "racccoon does not
+boot with `-m >= 2G`" note no longer reproduces: the current kernel
+boots cleanly at QEMU `-m 2G`, `-m 3G`, `-m 4G`, and `-m 8G`, runs
+`gotest` and the regression sweep, and still boots + runs Go with
+`__free_ram` experimentally raised to 1792 MiB under `-m 2G`. The
+kernel runs bare-mode through `kernel_main` and never reads the FDT,
+so the FDT-placement theory in the original note was wrong; the real
+earlier failure was in the pre-Stage-2 allocator (a `RAM_SIZE` /
+`__free_ram` mismatch), fixed by the Stage 2 rework + allocation rover.
+What *was* still capped: `src/allocation.c3`'s `RAM_SIZE` (the page
+bitmap's compile-time size) hardcoded 768 MiB — so any board's usable
+pool was ceilinged there regardless of its own `kernel.ld`. Raised to
+**1920 MiB** (≈ the medany code-model ceiling — every global ref must
+sit within ±2 GiB of the kernel text PC, so `__free_ram_end` can't run
+much past ~1.9 GiB from a kernel at DRAM_BASE + 2 MiB anyway). Bitmap
+is now 60 KiB of BSS; `ram_page_count()` still caps the allocator to
+each board's real linker span, so QEMU (768 MiB) and Duo (~59 MiB) are
+behaviourally unchanged. The Orange Pi RV board (`opi-rv-port` branch)
+can now size `boards/opi-rv/kernel.ld` up to that ceiling.
+
+Follow-up (not blocking): `create_process` / `sys_rfork` / `sys_exec`
+identity-map the whole pool at 4 KiB granularity into *every* process
+page table — ~4 MiB of page tables per process and ~500 K `map_page`
+calls per process at a 2 GiB pool. Boots fine (measured at 1792 MiB)
+but wasteful; a 2 MiB-megapage kernel identity map, or a shared
+kernel L1 sub-table referenced from every root table, is the real fix.
+Touches ~5 page-table walk sites (the teardown / COW loops must skip a
+megapage/shared entry rather than descend or free it).
 
 Optional later: racccoon *has* the thread primitives — `rfork(RFPROC|
 RFMEM)` + `SYS_FUTEX_WAIT`/`_WAKE` keyed on `(addr, page_table)`. A real

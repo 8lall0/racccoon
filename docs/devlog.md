@@ -4,6 +4,53 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-01 — JH7110 `-m 2G` blocker: cleared, and the bitmap ceiling raised
+
+The go-port notes carried a "racccoon does not boot with QEMU `-m >= 2G`
+(no output, fails before BSS clear — FDT placement / kernel identity
+map)" blocker, flagged as a must-fix before Orange Pi RV (JH7110, 2 GB)
+bring-up.
+
+**It doesn't reproduce.** The current kernel boots cleanly at `-m 2G`,
+`-m 3G`, `-m 4G`, and `-m 8G` — through to the shell prompt, `gotest`
+green, the full regression sweep (`gostage35test` / `gostage41test` /
+`wasmtest` / `dirpacktest` / `oomtest` / `fsdkilltest` / `fspermtest` /
+`chmodtest`) green at `-m 2G`. It also still boots and runs Go with
+`__free_ram` experimentally bumped to 1792 MiB under `-m 2G`. The
+kernel runs bare-mode all the way through `kernel_main` and never
+touches the FDT (`a1` is ignored; `board::plic_init()` uses static
+constants), so the FDT-placement theory was wrong — the real earlier
+failure was a pre-Stage-2 allocator bug (`RAM_SIZE` vs `__free_ram`
+mismatch) that the Stage 2 rework + allocation rover already fixed.
+
+What *was* still a real ceiling: `src/allocation.c3`'s `RAM_SIZE` — the
+page bitmap's compile-time size — hardcoded at 768 MiB, one constant
+shared by every board. `ram_page_count()` caps allocation to
+`min(real linker span, RAM_SIZE)`, so a board whose `kernel.ld`
+reserved more than 768 MiB (the JH7110 wants ~1.9 GiB of its 2 GiB for
+Go's toolchain) would have silently lost everything past 768 MiB.
+
+Raised to **1920 MiB** — chosen at the medany code-model ceiling
+(`llc -code-model=medium`: every global reference must land within
+±2 GiB of the kernel text PC, so `__free_ram_end` can't sit much past
+~1.9 GiB from a kernel linked at DRAM_BASE + 2 MiB regardless of DRAM
+size), and kept just under 2^31 so the constant stays a plain 32-bit
+int. The bitmap is now 60 KiB of BSS (was 24 KiB) — negligible even on
+the 64 MiB Duo. QEMU (768 MiB pool) and Duo (~59 MiB, `__free_ram_end`
+pinned to `__dram_end`) are behaviourally unchanged: `oomtest` still
+green, `-m 1G` default boot still green, Duo kernel still builds clean.
+`boards/opi-rv/kernel.ld` (on `opi-rv-port`) can now size its pool up
+to the ceiling.
+
+Not done here (documented as a follow-up in `docs/go-port-plan.md`):
+`create_process` / `sys_rfork` / `sys_exec` still identity-map the pool
+at 4 KiB granularity into every process page table — ~4 MiB of page
+tables and ~500 K `map_page` calls per process at a 2 GiB pool. Boots
+fine, but a 2 MiB-megapage or shared-L1 kernel identity map is the
+right long-term fix.
+
+---
+
 ## 2026-09-01 — Go Stage 4.4 spike: `cmd/go` runs, needs a GOROOT
 
 Scoping spike, no commit (like the 4.2 spike). `scripts/build_go.sh
