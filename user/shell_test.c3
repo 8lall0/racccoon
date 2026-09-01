@@ -2162,6 +2162,37 @@ fn void main() {
                     print(")\n");
                 }
             }
+        } else if (strcmp(cmd, "goversiontest") == 0) {
+            // Stage 4.4 part 1 (docs/go-port-plan.md): the `go` command
+            // itself runs on racccoon. `go version` + `go env GOROOT`
+            // (the cheap milestone — no $GOROOT/src / tools needed, just
+            // the /goroot/{VERSION,go.env} skeleton baked GOROOT=/goroot
+            // resolves to). `go build` is groundwork, not wired here.
+            // Slow (a ~14 MiB binary off fsd, twice) — not in the quick
+            // sweep. Skips cleanly without /bin/go.
+            uint gv_size = 0; int gv_type = 0;
+            if (fs_stat("/bin/go", &gv_size, &gv_type) < 0) {
+                print("goversiontest: skipped (no /bin/go — build with TAMAGO set)\n");
+            } else {
+                char*[1] gv_ver_av; gv_ver_av[0] = "version";
+                uint gv_g1 = 0;
+                int gv_c1 = rfork(RFPROC, &gv_g1);
+                if (gv_c1 == 0) { exec("/bin/go", exec_buf(), exec_buf_max(), 0, &gv_ver_av[0], 1); exitcode(127); }
+                int gv_rc1 = join(gv_c1, gv_g1);
+
+                char*[2] gv_env_av; gv_env_av[0] = "env"; gv_env_av[1] = "GOROOT";
+                uint gv_g2 = 0;
+                int gv_c2 = rfork(RFPROC, &gv_g2);
+                if (gv_c2 == 0) { exec("/bin/go", exec_buf(), exec_buf_max(), 0, &gv_env_av[0], 2); exitcode(127); }
+                int gv_rc2 = join(gv_c2, gv_g2);
+
+                if (gv_rc1 == 0 && gv_rc2 == 0) {
+                    print("goversiontest: ok\n");
+                } else {
+                    print("goversiontest: FAILED (version exit "); print_uint((uint)gv_rc1);
+                    print(", env exit "); print_uint((uint)gv_rc2); print(")\n");
+                }
+            }
         } else if (strcmp(cmd, "gotoolchaintest") == 0) {
             // Stage 4.3 (docs/go-port-plan.md) — racccoon's OWN go tool
             // compile + go tool link, running natively on racccoon,

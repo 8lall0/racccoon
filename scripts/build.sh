@@ -72,6 +72,13 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
     bash scripts/build_go.sh cmd/compile || true
     bash scripts/build_go.sh cmd/link || true
     bash scripts/build_go_toolchain.sh || true
+
+    # Stage 4.4 part 1: the `go` command itself (`go version` / `go env`
+    # run on racccoon; `go build` is groundwork — docs/go-port-plan.md).
+    # `go.elf` bakes GOROOT=/goroot; build_go_goroot.sh assembles the
+    # /goroot skeleton (VERSION + go.env). Seeded as /bin/go below.
+    bash scripts/build_go.sh cmd/go || true
+    bash scripts/build_go_goroot.sh || true
   fi
 
   # The disk images built below are pristine masters — every one is
@@ -143,7 +150,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # image (and only meaningfully testable next to the toolchain
   # closure seeded onto disk_ext2.img) — skip them here.
   for g in build/go/*.elf; do
-    case "$(basename "$g")" in compile.elf|link.elf|gostage*.elf) continue ;; esac
+    case "$(basename "$g")" in compile.elf|link.elf|go.elf|gostage*.elf) continue ;; esac
     [ -e "$g" ] && mcopy -i build/disk.img "$g" "::bin/go-$(basename "$g" .elf)"
   done
   # bin/{cat,ls,write,rm,mkdir,mv} — the real, argv-taking utilities
@@ -231,7 +238,27 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "sif adm/secret mode 0100600" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_ext2.img > /dev/null
-  for g in build/go/*.elf; do [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_ext2.img > /dev/null; done
+  for g in build/go/*.elf; do
+    # go.elf is the `go` command itself — seeded as /bin/go with its
+    # /goroot below, not as /bin/go-go.
+    case "$(basename "$g")" in go.elf) continue ;; esac
+    [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_ext2.img > /dev/null
+  done
+  # Stage 4.4 part 1 (docs/go-port-plan.md): the `go` command + its
+  # baked GOROOT skeleton. /goroot/{VERSION,go.env}; /gocache +
+  # /gomodcache are the writable dirs go.env points GOCACHE/GOMODCACHE
+  # at (go build needs a real cache dir — GOCACHE=off is rejected).
+  if [ -d build/go/goroot ]; then
+    debugfs -w -R "write build/go/go.elf bin/go" build/disk_ext2.img > /dev/null
+    debugfs -w -R "mkdir goroot" build/disk_ext2.img > /dev/null
+    debugfs -w -R "mkdir goroot/pkg" build/disk_ext2.img > /dev/null
+    debugfs -w -R "mkdir goroot/pkg/tool" build/disk_ext2.img > /dev/null
+    debugfs -w -R "mkdir goroot/pkg/tool/tamago_riscv64" build/disk_ext2.img > /dev/null
+    debugfs -w -R "write build/go/goroot/VERSION goroot/VERSION" build/disk_ext2.img > /dev/null
+    debugfs -w -R "write build/go/goroot/go.env goroot/go.env" build/disk_ext2.img > /dev/null
+    debugfs -w -R "mkdir gocache" build/disk_ext2.img > /dev/null
+    debugfs -w -R "mkdir gomodcache" build/disk_ext2.img > /dev/null
+  fi
   # Stage 4 (docs/go-port-plan.md): the stdlib object closure + importcfg
   # go-compile/go-link need to build+link go/cmd/hello entirely on-device
   # (build_go_toolchain.sh). /lib/go/pkg/*.a, /lib/go/importcfg{,.link},
@@ -318,7 +345,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_root_part.img > /dev/null
   # Same exclusion as the FAT32 image above — too big for this partition.
   for g in build/go/*.elf; do
-    case "$(basename "$g")" in compile.elf|link.elf|gostage*.elf) continue ;; esac
+    case "$(basename "$g")" in compile.elf|link.elf|go.elf|gostage*.elf) continue ;; esac
     [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_dual_root_part.img > /dev/null
   done
   for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do
@@ -346,7 +373,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_ext2_part.img > /dev/null
   # Same exclusion as the FAT32 image above — too big for this partition.
   for g in build/go/*.elf; do
-    case "$(basename "$g")" in compile.elf|link.elf|gostage*.elf) continue ;; esac
+    case "$(basename "$g")" in compile.elf|link.elf|go.elf|gostage*.elf) continue ;; esac
     [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_dual_ext2_part.img > /dev/null
   done
   for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do

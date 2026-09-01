@@ -48,11 +48,20 @@ if [ -f "$GOROOT_SRC/runtime/goos/linux_user.go" ] && \
 fi
 
 # -s -w keeps the big Stage-4 binaries (compile ~23 MiB) under the exec cap.
+# cmd/go: bake the on-device GOROOT (Stage 4.4, docs/go-port-plan.md).
+# runtime.GOROOT() falls back to this when os.Executable()-based
+# detection fails (it does on racccoon), and cfg.findGOROOT returns it;
+# then $GOROOT/go.env supplies GOFLAGS / GOPROXY / GOCACHE / etc.
+EXTRA_LDFLAGS=""
+if [ "$1" = "cmd/go" ]; then
+  EXTRA_LDFLAGS="-X runtime.defaultGOROOT=/goroot"
+fi
+
 cd "$REPO/go"
 GOOS=tamago GOARCH=riscv64 CGO_ENABLED=0 \
 GOOSPKG=racccoon.local/goport GOFLAGS=-mod=mod \
   "$TAMAGO" build \
-  -ldflags "-T 0x1010000 -R 0x1000 -s -w" \
+  -ldflags "-T 0x1010000 -R 0x1000 -s -w $EXTRA_LDFLAGS" \
   -o "$OUT" \
   "$PKG"
 

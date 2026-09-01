@@ -1,3 +1,74 @@
+diff --git a/src/cmd/go/internal/goos/goos.go b/src/cmd/go/internal/goos/goos.go
+index cb0fef21..d89e9f4f 100644
+--- a/src/cmd/go/internal/goos/goos.go
++++ b/src/cmd/go/internal/goos/goos.go
+@@ -27,6 +27,7 @@ import (
+ 	"context"
+ 	"os"
+ 	"path/filepath"
++	"runtime"
+ 
+ 	"cmd/go/internal/base"
+ 	"cmd/go/internal/cfg"
+@@ -58,6 +59,11 @@ func ResolveImport(moduleLoader *modload.Loader, imp string) (newPath, dir strin
+ 		}
+ 
+ 		dir = filepath.Join(dir, "goos")
++	} else if runtime.GOOS == "tamago" {
++		// racccoon (lib/go/racccoon.patch): the `go` command runs
++		// on-device, and the racccoon runtime/goos overlay is baked
++		// straight into this GOROOT — no GOOSPKG module to resolve.
++		dir = filepath.Join(cfg.GOROOT, "src/runtime/goos")
+ 	} else {
+ 		// fallback to Linux userspace goos defined in GOROOT/src/runtime/goos
+ 		if os.Getenv("GOHOSTOS") == "linux" && (cfg.Goarch == "amd64" || cfg.Goarch == "arm" || cfg.Goarch == "arm64" || cfg.Goarch == "loong64" || cfg.Goarch == "riscv64") {
+diff --git a/src/cmd/go/internal/lockedfile/internal/filelock/filelock_other.go b/src/cmd/go/internal/lockedfile/internal/filelock/filelock_other.go
+index b16709ed..94051399 100644
+--- a/src/cmd/go/internal/lockedfile/internal/filelock/filelock_other.go
++++ b/src/cmd/go/internal/lockedfile/internal/filelock/filelock_other.go
+@@ -9,6 +9,7 @@ package filelock
+ import (
+ 	"errors"
+ 	"io/fs"
++	"runtime"
+ )
+ 
+ type lockType int8
+@@ -18,7 +19,13 @@ const (
+ 	writeLock
+ )
+ 
++// racccoon (lib/go/racccoon.patch): no filesystem locking, and none
++// needed — `go` runs one process at a time and fsd has no flock. A
++// no-op lock keeps modload / the build cache working.
+ func lock(f File, lt lockType) error {
++	if runtime.GOOS == "tamago" {
++		return nil
++	}
+ 	return &fs.PathError{
+ 		Op:   lt.String(),
+ 		Path: f.Name(),
+@@ -27,6 +34,9 @@ func lock(f File, lt lockType) error {
+ }
+ 
+ func unlock(f File) error {
++	if runtime.GOOS == "tamago" {
++		return nil
++	}
+ 	return &fs.PathError{
+ 		Op:   "Unlock",
+ 		Path: f.Name(),
+diff --git a/src/cmd/vendor/golang.org/x/telemetry/internal/telemetry/dir.go b/src/cmd/vendor/golang.org/x/telemetry/internal/telemetry/dir.go
+index 0673be56..cdcb353b 100644
+--- a/src/cmd/vendor/golang.org/x/telemetry/internal/telemetry/dir.go
++++ b/src/cmd/vendor/golang.org/x/telemetry/internal/telemetry/dir.go
+@@ -159,5 +159,6 @@ const DisabledOnPlatform = false ||
+ 	// These platforms fundamentally can't be supported:
+ 	runtime.GOOS == "js" || // #60971
+ 	runtime.GOOS == "wasip1" || // #60971
++	runtime.GOOS == "tamago" || // racccoon (lib/go/racccoon.patch): no telemetry child / config dir
+ 	runtime.GOOS == "plan9" || // https://github.com/golang/go/issues/57540#issuecomment-1470766639
+ 	runtime.GOARCH == "mips" || runtime.GOARCH == "mipsle" // mips lacks cross-process 64-bit atomics
 diff --git a/src/os/pipe_tamago.go b/src/os/pipe_tamago.go
 index 442f0cdf..0d0635f2 100644
 --- a/src/os/pipe_tamago.go
@@ -105,10 +176,10 @@ index 6d57f5f9..7060f5da 100644
  func msigrestore(sigmask sigset)     {}
 diff --git a/src/syscall/fs_racccoon.go b/src/syscall/fs_racccoon.go
 new file mode 100644
-index 00000000..341c17a1
+index 00000000..41f1cc12
 --- /dev/null
 +++ b/src/syscall/fs_racccoon.go
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,259 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -156,6 +227,7 @@ index 00000000..341c17a1
 +type goosFile struct {
 +	defaultFileImpl
 +	h     uintptr
++	path  string // kept for fd-based ops the backend only does by path (Ftruncate)
 +	off   int64
 +	isDir bool
 +	dents  []string
@@ -163,12 +235,20 @@ index 00000000..341c17a1
 +	dpos   int
 +}
 +
++// ftruncate: the backend has no truncate-by-handle, so resize by path.
++func (f *goosFile) ftruncate(length int64) error {
++	if f.path == "" {
++		return EINVAL
++	}
++	return goosErrno(goos.FS.Truncate(f.path, length))
++}
++
 +func goosOpen(path string, openmode int, perm uint32) (int, error) {
 +	h, isDir, size, e := goos.FS.Open(path, openmode, perm)
 +	if e != 0 {
 +		return -1, goosErrno(e)
 +	}
-+	f := &goosFile{h: h, isDir: isDir}
++	f := &goosFile{h: h, path: path, isDir: isDir}
 +	if openmode&O_APPEND != 0 {
 +		f.off = size
 +	}
@@ -360,7 +440,7 @@ index 00000000..341c17a1
 +	return nil
 +}
 diff --git a/src/syscall/fs_tamago.go b/src/syscall/fs_tamago.go
-index 55aea4cc..c8362213 100644
+index 55aea4cc..501ab344 100644
 --- a/src/syscall/fs_tamago.go
 +++ b/src/syscall/fs_tamago.go
 @@ -368,6 +368,9 @@ func (f *fsysFile) read(b []byte) (int, error) {
@@ -448,7 +528,17 @@ index 55aea4cc..c8362213 100644
  	fsinit()
  	fs.mu.Lock()
  	defer fs.mu.Unlock()
-@@ -835,6 +866,9 @@ func Ftruncate(fd int, length int64) error {
+@@ -825,6 +856,9 @@ func Truncate(path string, length int64) error {
+ }
+ 
+ func Ftruncate(fd int, length int64) error {
++	if gf, ok := fdToGoosFile(fd); ok {
++		return gf.ftruncate(length)
++	}
+ 	f, err := fdToFsysFile(fd)
+ 	if err != nil {
+ 		return err
+@@ -835,6 +869,9 @@ func Ftruncate(fd int, length int64) error {
  }
  
  func Chdir(path string) error {
@@ -459,7 +549,7 @@ index 55aea4cc..c8362213 100644
  	return chdir(path)
  }
 diff --git a/src/syscall/syscall_tamago.go b/src/syscall/syscall_tamago.go
-index d7ab81f1..672c9e33 100644
+index d7ab81f1..2f626f97 100644
 --- a/src/syscall/syscall_tamago.go
 +++ b/src/syscall/syscall_tamago.go
 @@ -10,6 +10,7 @@ import (
@@ -486,11 +576,21 @@ index d7ab81f1..672c9e33 100644
  func (w WaitStatus) Signaled() bool     { return false }
  func (w WaitStatus) Signal() Signal     { return 0 }
  func (w WaitStatus) CoreDump() bool     { return false }
-@@ -284,7 +290,13 @@ func Sysctl(key string) (string, error) {
+@@ -282,9 +288,21 @@ func Sysctl(key string) (string, error) {
  
- const ImplementsGetwd = false
+ // Unimplemented Unix midden heap.
  
+-const ImplementsGetwd = false
+-
 -func Getwd() (wd string, err error)     { return "", ENOSYS }
++// racccoon: true when goos.FS is installed, so os.Getwd() uses
++// syscall.Getwd() (the fsd cwd) directly instead of the "read .. and
++// match inodes" fallback — that fallback needs real st_ino values,
++// which the fsd backend doesn't synthesise (every Stat returns ino 0,
++// so SameFile matches everything and the walk stops at "/"). A vanilla
++// GOOS=tamago build keeps the old behaviour.
++var ImplementsGetwd = goos.FS != nil
++
 +func Getwd() (wd string, err error) {
 +	if goos.FS != nil {
 +		wd, e := goos.FS.Getwd()
@@ -501,7 +601,7 @@ index d7ab81f1..672c9e33 100644
  func Getegid() int                      { return 1 }
  func Geteuid() int                      { return 1 }
  func Getgid() int                       { return 1 }
-@@ -298,10 +310,40 @@ func Sendfile(outfd int, infd int, offset *int64, count int) (written int, err e
+@@ -298,10 +316,40 @@ func Sendfile(outfd int, infd int, offset *int64, count int) (written int, err e
  	return 0, ENOSYS
  }
  func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle uintptr, err error) {

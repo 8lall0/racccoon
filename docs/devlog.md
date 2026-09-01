@@ -4,6 +4,64 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-01 — Go Stage 4.4 part 1: `go version` / `go env` on racccoon
+
+The `go` command itself runs on racccoon. `go version` →
+`go version go1.27.0 tamago/riscv64`, exit 0. `go env GOROOT` → `/goroot`,
+`go env GOOS GOARCH` → `tamago` / `riscv64`. `goversiontest` builtin.
+
+What it took:
+- **GOROOT.** `scripts/build_go.sh` links `cmd/go` with
+  `-X runtime.defaultGOROOT=/goroot`. `cfg.findGOROOT` falls back to
+  `runtime.GOROOT()` when `os.Executable()`-based detection fails (it
+  does on racccoon), so the baked value wins. `build_go_goroot.sh`
+  assembles the `/goroot` skeleton — `VERSION` + a `go.env` that
+  `cfg.findGOROOT` reads *before* the (empty) process environment,
+  supplying `GOFLAGS=-mod=mod` / `GOPROXY=off` / `GOTOOLCHAIN=local` /
+  `GOCACHE=/gocache` / `GO111MODULE=on` / `CGO_ENABLED=0`.
+- **Telemetry.** `go` was logging `can't start telemetry child
+  process: exec: "tamago": ...` on every invocation (non-fatal, but
+  noise). One-liner in `x/telemetry`'s `DisabledOnPlatform` — add
+  `runtime.GOOS == "tamago"`.
+- **os.Getwd.** Flipped `syscall.ImplementsGetwd` (const → `var =
+  goos.FS != nil`) so `os.Getwd()` uses `syscall.Getwd()` (the fsd
+  cwd) directly instead of the "read `..` and match st_ino" fallback —
+  that fallback needs real inode numbers, which the fsd backend
+  doesn't synthesise (every Stat is ino 0, so `SameFile` matches
+  everything and the walk stops at `/`). Also fixed `getcwd()` in the
+  goos backend: racccoon stores the root cwd as `""` (SYS_GETCWD
+  returns length 0), which the backend was treating as an error
+  instead of `/` — this broke gostage35test's `os.Getwd` check the
+  moment `ImplementsGetwd` went true; fixed, sweep green again.
+
+`go build` — groundwork only, not working yet. It now gets *through*
+GOROOT resolution, module loading, the build cache setup, and the
+compile/link toolID probe before failing. Blockers fixed along the way
+(all in `lib/go/racccoon.patch` / `go/goos/`): file locking
+(`filelock_other.go` `lock`/`unlock` → no-op on tamago — `go` runs one
+process at a time, fsd has no flock); the `GOOS tamago unsupported
+without external GOOSPKG` fatal (`cmd/go/internal/goos` now uses
+`$GOROOT/src/runtime/goos` directly on tamago — the racccoon overlay
+is baked into the seeded GOROOT, no GOOSPKG module to resolve);
+`GOCACHE=off` rejected (needs a real writable dir — `/gocache`);
+`syscall.Ftruncate` not routed to the fsd hook; `goos.FS.Truncate`
+only handling truncate-to-0 (now shrinks via read+rewrite, grows via
+zero-pad). **Still open:** `go tool compile -V=full` reports its name
+as `go` not `compile` — racccoon's exec ABI carries no argv[0], so the
+goos layer synthesises `os.Args[0] = "go"` for every spawned Go binary,
+and `cmd/go`'s toolID parser rejects the mismatch. Fixing that
+properly means carrying argv[0] through `SYS_EXEC` (kernel ABI +
+`exec()` + every c3 caller + `start()`), or relaxing the toolID check.
+Plus: seeding `$GOROOT/src` (the ~10 MiB stdlib closure) + the
+`{compile,link,asm}` tool binaries into `/goroot/pkg/tool/`.
+
+Regressions green (`goversiontest` / gostage35 / gostage41 / gostage42
+/ gotest / chmodtest / wasmtest / oomtest). Duo kernel builds clean;
+the patch is inert for a vanilla `GOOS=tamago` build. `racccoon.patch`
+now 646 lines.
+
+---
+
 ## 2026-09-01 — rfork: atomic stdout/stdin pipe wiring (a2 / a4)
 
 Follow-up to the previous entry, and a **correction** to its closing

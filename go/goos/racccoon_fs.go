@@ -76,8 +76,14 @@ func putPath(b []byte, s string, n int) {
 func getcwd() (string, int) {
 	var cw [256]byte
 	n := sysGetcwd(&cw[0], int64(len(cw)))
-	if n <= 0 {
+	if n < 0 {
 		return "", eIO
+	}
+	if n == 0 {
+		// racccoon stores the root cwd as the empty string (process.c3
+		// `proc.cwd[0] = 0`); SYS_GETCWD returns length 0. That's "/",
+		// not an error.
+		return "/", eOK
 	}
 	return string(cw[:n]), eOK
 }
@@ -92,6 +98,9 @@ func abspath(p string) string {
 	}
 	if p == "" {
 		return cw
+	}
+	if cw == "/" {
+		return "/" + p
 	}
 	return cw + "/" + p
 }
@@ -403,13 +412,41 @@ func (fsdBackend) Rename(from, to string) int {
 }
 
 func (fsdBackend) Truncate(path string, size int64) int {
-	if size != 0 {
-		return eNOSYS
+	if size < 0 {
+		return eIO
 	}
 	ap := abspath(path)
-	simpleVerb(ap, fsDelete, 0)
-	_, e := writeAt(ap, nil, 0)
-	return e
+	cur, isDir, e := statPath(ap)
+	if e != 0 {
+		return e
+	}
+	if isDir {
+		return eIO
+	}
+	if size == cur {
+		return eOK
+	}
+	if size == 0 {
+		// fsd has no truncate verb; delete + recreate empty.
+		simpleVerb(ap, fsDelete, 0)
+		_, we := writeAt(ap, nil, 0)
+		return we
+	}
+	if size < cur {
+		// shrink: keep the first `size` bytes, delete, rewrite.
+		buf := make([]byte, size)
+		n, re := readAt(ap, buf, 0)
+		if re != 0 || int64(n) != size {
+			return eIO
+		}
+		simpleVerb(ap, fsDelete, 0)
+		_, we := writeAt(ap, buf, 0)
+		return we
+	}
+	// grow: zero-pad from the current end (FS_WRITE_AT extends).
+	pad := make([]byte, size-cur)
+	_, we := writeAt(ap, pad, cur)
+	return we
 }
 
 func (fsdBackend) Getwd() (string, int) { return getcwd() }

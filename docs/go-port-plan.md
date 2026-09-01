@@ -377,13 +377,33 @@ unknowns. Staged:
      not-found, `go` continues (non-fatal). Disable with
      `GOTELEMETRY=off` / patch out the telemetry package.
 
-  Unmeasured: `$GOROOT/src` seed (~60 MB stdlib source, thousands of
-  fsd writes — minutes on emulated disk), build-cache `flock` (fsd has
-  none — likely a no-op shim), module pinning (`GO111MODULE`,
-  `GOPROXY=off`, `GOFLAGS=-mod=mod`). It's env plumbing + a bulk seed,
-  not a runtime port — the self-hosting compiler already works (4.3).
-  A first target smaller than full `go build`: `go env` / `go version`
-  green (only needs blockers 1+2, no stdlib tree).
+  **4.4 part 1 — DONE (commit TBD): `go version` / `go env` run on
+  racccoon.** `go version go1.27.0 tamago/riscv64`, exit 0.
+  `goversiontest`. `scripts/build_go.sh` links `cmd/go` with
+  `-X runtime.defaultGOROOT=/goroot`; `build_go_goroot.sh` +
+  `scripts/build.sh` seed `/goroot/{VERSION,go.env}` (go.env carries
+  `GOFLAGS`/`GOPROXY=off`/`GOTOOLCHAIN=local`/`GOCACHE=/gocache`/...,
+  read by `cfg.findGOROOT` before the empty process env). Telemetry
+  child spawn silenced (`x/telemetry` `DisabledOnPlatform` +=
+  `tamago`). `syscall.ImplementsGetwd` flipped to a `var = goos.FS !=
+  nil` so `os.Getwd()` uses the fsd cwd directly (the `..`-walk
+  fallback needs real st_ino, which the fsd backend fakes as 0);
+  `getcwd()` in `go/goos` now returns `/` for the empty root cwd.
+
+  **4.4 part 2 — `go build` — groundwork, not working.** Gets through
+  GOROOT / module load / build-cache / toolID probe. Fixed on the way:
+  filelock → no-op on tamago; `GOOS tamago unsupported without GOOSPKG`
+  fatal (`cmd/go/internal/goos` uses `$GOROOT/src/runtime/goos`
+  directly on tamago — seed the racccoon overlay there, no GOOSPKG);
+  `GOCACHE=off` rejected → real `/gocache` dir; `syscall.Ftruncate`
+  routed to the fsd hook; `goos.FS.Truncate` generalised (shrink =
+  read+rewrite, grow = zero-pad). **Open:** `compile -V=full` reports
+  its name as `go` (racccoon exec ABI has no argv[0]; the goos layer
+  synthesises `os.Args[0]="go"`), which `cmd/go`'s toolID parser
+  rejects — needs argv[0] carried through `SYS_EXEC` (kernel + `exec()`
+  + c3 callers + `start()`) or a relaxed toolID check. Plus seeding
+  `$GOROOT/src` (~10 MiB closure) + `{compile,link,asm}` into
+  `/goroot/pkg/tool/tamago_riscv64/`.
 
 Likely wants the `GOOS=racccoon` rename around 4.3–4.4 (own identity,
 room for `os`/`syscall` to diverge further) — apply tamago's patchset
