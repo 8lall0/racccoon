@@ -117,3 +117,59 @@ func GetRandomData(b []byte) {
 		b[i] = byte(i * 2654435761)
 	}
 }
+
+// FS, when set (by the go/racccoon package's init), routes package os's
+// filesystem operations to racccoon's fsd server instead of
+// GOOS=tamago's in-memory fs. nil keeps the in-memory behaviour. The
+// syscall-side hooks that read this are a small toolchain patch
+// (lib/go/racccoon.patch); keep this type in sync with that patch's
+// copy in src/runtime/goos/linux_user.go. See docs/go-port-plan.md.
+var FS FSHook
+
+// rcArgc / rcArgvBlob are filled by CPUInit (asm) from racccoon's exec
+// ABI: argc, and the base of the NUL-separated argv string blob.
+var (
+	rcArgc     int
+	rcArgvBlob *byte
+)
+
+// Args returns os.Args, parsed from the exec-ABI blob CPUInit stashed.
+// The runtime reaches it via goosArgs() (lib/go/racccoon.patch).
+// racccoon's c3 exec() ABI carries only the real arguments (no argv[0]),
+// so a synthetic "go" is prepended — same convention the libc crt0
+// uses — leaving the real args at os.Args[1:].
+var Args = func() []string {
+	out := []string{"go"}
+	if rcArgc <= 0 || rcArgvBlob == nil {
+		return out
+	}
+	p := unsafe.Pointer(rcArgvBlob)
+	for i := 0; i < rcArgc; i++ {
+		n := 0
+		for *(*byte)(unsafe.Add(p, n)) != 0 {
+			n++
+		}
+		out = append(out, unsafe.String((*byte)(p), n))
+		p = unsafe.Add(p, n+1)
+	}
+	return out
+}
+
+// FSHook is the host filesystem backend contract. Handles are opaque
+// tokens Open hands back and every later call passes in. Paths are
+// already absolute (the syscall layer resolves cwd first via Getwd).
+type FSHook interface {
+	Open(path string, flags int, perm uint32) (h uintptr, isDir bool, size int64, err error)
+	Close(h uintptr) error
+	Pread(h uintptr, b []byte, off int64) (int, error)
+	Pwrite(h uintptr, b []byte, off int64) (int, error)
+	Fstat(h uintptr) (size int64, isDir bool, err error)
+	Dirents(h uintptr) (names []string, isDir []bool, err error)
+	Stat(path string) (size int64, isDir bool, err error)
+	Mkdir(path string, perm uint32) error
+	Remove(path string, dir bool) error
+	Rename(from, to string) error
+	Truncate(path string, size int64) error
+	Getwd() (string, error)
+	Chdir(path string) error
+}

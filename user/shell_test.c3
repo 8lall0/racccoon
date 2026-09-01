@@ -2061,7 +2061,7 @@ fn void main() {
                 if (wt_code != 0) { wt_ok = -1; }
             }
             print(wt_ok == 0 ? "wasmtest: ok\n" : "wasmtest: FAILED\n");
-        } else if (strcmp(cmd, "gotest") == 0 || strcmp(cmd, "gostage2test") == 0 || strcmp(cmd, "gostage3test") == 0) {
+        } else if (strcmp(cmd, "gotest") == 0 || strcmp(cmd, "gostage2test") == 0 || strcmp(cmd, "gostage3test") == 0 || strcmp(cmd, "gostage35test") == 0) {
             // Go on racccoon (docs/go-port-plan.md). /bin/go-* are
             // GOOS=tamago static riscv64 binaries built by
             // scripts/build_go.sh from go/cmd/*, loaded through
@@ -2090,6 +2090,13 @@ fn void main() {
             //                  + read back + rename + remove under /tmp,
             //                  build a directory tree. e2fsck must be
             //                  clean after.
+            //   gostage35test — go/cmd/gostage35: the *standard* os
+            //                  package (os.Open / ReadFile / ReadDir /
+            //                  Create / Rename / Getwd / RemoveAll,
+            //                  os.IsNotExist) routed to fsd through
+            //                  runtime/goos.FS — the go/racccoon blank
+            //                  import + lib/go/racccoon.patch. e2fsck
+            //                  clean after.
             //
             // The program prints to the console directly (goos.Printk ->
             // SYS_PUTCHAR) so its output shows inline above the verdict.
@@ -2099,15 +2106,25 @@ fn void main() {
                 gt_path = "bin/go-gostage2"; gt_name = "gostage2test";
             } else if (strcmp(cmd, "gostage3test") == 0) {
                 gt_path = "bin/go-gostage3"; gt_name = "gostage3test";
+            } else if (strcmp(cmd, "gostage35test") == 0) {
+                gt_path = "bin/go-gostage35"; gt_name = "gostage35test";
             } else {
                 gt_path = "bin/go-hello"; gt_name = "gotest";
             }
+            // gostage35test also checks os.Args — pass it two.
+            char*[2] gt_av;
+            gt_av[0] = "alpha"; gt_av[1] = "beta";
+            bool gt_s35 = strcmp(cmd, "gostage35test") == 0;
             uint gt_gen = 0;
             int gt_c = rfork(RFPROC, &gt_gen);
             if (gt_c < 0) {
                 print("rfork failed\n");
             } else if (gt_c == 0) {
-                exec(gt_path, exec_buf(), exec_buf_max(), 0, null, 0);
+                if (gt_s35) {
+                    exec(gt_path, exec_buf(), exec_buf_max(), 0, &gt_av[0], 2);
+                } else {
+                    exec(gt_path, exec_buf(), exec_buf_max(), 0, null, 0);
+                }
                 exitcode(127);
             } else {
                 int gt_code = join(gt_c, gt_gen);

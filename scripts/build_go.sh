@@ -26,6 +26,16 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${2:-$REPO/build/go/$NAME.elf}"
 mkdir -p "$(dirname "$OUT")"
 
+# The os <-> fsd bridge (go/racccoon) needs runtime/goos.FSHook, added by
+# lib/go/racccoon.patch. Warn if $TAMAGO's tree is unpatched — cmd/gostage35
+# and anything importing go/racccoon for os.* won't build otherwise.
+GOROOT_SRC="$("$TAMAGO" env GOROOT 2>/dev/null)/src"
+if [ -f "$GOROOT_SRC/runtime/goos/linux_user.go" ] && \
+   ! grep -q "FSHook" "$GOROOT_SRC/runtime/goos/linux_user.go" 2>/dev/null; then
+  echo "build_go.sh: note — \$TAMAGO tree is missing lib/go/racccoon.patch"
+  echo "  (os.* -> fsd won't work; run scripts/setup_tamago.sh). Building anyway."
+fi
+
 cd "$REPO/go"
 GOOS=tamago GOARCH=riscv64 CGO_ENABLED=0 \
 GOOSPKG=racccoon.local/goport \

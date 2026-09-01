@@ -151,14 +151,44 @@ clean afterward. Regressions green (gotest / gostage3test / chmodtest /
 wasmtest / tcctest / dirpacktest / fspermtest / oomtest /
 storagekilltest). Duo kernel builds clean.
 
-Deferred to a Stage 3.5: wiring `go/racccoon` into Go's own `os`
-package (`GOOS=tamago`'s `os`/`syscall` back onto an in-memory fs —
-making `os.Open` hit fsd needs a `fs_tamago.go` patch or the
-`GOOS=racccoon` rename), plus `os.Args` and `os/exec`. The bridge
-already unblocks Go programs that do filesystem work.
+**Stage 3.5 — Go's standard `os` package on fsd.** The stdlib `os` now
+operates on racccoon's filesystem; the only racccoon-specific line in a
+program is a blank import (`import _ "racccoon.local/goport/racccoon"`).
 
-Next: Stage 3.5 (`os.*` transparency) or Stage 4 (the Go toolchain
-self-hosting on the JH7110).
+- `lib/go/racccoon.patch` (4 files, ~255 lines, applied to the tamago-go
+  tree by `scripts/setup_tamago.sh`, in-repo like `lib/tcc/racccoon.patch`):
+  an optional `runtime/goos.FS` `FSHook`. When set, `syscall`'s path
+  ops (`Open`/`Read`/`Write`/`Seek`/`Stat`/`Mkdir`/`Unlink`/`Rename`/
+  `ReadDirent`/`Getwd`/`Chdir`) route to it instead of `fs_tamago.go`'s
+  in-memory fs. `nil` = stock tamago, so the patch is inert otherwise.
+- `go/racccoon/osbridge.go` installs the fsd backend in `init`; handles
+  are a small path table (fsd has no server fds); errors map best-effort
+  (`ENOENT` for a failed resolve so `os.IsNotExist` works, `EIO`
+  otherwise).
+- `os.Args`: `CPUInit` (asm) stashes the exec-ABI argc + argv blob;
+  `go/goos`'s `init` parses them and `//go:linkname`-replaces the
+  runtime's hardcoded `{"tamago"}` `argslice` before `os` init reads it.
+  `os.Args[0]` is a synthetic `"go"` (the c3 exec ABI carries no
+  argv[0]).
+
+`go/cmd/gostage35` (`gostage35test`) — `os.ReadFile` / `os.Stat` /
+`os.Open`+`io.ReadAll` / `Seek` / `ReadAt`, `os.IsNotExist`, `os.ReadDir`
+(incl. the 60-entry paginated dir — the dirent synthesis), `os.WriteFile`
+/ `os.Create` / O_TRUNC, `os.Mkdir` / `os.Rename` / `os.Remove` /
+`os.RemoveAll`, `os.Getwd`, `os.Args`. 26/26 pass on racccoon in QEMU;
+`e2fsck -fn` clean. Regressions green (all the go tests + chmod / wasm /
+tcc / dirpack / fsperm / oom / fsdkill). Duo builds clean.
+
+Note: importing `go/racccoon` at all now requires the patched
+toolchain (`osbridge.go` references `goos.FSHook`) — so
+`scripts/setup_tamago.sh` (clone + patch + `make.bash`) is THE setup
+path, and `build_go.sh` warns if `$TAMAGO`'s tree looks unpatched.
+
+Next: Stage 4 — the Go toolchain self-hosting on the JH7110. A
+multi-session effort (`compile` alone is ~20 MiB): 4.0 raise the exec
+caps + speed the fsd read loop, 4.1 `os/exec` → `rfork`+`SYS_EXEC`, 4.2
+`go tool compile` on racccoon, 4.3 `link`, 4.4 the `go` command. See
+docs/go-port-plan.md; the `GOOS=racccoon` rename probably lands by 4.2.
 
 ---
 

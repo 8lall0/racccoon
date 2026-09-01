@@ -39,10 +39,18 @@ const (
 	offsetAppend = 0xFFFFFFFF
 )
 
-// ErrIO is returned for any fsd-side failure — not found, permission,
-// not a directory, a dead server. racccoon's wire protocol only carries
-// a -1, so this package cannot distinguish them.
-var ErrIO = errors.New("racccoon: fs error (not found / permission / not a dir)")
+// ErrIO is returned for any fsd-side failure that isn't a clean
+// "nothing resolves there" — permission, not a directory, a dead
+// server, a mid-transfer fault. racccoon's wire protocol only carries a
+// -1, so the distinction from ErrNotExist is a best guess (a failed
+// SYS_NS_RESOLVE, or a stat that finds nothing, is reported as
+// ErrNotExist; everything else as ErrIO).
+var ErrIO = errors.New("racccoon: fs error")
+
+// ErrNotExist is returned when a path resolves to no filesystem or no
+// entry. Mapped to syscall.ENOENT by the os bridge (osbridge.go) so
+// os.IsNotExist works.
+var ErrNotExist = errors.New("racccoon: no such file or directory")
 
 //go:noescape
 func nsResolve(path *byte, prefixOut *uint32) int64
@@ -83,12 +91,14 @@ func Getwd() (string, error) {
 	return string(cw[:n]), nil
 }
 
-// Chdir sets the caller's cwd. The path must already be absolute and
-// normalised — this is the raw syscall, same as the shell's `cd` after
-// its own normalisation.
+// Chdir sets the caller's cwd. Relative paths are resolved against the
+// current cwd; "." / ".." components are NOT normalised away (racccoon's
+// SYS_CHDIR stores the string verbatim — the shell normalises before
+// calling it), so prefer absolute, clean paths.
 func Chdir(path string) error {
+	ap := abspath(path)
 	var pb [256]byte
-	putPath(pb[:], path, len(pb))
+	putPath(pb[:], ap, len(pb))
 	if sysChdir(&pb[0]) != 0 {
 		return ErrIO
 	}
@@ -139,39 +149,94 @@ func fsdCall(pid, verb int64, buf []byte) (int32, bool) {
 	return int32(rd32(buf)), true
 }
 
-// ReadFile reads the entire named file.
-func ReadFile(name string) ([]byte, error) {
-	pid, stripped, ok := resolve(abspath(name))
+// readAtPath reads up to len(b) bytes from an absolute path starting at
+// off, looping over FS_READ_AT chunks. Returns the count (short at EOF).
+func readAtPath(ap string, b []byte, off int64) (int, error) {
+	pid, stripped, ok := resolve(ap)
 	if !ok {
-		return nil, ErrIO
+		return 0, ErrNotExist
 	}
-	var buf [fsMsgMax]byte
-	var out []byte
-	var off uint32
-	for {
-		putPath(buf[:100], stripped, 100)
-		le32(buf[100:104], uint32(readChunk))
-		le32(buf[104:108], off)
-		res, ok := fsdCall(pid, fsReadAt, buf[:])
+	var msg [fsMsgMax]byte
+	total := 0
+	for total < len(b) {
+		want := len(b) - total
+		if want > readChunk {
+			want = readChunk
+		}
+		putPath(msg[:100], stripped, 100)
+		le32(msg[100:104], uint32(want))
+		le32(msg[104:108], uint32(off+int64(total)))
+		res, ok := fsdCall(pid, fsReadAt, msg[:])
 		if !ok || res < 0 {
-			if off == 0 {
-				return nil, ErrIO
+			if total == 0 {
+				return 0, ErrIO
 			}
 			break
 		}
 		if res == 0 {
 			break
 		}
-		if int(res) > readChunk {
-			res = int32(readChunk)
+		if int(res) > want {
+			res = int32(want)
 		}
-		out = append(out, buf[4:4+res]...)
-		off += uint32(res)
-		if int(res) < readChunk {
+		copy(b[total:], msg[4:4+res])
+		total += int(res)
+		if int(res) < want {
 			break
 		}
 	}
-	return out, nil
+	return total, nil
+}
+
+// writeAtPath writes b to an absolute path starting at off, chunked over
+// FS_WRITE_AT. Returns bytes written.
+func writeAtPath(ap string, b []byte, off int64) (int, error) {
+	pid, stripped, ok := resolve(ap)
+	if !ok {
+		return 0, ErrNotExist
+	}
+	var msg [fsMsgMax]byte
+	done := 0
+	for done < len(b) || (done == 0 && len(b) == 0) {
+		n := len(b) - done
+		if n > writeChunk {
+			n = writeChunk
+		}
+		putPath(msg[:100], stripped, 100)
+		le32(msg[100:104], uint32(n))
+		le32(msg[104:108], uint32(off+int64(done)))
+		copy(msg[108:108+n], b[done:done+n])
+		res, ok := fsdCall(pid, fsWriteAt, msg[:])
+		if !ok || res < 0 {
+			if done == 0 {
+				return 0, ErrIO
+			}
+			break
+		}
+		done += n
+		if len(b) == 0 {
+			break
+		}
+	}
+	return done, nil
+}
+
+// ReadFile reads the entire named file.
+func ReadFile(name string) ([]byte, error) {
+	ap := abspath(name)
+	fi, err := Stat(ap)
+	if err != nil {
+		return nil, err
+	}
+	if fi.IsDir {
+		return nil, ErrIO
+	}
+	buf := make([]byte, fi.Size)
+	n, err := readAtPath(ap, buf, 0)
+	if err != nil {
+		return nil, err
+	}
+	return buf[:n], nil
 }
 
 // WriteFile writes data to the named file, creating it if needed and
@@ -180,31 +245,8 @@ func ReadFile(name string) ([]byte, error) {
 // not done here — fsd's FS_WRITE_AT overwrites in place; callers that
 // need a clean truncate should Remove first).
 func WriteFile(name string, data []byte) error {
-	pid, stripped, ok := resolve(abspath(name))
-	if !ok {
-		return ErrIO
-	}
-	var buf [fsMsgMax]byte
-	off := 0
-	for off < len(data) || (off == 0 && len(data) == 0) {
-		n := len(data) - off
-		if n > writeChunk {
-			n = writeChunk
-		}
-		putPath(buf[:100], stripped, 100)
-		le32(buf[100:104], uint32(n))
-		le32(buf[104:108], uint32(off))
-		copy(buf[108:108+n], data[off:off+n])
-		res, ok := fsdCall(pid, fsWriteAt, buf[:])
-		if !ok || res < 0 {
-			return ErrIO
-		}
-		off += n
-		if len(data) == 0 {
-			break
-		}
-	}
-	return nil
+	_, err := writeAtPath(abspath(name), data, 0)
+	return err
 }
 
 // FileInfo is the subset of stat racccoon's FS_STAT carries.
@@ -217,13 +259,13 @@ type FileInfo struct {
 func Stat(name string) (FileInfo, error) {
 	pid, stripped, ok := resolve(abspath(name))
 	if !ok {
-		return FileInfo{}, ErrIO
+		return FileInfo{}, ErrNotExist
 	}
 	var buf [fsMsgMax]byte
 	putPath(buf[:100], stripped, 100)
 	res, ok := fsdCall(pid, fsStat, buf[:])
 	if !ok || res < 0 {
-		return FileInfo{}, ErrIO
+		return FileInfo{}, ErrNotExist
 	}
 	return FileInfo{Size: int64(rd32(buf[4:8])), IsDir: buf[8] == 1}, nil
 }

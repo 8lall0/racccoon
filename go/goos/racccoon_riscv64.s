@@ -23,6 +23,12 @@
 //
 // Runs before the Go world starts: no allocation, no g.
 TEXT ·CPUInit(SB),NOSPLIT|NOFRAME,$0
+	// racccoon's exec ABI hands the ELF entry argc in A0 and the
+	// argv blob base (NUL-separated strings) in A1 — stash both before
+	// they are clobbered; ·Args parses them for os.Args.
+	MOV	A0, ·rcArgc(SB)
+	MOV	A1, ·rcArgvBlob(SB)
+
 	// SYS_MAP(RamSize) -> base vaddr, or -1 if the board's per-process
 	// HEAP_MAX_BYTES can't honour it. On failure fall back to 8 MiB so
 	// the runtime still starts (and OOMs cleanly) rather than running
