@@ -102,9 +102,11 @@ const SYS_GETPID        = 50; // the caller's own pid — a c3 program gets its 
 const SYS_EXEC_MAX      = 51; // board::EXEC_MAX_IMAGE_SIZE — the shell reads this to size its own exec() receive buffer per-board instead of hardcoding a constant
 
 // Per-process SYS_MAP ceiling: the bump pointer can't grow more than this
-// past USER_BASE. 16 MiB is generous for a wasm linear memory and keeps
-// PROCS_MAX processes all maxing out well under the 64 MiB RAM pool.
-const uptr HEAP_MAX_BYTES = 16 * 1024 * 1024;
+// past USER_BASE. Board-specific (board::HEAP_MAX_BYTES): 16 MiB on the
+// Duo — generous for a wasm linear memory, keeps PROCS_MAX processes all
+// maxing out under its 64 MiB RAM pool; 64 MiB on QEMU/JH7110 so a Go
+// process can map its heap arena (docs/go-port-plan.md).
+const uptr HEAP_MAX_BYTES = board::HEAP_MAX_BYTES;
 
 // Flipped by SYS_BOOT_QUIET (the shell, once, after a settle delay).
 // While true, SYS_PUTCHAR from a process with is_boot_server set is

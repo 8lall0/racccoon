@@ -113,6 +113,12 @@ const ulong TIMEBASE_HZ = 25000000;
 // it to 4 MiB for the Go port (boards/qemu/board.c3).
 const EXEC_MAX_IMAGE_SIZE = 1048576;
 
+// Per-process SYS_MAP ceiling (src/entry.c3's HEAP_MAX_BYTES). 16 MiB on
+// the Duo — generous for a wasm linear memory and keeps PROCS_MAX
+// processes all maxing out under the 64 MiB DRAM pool. QEMU/JH7110 raise
+// it (boards/qemu/board.c3) for the Go port.
+const uptr HEAP_MAX_BYTES = 16 * 1024 * 1024;
+
 // One-time SD pad/power/clock bring-up (see user/sdd.c3's sdd_init) needs
 // three more, separate MMIO pages besides SD_MMIO_BASE itself — none of
 // them adjacent to it or to each other, so all three (plus SD_MMIO_BASE)

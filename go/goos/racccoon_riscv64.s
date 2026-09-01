@@ -63,9 +63,17 @@ TEXT ·sys_yield(SB),NOSPLIT,$0
 	ECALL
 	RET
 
-// func sys_timebase() int64
+// func sys_timebase() int64 — the `time` CSR tick rate in Hz
 TEXT ·sys_timebase(SB),NOSPLIT,$0-8
 	MOV	$SYS_TIMEBASE, A3
 	ECALL
+	MOV	A0, ret+0(FP)
+	RET
+
+// func rdtime() int64 — the `time` CSR. racccoon's kernel sets
+// scounteren.TM so S/U-mode reads don't trap (user/user.c3 does the
+// same csrr from c3).
+TEXT ·rdtime(SB),NOSPLIT,$0-8
+	RDTIME	A0
 	MOV	A0, ret+0(FP)
 	RET

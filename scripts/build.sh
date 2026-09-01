@@ -52,6 +52,19 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
     rm -f "$name.wasm.o" "build/wasm/$name.wasm.o" 2>/dev/null
   done
 
+  # Go programs for racccoon (go/cmd/*, via the GOOS=tamago toolchain).
+  # No-op unless TAMAGO points at a tamago-go/bin/go — build_go.sh says
+  # so and exits 0. Seeded as /bin/go<name> onto the images below;
+  # gotest (shell_test.c3) skips cleanly if the binary isn't there,
+  # same as tcctest without /bin/tcc. See docs/go-port-plan.md.
+  rm -rf build/go
+  if [ -n "${TAMAGO:-}" ]; then
+    for gd in go/cmd/*/; do
+      [ -e "$gd" ] || continue
+      bash scripts/build_go.sh "$(basename "$gd")" || true
+    done
+  fi
+
   # The disk images built below are pristine masters — every one is
   # rm -f'd and rebuilt from scratch on each run, so re-running this
   # script is itself a full reset. The scripts/launch64*.sh scripts
@@ -117,6 +130,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # replacement for bin/echod — elftest execs this one specifically,
   # runtest/argvtest/pathtest keep using the flat binary unchanged.
   mcopy -i build/disk.img build/user/echod.elf ::bin/echod.elf
+  for g in build/go/*.elf; do [ -e "$g" ] && mcopy -i build/disk.img "$g" "::bin/go$(basename "$g" .elf)"; done
   # bin/{cat,ls,write,rm,mkdir,mv} — the real, argv-taking utilities
   # shell.c3's own /bin/ fallback branch execs (see docs/devlog.md),
   # replacing what used to be hardcoded shell builtins.
@@ -196,6 +210,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "sif adm/secret mode 0100600" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_ext2.img > /dev/null
+  for g in build/go/*.elf; do [ -e "$g" ] && debugfs -w -R "write $g bin/go$(basename "$g" .elf)" build/disk_ext2.img > /dev/null; done
   for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_ext2.img > /dev/null
   done
@@ -266,6 +281,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "write build/adm_users_fixture adm/users" build/disk_dual_root_part.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_root_part.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_root_part.img > /dev/null
+  for g in build/go/*.elf; do [ -e "$g" ] && debugfs -w -R "write $g bin/go$(basename "$g" .elf)" build/disk_dual_root_part.img > /dev/null; done
   for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_root_part.img > /dev/null
   done
@@ -289,6 +305,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "mkdir bin" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_ext2_part.img > /dev/null
+  for g in build/go/*.elf; do [ -e "$g" ] && debugfs -w -R "write $g bin/go$(basename "$g" .elf)" build/disk_dual_ext2_part.img > /dev/null; done
   for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_ext2_part.img > /dev/null
   done

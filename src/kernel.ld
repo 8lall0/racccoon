@@ -53,6 +53,13 @@ SECTIONS {
 
     . = ALIGN(4096);
     __free_ram = .;
-    . += 64 * 1024 * 1024; /* 64MB */
+    . += 112 * 1024 * 1024; /* 112MB — QEMU virt defaults to 128MB of DRAM
+                               (query-memory-size-summary), kernel links at
+                               DRAM_BASE+2MB, so ~126MB is available. Was
+                               64MB; raised so a Go process can eagerly
+                               SYS_MAP its ~48MB heap arena (SYS_MAP is not
+                               lazy) alongside the servers — docs/go-port-plan.md.
+                               boards/duo/kernel.ld stays sized to the Duo's
+                               real 64MB DRAM. */
     __free_ram_end = .;
 }

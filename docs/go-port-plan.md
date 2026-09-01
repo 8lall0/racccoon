@@ -88,36 +88,34 @@ port and every racccoon feature.
   convention as `build_opi.sh`).
 - No kernel changes yet. QEMU + Duo builds unaffected.
 
-### Stage 1 — a Go program prints and exits (QEMU)
+### Stage 1 — a Go program prints and exits (QEMU) — **DONE**
 
-Target: `GOOS=tamago GOARCH=riscv64 GOOSPKG=<go/ module> tamago-go build
-hello.go` → static ELF → runs on racccoon in QEMU, prints, exits 0.
+`go/cmd/hello` (println, int/float math, slice+`append`, `map`, `defer`,
+`panic`/`recover`) builds via `scripts/build_go.sh` and **runs on
+racccoon in QEMU** — correct output, clean exit 0, re-runnable. `gotest`
+in `shell_test.c3`.
 
-- ~~Build the tamago-go toolchain~~ **DONE** (research pass) — builds
-  clean, `GOOS=tamago GOARCH=riscv64 go build hello.go` emits a static
-  riscv64 ELF (the in-tree `runtime/goos/linux_user*` supplies the
-  hooks against the Linux ABI; the racccoon provider swaps that for
-  `ecall`).
-- ~~Kernel: raise the exec caps behind a `board::` flag~~ **DONE**
-  (commit below) — `board::EXEC_MAX_IMAGE_SIZE` (4 MiB QEMU, 1 MiB
-  Duo) + `SYS_EXEC_MAX` for the shell's buffer. Regressions green
-  (runtest / elftest / tcctest / wasmtest / mounttest / chmodtest).
-- Provider — finish `go/goos/`: `Nanotime` = `rdtime()` × `timebase_hz`
-  (both already work from userspace), `CPUInit` `SYS_MAP` arena + SP +
-  jump `rt0`. `GetRandomData` stubbed, no `Task`.
-- Confirm the racccoon ELF loader eats a Go binary (3 PT_LOAD, the
-  inter-segment gaps, `.bss` `p_memsz > p_filesz` zeroing). Link at
-  `USER_BASE` (`-ldflags "-T 0x1000000"`).
-- Nail the `GOOSPKG` / `go.work` invocation in `scripts/build_go.sh`.
-- Success = `hello`, a `for` loop, int/float math, `defer`,
-  `panic`/`recover`, a slice + `append`, a `map`. GC may not trigger.
-- `gotest` builtin in `shell_test.c3`; `test/go-src/` fixtures; seed
-  `build/go/*.elf` onto the images (`build.sh`).
+What it took:
+- Toolchain: tamago-go `tamago1.27.0` branch, `./make.bash` once.
+- Provider `go/goos/`: `CPUInit` (asm) `SYS_MAP`s a 48 MiB arena, writes
+  the base to `RamStart`/`Bloc`, sets SP, jumps the tamago rt0.
+  `Printk`→`SYS_PUTCHAR`, `Exit`→`SYS_EXIT`, `Idle`→`SYS_YIELD`,
+  `Nanotime` = `rdtime()` split-scaled by `sys_timebase()` (cached).
+  `Task` nil (single-threaded), `GetRandomData` a fixed fill.
+- Link flags: `-ldflags "-T 0x1010000 -R 0x1000"` — text at
+  `USER_BASE + 64 KiB` so the ELF header lands exactly at `USER_BASE`;
+  `-R 0x1000` (page rounding) keeps `-T`'s file offsets non-negative.
+  Result: 3 PT_LOAD, all inside `[USER_BASE, USER_BASE + 4 MiB)`,
+  ET_EXEC, `e_phnum` 6 — the existing racccoon ELF loader eats it
+  unchanged (`.bss` `p_memsz > p_filesz` auto-zeroed by `alloc_pages`).
+- Kernel, board-gated (QEMU/JH7110, never the Duo):
+  `board::EXEC_MAX_IMAGE_SIZE` 4 MiB (+ `SYS_EXEC_MAX` so the shell
+  sizes its exec buffer), `board::HEAP_MAX_BYTES` 64 MiB (SYS_MAP is
+  eager, and the Go arena is ~48 MiB), `src/kernel.ld` `__free_ram`
+  64 → 112 MiB (QEMU virt has 128 MiB; the arena + servers need room).
 
-Note on RAM: the QEMU kernel's `__free_ram` window is a fixed 64 MiB
-(`src/kernel.ld`), independent of `-m`. A single Go process (≈2 MiB
-image + a ~16 MiB arena) fits; if it turns out tight, the lever is
-that linker-script number, not the QEMU `-m` flag.
+Not yet exercised: GC under real pressure, goroutines, `time.Sleep`
+(that's Stage 2).
 
 ### Stage 2 — GC + goroutines under memory pressure
 

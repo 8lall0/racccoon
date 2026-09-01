@@ -64,6 +64,46 @@ no new syscall; and racccoon *has* thread primitives (`rfork(RFMEM)` +
 `SYS_FUTEX_WAIT`/`_WAKE` keyed on `(addr, page_table)`) — the plan's
 "single-threaded" is a Stage-1 simplification, not a hard limit.
 
+**Stage 1 — a Go program runs on racccoon.** `go/cmd/hello` (println,
+int + hardware-FP math, slice `append`, `map`, `defer`, `panic`/
+`recover`, a `switch`) builds via `scripts/build_go.sh` and executes
+correctly on racccoon in QEMU, clean exit 0, re-runnable. `gotest`
+(shell_test.c3) — skips like tcctest if `/bin/gohello` isn't on the
+image (only built when `TAMAGO` is set). Full regression green on the
+ext2 and dual images (gotest / wasmtest / tcctest / chmodtest / maptest
+/ oomtest / runtest / elftest / mounttest / fspermtest / dirpacktest /
+p9fswritetest / storagekilltest).
+
+What it took:
+- **Toolchain**: tamago-go `tamago1.27.0` (matches Go 1.27.0),
+  `./make.bash` once. `GOOS=tamago GOARCH=riscv64` + `GOOSPKG=racccoon.local/goport`.
+- **Provider `go/goos/`**: `CPUInit` (asm, the tamago rt0 entry)
+  `SYS_MAP`s a 48 MiB arena, publishes its base to `RamStart`/`Bloc`,
+  sets SP, jumps `runtime·rt0_riscv64_tamago`. `Printk`→`SYS_PUTCHAR`,
+  `Exit`→`SYS_EXIT`, `Idle`→`SYS_YIELD` (racccoon userspace is
+  cooperative — exactly what tamago's `semasleep` idle-hook wants),
+  `Nanotime` = `rdtime()` split-scaled by a cached `sys_timebase()`.
+  `Task` nil (single-threaded, `GOMAXPROCS=1`).
+- **Link**: `-ldflags "-T 0x1010000 -R 0x1000"` — text at USER_BASE +
+  64 KiB puts the ELF header exactly at USER_BASE; `-R 0x1000` keeps
+  `-T`'s file offsets non-negative (a bare `-T` with the default
+  64 KiB rounding produced a segment with `p_offset = -0xF000`). Result:
+  ET_EXEC, 3 PT_LOAD all inside `[USER_BASE, USER_BASE+4 MiB)`, 6
+  phdrs, no PT_TLS — the existing racccoon ELF loader
+  (`src/entry.c3`'s `sys_exec`) takes it unchanged.
+- **Kernel, board-gated** (QEMU/JH7110, never the Duo):
+  `board::EXEC_MAX_IMAGE_SIZE` 4 MiB (a `GOOS=tamago` binary is
+  ~1.5 MiB) + `SYS_EXEC_MAX` (51) so the shell sizes its exec buffer;
+  `board::HEAP_MAX_BYTES` 16 → 64 MiB (`SYS_MAP` is eager and the Go
+  arena is ~48 MiB); `src/kernel.ld` `__free_ram` 64 → 112 MiB (QEMU
+  virt has 128 MiB — the arena plus the servers need the room). First
+  symptom of the too-small limits: `user fault … stval=0xffeff7`, a
+  stack store just below USER_BASE because `SYS_MAP` failed and
+  `CPUInit`'s `base(-1) + RamSize` wrapped.
+
+Next (Stage 2): GC under real allocation pressure, goroutines +
+channels, `time.Sleep` (the `wakeG` timer path).
+
 ---
 
 ## 2026-09-01 — `chmod` / `chown` (roadmap §2 closeout)

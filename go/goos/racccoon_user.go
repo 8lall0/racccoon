@@ -18,6 +18,8 @@
 // makes this actually run.
 package goos
 
+import "unsafe"
+
 // adapted from tamago-go src/runtime/goos/linux_user.go
 const (
 	bits = 32 << (^uint(0) >> 63) / 8
@@ -36,8 +38,15 @@ var (
 	// there is no fixed physical map — CPUInit (asm) SYS_MAPs RamSize
 	// bytes at startup and writes the returned base into RamStart and
 	// Bloc before the Go world starts.
-	RamStart       uint
-	RamSize        uint = 16 << 20 // 16 MiB — Stage 1 default; raise per board (JH7110 has GiBs)
+	RamStart uint
+	// RamSize must fit under the kernel's per-process SYS_MAP ceiling
+	// (board::HEAP_MAX_BYTES: 64 MiB on QEMU/JH7110) minus this binary's
+	// own image, and SYS_MAP is eager — every page is really allocated.
+	// 48 MiB is comfortable for Go hello-world on QEMU; the JH7110 with
+	// GiBs can take far more. On a board too small to honour it (the
+	// Duo) SYS_MAP fails and the first stack store faults — a retry-with-
+	// smaller loop in CPUInit is a follow-up.
+	RamSize        uint = 48 << 20
 	RamStackOffset uint = 0x1000
 
 	// Bloc redefines the heap start (osinit picks it up). Set from asm
@@ -53,6 +62,12 @@ var (
 	ProcID func() uint64
 	Wake   func(uint64)
 
+	// Task stays nil — racccoon has rfork(RFPROC|RFMEM) + futex and
+	// could do real multi-M scheduling, but Stage 1 is single-threaded
+	// (GOMAXPROCS=1). newosproc throws only if it's ever actually
+	// called, which it isn't at GOMAXPROCS=1.
+	Task func(sp, mp, gp, fn unsafe.Pointer)
+
 	Hwinit0  = func() {}
 	InitRNG  = func() {}
 	Hwinit1  = func() {}
@@ -65,6 +80,7 @@ func sys_putchar(c *byte)
 func sys_exit(code int32)
 func sys_yield()
 func sys_timebase() int64 // the `time` CSR tick rate (Hz) — SYS_TIMEBASE
+func rdtime() int64       // the `time` CSR itself
 
 // preallocated to avoid an allocation on the panic path
 var pchar [1]byte
@@ -75,11 +91,23 @@ func Printk(c byte) {
 	sys_putchar(&pchar[0])
 }
 
-// Nanotime — STAGE 0 STUB. sys_timebase() only returns the tick *rate*;
-// a monotonic clock needs a confirmed userspace `rdtime` (scounteren.TM)
-// or a new racccoon SYS_CLOCK verb. See the plan's Stage 1.
+// tbHz caches the `time` CSR rate (SYS_TIMEBASE) — a syscall, and
+// nanotime() is on hot paths (scheduler, GC, timers). 0 until the first
+// call. Single-threaded, so no lock.
+var tbHz int64
+
+// nanotime converts the monotonic `time` CSR into nanoseconds. The
+// split-then-recombine avoids the int64 overflow a plain
+// ticks*1e9/hz would hit after ~500 s at a 10 MHz timebase.
 func nanotime() int64 {
-	return 0
+	if tbHz == 0 {
+		tbHz = sys_timebase()
+		if tbHz == 0 {
+			return 0
+		}
+	}
+	t := rdtime()
+	return (t/tbHz)*1e9 + (t%tbHz)*1e9/tbHz
 }
 
 // GetRandomData — STAGE 0 STUB (fixed bytes). racccoon has no RNG
