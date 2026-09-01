@@ -143,7 +143,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # image (and only meaningfully testable next to the toolchain
   # closure seeded onto disk_ext2.img) — skip them here.
   for g in build/go/*.elf; do
-    case "$(basename "$g")" in compile.elf|link.elf) continue ;; esac
+    case "$(basename "$g")" in compile.elf|link.elf|gostage*.elf) continue ;; esac
     [ -e "$g" ] && mcopy -i build/disk.img "$g" "::bin/go-$(basename "$g" .elf)"
   done
   # bin/{cat,ls,write,rm,mkdir,mv} — the real, argv-taking utilities
@@ -318,7 +318,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_root_part.img > /dev/null
   # Same exclusion as the FAT32 image above — too big for this partition.
   for g in build/go/*.elf; do
-    case "$(basename "$g")" in compile.elf|link.elf) continue ;; esac
+    case "$(basename "$g")" in compile.elf|link.elf|gostage*.elf) continue ;; esac
     [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_dual_root_part.img > /dev/null
   done
   for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do
@@ -346,7 +346,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_ext2_part.img > /dev/null
   # Same exclusion as the FAT32 image above — too big for this partition.
   for g in build/go/*.elf; do
-    case "$(basename "$g")" in compile.elf|link.elf) continue ;; esac
+    case "$(basename "$g")" in compile.elf|link.elf|gostage*.elf) continue ;; esac
     [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_dual_ext2_part.img > /dev/null
   done
   for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do

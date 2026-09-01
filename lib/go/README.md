@@ -28,21 +28,34 @@ the host exec ABI); a tiny `os_tamago.go` `init()` refreshes
 `WaitStatus` stubs (labelled "not supported, just enough for package
 os") get real bodies via `runtime/goos.Spawn` / `Wait` — racccoon's
 `rfork(RFPROC)` + `SYS_EXEC` + `SYS_JOIN`. `WaitStatus` uses the
-standard `wait(2)` bit layout (exit code in bits 8..15). First cut: the
-child inherits the console (`cmd.Stdout = os.Stdout` works, pipe
-capture doesn't); `/dev/null` is a reserved fs-backend handle.
+standard `wait(2)` bit layout (exit code in bits 8..15). `/dev/null`
+is a reserved fs-backend handle.
+
+**Output capture.** `os.Pipe()` (`os/pipe_tamago.go`) calls a new
+`syscall.PipeGoos`, which reserves a `runtime/goos` capture slot and
+two `goosPipeFile` fds. `StartProcess` reads the slot id off the child's
+stdout/stderr fd in `attr.Files` and passes it to `Spawn`, which points
+the child's console at a kernel pipe **as part of `rfork` (a new `a2`
+on `SYS_RFORK`)** — a follow-up `SYS_PIPE_SETOUT` loses the race to the
+Go scheduler. `Spawn` drains the pipe to a byte slice; the read end
+serves it to os/exec's `io.Copy` goroutine. racccoon has one console
+stream per process, so `Cmd.Output` / `CombinedOutput` capture combined
+stdout+stderr. `Cmd.Stdin` from a non-`*os.File` isn't wired.
 
 Files touched:
 
 - `src/runtime/goos/linux_user.go` — `FSHook` + `var FS` + `var Args` +
-  `Spawn`/`Wait` stubs (kept in sync with `go/goos/racccoon_user.go`).
+  `Spawn`/`Wait`/`Capture*` stubs (kept in sync with `go/goos/`).
 - `src/runtime/os_tamago.go` — the `init()` that refreshes `argslice`.
 - `src/syscall/fs_racccoon.go` (new) — the `goosFile` `fileImpl`, the
-  `goos.FS` call-site helpers + dirent synthesis, errno→`Errno`.
+  `goos.FS` call-site helpers + dirent synthesis, errno→`Errno`, plus
+  `goosPipeFile` + `PipeGoos` for output capture.
 - `src/syscall/fs_tamago.go` — one `if goos.FS != nil { … }` guard per
   entry point.
 - `src/syscall/syscall_tamago.go` — `Getwd` uses the hook;
-  `StartProcess`/`Wait4`/`WaitStatus` real bodies.
+  `StartProcess` (with `attr.Files` capID resolution) / `Wait4` /
+  `WaitStatus` real bodies.
+- `src/os/pipe_tamago.go` — `os.Pipe()` via `syscall.PipeGoos`.
 
 ## Bumping the Go version
 

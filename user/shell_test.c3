@@ -2061,7 +2061,7 @@ fn void main() {
                 if (wt_code != 0) { wt_ok = -1; }
             }
             print(wt_ok == 0 ? "wasmtest: ok\n" : "wasmtest: FAILED\n");
-        } else if (strcmp(cmd, "gotest") == 0 || strcmp(cmd, "gostage2test") == 0 || strcmp(cmd, "gostage3test") == 0 || strcmp(cmd, "gostage35test") == 0 || strcmp(cmd, "gostage41test") == 0) {
+        } else if (strcmp(cmd, "gotest") == 0 || strcmp(cmd, "gostage2test") == 0 || strcmp(cmd, "gostage3test") == 0 || strcmp(cmd, "gostage35test") == 0 || strcmp(cmd, "gostage41test") == 0 || strcmp(cmd, "gostage42test") == 0) {
             // Go on racccoon (docs/go-port-plan.md). /bin/go-* are
             // GOOS=tamago static riscv64 binaries built by
             // scripts/build_go.sh from go/cmd/*, loaded through
@@ -2101,9 +2101,16 @@ fn void main() {
             //                  + SYS_JOIN via runtime/goos.Spawn/Wait) —
             //                  runs /bin/echo, /bin/false (exit code
             //                  propagates), a missing command, and
-            //                  another Go binary spawned from Go. First
-            //                  cut: child inherits the console, no pipe
-            //                  capture yet.
+            //                  another Go binary spawned from Go, all
+            //                  with the child inheriting the console.
+            //   gostage42test — go/cmd/gostage42: os/exec OUTPUT CAPTURE
+            //                  (exec.Cmd.Output / CombinedOutput / a
+            //                  bytes.Buffer Stdout) — the child's stdout
+            //                  is wired to a kernel pipe by rfork (a2),
+            //                  drained by goos.Spawn. Includes a 22 KiB
+            //                  capture past the 4 KiB pipe buffer
+            //                  (/bin/go-spew) and a console-inherit
+            //                  regression check.
             //
             // The program prints to the console directly (goos.Printk ->
             // SYS_PUTCHAR) so its output shows inline above the verdict.
@@ -2117,6 +2124,8 @@ fn void main() {
                 gt_path = "bin/go-gostage35"; gt_name = "gostage35test";
             } else if (strcmp(cmd, "gostage41test") == 0) {
                 gt_path = "bin/go-gostage41"; gt_name = "gostage41test";
+            } else if (strcmp(cmd, "gostage42test") == 0) {
+                gt_path = "bin/go-gostage42"; gt_name = "gostage42test";
             } else {
                 gt_path = "bin/go-hello"; gt_name = "gotest";
             }

@@ -4,6 +4,67 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-01 — Go Stage 4.1 follow-up: os/exec output capture
+
+`exec.Cmd.Output` / `CombinedOutput` / a `bytes.Buffer` `Stdout` now
+work on racccoon. `go/cmd/gostage42` + `gostage42test`.
+
+The shape: `os.Pipe()` (patched to call a new `syscall.PipeGoos`)
+reserves a `runtime/goos` capture slot backed by two `goosPipeFile`
+fds; `StartProcess` reads the slot id off the write-end fd in
+`attr.Files`; `goos.Spawn` points the child's console at a kernel pipe
+(`src/pipe.c3`), drains it to EOF, joins, and records the exit code —
+the child runs to completion synchronously (fine here: GOMAXPROCS=1, a
+blocking ecall freezes the whole Go world regardless, so `Wait`
+degrades to a lookup). The pipe's read end serves the drained bytes to
+os/exec's `io.Copy` goroutine once `Start` returns.
+
+**The fix that mattered.** First cut wired the child's stdout with a
+`SYS_PIPE_SETOUT` right after `rfork` — the way the c3 shell's pipeline
+code does. It captured `/bin/echo` (~9 bytes, written and gone before
+the parent's next instruction) but got **0 bytes from `/bin/go-hello`**
+and a false EOF from anything slower. Cause: the Go runtime parks the
+`Spawn` goroutine at the first safepoint after `rfork` and — with
+nothing else runnable — calls `goos.Idle` → `sys_yield`, letting the
+child run *ahead* of the parent's setout. The c3 shell's plain loop
+never yields there, so it always wins that race; Go can't.
+
+Fix: an optional `a2` on `SYS_RFORK` that wires the child's
+`stdout_pipe` **atomically as part of the fork**, before the child is
+schedulable. `pipe_valid` gates it (RFMEM excluded — `threadcreate`
+leaves a stale a2); the c3 `rfork()` wrapper now passes `a2 = -1`. With
+that, `/bin/go-hello` CombinedOutput captures all 169 bytes and a
+22 KiB `/bin/go-spew` stream drains cleanly through the 4 KiB pipe
+buffer (producer blocks, parent's drain loop keeps up).
+
+racccoon gives a process one console stream, so captured output is
+combined stdout+stderr. Not done: stdin-from-pipe (`go` never needs
+it); truly async Start (Start blocks until the child exits).
+
+Regressions green at QEMU `-m 2G` and `-m 1G`: gostage42test / 41test /
+gotest / gostage35test / chmodtest / wasmtest / oomtest / fsdkilltest /
+storagekilltest / fspermtest, plus c3 shell `|` and `rforktest`. Duo
+kernel builds clean. `lib/go/racccoon.patch` regenerated (546 lines;
+adds `os/pipe_tamago.go`, `syscall.PipeGoos` + `goosPipeFile`, the
+`StartProcess` capID resolution, `runtime/goos` Capture* + the `Spawn`
+signature).
+
+**Pre-existing bug noticed while chasing the setout race** (NOT caused
+by this change — reproduces identically on a clean `1c1305d` build):
+the c3 shell's `>` file redirection intermittently fails to wire the
+child — `echo foo > /tmp/x` prints `foo` to the console and leaves
+`/tmp/x` empty. `echo a | cat` (stage→stage pipes) is unaffected; only
+the `pipe_hold` + shell-pumps-`pipe_read`→`fs_write` path for `>`/`<`.
+Under a non-interactive `printf | qemu` feed it fails most runs;
+interactively it's rarer. Same class of race as the one the Go side
+just designed around — the shell's `SYS_PIPE_SETOUT` after
+`shell_spawn` losing to a fast `/bin/echo` child — but the shell should
+be able to win it (no safepoints), so something else is off. Left for
+its own fix; `SYS_RFORK`'s new `a2` is the obvious lever (thread the
+redirect pipe id through `shell_spawn`).
+
+---
+
 ## 2026-09-01 — JH7110 `-m 2G` blocker: cleared, and the bitmap ceiling raised
 
 The go-port notes carried a "racccoon does not boot with QEMU `-m >= 2G`

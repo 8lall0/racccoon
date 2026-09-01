@@ -769,7 +769,24 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		child.ipc_peer_died = false;
 		child.in_call_reply_wait = false;
 		child.is_boot_server = false; // an rfork child is user work, not a boot server
-		child.stdout_pipe = -1; // console until the shell wires a pipe end
+		// a2 (optional, RFPROC only): wire the child's stdout to this pipe
+		// id atomically, as part of the fork — a caller whose runtime may
+		// yield between rfork and a follow-up SYS_PIPE_SETOUT (Go's does;
+		// the c3 shell's loop never does, so it keeps the two-step) can't
+		// otherwise guarantee the child hasn't already run. pipe_valid
+		// rejects anything that isn't a live pipe id (the c3 rfork()
+		// wrapper passes -1; threadcreate leaves a stale value in a2, hence
+		// the RFMEM exclusion too). -1 / invalid = plain console.
+		int rfork_stdout_pipe = (int)f.a2;
+		if ((rfork_flags & RFMEM) == 0 && rfork_stdout_pipe >= 0 && pipe_valid(rfork_stdout_pipe))
+		{
+			child.stdout_pipe = rfork_stdout_pipe;
+			pipes[rfork_stdout_pipe].writers++;
+		}
+		else
+		{
+			child.stdout_pipe = -1; // console until the shell wires a pipe end
+		}
 		child.stdin_pipe = -1;
 		child.pid   = child_i + 1;
 		child.generation++;

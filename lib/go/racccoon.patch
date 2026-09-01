@@ -1,8 +1,32 @@
+diff --git a/src/os/pipe_tamago.go b/src/os/pipe_tamago.go
+index 442f0cdf..0d0635f2 100644
+--- a/src/os/pipe_tamago.go
++++ b/src/os/pipe_tamago.go
+@@ -9,8 +9,16 @@ package os
+ import "syscall"
+ 
+ // Pipe returns a connected pair of Files; reads from r return bytes written to w.
+-// It returns the files and an error, if any.
++//
++// On racccoon (lib/go/racccoon.patch) this backs os/exec output capture:
++// the pair reserves a runtime/goos capture slot, StartProcess points the
++// spawned child's console at a kernel pipe, and reads from r return the
++// child's combined output once it has exited. Without the racccoon
++// backend (a vanilla GOOS=tamago build) it stays unsupported.
+ func Pipe() (r *File, w *File, err error) {
+-	// GOOS=tamago does not have pipes.
+-	return nil, nil, NewSyscallError("pipe", syscall.ENOSYS)
++	var fds [2]int
++	if e := syscall.PipeGoos(fds[:]); e != nil {
++		return nil, nil, NewSyscallError("pipe", e)
++	}
++	return newFile(fds[0], "|0", kindNoPoll, false), newFile(fds[1], "|1", kindNoPoll, false), nil
+ }
 diff --git a/src/runtime/goos/linux_user.go b/src/runtime/goos/linux_user.go
-index fac5dfe1..e675e03a 100644
+index fac5dfe1..4edaef78 100644
 --- a/src/runtime/goos/linux_user.go
 +++ b/src/runtime/goos/linux_user.go
-@@ -58,6 +58,46 @@ var (
+@@ -58,6 +58,53 @@ var (
  	Nanotime = sys_clock_gettime
  )
  
@@ -18,12 +42,19 @@ index fac5dfe1..e675e03a 100644
 +// {"tamago"}). Keep in sync with go/goos/racccoon_user.go.
 +var Args func() []string
 +
-+// Spawn / Wait are the os/exec bridge (syscall.StartProcess / Wait4,
-+// lib/go/racccoon.patch). A GOOSPKG provider replaces this whole file,
-+// so these stubs only apply to a vanilla GOOS=tamago build, where
-+// process creation stays unsupported.
-+func Spawn(path string, argv []string, dir string) int { return -38 }
-+func Wait(pid int) int                                 { return -38 }
++// Spawn / Wait / Capture* are the os/exec bridge (syscall.StartProcess /
++// Wait4 / os.Pipe, lib/go/racccoon.patch). A GOOSPKG provider replaces
++// this whole file, so these stubs only apply to a vanilla GOOS=tamago
++// build, where process creation stays unsupported.
++//
++// capID on Spawn selects an output-capture slot (>= 0) or console
++// inherit (-1); CaptureAlloc reserves one for an os.Pipe pair, and the
++// pipe's read end serves CaptureData once Spawn has returned.
++func Spawn(path string, argv []string, dir string, capID int) int { return -38 }
++func Wait(pid int) int                                            { return -38 }
++func CaptureAlloc() int                                           { return -1 }
++func CaptureData(id int) []byte                                   { return nil }
++func CaptureFree(id int)                                          {}
 +
 +// FSHook is the contract a host filesystem backend implements. Handles
 +// are opaque tokens the backend hands back from Open and gets back on
@@ -74,10 +105,10 @@ index 6d57f5f9..7060f5da 100644
  func msigrestore(sigmask sigset)     {}
 diff --git a/src/syscall/fs_racccoon.go b/src/syscall/fs_racccoon.go
 new file mode 100644
-index 00000000..fee15d86
+index 00000000..341c17a1
 --- /dev/null
 +++ b/src/syscall/fs_racccoon.go
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,250 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -263,6 +294,71 @@ index 00000000..fee15d86
 +	}
 +	return n, nil
 +}
++
++// --- os.Pipe output capture -------------------------------------------
++// os/exec builds an os.Pipe() when Cmd.Stdout/Stderr is not an *os.File
++// (a bytes.Buffer, for Output / CombinedOutput). On racccoon the write
++// end never reaches the child — it's a separate process — so instead
++// StartProcess reads the capID off the write end, goos.Spawn points the
++// child's console at a kernel pipe and drains it, and the read end
++// (goosPipeFile) serves those bytes to os/exec's io.Copy goroutine.
++
++type goosPipeFile struct {
++	defaultFileImpl
++	capID  int
++	isRead bool
++	data   []byte
++	rpos   int
++	got    bool
++}
++
++// PipeGoos backs os.Pipe() on racccoon. nil goos.FS (a vanilla tamago
++// build) keeps os.Pipe unsupported.
++func PipeGoos(fd []int) error {
++	if goos.FS == nil {
++		return ENOSYS
++	}
++	id := goos.CaptureAlloc()
++	if id < 0 {
++		return EMFILE
++	}
++	fd[0] = newFD(&goosPipeFile{capID: id, isRead: true})
++	fd[1] = newFD(&goosPipeFile{capID: id, isRead: false})
++	return nil
++}
++
++func (f *goosPipeFile) read(b []byte) (int, error) {
++	if !f.isRead {
++		return 0, EINVAL
++	}
++	if !f.got {
++		f.data = goos.CaptureData(f.capID)
++		f.got = true
++	}
++	if f.rpos >= len(f.data) {
++		return 0, nil // EOF (os.File has ZeroReadIsEOF)
++	}
++	n := copy(b, f.data[f.rpos:])
++	f.rpos += n
++	return n, nil
++}
++
++// The write end is a placeholder: the child writes to its own console,
++// not through this fd. Accept and discard so os/exec's bookkeeping
++// (which closes it right after StartProcess) doesn't error.
++func (f *goosPipeFile) write(b []byte) (int, error) { return len(b), nil }
++
++func (f *goosPipeFile) stat(st *Stat_t) error {
++	*st = Stat_t{Mode: S_IFIFO | 0600, Nlink: 1}
++	return nil
++}
++
++func (f *goosPipeFile) close() error {
++	if f.isRead {
++		goos.CaptureFree(f.capID)
++	}
++	return nil
++}
 diff --git a/src/syscall/fs_tamago.go b/src/syscall/fs_tamago.go
 index 55aea4cc..c8362213 100644
 --- a/src/syscall/fs_tamago.go
@@ -363,7 +459,7 @@ index 55aea4cc..c8362213 100644
  	return chdir(path)
  }
 diff --git a/src/syscall/syscall_tamago.go b/src/syscall/syscall_tamago.go
-index d7ab81f1..0ba5b548 100644
+index d7ab81f1..672c9e33 100644
 --- a/src/syscall/syscall_tamago.go
 +++ b/src/syscall/syscall_tamago.go
 @@ -10,6 +10,7 @@ import (
@@ -405,16 +501,31 @@ index d7ab81f1..0ba5b548 100644
  func Getegid() int                      { return 1 }
  func Geteuid() int                      { return 1 }
  func Getgid() int                       { return 1 }
-@@ -298,10 +310,25 @@ func Sendfile(outfd int, infd int, offset *int64, count int) (written int, err e
+@@ -298,10 +310,40 @@ func Sendfile(outfd int, infd int, offset *int64, count int) (written int, err e
  	return 0, ENOSYS
  }
  func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle uintptr, err error) {
 -	return 0, 0, ENOSYS
 +	dir := ""
++	capID := -1
 +	if attr != nil {
 +		dir = attr.Dir
++		// racccoon gives a process one console stream (no separate
++		// stderr), so capture is combined: honour whichever of the
++		// child's fd 1 / fd 2 is an os.Pipe write end.
++		for _, i := range [2]int{1, 2} {
++			if i >= len(attr.Files) {
++				continue
++			}
++			if f, e := fdToFile(int(attr.Files[i])); e == nil {
++				if gp, ok := f.impl.(*goosPipeFile); ok && !gp.isRead {
++					capID = gp.capID
++					break
++				}
++			}
++		}
 +	}
-+	p := goos.Spawn(argv0, argv, dir)
++	p := goos.Spawn(argv0, argv, dir, capID)
 +	if p < 0 {
 +		return 0, 0, goosErrno(-p)
 +	}

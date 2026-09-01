@@ -20,6 +20,10 @@
 #define SYS_IPC_CALL     34
 #define SYS_CHDIR        37
 #define SYS_GETCWD       38
+#define SYS_PIPE         39
+#define SYS_PIPE_SETOUT  40
+#define SYS_PIPE_READ    42
+#define SYS_PIPE_HOLD    44
 #define SYS_MAP          47
 #define SYS_TIMEBASE     49
 
@@ -146,13 +150,17 @@ TEXT ·sysChdir(SB),NOSPLIT,$0-16
 // blob (image bytes + packed argv) prepared by the parent — so the
 // child does exactly one ecall between fork and exec, no allocation.
 
-// func sysRfork(flags int64, genOut *uint32) int64
-TEXT ·sysRfork(SB),NOSPLIT,$0-24
+// func sysRfork(flags int64, genOut *uint32, stdoutPipe int64) int64
+// stdoutPipe >= 0 wires the child's stdout to that pipe id as part of
+// the fork (SYS_RFORK a2) — race-free vs. a follow-up SYS_PIPE_SETOUT,
+// which the Go scheduler can let the child outrun. -1 = plain console.
+TEXT ·sysRfork(SB),NOSPLIT,$0-32
 	MOV	flags+0(FP), A0
 	MOV	genOut+8(FP), A1
+	MOV	stdoutPipe+16(FP), A2
 	MOV	$SYS_RFORK, A3
 	ECALL
-	MOV	A0, ret+16(FP)
+	MOV	A0, ret+24(FP)
 	RET
 
 // func sysExecRaw(buf *byte, imgLen, argvLen, argc int64) int64
@@ -181,4 +189,41 @@ TEXT ·sysExitCode(SB),NOSPLIT,$0-8
 	MOV	code+0(FP), A0
 	MOV	$SYS_EXIT, A3
 	ECALL
+	RET
+
+// --- output-capture ecalls (racccoon_exec.go) -------------------
+// A captured child's console output goes through a kernel pipe: the
+// parent allocates it, holds the read end, points the child's stdout
+// there right after rfork, then drains it to EOF (child exit). racccoon
+// has one console stream per process (no separate stderr) — capture is
+// therefore combined stdout+stderr. Numbers from src/pipe.c3 / user.c3.
+
+// func sysPipeNew() int64  — SYS_PIPE, returns a pipe id or -1
+TEXT ·sysPipeNew(SB),NOSPLIT,$0-8
+	MOV	$0, A0
+	MOV	$0, A1
+	MOV	$0, A2
+	MOV	$SYS_PIPE, A3
+	ECALL
+	MOV	A0, ret+0(FP)
+	RET
+
+// func sysPipeRead(id int64, buf *byte, max int64) int64  — drain, 0 = EOF
+TEXT ·sysPipeRead(SB),NOSPLIT,$0-32
+	MOV	id+0(FP), A0
+	MOV	buf+8(FP), A1
+	MOV	max+16(FP), A2
+	MOV	$SYS_PIPE_READ, A3
+	ECALL
+	MOV	A0, ret+24(FP)
+	RET
+
+// func sysPipeHold(id, asWriter, delta int64) int64  — claim/release an end
+TEXT ·sysPipeHold(SB),NOSPLIT,$0-32
+	MOV	id+0(FP), A0
+	MOV	asWriter+8(FP), A1
+	MOV	delta+16(FP), A2
+	MOV	$SYS_PIPE_HOLD, A3
+	ECALL
+	MOV	A0, ret+24(FP)
 	RET

@@ -267,13 +267,37 @@ unknowns. Staged:
   a Go program, runs correctly). Verdict bit off by one on the first
   run (`WaitStatus` used a made-up `0x100` "exited" bit instead of the
   standard `low-7-bits == 0`) — fixed.
-  - **Not yet**: `ProcAttr.Files` pipe redirection — the child inherits
-    the parent's console, so `cmd.Stdout = os.Stdout` works but
-    `cmd.Output()` (capture into a buffer) doesn't. racccoon has
-    `SYS_PIPE` + `SYS_PIPE_SETOUT`/`_SETIN`; wiring those into `Spawn`
-    is the follow-up the `go` command will need.
   - **Not yet**: argv[0] — packed plain, so a spawned Go child's
     `os.Args[0]` is the synthetic `"go"`, real args at `[1:]`.
+- **4.1 follow-up — `os/exec` OUTPUT CAPTURE — DONE.** `exec.Cmd.Output`
+  / `CombinedOutput` / a `bytes.Buffer` `Stdout` now work.
+  - `os.Pipe()` (patched `os/pipe_tamago.go` → `syscall.PipeGoos`)
+    reserves a `runtime/goos` capture slot and two `goosPipeFile` fds.
+    `StartProcess` reads the slot id off the write-end fd in
+    `attr.Files` and passes it to `Spawn`.
+  - The child's stdout is wired to a kernel pipe **atomically by
+    `rfork`** — a new optional `a2` on `SYS_RFORK` (`src/entry.c3`).
+    A follow-up `SYS_PIPE_SETOUT` loses the race: the Go scheduler
+    parks the parent at the first safepoint after `rfork` and lets the
+    child run ahead (the c3 shell's loop never yields there, so it
+    keeps the two-step). The c3 `rfork()` wrapper now passes `a2 = -1`.
+  - `Spawn` drains the pipe to EOF (child exit) into a byte slice,
+    joins, records the exit code, returns — the whole child runs
+    synchronously (fine: GOMAXPROCS=1, a blocking ecall freezes the Go
+    world anyway; `Wait` becomes a lookup). The pipe's read end
+    (`goosPipeFile`) serves the drained bytes to os/exec's `io.Copy`
+    goroutine.
+  - racccoon gives a process **one console stream** (no separate
+    stderr), so captured output is combined stdout+stderr.
+  - **Not done**: stdin-from-pipe (`Cmd.Stdin` as a non-`*os.File`) —
+    the child inherits the console's stdin; `go` never feeds its
+    subtools stdin. Truly concurrent Start-then-work-then-Wait (Start
+    blocks until the child exits).
+  - `go/cmd/gostage42` + `gostage42test`: `echo` via `Output()`, a Go
+    binary via `CombinedOutput`, a `bytes.Buffer` `Stdout`, a 22 KiB
+    capture past the 4 KiB pipe buffer (`/bin/go-spew`), and a
+    console-inherit regression check. c3 shell `|` / `>` / `rfork`
+    regressions all still green.
 - **4.2 — `go tool compile` on racccoon — DONE**, first try, no fixes
   needed. `build_go.sh cmd/compile` cross-builds it (self-installing
   fsd backend, no wrapper needed — a stdlib command can't blank-import
