@@ -22,6 +22,7 @@ fn void main() {
     // QEMU build, skips this — its automated runs expect a root shell
     // immediately; the `login` builtin is still there to exercise it.)
     shell_login();
+    shell_bind_user_bin();   // union /usr/$user/bin onto /bin (docs/bin-layout.md)
 
     for (;;) {
         shell_prompt();

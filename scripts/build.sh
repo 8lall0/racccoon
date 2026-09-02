@@ -247,7 +247,7 @@ ext2_seed_tree() {
   # they're absent here. Kept in sync by hand with the same list in
   # scripts/populate_duo_bin.sh (real Duo) — same convention as the
   # binary list below.
-  for d in bin lib usr usr/root usr/glenda adm tmp mnt; do
+  for d in bin lib usr usr/root usr/root/bin usr/glenda usr/glenda/bin adm tmp mnt; do
     debugfs -w -R "mkdir $d" build/disk_ext2.img > /dev/null
   done
   printf '0:root\n1000:glenda\n65534:none\n' > build/adm_users_fixture
@@ -311,6 +311,11 @@ GOEOF
   for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_ext2.img > /dev/null
   done
+  # A binary in /usr/root/bin, NOT /bin — bindirtest execs it by bare
+  # name to prove the `bind -ac /usr/root/bin /bin` union at login
+  # (docs/bin-layout.md). Byte-exact (debugfs write), unlike a runtime
+  # `cat > file` copy.
+  debugfs -w -R "write build/user/whoami.bin usr/root/bin/mywho" build/disk_ext2.img > /dev/null
   for c in build/libc/*.bin; do [ -e "$c" ] && debugfs -w -R "write $c bin/$(basename "$c" .bin)" build/disk_ext2.img > /dev/null; done
   bash scripts/seed_tcc.sh ext2 build/disk_ext2.img
   for w in build/wasm/*.wasm; do debugfs -w -R "write $w $(basename "$w")" build/disk_ext2.img > /dev/null; done
@@ -372,7 +377,7 @@ GOEOF
   # mnt` behaves sensibly, not because anything reads its contents.
   # Canonical root tree — same set as disk_ext2.img above / the real
   # Duo (docs/filesystem-layout.md).
-  for d in bin lib usr usr/root usr/glenda adm tmp mnt; do
+  for d in bin lib usr usr/root usr/root/bin usr/glenda usr/glenda/bin adm tmp mnt; do
     debugfs -w -R "mkdir $d" build/disk_dual_root_part.img > /dev/null
   done
   debugfs -w -R "write build/adm_users_fixture adm/users" build/disk_dual_root_part.img > /dev/null

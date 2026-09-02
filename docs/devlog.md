@@ -4,6 +4,47 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-03 — Plan 9 /bin, part 3: the /bin union goes live
+
+`/bin` is now a real union: the physical `/bin` plus `/usr/$user/bin`,
+so a binary a user builds into their own dir runs by bare name without
+`/bin` itself being writable.
+
+**Login.** New `shell_bind_user_bin()` (`user/shell_common.c3`), called
+once from both shells' startup (`shell.c3` after `shell_login`,
+`shell_test.c3` after the boot settle). It does two binds: `bind /bin
+/bin` first — the physical `/bin` isn't a distinct mount, it's just
+"under root" (the shortest prefix), so a plain `bind X /bin` would
+create a longer `/bin/` prefix that shadows it entirely — then
+`bind -ac /usr/$user/bin /bin` to union the user's dir after it, with
+`-c` so new files land there.
+
+**Seeding.** `/usr/root/bin` + `/usr/glenda/bin` added to the dir lists
+in `scripts/build.sh` and `scripts/populate_duo_bin.sh`; a byte-exact
+`whoami` copy seeded as `/usr/root/bin/mywho` for the test.
+
+**Go fs client.** `go/goos/racccoon_fs.go`'s `resolve()` used
+`nsResolve` + a manual prefix strip — same pattern P1 replaced in
+`user/user.c3`, and it silently dropped the `bind` rewrite, so Go's
+`os/exec` of `/bin/echo` broke the moment `/bin` became a union. Now it
+calls a new `nsTranslate` stub (`SYS_NS_TRANSLATE`, member 0). A full
+union walk on the Go side is still TODO — the only consumer that needs
+it (Go exec'ing a `$home/bin` binary) is rare.
+
+Verified QEMU `-m 2G`: `mywho` runs by bare name (served from
+`/usr/root/bin`), `whoami` still runs from the physical `/bin`, `ls
+/bin` shows the full merge, `namespace` shows both members. Regression
+green — runtest / elftest / wasmtest / gostage3 / **gostage41**
+(the Go-exec fix) / chmodtest / p9fstest / sandboxtest. tcctest still
+the pre-existing `\x17` failure.
+
+Deferred: pointing the on-device toolchains' bare `-o` at
+`/usr/$user/bin` (a Go-tree + tcc-config change) — `-o /usr/$user/bin/x`
+works today. `su <user>` mid-session doesn't re-bind the union (needs a
+`newns`-style step). P4 = the wider regression + Duo.
+
+---
+
 ## 2026-09-03 — Plan 9 /bin, part 2: union mounts
 
 `bind -a` / `bind -c`, and every `fs_*` wrapper made union-aware.

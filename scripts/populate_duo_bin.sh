@@ -59,7 +59,7 @@ echo "==> Ensuring the canonical root tree exists..."
 # docs/filesystem-layout.md / roadmap §1 — kept in sync by hand with the
 # same list in scripts/build.sh (the QEMU images). /proc /srv /env are
 # namespace mounts, not real dirs.
-for d in bin lib usr usr/root usr/glenda adm tmp mnt; do
+for d in bin lib usr usr/root usr/root/bin usr/glenda usr/glenda/bin adm tmp mnt; do
   mkdir -p "$MNT/$d"
 done
 if [ ! -e "$MNT/adm/users" ]; then

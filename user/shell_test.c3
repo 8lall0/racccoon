@@ -139,6 +139,7 @@ fn void main() {
     // chatter; automated test runs wait much longer than this before
     // sending anything anyway.
     shell_boot_settle(30000000);
+    shell_bind_user_bin();   // union /usr/root/bin onto /bin (docs/bin-layout.md)
     for (;;) {
         shell_prompt();
 

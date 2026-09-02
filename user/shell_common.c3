@@ -90,6 +90,34 @@ fn void shell_refresh_user()
     user_name_by_uid(g_shell_uid, &g_shell_user[0], 32);
 }
 
+// Union `/usr/$user/bin` onto `/bin` (`bind -ac`), so a binary the user
+// built into their own bin dir runs by bare name without `/bin` itself
+// being writable — see docs/bin-layout.md. Idempotent-ish: a second
+// call just adds another (identical) union member, so both shells call
+// it exactly once at startup, after the user's identity is settled.
+// The dir is seeded per user (scripts/build.sh, populate_duo_bin.sh);
+// the bind still succeeds if it's missing, it just contributes nothing.
+fn void shell_bind_user_bin()
+{
+    shell_refresh_user();
+    if (g_shell_user[0] == 0) { return; }
+    char[64] hb @noinit;
+    int k = 0;
+    char* pfx = "/usr/";
+    while (pfx[k] != 0) { hb[k] = pfx[k]; k++; }
+    for (int j = 0; g_shell_user[j] != 0 && k < 58; j++) { hb[k] = g_shell_user[j]; k++; }
+    char* sfx = "/bin";
+    for (int j = 0; sfx[j] != 0 && k < 62; j++) { hb[k] = sfx[j]; k++; }
+    hb[k] = 0;
+    // The physical /bin isn't a distinct mount — it's just "under root"
+    // (prefix "", the shortest possible). A plain `bind X /bin` would
+    // create a longer-prefix "/bin/" mount that shadows it entirely,
+    // so establish an explicit "/bin/" -> /bin member first, then union
+    // the user's dir after it.
+    ns_bind_flags("/bin/", "/bin", 0);       // member 0: the real /bin
+    ns_bind_flags("/bin/", &hb[0], 1 | 4);   // member 1: /usr/$user/bin, -a + -c (creates land here)
+}
+
 // Wait out the boot servers' init chatter, then tell the kernel to drop
 // their console output (SYS_BOOT_QUIET). settle_ticks is a raw rdtime()
 // delta — the caller picks it for its board's timebase (there's no

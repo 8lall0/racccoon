@@ -13,6 +13,7 @@
 #define SYS_PUTCHAR      1
 #define SYS_EXIT         3
 #define SYS_NS_RESOLVE   8
+#define SYS_NS_TRANSLATE 52
 #define SYS_RFORK        11
 #define SYS_JOIN         13
 #define SYS_EXEC         24
@@ -114,6 +115,17 @@ TEXT ·nsResolve(SB),NOSPLIT,$0-24
 	MOV	$SYS_NS_RESOLVE, A3
 	ECALL
 	MOV	A0, ret+16(FP)
+	RET
+
+// func nsTranslate(path *byte, member int64, out *byte, outMax int64) int64
+TEXT ·nsTranslate(SB),NOSPLIT,$0-40
+	MOV	path+0(FP), A0
+	MOV	member+8(FP), A1
+	MOV	out+16(FP), A2
+	MOV	outMax+24(FP), A4
+	MOV	$SYS_NS_TRANSLATE, A3
+	ECALL
+	MOV	A0, ret+32(FP)
 	RET
 
 // func ipcCall(pid, verb int64, buf *byte, packed int64, verbOut *uint32) int64

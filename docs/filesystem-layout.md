@@ -9,6 +9,9 @@ The canonical root tree. Plan 9-flavoured — see `docs/roadmap.md` §1.
 /lib            shared data: wasm modules, fixtures, anything exec-adjacent
 /usr            per-user home directories
 /usr/root       root's home (§2 adds real users: /usr/glenda, …)
+/usr/$user/bin  the user's own binaries — `bind -ac`'d onto /bin at
+                login, so a self-built program runs by bare name without
+                /bin itself being writable (docs/bin-layout.md)
 /adm            host administration
 /adm/users      the user database (§2) — "uid:name" lines, one per user
 /tmp            scratch

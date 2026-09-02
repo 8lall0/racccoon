@@ -51,6 +51,14 @@ const (
 //go:noescape
 func nsResolve(path *byte, prefixOut *uint32) int64
 
+// nsTranslate resolves an absolute path through the caller's namespace,
+// applying any `bind` path rewrite, and writes the server-relative path
+// for union member `member` into `out`. Returns the serving pid, -1 if
+// nothing matches / member past the end. See src/entry.c3.
+//
+//go:noescape
+func nsTranslate(path *byte, member int64, out *byte, outMax int64) int64
+
 //go:noescape
 func ipcCall(pid, verb int64, buf *byte, packed int64, verbOut *uint32) int64
 
@@ -108,20 +116,25 @@ func abspath(p string) string {
 	return cw + "/" + p
 }
 
-// resolve maps an absolute path to (fsd pid, path with the mount prefix
-// stripped).
+// resolve maps an absolute path to (fsd pid, server-relative path).
+// Uses SYS_NS_TRANSLATE so a `bind` path rewrite (e.g. the /bin union at
+// login) is applied — member 0, the highest-priority binding. A full
+// union walk (member 1, 2, …) isn't done here yet: the one consumer
+// that would need it, os/exec against a $home/bin binary, is rare and
+// can wait.
 func resolve(ap string) (int64, string, bool) {
 	var pb [256]byte
 	putPath(pb[:], ap, len(pb))
-	var prefix uint32
-	pid := nsResolve(&pb[0], &prefix)
+	var out [256]byte
+	pid := nsTranslate(&pb[0], 0, &out[0], int64(len(out)))
 	if pid < 0 {
 		return 0, "", false
 	}
-	if int(prefix) > len(ap) {
-		prefix = uint32(len(ap))
+	i := 0
+	for i < len(out) && out[i] != 0 {
+		i++
 	}
-	return pid, ap[prefix:], true
+	return pid, string(out[:i]), true
 }
 
 func fsdCall(pid, verb int64, buf []byte) (int32, bool) {
