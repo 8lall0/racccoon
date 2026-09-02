@@ -1329,7 +1329,9 @@ const uint FS_CACHE_STATS = 31;
 // Sentinel offset for FS_WRITE_AT meaning "append at the file's current
 // end" — fsd resolves it per-backend before dispatching.
 const uint FS_OFFSET_APPEND = 0xFFFFFFFF;
-const uint FS_MSG_MAX = 1128;
+// Must stay == src/process.c3's MSG_MAX (the kernel IPC inbox size).
+// 8 KiB since 2026-09-02 — see that comment.
+const uint FS_MSG_MAX = 8192;
 
 // FS_LIST: byte 0..99 = directory path ("" means the root), same as
 // FS_READ/FS_WRITE/FS_DELETE's own filename field. Reply: byte 0..3 =

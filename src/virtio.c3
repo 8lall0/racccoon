@@ -55,11 +55,16 @@ struct Virtio_virtq @packed
 	ushort last_used_index;
 }
 
+// data holds one sector for DISKD_READ/WRITE, up to DISKD_MAX_SECTORS
+// (15) consecutive sectors for DISKD_READ_MULTI — virtio-blk transfers
+// them in one queue op (descs[1].len = count * 512). Kept in sync by
+// hand with user/block/diskd.c3's copy; the ::size here sizes the DMA
+// region alloc in process.c3's setup_diskd_mappings (now 2 pages).
 struct Virtio_blk_req @packed
 {
-	uint      type;
-	uint      reserved;
-	ulong     sector;
-	char[512] data;
-	char      status;
+	uint          type;
+	uint          reserved;
+	ulong         sector;
+	char[15 * 512] data;
+	char          status;
 }

@@ -19,7 +19,10 @@ package goos
 // needs no lock: nothing between a Lock-shaped pair yields.
 
 const (
-	fsMsgMax  = 1128
+	// Must equal user.c3's FS_MSG_MAX / src/process.c3's MSG_MAX — fsd
+	// pages FS_LIST at (fsMsgMax-4)/36 entries and reports that count,
+	// which this client trusts. 8 KiB since 2026-09-02.
+	fsMsgMax  = 8192
 	fsReadAt  = 26
 	fsWriteAt = 27
 	fsDelete  = 22
@@ -28,8 +31,8 @@ const (
 	fsRename  = 25
 	fsStat    = 28
 
-	readChunk     = fsMsgMax - 4   // 1124
-	writeChunk    = fsMsgMax - 108 // 1020
+	readChunk     = fsMsgMax - 4   // 8188
+	writeChunk    = fsMsgMax - 108 // 8084
 	listEntrySize = 36
 	listNameMax   = 32
 	listPageMax   = (fsMsgMax - 4) / listEntrySize

@@ -4,6 +4,68 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-02 — IPC: 8 KiB messages, multi-sector diskd, conditional FP save
+
+Three of the four IPC follow-ups the read-cache entry flagged — #1, #2,
+#4. Not #3 (fsd read-ahead) or #5 (shared-memory transport).
+
+**#1 — `MSG_MAX` 1128 → 8192.** The kernel's per-process IPC inbox
+(`Process.msg_data`, `src/process.c3`). 16 inboxes × 8 KiB = 128 KiB
+kernel BSS. The four independent copies that must agree move together:
+`MSG_MAX` (kernel), `FS_MSG_MAX` (`user/user.c3`), `RC_FS_MSG_MAX`
+(libc `syscall.h`), `fsMsgMax` (Go overlay `racccoon_fs.go`). fsd pages
+`FS_LIST` / `FS_READ_AT` / `FS_WRITE_AT` at `MSG_MAX - hdr`, so bulk
+`p9_call` traffic (shell↔fsd, client↔fsd) drops ~7× in round trips.
+
+**#2 — multi-sector `diskd` protocol.** New verb `DISKD_READ_MULTI`
+(212): one IPC + one virtio-blk op moves up to `DISKD_MAX_SECTORS`
+(15 → 7680 B, fits an 8 KiB message) at once — `virtio_blk_req.data`
+widened to `char[15*512]` (kernel copy in `src/virtio.c3` drives the
+`setup_diskd_mappings` alloc, now 2 pages; hand-synced copy in
+`user/block/diskd.c3`), `descs[1].len = count*512`. Replies are trimmed
+to the real payload length (`4 + count*512`, or `4` for a write ack)
+instead of always 516/`DISKD_MSG_MAX`.
+- `user/fs/fsd.c3`: `diskd_read_multi()` + `fs_read_sectors(start,
+  count, buf)` — cache-aware, serves hits from the sector cache and
+  batches miss-runs (≤15). A one-shot probe at mount flips
+  `g_diskd_multi_ok` off if the backend doesn't answer verb 212
+  (USB-MSC `usbrw` speaks the single-sector subset only). The 8 KiB
+  disk I/O buffer is a file-scope `@noinit` global, off the deep stack.
+- `user/fs/ext2.c3`: `ext2_read` / `ext2_read_inode_at` now resolve a
+  contiguous run of logical→physical blocks and issue one
+  `fs_read_sectors` per run, instead of one `ext2_read_block` per
+  block. Holes zero-fill one block and break the run. This is the
+  cold-load fix — `/bin/go` (13.6 MB) was ~26k single-sector round
+  trips.
+
+**#4 — conditional FP save in `yield()`.** `src/process.c3` calls
+`fp_save` only when `sstatus.FS == Dirty` (i.e. `prev` actually touched
+an f-reg since its last `fp_restore`), then forces FS back to `Clean`
+after the restore — `kernel_entry` doesn't snapshot sstatus, so that
+value rides through the switch and out via `next`'s `sret`. Every
+server and the Go / tcc / toolchain workloads are FP-free, and an
+`exec` yields thousands of times; each such switch drops ~66 FP mem
+ops.
+
+Verified QEMU `-m 2G`, ext2 + dual images: `p9test` `p9fstest`
+`p9fswritetest` `p9realtest` `chmodtest` `permtest` `fspermtest`
+`mounttest` `nstest` `maptest` `oomtest` `faulttest` `hardentest`
+`runtest` `runtest2` `elftest` `elftest2` `argvtest2` `wasmtest`
+`fscachestat` (68 % hit) `gotest` `gostage3test` `gostage35test`
+`gostage41test` `gostage42test` `gotoolchaintest` — all pass.
+`bigreadtest` (ext2 double-indirect 300 KB read — exercises the new
+contiguous-run path) passes. `gobuildtest` not re-confirmed this pass
+(on-device `go build` under TCG is 10-15 min and the compile/link path
+is untouched by this change; `gotoolchaintest` covers on-device
+build+link).
+
+`tcctest` still fails — `bin/tcc:0: error: unrecognized character
+\x17` — **pre-existing**, confirmed identical at `096dcc8` and
+`a8d0799` before any of this work. Last passed ~2026-08-31; separate
+investigation (tcc appears to treat `argv[0]` as an input file).
+
+---
+
 ## 2026-09-02 — fsd: a sector read cache
 
 The fsd read path was `ext2_read_block` → `fs_read_sector` (one 512 B

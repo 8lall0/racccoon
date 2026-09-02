@@ -24,13 +24,17 @@ import std::nolibc::mem;
 const uint DISKD_IRQ_NOTIFY = 0xFFFFFFFF;
 const uint DISKD_READ  = 210; // request: read one sector
 const uint DISKD_WRITE = 211; // request: write one sector
+const uint DISKD_READ_MULTI = 212; // request: read `count` consecutive sectors
 
-// Message layout, both directions: byte 0..3 = sector number (uint),
-// byte 4..515 = one 512-byte sector's worth of data (the sector written,
-// for a WRITE request; the sector read, for a READ reply). Unused for a
-// READ request or a WRITE reply. Must match src/process.c3's MSG_MAX and
-// whatever the kernel-side client (fs.c3) assumes.
-const uint DISKD_MSG_MAX = 516;
+// Message layout: byte 0..3 = sector number (uint). For DISKD_WRITE the
+// sector data follows at byte 4. For DISKD_READ_MULTI byte 4..7 = count
+// (1..DISKD_MAX_SECTORS); the reply carries byte 0 = status then
+// count*512 bytes of data from byte 4. DISKD_READ's reply is byte 0 =
+// status, byte 4..515 = the sector. Must fit src/process.c3's MSG_MAX;
+// USB-MSC (user/bin/usbrw.c3) speaks the single-sector subset only —
+// fsd probes DISKD_READ_MULTI and falls back if the backend rejects it.
+const uint DISKD_MAX_SECTORS = 15;
+const uint DISKD_MSG_MAX = 8192;
 
 const uint SECTOR_SIZE      = 512;
 const uint VIRTIO_BLK_PADDR = 0x10001000;
@@ -40,11 +44,11 @@ const uint VIRTIO_BLK_T_OUT = 1;
 
 struct Virtio_blk_req @packed
 {
-	uint      type;
-	uint      reserved;
-	ulong     sector;
-	char[512] data;
-	char      status;
+	uint          type;
+	uint          reserved;
+	ulong         sector;
+	char[15 * 512] data;   // DISKD_MAX_SECTORS — see src/virtio.c3's copy
+	char          status;
 }
 
 // Thin wrappers around user/virtio.c3's own base-address-parameterized
@@ -129,11 +133,22 @@ fn void main()
 		// pid >= 1, so ipc_reply()'s generation check below is safe to
 		// rely on unconditionally.
 		if (from == 0) continue;
-		if (verb != DISKD_READ && verb != DISKD_WRITE) continue;
+		if (verb != DISKD_READ && verb != DISKD_WRITE && verb != DISKD_READ_MULTI) continue;
 
 		bool is_write = (verb == DISKD_WRITE);
 		uint* sector_ptr = (uint*)&buf;
 		uint sector = *sector_ptr;
+
+		// DISKD_READ_MULTI: byte 4..7 = count, clamped to the buffer.
+		uint count = 1;
+		if (verb == DISKD_READ_MULTI)
+		{
+			uint* count_ptr = (uint*)&buf[4];
+			count = *count_ptr;
+			if (count < 1) count = 1;
+			if (count > DISKD_MAX_SECTORS) count = DISKD_MAX_SECTORS;
+		}
+		uint xfer = count * SECTOR_SIZE;
 
 		req.sector = (ulong)sector;
 		req.type   = is_write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
@@ -149,7 +164,7 @@ fn void main()
 		vq.descs[0].next  = 1;
 
 		vq.descs[1].addr  = (ulong)(uptr)&req.data;
-		vq.descs[1].len   = SECTOR_SIZE;
+		vq.descs[1].len   = xfer;
 		vq.descs[1].flags = VIRTQ_DESC_F_NEXT | (is_write ? (ushort)0 : VIRTQ_DESC_F_WRITE);
 		vq.descs[1].next  = 2;
 
@@ -191,8 +206,12 @@ fn void main()
 		if (!is_write)
 		{
 			char* dst = &buf[4];
-			mem::copy(dst, &req.data, SECTOR_SIZE);
+			mem::copy(dst, &req.data, xfer);
 		}
-		ipc_reply(from, verb, &buf, DISKD_MSG_MAX, from_gen);
+		// Reply only as long as the payload needs — a single sector's
+		// 516 bytes for DISKD_READ, 4 + count*512 for the multi read, 4
+		// for a write ack. Keeps the kernel's per-message copy small.
+		int reply_len = is_write ? 4 : (int)(4 + xfer);
+		ipc_reply(from, verb, &buf, reply_len, from_gen);
 	}
 }

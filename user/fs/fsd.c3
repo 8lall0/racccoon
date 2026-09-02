@@ -80,9 +80,24 @@ import std::nolibc::mem;
 // fsd would dispatch it and reply straight back to diskd — a mutual
 // deadlock. Out of range, fsd just drops it (the recv still acks diskd,
 // so diskd unblocks) and recovers.
-const uint DISKD_READ    = 210;
-const uint DISKD_WRITE   = 211;
-const uint DISKD_MSG_MAX = 516;
+const uint DISKD_READ        = 210;
+const uint DISKD_WRITE       = 211;
+const uint DISKD_READ_MULTI  = 212; // read N consecutive sectors in one op
+const uint DISKD_MAX_SECTORS = 15;  // must match user/block/diskd.c3
+const uint DISKD_MSG_MAX     = 8192;
+
+// One shared static scratch for every diskd request/reply. fsd handles
+// one client request at a time and issues one diskd op at a time within
+// it, so this is safe and keeps an 8 KiB buffer off the deep
+// fs_ops.read -> ext2 -> fs_read_sectors -> diskd_* call chain (fsd's
+// stack is 64 KiB and the ext2 block cache alone is 16 KiB).
+char[DISKD_MSG_MAX] g_disk_io_buf @noinit;
+
+// Cleared the first time DISKD_READ_MULTI comes back with the wrong
+// reply verb — the USB-MSC backend (user/bin/usbrw.c3) speaks only the
+// single-sector subset. After that fs_read_sectors falls back to
+// per-sector DISKD_READ (still cached, still correct, just no batching).
+bool g_diskd_multi_ok = true;
 const uint SECTOR_SIZE   = 512;
 
 // --- read cache -----------------------------------------------------
@@ -443,8 +458,8 @@ fn bool diskd_rw(char* buf, uint sector, bool is_write)
 		if (fs_sector_is_reserved(sector - fs_partition_start)) return false;
 	}
 
-	char[DISKD_MSG_MAX] req @noinit;
-	uint* sector_field = (uint*)&req;
+	char* req = &g_disk_io_buf[0];
+	uint* sector_field = (uint*)req;
 	*sector_field = sector;
 	if (is_write)
 	{
@@ -456,7 +471,7 @@ fn bool diskd_rw(char* buf, uint sector, bool is_write)
 
 	uint verb = is_write ? DISKD_WRITE : DISKD_READ;
 	uint reply_verb = 0;
-	int from = p9_call(g_diskd_pid, verb, &req, DISKD_MSG_MAX, &req, DISKD_MSG_MAX, &reply_verb);
+	int from = p9_call(g_diskd_pid, verb, req, 516, req, DISKD_MSG_MAX, &reply_verb);
 	if (from <= 0 && !g_fsd_dynamic)
 	{
 		// The storage driver may have died and been respawned —
@@ -479,7 +494,7 @@ fn bool diskd_rw(char* buf, uint sector, bool is_write)
 		{
 			g_diskd_pid = rr_pid;
 			reply_verb = 0;
-			from = p9_call(g_diskd_pid, verb, &req, DISKD_MSG_MAX, &req, DISKD_MSG_MAX, &reply_verb);
+			from = p9_call(g_diskd_pid, verb, req, 516, req, DISKD_MSG_MAX, &reply_verb);
 		}
 	}
 	if (from <= 0 || reply_verb != verb) return false;
@@ -518,6 +533,107 @@ fn bool fs_read_sector(uint sector, char* buf)
 		return true;
 	}
 	return diskd_rw(buf, fs_partition_start + sector, false);
+}
+
+// Reads `count` (1..DISKD_MAX_SECTORS) consecutive sectors starting at
+// partition-absolute `abs_sector` into `buf` with one DISKD_READ_MULTI.
+// No cache interaction — fs_read_sectors does that around it. Returns
+// false and flips g_diskd_multi_ok off if the backend doesn't speak the
+// verb (so the caller retries per-sector).
+fn bool diskd_read_multi(char* buf, uint abs_sector, uint count)
+{
+	char* req = &g_disk_io_buf[0];
+	uint* sector_field = (uint*)req;
+	uint* count_field  = (uint*)&req[4];
+	*sector_field = abs_sector;
+	*count_field  = count;
+
+	uint reply_verb = 0;
+	int from = p9_call(g_diskd_pid, DISKD_READ_MULTI, req, 8, req, DISKD_MSG_MAX, &reply_verb);
+	if (from <= 0)
+	{
+		// Could be a driver respawn; let the per-sector path (diskd_rw)
+		// handle the re-query + retry, and just report failure here.
+		return false;
+	}
+	if (reply_verb != DISKD_READ_MULTI)
+	{
+		g_diskd_multi_ok = false;
+		return false;
+	}
+	if (req[0] != 0) return false;
+	uint n = count * SECTOR_SIZE;
+	for (uint i = 0; i < n; i++) buf[i] = req[4 + i];
+	return true;
+}
+
+// Batched read: `count` consecutive partition-relative sectors from
+// `start` into `buf`. Serves cached sectors from the cache and reads
+// runs of uncached ones with diskd_read_multi (falling back to
+// per-sector fs_read_sector if the backend or a call fails). Every
+// sector read from disk is inserted into the cache. This is the path
+// ext2's block / file readers use.
+fn bool fs_read_sectors(uint start, uint count, char* buf)
+{
+	uint i = 0;
+	while (i < count)
+	{
+		uint sec = start + i;
+		// Serve a cache hit.
+		if (fs_cache_data != null)
+		{
+			uint hidx = sec % FS_CACHE_ENTRIES;
+			if (fs_cache_tag[hidx] == sec)
+			{
+				char* hslot = &fs_cache_data[(uptr)hidx * SECTOR_SIZE];
+				for (uint k = 0; k < SECTOR_SIZE; k++) buf[i * SECTOR_SIZE + k] = hslot[k];
+				fs_cache_hits++;
+				i++;
+				continue;
+			}
+		}
+		// Gather the longest run of not-currently-cached sectors, capped
+		// at DISKD_MAX_SECTORS, and read it in one op.
+		uint run = 1;
+		while (i + run < count && run < DISKD_MAX_SECTORS)
+		{
+			uint nsec = start + i + run;
+			if (fs_cache_data != null && fs_cache_tag[nsec % FS_CACHE_ENTRIES] == nsec) break;
+			run++;
+		}
+
+		char* dst = &buf[i * SECTOR_SIZE];
+		bool got = false;
+		if (g_diskd_multi_ok && run > 1)
+		{
+			got = diskd_read_multi(dst, fs_partition_start + sec, run);
+		}
+		if (!got)
+		{
+			// Per-sector fallback (also the run == 1 case).
+			for (uint j = 0; j < run; j++)
+			{
+				if (!fs_read_sector(sec + j, &buf[(i + j) * SECTOR_SIZE])) return false;
+			}
+			i += run;
+			continue;
+		}
+		// Populate the cache from the batch.
+		if (fs_cache_data != null)
+		{
+			for (uint j = 0; j < run; j++)
+			{
+				uint cs = sec + j;
+				uint cidx = cs % FS_CACHE_ENTRIES;
+				char* cslot = &fs_cache_data[(uptr)cidx * SECTOR_SIZE];
+				for (uint k = 0; k < SECTOR_SIZE; k++) cslot[k] = dst[j * SECTOR_SIZE + k];
+				fs_cache_tag[cidx] = cs;
+			}
+		}
+		fs_cache_misses += run;
+		i += run;
+	}
+	return true;
 }
 
 // Write counterpart to fs_read_sector — every filesystem-level write in
@@ -869,6 +985,19 @@ fn void main(String[] args)
 	else
 	{
 		fs_mount(false, null);
+	}
+
+	// One-shot probe: does the storage backend speak DISKD_READ_MULTI?
+	// diskd/sdd do; the USB-MSC backend (user/bin/usbrw.c3) doesn't and
+	// either error-replies or drops it. Either way g_diskd_multi_ok goes
+	// false and fs_read_sectors uses per-sector DISKD_READ from then on.
+	if (g_diskd_pid > 0)
+	{
+		char[2 * SECTOR_SIZE] probe @noinit;
+		if (!diskd_read_multi(&probe[0], fs_partition_start, 2))
+		{
+			g_diskd_multi_ok = false;
+		}
 	}
 
 	for (;;)

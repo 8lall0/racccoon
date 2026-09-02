@@ -25,14 +25,15 @@ const PROC_UNUSED   = 0; // Unused process control structure
 const PROC_RUNNABLE = 1; // Runnable process
 const PROC_BLOCKED  = 2; // Waiting on SYS_IPC_RECV for a message to arrive
 
-// 1128 = 100-byte filename + 4-byte length header + one full 1024-byte
-// file (fsd's own protocol, see user/fsd.c3 — matches the File struct's
-// own data capacity there, so moving file I/O out of the kernel doesn't
-// shrink the max file size the old direct SYS_WRITEFILE syscall allowed).
-// Comfortably covers diskd's smaller 516-byte sector protocol too — every
-// process's inbox is sized for the largest thing anyone speaks over IPC,
-// not per-conversation.
-const MSG_MAX = 1128;
+// Every process's IPC inbox (Process.msg_data). Sized for the largest
+// thing anyone speaks over IPC, not per-conversation. 8 KiB: raised from
+// 1128 (= 100-byte name + header + one 1024-byte file block) so bulk
+// transfers — FS_READ/FS_WRITE payloads, and diskd's new multi-sector
+// batches (up to 15 × 512 B + header) — carry ~8x more per round trip.
+// Cost: PROCS_MAX (16) inboxes × 8 KiB = 128 KiB kernel BSS. Must stay
+// == user.c3's FS_MSG_MAX; DISKD_MSG_MAX (user/fs/fsd.c3, user/block/
+// diskd.c3) must stay <= this.
+const MSG_MAX = 8192;
                      // yield()'s scan only matches PROC_RUNNABLE, so
                      // PROC_BLOCKED is automatically skipped without any
                      // scheduler change.
@@ -1503,16 +1504,24 @@ fn void yield() @noinline
 	Process* prev = current_proc;
 	current_proc = next;
 
-	// Bracket the switch with a full FP save/restore. Eager, not lazy:
-	// switch_context is @naked (preserves no FP regs, incl. callee-saved
-	// fs0-fs11) and is the *only* caller of it, so this one spot covers
-	// every context switch. Cost is ~66 FP mem ops (< 1us); the timer
-	// fires ~1Hz and the frequent yield() callers (driver poll loops) are
-	// integer-only. A conditional save (skip when sstatus.FS != Dirty,
-	// then push FS to Clean) is the optimisation to reach for only if a
-	// yield()/sec counter ever shows it matters.
-	fp_save((uptr)&prev.fp_area);
+	// Bracket the switch with an FP save/restore — switch_context is
+	// @naked (preserves no FP regs, incl. callee-saved fs0-fs11) and is
+	// its only caller, so this one spot covers every context switch.
+	//
+	// Conditional save: sstatus.FS is Dirty iff `prev` wrote an f-reg
+	// since we last fp_restore'd it — otherwise prev.fp_area is still
+	// current and the ~66-op save is wasted. fp_restore itself dirties
+	// FS (fld/fscsr), so force it back to Clean afterward or every
+	// subsequent yield would see Dirty and save. kernel_entry doesn't
+	// snapshot sstatus, so this Clean value rides through the switch to
+	// `next` and out via its sret. Matters: an exec yields thousands of
+	// times and the Go/tcc/toolchain workloads are FP-free.
+	if ((read_reg("sstatus") & SSTATUS_FS_MASK) == SSTATUS_FS_DIRTY)
+	{
+		fp_save((uptr)&prev.fp_area);
+	}
 	fp_restore((uptr)&next.fp_area);
+	write_csr("sstatus", (read_reg("sstatus") & ~SSTATUS_FS_MASK) | SSTATUS_FS_CLEAN);
 
 	switch_context(&prev.sp, &next.sp, ((ulong)(uptr)next.page_table >> 12) | SATP_SV39, (uptr)&next.stack + STACK_SIZE);
 }

@@ -250,11 +250,45 @@ fn bool ext2_probe()
 // codebase's other char[SECTOR_SIZE]/char[100] locals.
 fn bool ext2_read_block(uint block, char* buf)
 {
-	for (uint s = 0; s < ext2_sectors_per_block; s++)
+	// One batched op for the whole block (fs_read_sectors caps at
+	// DISKD_MAX_SECTORS; ext2_sectors_per_block is 1..8 for 512 B..4 KiB
+	// blocks, always within that).
+	return fs_read_sectors(block * ext2_sectors_per_block, ext2_sectors_per_block, buf);
+}
+
+// Reads a run of physically-consecutive logical blocks starting at
+// logical block `lb` into `run_buf` (which must hold DISKD_MAX_SECTORS
+// sectors — see EXT2_READ_RUN_BYTES). Returns the number of blocks
+// placed (>= 1), or 0 on I/O error. A hole (resolve -> 0) returns 1
+// with one block zero-filled. Extends the run only while consecutive
+// logical blocks map to consecutive physical blocks and the batch fits
+// one fs_read_sectors op — turns a big contiguous file read into a
+// handful of multi-sector diskd ops instead of one per block.
+const uint EXT2_READ_RUN_BYTES = DISKD_MAX_SECTORS * SECTOR_SIZE;
+
+fn uint ext2_read_contig_run(Ext2_inode_info* inode, Ext2_block_cache* cache,
+	uint lb, uint want_blocks, uint max_block, char* run_buf)
+{
+	uint spb = ext2_sectors_per_block;
+	uint max_run = DISKD_MAX_SECTORS / spb;
+	if (max_run < 1) max_run = 1;
+	if (want_blocks < 1) want_blocks = 1;
+	if (want_blocks > max_run) want_blocks = max_run;
+
+	uint phys0 = ext2_resolve_block(inode, lb, cache);
+	if (phys0 == 0)
 	{
-		if (!fs_read_sector(block * ext2_sectors_per_block + s, &buf[s * SECTOR_SIZE])) return false;
+		for (uint i = 0; i < ext2_block_size; i++) run_buf[i] = 0;
+		return 1;
 	}
-	return true;
+	uint run = 1;
+	while (run < want_blocks && lb + run < max_block)
+	{
+		if (ext2_resolve_block(inode, lb + run, cache) != phys0 + run) break;
+		run++;
+	}
+	if (!fs_read_sectors(phys0 * spb, run * spb, run_buf)) return 0;
+	return run;
 }
 
 // Write counterpart to ext2_read_block — every ext2-level write in this
@@ -713,30 +747,27 @@ fn int ext2_read(char* name, char* dst, uint len)
 	cache.double_top_loaded = false;
 	cache.triple_top_loaded = false;
 
+	// Same contiguous-run batching as ext2_read_inode_at (which see) —
+	// offset is always 0 here so there's no first-block skip.
+	char[EXT2_READ_RUN_BYTES] run_buf @noinit;
 	uint bytes_read = 0;
-	for (uint b = 0; b < max_block && bytes_read < read_len; b++)
+	uint b = 0;
+	while (b < max_block && bytes_read < read_len)
 	{
-		uint block = ext2_resolve_block(&inode, b, &cache);
-		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
-		if (block == 0)
+		uint want = (read_len - bytes_read + ext2_block_size - 1) / ext2_block_size;
+		uint run = ext2_read_contig_run(&inode, &cache, b, want, max_block, &run_buf);
+		if (run == 0) return (int)bytes_read;
+		for (uint k = 0; k < run && bytes_read < read_len; k++)
 		{
-			// Sparse block — zero-fill this portion rather than
-			// stopping, matching the region's logical content (all-
-			// zero) per ext2's own sparse-file semantics.
-			for (uint i = 0; i < EXT2_MAX_BLOCK_SIZE; i++) block_buf[i] = 0;
+			uint chunk = read_len - bytes_read;
+			if (chunk > ext2_block_size) chunk = ext2_block_size;
+			for (uint i = 0; i < chunk; i++)
+			{
+				dst[bytes_read + i] = run_buf[k * ext2_block_size + i];
+			}
+			bytes_read += chunk;
 		}
-		else if (!ext2_read_block(block, &block_buf))
-		{
-			return (int)bytes_read;
-		}
-
-		uint chunk = read_len - bytes_read;
-		if (chunk > ext2_block_size) chunk = ext2_block_size;
-		for (uint i = 0; i < chunk; i++)
-		{
-			dst[bytes_read + i] = block_buf[i];
-		}
-		bytes_read += chunk;
+		b += run;
 	}
 	return (int)bytes_read;
 }
@@ -845,29 +876,27 @@ fn int ext2_read_inode_at(uint inode_num, char* dst, uint len, uint offset)
 	cache.double_top_loaded = false;
 	cache.triple_top_loaded = false;
 
+	char[EXT2_READ_RUN_BYTES] run_buf @noinit;
 	uint bytes_read = 0;
-	for (uint b = start_block; b < max_block && bytes_read < read_len; b++)
+	uint b = start_block;
+	while (b < max_block && bytes_read < read_len)
 	{
-		uint block = ext2_resolve_block(&inode, b, &cache);
-		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
-		if (block == 0)
+		uint want = (read_len - bytes_read + ext2_block_size - 1) / ext2_block_size;
+		uint run = ext2_read_contig_run(&inode, &cache, b, want, max_block, &run_buf);
+		if (run == 0) return (int)bytes_read;
+		for (uint k = 0; k < run && bytes_read < read_len; k++)
 		{
-			for (uint i = 0; i < EXT2_MAX_BLOCK_SIZE; i++) block_buf[i] = 0;
+			uint skip = (b + k == start_block) ? offset_in_block : 0;
+			uint available = ext2_block_size - skip;
+			uint chunk = read_len - bytes_read;
+			if (chunk > available) chunk = available;
+			for (uint i = 0; i < chunk; i++)
+			{
+				dst[bytes_read + i] = run_buf[k * ext2_block_size + skip + i];
+			}
+			bytes_read += chunk;
 		}
-		else if (!ext2_read_block(block, &block_buf))
-		{
-			return (int)bytes_read;
-		}
-
-		uint skip = (b == start_block) ? offset_in_block : 0;
-		uint available = ext2_block_size - skip;
-		uint chunk = read_len - bytes_read;
-		if (chunk > available) chunk = available;
-		for (uint i = 0; i < chunk; i++)
-		{
-			dst[bytes_read + i] = block_buf[skip + i];
-		}
-		bytes_read += chunk;
+		b += run;
 	}
 	return (int)bytes_read;
 }

@@ -44,8 +44,11 @@
 #define RC_FS_READ_AT         26
 #define RC_FS_WRITE_AT        27
 #define RC_FS_STAT            28
-#define RC_FS_MSG_MAX         1128
-#define RC_FS_WRITE_AT_MAXCHUNK (1128 - 108)
+/* Must equal user.c3's FS_MSG_MAX / src/process.c3's MSG_MAX — fsd
+ * pages FS_LIST at (RC_FS_MSG_MAX-4)/36 entries and reports that count,
+ * which rc_fs.c trusts. 8 KiB since 2026-09-02. */
+#define RC_FS_MSG_MAX         8192
+#define RC_FS_WRITE_AT_MAXCHUNK (8192 - 108)
 #define RC_FS_LIST_NAME_MAX    32
 #define RC_FS_LIST_ENTRY_SIZE  36
 #define RC_FS_OFFSET_APPEND    0xFFFFFFFFu
