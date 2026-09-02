@@ -1,0 +1,728 @@
+diff --git a/src/cmd/go/internal/goos/goos.go b/src/cmd/go/internal/goos/goos.go
+index cb0fef21..d89e9f4f 100644
+--- a/src/cmd/go/internal/goos/goos.go
++++ b/src/cmd/go/internal/goos/goos.go
+@@ -27,6 +27,7 @@ import (
+ 	"context"
+ 	"os"
+ 	"path/filepath"
++	"runtime"
+ 
+ 	"cmd/go/internal/base"
+ 	"cmd/go/internal/cfg"
+@@ -58,6 +59,11 @@ func ResolveImport(moduleLoader *modload.Loader, imp string) (newPath, dir strin
+ 		}
+ 
+ 		dir = filepath.Join(dir, "goos")
++	} else if runtime.GOOS == "tamago" {
++		// racccoon (lib/go/racccoon.patch): the `go` command runs
++		// on-device, and the racccoon runtime/goos overlay is baked
++		// straight into this GOROOT — no GOOSPKG module to resolve.
++		dir = filepath.Join(cfg.GOROOT, "src/runtime/goos")
+ 	} else {
+ 		// fallback to Linux userspace goos defined in GOROOT/src/runtime/goos
+ 		if os.Getenv("GOHOSTOS") == "linux" && (cfg.Goarch == "amd64" || cfg.Goarch == "arm" || cfg.Goarch == "arm64" || cfg.Goarch == "loong64" || cfg.Goarch == "riscv64") {
+diff --git a/src/cmd/go/internal/lockedfile/internal/filelock/filelock_other.go b/src/cmd/go/internal/lockedfile/internal/filelock/filelock_other.go
+index b16709ed..94051399 100644
+--- a/src/cmd/go/internal/lockedfile/internal/filelock/filelock_other.go
++++ b/src/cmd/go/internal/lockedfile/internal/filelock/filelock_other.go
+@@ -9,6 +9,7 @@ package filelock
+ import (
+ 	"errors"
+ 	"io/fs"
++	"runtime"
+ )
+ 
+ type lockType int8
+@@ -18,7 +19,13 @@ const (
+ 	writeLock
+ )
+ 
++// racccoon (lib/go/racccoon.patch): no filesystem locking, and none
++// needed — `go` runs one process at a time and fsd has no flock. A
++// no-op lock keeps modload / the build cache working.
+ func lock(f File, lt lockType) error {
++	if runtime.GOOS == "tamago" {
++		return nil
++	}
+ 	return &fs.PathError{
+ 		Op:   lt.String(),
+ 		Path: f.Name(),
+@@ -27,6 +34,9 @@ func lock(f File, lt lockType) error {
+ }
+ 
+ func unlock(f File) error {
++	if runtime.GOOS == "tamago" {
++		return nil
++	}
+ 	return &fs.PathError{
+ 		Op:   "Unlock",
+ 		Path: f.Name(),
+diff --git a/src/cmd/link/internal/ld/main.go b/src/cmd/link/internal/ld/main.go
+index 19ed197a..05a8ded0 100644
+--- a/src/cmd/link/internal/ld/main.go
++++ b/src/cmd/link/internal/ld/main.go
+@@ -244,6 +244,21 @@ func Main(arch *sys.Arch, theArch Arch) {
+ 		ctxt.HeadType.Set(buildcfg.GOOS)
+ 	}
+ 
++	// racccoon (lib/go/racccoon.patch): a GOOS=tamago ELF loads into a
++	// racccoon process at USER_BASE (0x1000000); the loader needs the
++	// ELF header at USER_BASE and every PT_LOAD inside the exec window,
++	// so default -T to USER_BASE+64KiB and -R to the page size when the
++	// caller didn't set them (scripts/build_go.sh passes these
++	// explicitly; an on-device `go build` relies on this default).
++	if buildcfg.GOOS == "tamago" && ctxt.Arch.Family == sys.RISCV64 {
++		if *FlagTextAddr == -1 {
++			*FlagTextAddr = 0x1010000
++		}
++		if *FlagRound == -1 {
++			*FlagRound = 0x1000
++		}
++	}
++
+ 	if !*flagAslr && ctxt.BuildMode != BuildModeCShared {
+ 		Errorf("-aslr=false is only allowed for -buildmode=c-shared")
+ 		usage()
+diff --git a/src/cmd/vendor/golang.org/x/telemetry/internal/telemetry/dir.go b/src/cmd/vendor/golang.org/x/telemetry/internal/telemetry/dir.go
+index 0673be56..cdcb353b 100644
+--- a/src/cmd/vendor/golang.org/x/telemetry/internal/telemetry/dir.go
++++ b/src/cmd/vendor/golang.org/x/telemetry/internal/telemetry/dir.go
+@@ -159,5 +159,6 @@ const DisabledOnPlatform = false ||
+ 	// These platforms fundamentally can't be supported:
+ 	runtime.GOOS == "js" || // #60971
+ 	runtime.GOOS == "wasip1" || // #60971
++	runtime.GOOS == "tamago" || // racccoon (lib/go/racccoon.patch): no telemetry child / config dir
+ 	runtime.GOOS == "plan9" || // https://github.com/golang/go/issues/57540#issuecomment-1470766639
+ 	runtime.GOARCH == "mips" || runtime.GOARCH == "mipsle" // mips lacks cross-process 64-bit atomics
+diff --git a/src/os/exec/lp_tamago.go b/src/os/exec/lp_tamago.go
+index cf7ac99e..e0e0b043 100644
+--- a/src/os/exec/lp_tamago.go
++++ b/src/os/exec/lp_tamago.go
+@@ -8,17 +8,45 @@ package exec
+ 
+ import (
+ 	"errors"
++	"io/fs"
++	"os"
++	"strings"
++	"syscall"
+ )
+ 
+ // ErrNotFound is the error resulting if a path search failed to find an executable file.
+ var ErrNotFound = errors.New("executable file not found in $PATH")
+ 
++func findExecutable(file string) error {
++	d, err := os.Stat(file)
++	if err != nil {
++		return err
++	}
++	m := d.Mode()
++	if m.IsDir() {
++		return syscall.EISDIR
++	}
++	if m&0111 != 0 {
++		return nil
++	}
++	return fs.ErrPermission
++}
++
+ // LookPath searches for an executable named file in the
+ // directories named by the PATH environment variable.
+ // If file contains a slash, it is tried directly and the PATH is not consulted.
+-// The result may be an absolute path or a path relative to the current directory.
++//
++// racccoon (lib/go/racccoon.patch): the stock tamago stub always fails
++// ("tamago can not execute processes"), which it now can. There is no
++// PATH, so only a path containing a slash resolves — which is all
++// cmd/go ever passes for its own tools.
+ func lookPath(file string) (string, error) {
+-	// tamago can not execute processes, so act as if there are no executables at all.
++	if strings.Contains(file, "/") {
++		if err := findExecutable(file); err != nil {
++			return "", &Error{file, err}
++		}
++		return file, nil
++	}
+ 	return "", &Error{file, ErrNotFound}
+ }
+ 
+diff --git a/src/os/pipe_tamago.go b/src/os/pipe_tamago.go
+index 442f0cdf..0d0635f2 100644
+--- a/src/os/pipe_tamago.go
++++ b/src/os/pipe_tamago.go
+@@ -9,8 +9,16 @@ package os
+ import "syscall"
+ 
+ // Pipe returns a connected pair of Files; reads from r return bytes written to w.
+-// It returns the files and an error, if any.
++//
++// On racccoon (lib/go/racccoon.patch) this backs os/exec output capture:
++// the pair reserves a runtime/goos capture slot, StartProcess points the
++// spawned child's console at a kernel pipe, and reads from r return the
++// child's combined output once it has exited. Without the racccoon
++// backend (a vanilla GOOS=tamago build) it stays unsupported.
+ func Pipe() (r *File, w *File, err error) {
+-	// GOOS=tamago does not have pipes.
+-	return nil, nil, NewSyscallError("pipe", syscall.ENOSYS)
++	var fds [2]int
++	if e := syscall.PipeGoos(fds[:]); e != nil {
++		return nil, nil, NewSyscallError("pipe", e)
++	}
++	return newFile(fds[0], "|0", kindNoPoll, false), newFile(fds[1], "|1", kindNoPoll, false), nil
+ }
+diff --git a/src/runtime/goos/linux_user.go b/src/runtime/goos/linux_user.go
+index fac5dfe1..4edaef78 100644
+--- a/src/runtime/goos/linux_user.go
++++ b/src/runtime/goos/linux_user.go
+@@ -58,6 +58,53 @@ var (
+ 	Nanotime = sys_clock_gettime
+ )
+ 
++// FS, when set by a GOOSPKG provider (or any imported package), replaces
++// syscall's in-memory filesystem (syscall/fs_tamago.go) with a
++// host-backed one, so package os operates on real, persistent storage.
++// nil (the default) keeps the in-memory fs. See docs/go-port-plan.md in
++// the racccoon tree.
++var FS FSHook
++
++// Args, when set by a GOOSPKG provider, returns the process argument
++// vector for os.Args (the runtime's goargs() otherwise hardcodes
++// {"tamago"}). Keep in sync with go/goos/racccoon_user.go.
++var Args func() []string
++
++// Spawn / Wait / Capture* are the os/exec bridge (syscall.StartProcess /
++// Wait4 / os.Pipe, lib/go/racccoon.patch). A GOOSPKG provider replaces
++// this whole file, so these stubs only apply to a vanilla GOOS=tamago
++// build, where process creation stays unsupported.
++//
++// capID on Spawn selects an output-capture slot (>= 0) or console
++// inherit (-1); CaptureAlloc reserves one for an os.Pipe pair, and the
++// pipe's read end serves CaptureData once Spawn has returned.
++func Spawn(path string, argv []string, dir string, capID int) int { return -38 }
++func Wait(pid int) int                                            { return -38 }
++func CaptureAlloc() int                                           { return -1 }
++func CaptureData(id int) []byte                                   { return nil }
++func CaptureFree(id int)                                          {}
++
++// FSHook is the contract a host filesystem backend implements. Handles
++// are opaque tokens the backend hands back from Open and gets back on
++// every subsequent call; the syscall layer never inspects them. All
++// paths are already absolute (package os / syscall resolves cwd first
++// via Getwd).
++type FSHook interface {
++	Open(path string, flags int, perm uint32) (h uintptr, isDir bool, size int64, errno int)
++	Close(h uintptr) int
++	Pread(h uintptr, b []byte, off int64) (n int, errno int)
++	Pwrite(h uintptr, b []byte, off int64) (n int, errno int)
++	Fstat(h uintptr) (size int64, isDir bool, errno int)
++	Dirents(h uintptr) (names []string, isDir []bool, errno int)
++	Stat(path string) (size int64, isDir bool, errno int)
++	Mkdir(path string, perm uint32) int
++	Remove(path string, dir bool) int
++	Rename(from, to string) int
++	Truncate(path string, size int64) int
++	Getwd() (string, int)
++	Chdir(path string) int
++}
++
+ // defined in linux_user*.s
+ func CPUInit()
+ func sys_exit_group(code int32)
+diff --git a/src/runtime/os_tamago.go b/src/runtime/os_tamago.go
+index 6d57f5f9..7060f5da 100644
+--- a/src/runtime/os_tamago.go
++++ b/src/runtime/os_tamago.go
+@@ -50,6 +50,18 @@ func getgp() (gp uintptr) {
+ type sigset struct{}
+ type gsignalStack struct{}
+ 
++// goargs() in schedinit hardcoded argslice to {"tamago"} before any
++// package init could run. runtime/goos init has since run, so a
++// GOOSPKG provider's Args hook (the exec ABI) is now reachable —
++// refresh argslice before package os reads it into os.Args.
++func init() {
++	if goos.Args != nil {
++		if a := goos.Args(); len(a) > 0 {
++			argslice = a
++		}
++	}
++}
++
+ func goenvs()                        {}
+ func sigsave(p *sigset)              {}
+ func msigrestore(sigmask sigset)     {}
+diff --git a/src/syscall/fs_racccoon.go b/src/syscall/fs_racccoon.go
+new file mode 100644
+index 00000000..2ca776e2
+--- /dev/null
++++ b/src/syscall/fs_racccoon.go
+@@ -0,0 +1,263 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build tamago
++
++// When runtime/goos.FS is set (racccoon_fs.go's init installs it for
++// GOARCH=riscv64), every path-based filesystem syscall below routes to
++// that host backend instead of fs_tamago.go's in-memory filesystem.
++// nil FS keeps the in-memory behaviour unchanged. See docs/go-port-plan.md
++// in the racccoon tree.
++
++package syscall
++
++import "runtime/goos"
++
++// goosErrno maps a backend errno onto a syscall.Errno.
++func goosErrno(e int) error {
++	switch e {
++	case 0:
++		return nil
++	case 2:
++		return ENOENT
++	case 9:
++		return EBADF
++	case 17:
++		return EEXIST
++	case 38:
++		return ENOSYS
++	default:
++		return EIO
++	}
++}
++
++func goosFillStat(st *Stat_t, size int64, isDir bool) {
++	*st = Stat_t{Size: size, Nlink: 1}
++	if isDir {
++		st.Mode = S_IFDIR | 0755
++	} else {
++		// 0755, not 0644: racccoon's fsd exposes no per-file exec
++		// permission (exec() runs any readable file), and `go build`'s
++		// pathcache.LookPath rejects a tool binary whose mode has no
++		// execute bit ("executable file not found").
++		st.Mode = S_IFREG | 0755
++	}
++}
++
++// goosFile is the fileImpl for an fd opened through goos.FS.
++type goosFile struct {
++	defaultFileImpl
++	h     uintptr
++	path  string // kept for fd-based ops the backend only does by path (Ftruncate)
++	off   int64
++	isDir bool
++	dents  []string
++	dentsD []bool
++	dpos   int
++}
++
++// ftruncate: the backend has no truncate-by-handle, so resize by path.
++func (f *goosFile) ftruncate(length int64) error {
++	if f.path == "" {
++		return EINVAL
++	}
++	return goosErrno(goos.FS.Truncate(f.path, length))
++}
++
++func goosOpen(path string, openmode int, perm uint32) (int, error) {
++	h, isDir, size, e := goos.FS.Open(path, openmode, perm)
++	if e != 0 {
++		return -1, goosErrno(e)
++	}
++	f := &goosFile{h: h, path: path, isDir: isDir}
++	if openmode&O_APPEND != 0 {
++		f.off = size
++	}
++	return newFD(f), nil
++}
++
++func goosStat(path string, st *Stat_t) error {
++	size, isDir, e := goos.FS.Stat(path)
++	if e != 0 {
++		return goosErrno(e)
++	}
++	goosFillStat(st, size, isDir)
++	return nil
++}
++
++func fdToGoosFile(fd int) (*goosFile, bool) {
++	f, err := fdToFile(fd)
++	if err != nil {
++		return nil, false
++	}
++	gf, ok := f.impl.(*goosFile)
++	return gf, ok
++}
++
++func (f *goosFile) stat(st *Stat_t) error {
++	size, isDir, e := goos.FS.Fstat(f.h)
++	if e != 0 {
++		return goosErrno(e)
++	}
++	goosFillStat(st, size, isDir)
++	return nil
++}
++
++func (f *goosFile) read(b []byte) (int, error) {
++	if f.isDir {
++		return 0, EISDIR
++	}
++	n, e := goos.FS.Pread(f.h, b, f.off)
++	f.off += int64(n)
++	if e != 0 {
++		return n, goosErrno(e)
++	}
++	return n, nil
++}
++
++func (f *goosFile) pread(b []byte, off int64) (int, error) {
++	n, e := goos.FS.Pread(f.h, b, off)
++	if e != 0 {
++		return n, goosErrno(e)
++	}
++	return n, nil
++}
++
++func (f *goosFile) write(b []byte) (int, error) {
++	n, e := goos.FS.Pwrite(f.h, b, f.off)
++	f.off += int64(n)
++	if e != 0 {
++		return n, goosErrno(e)
++	}
++	return n, nil
++}
++
++func (f *goosFile) pwrite(b []byte, off int64) (int, error) {
++	n, e := goos.FS.Pwrite(f.h, b, off)
++	if e != 0 {
++		return n, goosErrno(e)
++	}
++	return n, nil
++}
++
++func (f *goosFile) seek(offset int64, whence int) (int64, error) {
++	switch whence {
++	case 1:
++		offset += f.off
++	case 2:
++		size, _, e := goos.FS.Fstat(f.h)
++		if e != 0 {
++			return 0, goosErrno(e)
++		}
++		offset += size
++	}
++	if offset < 0 {
++		return 0, EINVAL
++	}
++	f.off = offset
++	return offset, nil
++}
++
++func (f *goosFile) close() error {
++	return goosErrno(goos.FS.Close(f.h))
++}
++
++func goosPutDirent(rec []byte, ino int64, name string) {
++	for i := 0; i < direntSize; i++ {
++		rec[i] = 0
++	}
++	u := uint64(ino)
++	for i := 0; i < 8; i++ {
++		rec[i] = byte(u >> (8 * i))
++	}
++	rec[16] = byte(direntSize & 0xff)
++	rec[17] = byte((direntSize >> 8) & 0xff)
++	copy(rec[18:direntSize], name)
++}
++
++func (f *goosFile) readDirent(buf []byte) (int, error) {
++	if f.dents == nil {
++		names, isDir, e := goos.FS.Dirents(f.h)
++		if e != 0 {
++			return 0, goosErrno(e)
++		}
++		if names == nil {
++			names = []string{}
++		}
++		f.dents, f.dentsD = names, isDir
++	}
++	n := 0
++	for f.dpos < len(f.dents) && len(buf) >= direntSize {
++		goosPutDirent(buf[:direntSize], int64(f.dpos+1), f.dents[f.dpos])
++		buf = buf[direntSize:]
++		n += direntSize
++		f.dpos++
++	}
++	return n, nil
++}
++
++// --- os.Pipe output capture -------------------------------------------
++// os/exec builds an os.Pipe() when Cmd.Stdout/Stderr is not an *os.File
++// (a bytes.Buffer, for Output / CombinedOutput). On racccoon the write
++// end never reaches the child — it's a separate process — so instead
++// StartProcess reads the capID off the write end, goos.Spawn points the
++// child's console at a kernel pipe and drains it, and the read end
++// (goosPipeFile) serves those bytes to os/exec's io.Copy goroutine.
++
++type goosPipeFile struct {
++	defaultFileImpl
++	capID  int
++	isRead bool
++	data   []byte
++	rpos   int
++	got    bool
++}
++
++// PipeGoos backs os.Pipe() on racccoon. nil goos.FS (a vanilla tamago
++// build) keeps os.Pipe unsupported.
++func PipeGoos(fd []int) error {
++	if goos.FS == nil {
++		return ENOSYS
++	}
++	id := goos.CaptureAlloc()
++	if id < 0 {
++		return EMFILE
++	}
++	fd[0] = newFD(&goosPipeFile{capID: id, isRead: true})
++	fd[1] = newFD(&goosPipeFile{capID: id, isRead: false})
++	return nil
++}
++
++func (f *goosPipeFile) read(b []byte) (int, error) {
++	if !f.isRead {
++		return 0, EINVAL
++	}
++	if !f.got {
++		f.data = goos.CaptureData(f.capID)
++		f.got = true
++	}
++	if f.rpos >= len(f.data) {
++		return 0, nil // EOF (os.File has ZeroReadIsEOF)
++	}
++	n := copy(b, f.data[f.rpos:])
++	f.rpos += n
++	return n, nil
++}
++
++// The write end is a placeholder: the child writes to its own console,
++// not through this fd. Accept and discard so os/exec's bookkeeping
++// (which closes it right after StartProcess) doesn't error.
++func (f *goosPipeFile) write(b []byte) (int, error) { return len(b), nil }
++
++func (f *goosPipeFile) stat(st *Stat_t) error {
++	*st = Stat_t{Mode: S_IFIFO | 0600, Nlink: 1}
++	return nil
++}
++
++func (f *goosPipeFile) close() error {
++	if f.isRead {
++		goos.CaptureFree(f.capID)
++	}
++	return nil
++}
+diff --git a/src/syscall/fs_tamago.go b/src/syscall/fs_tamago.go
+index 55aea4cc..501ab344 100644
+--- a/src/syscall/fs_tamago.go
++++ b/src/syscall/fs_tamago.go
+@@ -368,6 +368,9 @@ func (f *fsysFile) read(b []byte) (int, error) {
+ }
+ 
+ func ReadDirent(fd int, buf []byte) (int, error) {
++	if gf, ok := fdToGoosFile(fd); ok {
++		return gf.readDirent(buf)
++	}
+ 	f, err := fdToFsysFile(fd)
+ 	if err != nil {
+ 		return 0, err
+@@ -518,6 +521,9 @@ func (f *fsysFile) pwriteLocked(b []byte, offset int64) (int, error) {
+ // Standard Unix system calls.
+ 
+ func Open(path string, openmode int, perm uint32) (fd int, err error) {
++	if goos.FS != nil {
++		return goosOpen(path, openmode, perm)
++	}
+ 	fsinit()
+ 	fs.mu.Lock()
+ 	defer fs.mu.Unlock()
+@@ -529,6 +535,9 @@ func Open(path string, openmode int, perm uint32) (fd int, err error) {
+ }
+ 
+ func Mkdir(path string, perm uint32) error {
++	if goos.FS != nil {
++		return goosErrno(goos.FS.Mkdir(path, perm))
++	}
+ 	fs.mu.Lock()
+ 	defer fs.mu.Unlock()
+ 	_, err := fs.open(path, O_CREATE|O_EXCL, perm&0777|S_IFDIR)
+@@ -536,11 +545,24 @@ func Mkdir(path string, perm uint32) error {
+ }
+ 
+ func Getcwd(buf []byte) (n int, err error) {
++	if goos.FS != nil {
++		wd, e := goos.FS.Getwd()
++		if e != 0 {
++			return 0, goosErrno(e)
++		}
++		if len(wd) >= len(buf) {
++			return 0, ERANGE
++		}
++		return copy(buf, wd), nil
++	}
+ 	// Force package os to default to the old algorithm using .. and directory reads.
+ 	return 0, ENOSYS
+ }
+ 
+ func Stat(path string, st *Stat_t) error {
++	if goos.FS != nil {
++		return goosStat(path, st)
++	}
+ 	fsinit()
+ 	fs.mu.Lock()
+ 	defer fs.mu.Unlock()
+@@ -557,6 +579,9 @@ func Lstat(path string, st *Stat_t) error {
+ }
+ 
+ func unlink(path string, isdir bool) error {
++	if goos.FS != nil {
++		return goosErrno(goos.FS.Remove(path, isdir))
++	}
+ 	fsinit()
+ 	fs.mu.Lock()
+ 	defer fs.mu.Unlock()
+@@ -723,6 +748,9 @@ func (fs *fsys) subtreeContains(dir, p *inode) bool {
+ }
+ 
+ func Rename(from, to string) error {
++	if goos.FS != nil {
++		return goosErrno(goos.FS.Rename(from, to))
++	}
+ 	fsinit()
+ 	fs.mu.Lock()
+ 	defer fs.mu.Unlock()
+@@ -814,6 +842,9 @@ func (fs *fsys) truncate(ip *inode, length int64) error {
+ }
+ 
+ func Truncate(path string, length int64) error {
++	if goos.FS != nil {
++		return goosErrno(goos.FS.Truncate(path, length))
++	}
+ 	fsinit()
+ 	fs.mu.Lock()
+ 	defer fs.mu.Unlock()
+@@ -825,6 +856,9 @@ func Truncate(path string, length int64) error {
+ }
+ 
+ func Ftruncate(fd int, length int64) error {
++	if gf, ok := fdToGoosFile(fd); ok {
++		return gf.ftruncate(length)
++	}
+ 	f, err := fdToFsysFile(fd)
+ 	if err != nil {
+ 		return err
+@@ -835,6 +869,9 @@ func Ftruncate(fd int, length int64) error {
+ }
+ 
+ func Chdir(path string) error {
++	if goos.FS != nil {
++		return goosErrno(goos.FS.Chdir(path))
++	}
+ 	fsinit()
+ 	return chdir(path)
+ }
+diff --git a/src/syscall/syscall_tamago.go b/src/syscall/syscall_tamago.go
+index d7ab81f1..2f626f97 100644
+--- a/src/syscall/syscall_tamago.go
++++ b/src/syscall/syscall_tamago.go
+@@ -10,6 +10,7 @@ import (
+ 	errorspkg "errors"
+ 	"internal/oserror"
+ 	"internal/strconv"
++	"runtime/goos"
+ 	"sync"
+ 	"unsafe"
+ )
+@@ -239,8 +240,13 @@ var ForkLock sync.RWMutex
+ 
+ type WaitStatus uint32
+ 
+-func (w WaitStatus) Exited() bool       { return false }
+-func (w WaitStatus) ExitStatus() int    { return 0 }
++func (w WaitStatus) Exited() bool       { return w&0x7f == 0 }
++func (w WaitStatus) ExitStatus() int {
++	if w&0x7f != 0 {
++		return -1
++	}
++	return int(w>>8) & 0xff
++}
+ func (w WaitStatus) Signaled() bool     { return false }
+ func (w WaitStatus) Signal() Signal     { return 0 }
+ func (w WaitStatus) CoreDump() bool     { return false }
+@@ -282,9 +288,21 @@ func Sysctl(key string) (string, error) {
+ 
+ // Unimplemented Unix midden heap.
+ 
+-const ImplementsGetwd = false
+-
+-func Getwd() (wd string, err error)     { return "", ENOSYS }
++// racccoon: true when goos.FS is installed, so os.Getwd() uses
++// syscall.Getwd() (the fsd cwd) directly instead of the "read .. and
++// match inodes" fallback — that fallback needs real st_ino values,
++// which the fsd backend doesn't synthesise (every Stat returns ino 0,
++// so SameFile matches everything and the walk stops at "/"). A vanilla
++// GOOS=tamago build keeps the old behaviour.
++var ImplementsGetwd = goos.FS != nil
++
++func Getwd() (wd string, err error) {
++	if goos.FS != nil {
++		wd, e := goos.FS.Getwd()
++		return wd, goosErrno(e)
++	}
++	return "", ENOSYS
++}
+ func Getegid() int                      { return 1 }
+ func Geteuid() int                      { return 1 }
+ func Getgid() int                       { return 1 }
+@@ -298,10 +316,40 @@ func Sendfile(outfd int, infd int, offset *int64, count int) (written int, err e
+ 	return 0, ENOSYS
+ }
+ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle uintptr, err error) {
+-	return 0, 0, ENOSYS
++	dir := ""
++	capID := -1
++	if attr != nil {
++		dir = attr.Dir
++		// racccoon gives a process one console stream (no separate
++		// stderr), so capture is combined: honour whichever of the
++		// child's fd 1 / fd 2 is an os.Pipe write end.
++		for _, i := range [2]int{1, 2} {
++			if i >= len(attr.Files) {
++				continue
++			}
++			if f, e := fdToFile(int(attr.Files[i])); e == nil {
++				if gp, ok := f.impl.(*goosPipeFile); ok && !gp.isRead {
++					capID = gp.capID
++					break
++				}
++			}
++		}
++	}
++	p := goos.Spawn(argv0, argv, dir, capID)
++	if p < 0 {
++		return 0, 0, goosErrno(-p)
++	}
++	return p, 0, nil
+ }
+ func Wait4(pid int, wstatus *WaitStatus, options int, rusage *Rusage) (wpid int, err error) {
+-	return 0, ENOSYS
++	rc := goos.Wait(pid)
++	if rc < 0 {
++		return 0, goosErrno(-rc)
++	}
++	if wstatus != nil {
++		*wstatus = WaitStatus((uint32(rc) & 0xff) << 8)
++	}
++	return pid, nil
+ }
+ func RouteRIB(facility, param int) ([]byte, error)                { return nil, ENOSYS }
+ func ParseRoutingMessage(b []byte) ([]RoutingMessage, error)      { return nil, ENOSYS }

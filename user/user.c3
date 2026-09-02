@@ -61,6 +61,8 @@ const int SYS_NS_BIND       = 46; // Plan 9 `bind` — see src/entry.c3's case
 const int SYS_MAP           = 47; // map fresh zero-filled RW pages, returns base vaddr or -1 — see src/entry.c3's case
 const int SYS_STDIN_ISATTY  = 48; // 1 = console, 0 = pipe — see src/entry.c3's case
 const int SYS_TIMEBASE      = 49; // the `time` CSR tick rate (Hz) — see src/entry.c3's case
+const int SYS_GETPID        = 50; // the caller's own pid — see src/entry.c3's case
+const int SYS_EXEC_MAX      = 51; // board::EXEC_MAX_IMAGE_SIZE — the largest image SYS_EXEC will install (varies by board: 1 MiB Duo, 4 MiB QEMU/JH7110) — see src/entry.c3's case
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -95,7 +97,18 @@ fn void exitcode(int code) @noreturn @export("exitcode") {
 // pid got reused by something unrelated" (see src/process.c3's
 // Process.generation and SYS_JOIN's case in src/entry.c3).
 fn int rfork(int flags, uint* generation_out) @export("rfork") {
-    return syscall(SYS_RFORK, flags, (long)generation_out, 0);
+    return rfork_io(flags, generation_out, -1, -1);
+}
+
+// rfork() plus atomic stdout/stdin pipe wiring: SYS_RFORK's a2 / a4 are
+// optional pipe ids to attach to the child's stdout / stdin *as part of
+// the fork*, closing the window a follow-up SYS_PIPE_SETOUT/SETIN leaves
+// open (the child can be scheduled — timer preemption, or a forking
+// runtime that yields — before the caller gets to the second call).
+// -1 for either = leave that stream on the console. The shell's `|` /
+// `>` / `<` path uses this; see src/entry.c3's SYS_RFORK case.
+fn int rfork_io(int flags, uint* generation_out, int stdout_pipe, int stdin_pipe) @export("rfork_io") {
+    return syscall4(SYS_RFORK, flags, (long)generation_out, stdout_pipe, stdin_pipe);
 }
 
 // Real exec(): replaces THIS process's own image in place — same pid,
@@ -163,7 +176,25 @@ fn int exec(char* path, char* buf, uint buf_max, int notify_pid, char** argv, in
     }
     if (total == 0) return -1; // empty/nonexistent file — nothing to run
 
+    // Blob string 0 is always argv[0] = the program path (the racccoon
+    // exec ABI carries it now — nolibc main_stub's @main_args peels it
+    // back off, so a c3 `main(String[] args)` still sees only the real
+    // arguments; a Go binary's runtime/goos reads the whole blob as
+    // os.Args). Then the `argc` real arguments. SYS_EXEC's count (a4)
+    // includes string 0.
     uint argv_len = 0;
+    {
+        uint j = 0;
+        while (path[j] != 0) {
+            if (total + argv_len >= buf_max) return -1;
+            buf[total + argv_len] = path[j];
+            argv_len++;
+            j++;
+        }
+        if (total + argv_len >= buf_max) return -1;
+        buf[total + argv_len] = 0;
+        argv_len++;
+    }
     for (int i = 0; i < argc; i++) {
         char* arg = argv[i];
         uint j = 0;
@@ -181,7 +212,7 @@ fn int exec(char* path, char* buf, uint buf_max, int notify_pid, char** argv, in
     if (notify_pid > 0) {
         ipc_send(notify_pid, 0, "ready", 6);
     }
-    return syscall4(SYS_EXEC, (long)buf, (long)total, (long)argv_len, (long)argc);
+    return syscall4(SYS_EXEC, (long)buf, (long)total, (long)argv_len, (long)(argc + 1));
 }
 
 // exec(), but resolves `name` against a real search list instead of
@@ -1126,6 +1157,14 @@ fn ulong rdtime() @export("rdtime") {
 // seconds from now, on any board.
 fn ulong timebase_hz() @export("timebase_hz") {
     return (ulong)syscall(SYS_TIMEBASE, 0, 0, 0);
+}
+
+// The largest image SYS_EXEC will install on this board
+// (board::EXEC_MAX_IMAGE_SIZE — 1 MiB on the Duo, 4 MiB on QEMU/JH7110).
+// A caller sizing its own exec() receive buffer (the shell) reads this
+// instead of hardcoding a constant that would be wrong on some board.
+fn uint exec_max() @export("exec_max") {
+    return (uint)syscall(SYS_EXEC_MAX, 0, 0, 0);
 }
 
 fn void putchar(char ch) @export("putchar") {

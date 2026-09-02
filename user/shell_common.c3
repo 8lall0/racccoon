@@ -1,20 +1,26 @@
 module user;
 
 // exec()'s own receive buffer — caller-owned per exec()'s header comment
-// (user.c3). Sized to src/entry.c3's EXEC_MAX_IMAGE_SIZE (the kernel cap
-// this must be at least as large as), which is now 1 MiB for the C
-// toolchain track (a native TinyCC is ~640 KiB). That's too big to carry
-// as a static array in every shell (.bss is materialised into the flat
-// binary, which is then embedded in the kernel), so it's SYS_MAP'd on
-// first use instead — only a process that actually exec()s a child pays
-// for it, and only then. exec_buf() is always called from the rfork'd
-// child, just before it exec()s, so the mapping lives for microseconds.
-const int RUN_EXEC_BUF_MAX = 1048576;
+// (user.c3). Sized to the board's EXEC_MAX_IMAGE_SIZE via SYS_EXEC_MAX
+// (exec_max(), user.c3) — 1 MiB on the Duo, 4 MiB on QEMU/JH7110 for the
+// Go port (docs/go-port-plan.md) — rather than a hardcoded constant that
+// would be wrong on some board. Too big to carry as a static array in
+// every shell (.bss is materialised into the flat binary, which is then
+// embedded in the kernel), so it's SYS_MAP'd on first use — only a
+// process that actually exec()s a child pays for it, and only then.
+// exec_buf() is always called from the rfork'd child, just before it
+// exec()s, so the mapping lives for microseconds.
+uint run_exec_buf_max = 0;
 char* run_exec_buf_ptr = null;
+
+fn uint exec_buf_max() {
+    if (run_exec_buf_max == 0) run_exec_buf_max = exec_max();
+    return run_exec_buf_max;
+}
 
 fn char* exec_buf() {
     if (run_exec_buf_ptr == null) {
-        run_exec_buf_ptr = (char*)map_pages(RUN_EXEC_BUF_MAX);
+        run_exec_buf_ptr = (char*)map_pages(exec_buf_max());
     }
     return run_exec_buf_ptr; // null on map failure -> exec() returns -1 -> "command not found"
 }
@@ -398,7 +404,7 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
             if (mountusb_child < 0) {
                 print("mountusb: rfork failed (no free process slot)\n");
             } else if (mountusb_child == 0) {
-                exec_path("fsd", exec_buf(), RUN_EXEC_BUF_MAX, 0, &mountusb_fsd_argv[0], 1);
+                exec_path("fsd", exec_buf(), exec_buf_max(), 0, &mountusb_fsd_argv[0], 1);
                 print("mountusb: failed to exec fsd\n");
                 exit();
             } else if (ns_mount_wait("/mnt/usb/", "usbfs", (ulong)MOUNTUSB_WAIT_ATTEMPTS) < 0) {
@@ -525,7 +531,11 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
 // that back through join() for `&&` / `||`). -1 = rfork failed.
 // Split out of shell_exec_external so shell_run_pipeline can start
 // several children, wire their pipe ends, then join them all.
-fn int shell_spawn(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out)
+// stdout_pipe / stdin_pipe (-1 = console): wired into the child
+// atomically by rfork_io — a follow-up SYS_PIPE_SETOUT/SETIN loses a
+// race to a timer-preempted shell (the child can run, and exit, in the
+// window between the fork and the second call).
+fn int shell_spawn(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out, int stdout_pipe, int stdin_pipe)
 {
             // A command with a '/' in it (absolute "/bin/foo", or
             // relative "./foo" / "sub/foo") is a path — exec() resolves
@@ -547,13 +557,13 @@ fn int shell_spawn(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out)
             }
 
             *gen_out = 0;
-            int sh_r = rfork(RFPROC, gen_out);
+            int sh_r = rfork_io(RFPROC, gen_out, stdout_pipe, stdin_pipe);
             if (sh_r < 0) {
                 print("rfork failed\n");
                 return -1;
             }
             if (sh_r == 0) {
-                exec(exec_target, exec_buf(), RUN_EXEC_BUF_MAX, 0, cmd_argv, cmd_argc);
+                exec(exec_target, exec_buf(), exec_buf_max(), 0, cmd_argv, cmd_argc);
                 print(cmd);
                 print(": command not found\n");
                 exitcode(127);
@@ -584,13 +594,13 @@ fn bool shell_builtin_pipeable(char* cmd)
 // command, just in a child that then exits. Everything else is an
 // ordinary /bin spawn. Returns the child pid (generation in *gen_out),
 // or -1 on rfork failure — same contract as shell_spawn.
-fn int shell_spawn_stage(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out)
+fn int shell_spawn_stage(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out, int stdout_pipe, int stdin_pipe)
 {
     if (!shell_builtin_pipeable(cmd)) {
-        return shell_spawn(cmd, cmd_argv, cmd_argc, gen_out);
+        return shell_spawn(cmd, cmd_argv, cmd_argc, gen_out, stdout_pipe, stdin_pipe);
     }
     *gen_out = 0;
-    int r = rfork(RFPROC, gen_out);
+    int r = rfork_io(RFPROC, gen_out, stdout_pipe, stdin_pipe);
     if (r < 0) { print("rfork failed\n"); return -1; }
     if (r == 0) {
         shell_dispatch_common(cmd, cmd_argv, cmd_argc);
@@ -605,7 +615,7 @@ fn int shell_spawn_stage(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out
 fn int shell_exec_external(char* cmd, char** cmd_argv, int cmd_argc)
 {
             uint sh_gen = 0;
-            int sh_r = shell_spawn(cmd, cmd_argv, cmd_argc, &sh_gen);
+            int sh_r = shell_spawn(cmd, cmd_argv, cmd_argc, &sh_gen, -1, -1);
             if (sh_r <= 0) { return 127; }
             return join(sh_r, sh_gen);
 }
@@ -823,16 +833,22 @@ fn int shell_run_pipeline(char* seg, int seg_len, bool bg)
     if (in_pipe  >= 0) { pipe_hold(in_pipe, 1, 1); }   // shell writes the file in
     if (out_pipe >= 0) { pipe_hold(out_pipe, 0, 1); }  // shell drains it to the file
 
-    // Spawn every stage, then wire its ends — before any child runs
-    // (cooperative sched, the shell doesn't yield until the feed / pump
-    // / join below). On a spawn failure, kill what started and bail.
+    // Spawn every stage with its pipe ends already wired *atomically by
+    // the fork* (rfork_io / SYS_RFORK a2+a4). The old code did an
+    // rfork then a separate SYS_PIPE_SETOUT/SETIN, on the assumption
+    // the shell is never preempted in between — but the timer can fire
+    // in that window, letting a fast child (`/bin/echo`) run and exit
+    // before its output was ever redirected. On a spawn failure, kill
+    // what started and bail.
     int[MAX_STAGES]  spid @noinit;
     uint[MAX_STAGES] sgen @noinit;
     int spawned = 0;
     for (int s = 0; s < nstages; s++) {
         char** argv = &stage_words[stage_off[s] + 1];
         int    argc = stage_n[s] - 1;
-        spid[s] = shell_spawn_stage(stage_words[stage_off[s]], argv, argc, &sgen[s]);
+        int stdin_p  = s == 0           ? in_pipe  : mpipe[s - 1];
+        int stdout_p = s == nstages - 1 ? out_pipe : mpipe[s];
+        spid[s] = shell_spawn_stage(stage_words[stage_off[s]], argv, argc, &sgen[s], stdout_p, stdin_p);
         if (spid[s] < 0) {
             for (int k = 0; k < spawned; k++) { kill(spid[k], sgen[k]); }
             if (in_pipe  >= 0) { pipe_hold(in_pipe, 1, -1); }
@@ -840,10 +856,6 @@ fn int shell_run_pipeline(char* seg, int seg_len, bool bg)
             return 2;
         }
         spawned++;
-        int stdin_p  = s == 0           ? in_pipe  : mpipe[s - 1];
-        int stdout_p = s == nstages - 1 ? out_pipe : mpipe[s];
-        if (stdin_p  >= 0) { pipe_setin(spid[s], stdin_p); }
-        if (stdout_p >= 0) { pipe_setout(spid[s], stdout_p); }
     }
 
     // Background: hand the whole pipeline to the job table and return

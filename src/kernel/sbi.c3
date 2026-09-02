@@ -64,3 +64,16 @@ fn void __set_timer(ulong stime_value)
 {
 	sbi_call((long)stime_value, 0, 0, 0, 0, 0, 0, 0);
 }
+
+// SBI Hart State Management extension (EID "HSM" = 0x48534D), FID 0 =
+// sbi_hart_start(hartid, start_addr, opaque): bring `hartid` (currently
+// STOPPED) into S-mode at `start_addr` with satp=0, a0=hartid,
+// a1=opaque. See src/smp.c3. Returns SBI_SUCCESS, or e.g.
+// SBI_ERR_INVALID_PARAM (-3) for a hartid the machine doesn't have,
+// SBI_ERR_ALREADY_AVAILABLE (-6) for one already running.
+const long SBI_EXT_HSM = 0x48534D;
+
+fn Sbiret sbi_hart_start(ulong hartid, ulong start_addr, ulong opaque)
+{
+	return sbi_call((long)hartid, (long)start_addr, (long)opaque, 0, 0, 0, 0, SBI_EXT_HSM);
+}

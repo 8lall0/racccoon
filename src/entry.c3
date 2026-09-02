@@ -6,6 +6,12 @@ import board;
 import sbi;
 
 const SCAUSE_ECALL             = 8;
+// Synchronous page-fault causes (RISC-V privileged spec table): a fetch,
+// load, or store/AMO through a PTE that's invalid or lacks permission.
+// try_lazy_fault (handle_trap) uses these to demand-map a SYS_MAP page.
+const SCAUSE_INST_PAGE_FAULT   = 12;
+const SCAUSE_LOAD_PAGE_FAULT   = 13;
+const SCAUSE_STORE_PAGE_FAULT  = 15;
 // RV64 port: the interrupt bit is scause's MSB — bit 63 on RV64, not
 // bit 31 as on RV32. This is a real correctness-critical difference,
 // not just a width bump; getting it wrong silently misclassifies every
@@ -99,25 +105,30 @@ const SYS_MAP           = 47; // map a0 bytes (rounded up to pages) of fresh zer
 const SYS_STDIN_ISATTY  = 48; // 1 if the caller's stdin is the console, 0 if a pipe — a poor-man's isatty(0) for the stdin-reading filters (/bin/head, /bin/cat)
 const SYS_TIMEBASE      = 49; // board::TIMEBASE_HZ — the `time` CSR's tick rate, so userspace can turn an rdtime() delta into wall-clock seconds (QEMU 10MHz vs Duo 25MHz)
 const SYS_GETPID        = 50; // the caller's own pid — a c3 program gets its children's pids from rfork() but never its own; the C libc's getpid() needs it (temp-file names, etc.)
+const SYS_EXEC_MAX      = 51; // board::EXEC_MAX_IMAGE_SIZE — the shell reads this to size its own exec() receive buffer per-board instead of hardcoding a constant
 
 // Per-process SYS_MAP ceiling: the bump pointer can't grow more than this
-// past USER_BASE. 16 MiB is generous for a wasm linear memory and keeps
-// PROCS_MAX processes all maxing out well under the 64 MiB RAM pool.
-const uptr HEAP_MAX_BYTES = 16 * 1024 * 1024;
+// past USER_BASE. Board-specific (board::HEAP_MAX_BYTES): 16 MiB on the
+// Duo — generous for a wasm linear memory, keeps PROCS_MAX processes all
+// maxing out under its 64 MiB RAM pool; 64 MiB on QEMU/JH7110 so a Go
+// process can map its heap arena (docs/go-port-plan.md).
+const uptr HEAP_MAX_BYTES = board::HEAP_MAX_BYTES;
 
 // Flipped by SYS_BOOT_QUIET (the shell, once, after a settle delay).
 // While true, SYS_PUTCHAR from a process with is_boot_server set is
 // dropped — keeps late server init chatter off the prompt.
 bool g_boot_quiet = false;
 
-// Cap on the image SYS_EXEC will install. racccoon's own binaries
-// (build/user/*.bin) run 70-105KB, but the C toolchain track (roadmap
-// §7 — a native TinyCC) produces ~450KB images, so this is 1 MiB. The
+// Cap on the image SYS_EXEC will install — board-specific
+// (board::EXEC_MAX_IMAGE_SIZE). racccoon's own binaries (build/user/*.bin)
+// run 70-105KB and a native TinyCC (roadmap §7) is ~640KB, so the Duo
+// keeps this at 1 MiB; QEMU/JH7110 raise it to 4 MiB for the Go port
+// (a GOOS=tamago static binary is 1-4 MiB — docs/go-port-plan.md). The
 // staging arrays it sizes (g_exec_staged / g_exec_seg_perm, below) are
 // file-scope, not on the kernel stack — see their comment. user/user.c3's
-// exec() wrapper and lib/racccoon-libc's execve() both enforce the same
-// bound on their own read-into-buffer loop before reaching this syscall.
-const EXEC_MAX_IMAGE_SIZE  = 1048576;
+// exec() wrapper and lib/racccoon-libc's execve() take their bound from
+// the caller-provided buffer size; the shell's is SYS_EXEC_MAX-driven.
+const EXEC_MAX_IMAGE_SIZE  = board::EXEC_MAX_IMAGE_SIZE;
 const EXEC_MAX_IMAGE_PAGES = EXEC_MAX_IMAGE_SIZE / PAGE_SIZE;
 
 // argv blob cap (user/user.c3's exec() / the libc execve(), NUL-separated
@@ -744,6 +755,7 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		// region — including any pages the parent SYS_MAP'd — matches the
 		// parent's at fork time. Continue the bump pointer from there.
 		child.heap_top = current_proc.heap_top;
+		child.map_floor = current_proc.map_floor;
 		// FP state: the child inherits the parent's, exactly (fork copy
 		// semantics). The live f-registers still hold the parent's values
 		// here — kernel_entry saves GPRs only and the handler is
@@ -764,8 +776,41 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		child.ipc_peer_died = false;
 		child.in_call_reply_wait = false;
 		child.is_boot_server = false; // an rfork child is user work, not a boot server
-		child.stdout_pipe = -1; // console until the shell wires a pipe end
-		child.stdin_pipe = -1;
+		// a2 / a4 (optional, RFPROC only): wire the child's stdout / stdin
+		// to these pipe ids atomically, as part of the fork. Both the c3
+		// shell (`|`, `>`, `<`) and Go's os/exec use this. A follow-up
+		// SYS_PIPE_SETOUT/SETIN has a race window the caller can't close:
+		// Go's runtime yields at the first safepoint after rfork, and the
+		// c3 shell — despite the "cooperative, doesn't yield until the
+		// pump" note it used to carry — is timer-preemptible at every
+		// tick (the SCAUSE_SUPERVISOR_TIMER handler yield()s whenever
+		// current_proc.pid > 0), so a tick landing between the fork and
+		// the setout lets a fast child (/bin/echo) run and exit with its
+		// output still on the console. Rare (a ~µs window per ~10 ms
+		// tick) but real. pipe_valid rejects anything that isn't a live
+		// pipe id (rfork()/rfork_io() pass -1 when unused; threadcreate
+		// leaves stale values here, hence the RFMEM exclusion). -1 /
+		// invalid = plain console.
+		int rfork_stdout_pipe = (int)f.a2;
+		int rfork_stdin_pipe  = (int)f.a4;
+		if ((rfork_flags & RFMEM) == 0 && rfork_stdout_pipe >= 0 && pipe_valid(rfork_stdout_pipe))
+		{
+			child.stdout_pipe = rfork_stdout_pipe;
+			pipes[rfork_stdout_pipe].writers++;
+		}
+		else
+		{
+			child.stdout_pipe = -1; // console until a pipe end is wired
+		}
+		if ((rfork_flags & RFMEM) == 0 && rfork_stdin_pipe >= 0 && pipe_valid(rfork_stdin_pipe))
+		{
+			child.stdin_pipe = rfork_stdin_pipe;
+			pipes[rfork_stdin_pipe].readers++;
+		}
+		else
+		{
+			child.stdin_pipe = -1;
+		}
 		child.pid   = child_i + 1;
 		child.generation++;
 		child.sp    = (uptr)child_sp;
@@ -1199,6 +1244,7 @@ fn void sys_exec(Trap_frame* f) @noinline
 		// argv. Any pages the *old* image had SYS_MAP'd were freed with
 		// every other PAGE_U leaf in the page-table clear above.
 		current_proc.heap_top = exec_argv_base + (uptr)(argv_page_count * PAGE_SIZE);
+		current_proc.map_floor = current_proc.heap_top; // lazy SYS_MAP region starts empty
 
 		// This process's own page table entries for USER_BASE just
 		// changed, but unlike a normal process switch, satp itself
@@ -2451,14 +2497,17 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			f.a0 = 0;
 		case SYS_MAP:
-			// a0 = byte count. Map that many bytes (rounded up to whole
-			// pages) of fresh zero-filled RW+U memory at current_proc.
-			// heap_top, bump it, return the base vaddr — or -1 on a bad
-			// size, the per-process ceiling, or not enough free RAM.
-			// No unmap: proc_destroy / sys_exit walk every PAGE_U leaf
-			// and free it, so a SYS_MAP'd region is reclaimed on exit
-			// for free. Inlined per the "complex fn from the switch"
-			// caution (docs/devlog.md) — it's small.
+			// a0 = byte count. Reserve that many bytes (rounded up to
+			// whole pages) of RW+U address space at current_proc.heap_top,
+			// bump it, return the base vaddr — or -1 on a bad size or the
+			// per-process ceiling. LAZY: no physical page is allocated
+			// here. A page fault in [map_floor, heap_top) demand-maps one
+			// zero page (try_lazy_fault, handle_trap's exception branch);
+			// running out of RAM there kills just the faulting process.
+			// No unmap: proc_destroy / sys_exit walk every PAGE_U leaf and
+			// free it, so whatever a SYS_MAP'd region actually touched is
+			// reclaimed on exit for free. rfork copies only real leaves,
+			// so forking a process with a big-but-untouched map is cheap.
 			ulong map_bytes = f.a0;
 			if (map_bytes == 0 || map_bytes > HEAP_MAX_BYTES)
 			{
@@ -2467,25 +2516,11 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			uint map_pages_n = (uint)((map_bytes + PAGE_SIZE - 1) / PAGE_SIZE);
 			uptr map_base = current_proc.heap_top;
-			// The free-page pre-check must also cover the L1/L0 page-table
-			// pages map_page() allocates as the mapped range crosses each
-			// 2 MiB / 1 GiB boundary — the old check only counted the leaf
-			// pages, so a large-enough SYS_MAP could still hit the OOM
-			// panic inside walk_to_leaf_table. `n/256 + 4` is a generous
-			// ceiling (one L0 table per 512 leaves, plus slack). The whole
-			// loop runs without preemption, so the count stays valid.
-			uint map_overhead = map_pages_n / 256 + 4;
 			if (map_base == 0
-				|| map_base + (uptr)map_pages_n * PAGE_SIZE - (uptr)USER_BASE > HEAP_MAX_BYTES
-				|| (uptr)free_page_count() < (uptr)(map_pages_n + map_overhead))
+				|| map_base + (uptr)map_pages_n * PAGE_SIZE - (uptr)USER_BASE > HEAP_MAX_BYTES)
 			{
 				f.a0 = (ulong)(-1);
 				break;
-			}
-			for (uint mp = 0; mp < map_pages_n; mp++)
-			{
-				uptr map_phys = alloc_pages(1); // free was pre-checked, incl. page-table overhead
-				map_page(current_proc.page_table, map_base + (uptr)mp * PAGE_SIZE, map_phys, PAGE_U | PAGE_R | PAGE_W);
 			}
 			current_proc.heap_top = map_base + (uptr)map_pages_n * PAGE_SIZE;
 			f.a0 = (ulong)map_base;
@@ -2734,6 +2769,13 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// learns its children's pids from rfork() but has no way
 			// to ask for its own — the C libc's getpid() needs it.
 			f.a0 = (ulong)(uint)current_proc.pid;
+		case SYS_EXEC_MAX:
+			// board::EXEC_MAX_IMAGE_SIZE — the largest image SYS_EXEC
+			// will install on this board. The shell reads this to size
+			// its own exec() receive buffer (1 MiB on the Duo, 4 MiB on
+			// QEMU/JH7110 for the Go port) rather than baking in a
+			// constant that would be wrong somewhere. Always succeeds.
+			f.a0 = (ulong)EXEC_MAX_IMAGE_SIZE;
 		case SYS_CHDIR:
 			// a0 = the new cwd, already made absolute + normalised by
 			// the caller (user.c3's cd path logic). The kernel just
@@ -2928,6 +2970,55 @@ fn void service_pending_external_irq() @noinline
 	}
 }
 
+// Lazy SYS_MAP: a page fault at `stval` inside the current process's
+// [map_floor, heap_top) reservation demand-maps one fresh zero page.
+// Returns true if it handled the fault (execution should retry the
+// faulting instruction); false for anything else — a fault outside the
+// lazy region, a permission fault on an already-present page, a fault
+// from S-mode, or an out-of-memory allocation failure (the caller then
+// tears the process down, which is the right response to a process that
+// touched more mapped memory than the machine has).
+fn bool try_lazy_fault(ulong scause, ulong stval) @noinline
+{
+	if (scause != SCAUSE_INST_PAGE_FAULT
+		&& scause != SCAUSE_LOAD_PAGE_FAULT
+		&& scause != SCAUSE_STORE_PAGE_FAULT)
+	{
+		return false;
+	}
+	if ((read_reg("sstatus") & SSTATUS_SPP) != 0 || current_proc.pid == 0)
+	{
+		return false;
+	}
+	uptr addr = (uptr)stval;
+	if (addr < current_proc.map_floor || addr >= current_proc.heap_top)
+	{
+		return false;
+	}
+	uptr page = addr & ~(uptr)(PAGE_SIZE - 1);
+	// Present already => this is a permission fault, not a demand fault
+	// (SYS_MAP pages are R|W|U, so it shouldn't be, but don't paper over
+	// it) — hand it back to the real-fault path. NB the PLIC's kernel-only
+	// pages used to alias into this range on QEMU and land here; they're
+	// mapped high now (boards/qemu/board.c3 PLIC_BASE).
+	if (pte_present(current_proc.page_table, page))
+	{
+		return false;
+	}
+	uptr phys = try_alloc_pages(1); // zero-filled
+	if (phys == 0)
+	{
+		return false;
+	}
+	if (!try_map_page(current_proc.page_table, page, phys, PAGE_U | PAGE_R | PAGE_W))
+	{
+		free_pages(phys, 1);
+		return false;
+	}
+	flush_tlb_page(page);
+	return true;
+}
+
 fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 {
 	ulong scause  = read_reg("scause");
@@ -3028,14 +3119,21 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 			current_proc.saved_sepc = user_pc + 4;
 		}
 	}
+	else if (try_lazy_fault(scause, stval))
+	{
+		// A demand fault on a lazily-reserved SYS_MAP page — one zero
+		// page was just mapped in. Fall through to write_sepc (which
+		// still points at the faulting instruction) + sret to retry it.
+	}
 	else
 	{
-		// Not an interrupt, not an ecall — a synchronous exception:
-		// a page fault, an illegal instruction, a misaligned access, a
-		// breakpoint. If it came from U-mode (sstatus.SPP == 0), it's a
-		// buggy user program — tear down just that process and move on,
-		// the same way SYS_EXIT / the watchdog do. Only an exception
-		// from S-mode is a genuine kernel bug worth a panic.
+		// Not an interrupt, not an ecall, not a lazy-map fault — a
+		// synchronous exception: an unrelated page fault, an illegal
+		// instruction, a misaligned access, a breakpoint. If it came
+		// from U-mode (sstatus.SPP == 0), it's a buggy user program —
+		// tear down just that process and move on, the same way
+		// SYS_EXIT / the watchdog do. Only an exception from S-mode is a
+		// genuine kernel bug worth a panic.
 		//
 		// This is also what lets a userspace interpreter (/bin/wasm)
 		// treat an out-of-bounds computed address as a clean process

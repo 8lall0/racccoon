@@ -423,18 +423,26 @@ Generation counters back most of the stale-reference handling:
 - Kernel idle loop respawns the **shell** if nothing is `PROC_RUNNABLE`
   (prevents a total-idle lockup when the shell exits).
 - **OOM is a −1, not a kernel panic.** `try_alloc_pages()` returns 0 on
-  exhaustion; `SYS_MAP` / `SYS_EXEC` / `SYS_RFORK` pre-check the free
-  pool (incl. page-table overhead) and fail the syscall. `alloc_pages()`
-  still panics — but only the boot-time callers use it, where a failure
-  means unbootable anyway. The allocator scans only the real
-  `__free_ram_end − __free_ram` span (`ram_page_count()`), not the
-  hardcoded 64 MiB ceiling. `oomtest`, Duo-verified.
+  exhaustion; `SYS_EXEC` / `SYS_RFORK` pre-check the free pool and fail
+  the syscall. `SYS_MAP` is lazy (below), so it fails only on a bad
+  size or the per-process ceiling — a fault-time OOM there kills the
+  faulting process instead. `alloc_pages()` still panics — but only the
+  boot-time callers use it, where a failure means unbootable anyway.
+  The allocator scans only the real `__free_ram_end − __free_ram` span
+  (`ram_page_count()`), not the hardcoded 64 MiB ceiling. `oomtest`,
+  Duo-verified.
 - **A user-mode fault kills just that process.** `handle_trap` tears
   down a process that takes a page fault / illegal instruction / etc.
   from U-mode (`proc_destroy` + `yield`, like SYS_EXIT); only an
-  S-mode exception still panics. `faulttest`, Duo-verified. (Swap /
-  demand paging is *not* planned — storage is behind userspace servers
-  the kernel can't IPC, and the board is 64 MiB.)
+  S-mode exception still panics. `faulttest`, Duo-verified.
+- **`SYS_MAP` is lazy** (demand paging for anonymous maps only, 2026-09).
+  The syscall reserves address space in `[map_floor, heap_top)` and
+  bumps `heap_top`; `try_lazy_fault` (`handle_trap`) demand-maps one
+  zero page per touched page and retries the instruction. This is *not*
+  swap — there is no backing store and pages are never evicted; it just
+  defers the allocation of an anon `SYS_MAP` region (the Go toolchain's
+  448 MiB arena) to first touch, so a big reservation is free until
+  used and `rfork` copies only the touched pages. `maptest` / `oomtest`.
 
 ### The gaps
 
@@ -748,6 +756,27 @@ flat-binary exec path like the c3 `/bin` commands.
 Full glibc/musl compatibility, threads, dynamic linking, a full
 `<termios.h>`/job-control surface. Just enough POSIX for a
 self-contained compiler and small Unix utilities.
+
+---
+
+## 8. Multi-core (SMP)
+
+**Scaffold DONE** (2026-09-02 devlog) — `src/smp.c3` + SBI HSM
+`sbi_hart_start`. `smp_start_secondaries()` (called last from
+`kernel_main`) enumerates harts up to `board::SMP_MAX_HARTS`, starts
+each into `secondary_main`, which announces itself and parks in `wfi`.
+QEMU `-smp N` discovered at runtime; Duo forced to 1 (no-MMU 2nd core).
+No behaviour change — the secondaries do nothing yet.
+
+**Real SMP — not started, large.** The kernel currently relies on
+"kernel code is never preempted" (one run queue, no locks anywhere —
+allocator, `fsd` IPC rendezvous, `procs[]`). A real scheduler needs:
+per-hart `current_proc` / kernel stack / `sscratch`; a lock (or
+lock-free discipline) around the run queue, the page allocator, and IPC
+rendezvous; IPIs (SBI `sbi_send_ipi`) for cross-hart reschedule; and a
+decision on whether GOMAXPROCS > 1 / parallel builds are worth it
+before the userspace is bigger. Likely lands on the JH7110 (4 cores),
+not QEMU.
 
 ---
 

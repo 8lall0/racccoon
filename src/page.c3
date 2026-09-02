@@ -126,14 +126,15 @@ fn ulong* walk_to_leaf_table(ulong* table2, uptr vaddr)
 // own table (process.c3's create_process) — and the kernel would read
 // or write it on the process's behalf.
 //
-// Deliberately non-allocating, unlike walk_to_leaf_table(): a missing
-// intermediate table means the address was never validly mapped at
-// all, which must fail closed (false), not silently allocate a fresh
-// empty table and then fail the leaf check anyway. Walks one page at a
-// time rather than reusing walk_to_leaf_table's cached table1 pointer
-// across pages — this is a boundary check on the way to a handful of
-// syscall arguments, not a hot path, so the extra per-page walk cost
-// isn't worth the complexity of short-circuiting it.
+// One exception to "non-allocating": a page inside the caller's own
+// lazy SYS_MAP reservation ([map_floor, heap_top), entry.c3) that hasn't
+// been touched yet has no leaf PTE, but it IS validly reserved — so
+// demand-map it here, the same as a real page fault would. A syscall
+// handed a freshly make()'d Go slice the runtime hasn't written to yet
+// would otherwise be rejected. Anywhere outside that range, a missing
+// intermediate table or leaf still means never-validly-mapped and still
+// fails closed. Walks one page at a time (not a hot path — a handful of
+// syscall arguments).
 fn bool user_range_valid(ulong* table2, uptr vaddr, ulong len, bool want_write)
 {
 	if (len == 0) return true;
@@ -141,6 +142,27 @@ fn bool user_range_valid(ulong* table2, uptr vaddr, ulong len, bool want_write)
 
 	uptr start_page = vaddr & ~(uptr)(PAGE_SIZE - 1);
 	uptr end_page = (vaddr + len - 1) & ~(uptr)(PAGE_SIZE - 1);
+
+	// Lazy-map fault-in pass (only for the current process's own table).
+	if (table2 == current_proc.page_table)
+	{
+		for (uptr pa = start_page; ; pa += PAGE_SIZE)
+		{
+			if (pa >= current_proc.map_floor && pa < current_proc.heap_top
+				&& !pte_present(table2, pa))
+			{
+				uptr ph = try_alloc_pages(1); // zero-filled
+				if (ph == 0) return false;
+				if (!try_map_page(table2, pa, ph, PAGE_U | PAGE_R | PAGE_W))
+				{
+					free_pages(ph, 1);
+					return false;
+				}
+				flush_tlb_page(pa);
+			}
+			if (pa == end_page) break;
+		}
+	}
 
 	for (uptr page_addr = start_page; ; page_addr += PAGE_SIZE)
 	{
@@ -162,6 +184,53 @@ fn bool user_range_valid(ulong* table2, uptr vaddr, ulong len, bool want_write)
 		if (page_addr == end_page) break;
 	}
 	return true;
+}
+
+// Fallible map_page for the lazy-SYS_MAP fault path (entry.c3's
+// try_lazy_fault): allocates the intermediate tables and the leaf with
+// try_alloc_pages, so an out-of-memory demand fault kills just the
+// faulting process instead of panicking the kernel. Returns false and
+// maps nothing on any allocation failure. Leaf memory type = ordinary
+// RAM (board::PTE_EXTRA_BITS), same as map_page — this is never MMIO.
+fn bool try_map_page(ulong* table2, uptr vaddr, uptr paddr, uint flags)
+{
+	uint vpn2 = (uint)((vaddr >> 30) & 0x1ff);
+	if ((table2[vpn2] & PAGE_V) == 0)
+	{
+		uptr pt = try_alloc_pages(1);
+		if (pt == 0) return false;
+		table2[vpn2] = paddr_to_ppn_field(pt) | PAGE_V | board::PTE_EXTRA_BITS;
+	}
+	ulong* table1 = (ulong*)pte_to_paddr(table2[vpn2]);
+
+	uint vpn1 = (uint)((vaddr >> 21) & 0x1ff);
+	if ((table1[vpn1] & PAGE_V) == 0)
+	{
+		uptr pt = try_alloc_pages(1);
+		if (pt == 0) return false;
+		table1[vpn1] = paddr_to_ppn_field(pt) | PAGE_V | board::PTE_EXTRA_BITS;
+	}
+	ulong* table0 = (ulong*)pte_to_paddr(table1[vpn1]);
+
+	uint vpn0 = (uint)((vaddr >> 12) & 0x1ff);
+	table0[vpn0] = paddr_to_ppn_field(paddr) | (ulong)flags | PAGE_V | PAGE_A | PAGE_D | board::PTE_EXTRA_BITS;
+	return true;
+}
+
+// Non-allocating: is `vaddr`'s leaf PTE present and user-accessible in
+// `table2`? Used by the lazy fault path to tell a genuine demand fault
+// (page absent) apart from a permission fault on an already-present page
+// (which must still be treated as a real user fault).
+fn bool pte_present(ulong* table2, uptr vaddr)
+{
+	uint vpn2 = (uint)((vaddr >> 30) & 0x1ff);
+	if ((table2[vpn2] & PAGE_V) == 0) return false;
+	ulong* table1 = (ulong*)pte_to_paddr(table2[vpn2]);
+	uint vpn1 = (uint)((vaddr >> 21) & 0x1ff);
+	if ((table1[vpn1] & PAGE_V) == 0) return false;
+	ulong* table0 = (ulong*)pte_to_paddr(table1[vpn1]);
+	uint vpn0 = (uint)((vaddr >> 12) & 0x1ff);
+	return (table0[vpn0] & PAGE_V) != 0;
 }
 
 fn void map_page(ulong* table2, uptr vaddr, uptr paddr, uint flags)

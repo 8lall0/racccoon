@@ -1199,7 +1199,7 @@ fn void main() {
                 char[16] run_sync_buf @noinit;
                 int run_parent = ipc_recv(&run_sync_buf, 16);
                 ipc_send(run_parent, 0, "ack", 4);
-                exec("bin/echod", exec_buf(), RUN_EXEC_BUF_MAX, run_parent, null, 0);
+                exec("bin/echod", exec_buf(), exec_buf_max(), run_parent, null, 0);
                 // exec() only ever returns on failure — success means
                 // this process is now running echod's own code, not
                 // this line, and exec() already sent "ready" itself
@@ -1252,7 +1252,7 @@ fn void main() {
                 char[16] rt2_sync_buf @noinit;
                 int rt2_parent = ipc_recv(&rt2_sync_buf, 16);
                 ipc_send(rt2_parent, 0, "ack", 4);
-                exec("/mnt/fs2/bin/echod", exec_buf(), RUN_EXEC_BUF_MAX, rt2_parent, null, 0);
+                exec("/mnt/fs2/bin/echod", exec_buf(), exec_buf_max(), rt2_parent, null, 0);
                 ipc_send(rt2_parent, 0, "failed", 7);
                 exit();
             } else {
@@ -1297,7 +1297,7 @@ fn void main() {
                 char[16] el_sync_buf @noinit;
                 int el_parent = ipc_recv(&el_sync_buf, 16);
                 ipc_send(el_parent, 0, "ack", 4);
-                exec("bin/echod.elf", exec_buf(), RUN_EXEC_BUF_MAX, el_parent, null, 0);
+                exec("bin/echod.elf", exec_buf(), exec_buf_max(), el_parent, null, 0);
                 ipc_send(el_parent, 0, "failed", 7);
                 exit();
             } else {
@@ -1334,7 +1334,7 @@ fn void main() {
                 char[16] el2_sync_buf @noinit;
                 int el2_parent = ipc_recv(&el2_sync_buf, 16);
                 ipc_send(el2_parent, 0, "ack", 4);
-                exec("/mnt/fs2/bin/echod.elf", exec_buf(), RUN_EXEC_BUF_MAX, el2_parent, null, 0);
+                exec("/mnt/fs2/bin/echod.elf", exec_buf(), exec_buf_max(), el2_parent, null, 0);
                 ipc_send(el2_parent, 0, "failed", 7);
                 exit();
             } else {
@@ -1379,7 +1379,7 @@ fn void main() {
                 char[16] av_sync_buf @noinit;
                 int av_parent = ipc_recv(&av_sync_buf, 16);
                 ipc_send(av_parent, 0, "ack", 4);
-                exec("bin/echod", exec_buf(), RUN_EXEC_BUF_MAX, av_parent, &av_arg, 1);
+                exec("bin/echod", exec_buf(), exec_buf_max(), av_parent, &av_arg, 1);
                 ipc_send(av_parent, 0, "failed", 7);
                 exit();
             } else {
@@ -1418,7 +1418,7 @@ fn void main() {
                 char[16] av2_sync_buf @noinit;
                 int av2_parent = ipc_recv(&av2_sync_buf, 16);
                 ipc_send(av2_parent, 0, "ack", 4);
-                exec("/mnt/fs2/bin/echod", exec_buf(), RUN_EXEC_BUF_MAX, av2_parent, &av2_arg, 1);
+                exec("/mnt/fs2/bin/echod", exec_buf(), exec_buf_max(), av2_parent, &av2_arg, 1);
                 ipc_send(av2_parent, 0, "failed", 7);
                 exit();
             } else {
@@ -1465,7 +1465,7 @@ fn void main() {
                 char[16] pt_sync_buf @noinit;
                 int pt_parent = ipc_recv(&pt_sync_buf, 16);
                 ipc_send(pt_parent, 0, "ack", 4);
-                exec_path("echod", exec_buf(), RUN_EXEC_BUF_MAX, pt_parent, null, 0);
+                exec_path("echod", exec_buf(), exec_buf_max(), pt_parent, null, 0);
                 ipc_send(pt_parent, 0, "failed", 7);
                 exit();
             } else {
@@ -1508,7 +1508,7 @@ fn void main() {
                 char[16] pt2_sync_buf @noinit;
                 int pt2_parent = ipc_recv(&pt2_sync_buf, 16);
                 ipc_send(pt2_parent, 0, "ack", 4);
-                exec_path("echod", exec_buf(), RUN_EXEC_BUF_MAX, pt2_parent, null, 0);
+                exec_path("echod", exec_buf(), exec_buf_max(), pt2_parent, null, 0);
                 ipc_send(pt2_parent, 0, "failed", 7);
                 exit();
             } else {
@@ -2053,7 +2053,7 @@ fn void main() {
                 uint wt_gen = 0;
                 int wt_c = rfork(RFPROC, &wt_gen);
                 if (wt_c == 0) {
-                    exec("bin/wasm", exec_buf(), RUN_EXEC_BUF_MAX, 0, &wt_av[0], wt_ac);
+                    exec("bin/wasm", exec_buf(), exec_buf_max(), 0, &wt_av[0], wt_ac);
                     exitcode(127);
                 }
                 print("wasm "); print(wt_arg); print(" -> ");
@@ -2061,6 +2061,265 @@ fn void main() {
                 if (wt_code != 0) { wt_ok = -1; }
             }
             print(wt_ok == 0 ? "wasmtest: ok\n" : "wasmtest: FAILED\n");
+        } else if (strcmp(cmd, "gotest") == 0 || strcmp(cmd, "gostage2test") == 0 || strcmp(cmd, "gostage3test") == 0 || strcmp(cmd, "gostage35test") == 0 || strcmp(cmd, "gostage41test") == 0 || strcmp(cmd, "gostage42test") == 0) {
+            // Go on racccoon (docs/go-port-plan.md). /bin/go-* are
+            // GOOS=tamago static riscv64 binaries built by
+            // scripts/build_go.sh from go/cmd/*, loaded through
+            // SYS_EXEC's ELF path. Same rfork -> exec -> join(code) shape
+            // as wasmtest; skip cleanly (exit 127) if the binary isn't on
+            // this image — they only exist when TAMAGO was set at build
+            // time, same as tcctest without /bin/tcc.
+            //
+            //   gotest       — go/cmd/hello: println, int/float math,
+            //                  slice+append, map, defer, panic/recover.
+            //                  A clean exit 0 means the whole Go runtime
+            //                  came up on the racccoon goos provider
+            //                  (go/goos/): SYS_MAP heap arena + stack
+            //                  (CPUInit), the scheduler, GC-managed
+            //                  allocation, and goos.Exit -> SYS_EXIT.
+            //   gostage2test — go/cmd/gostage2: the runtime under load —
+            //                  the GC cycling through ~48 MiB of garbage,
+            //                  200 goroutines + channels + WaitGroup +
+            //                  mutex, and the timer path (time.Sleep /
+            //                  Ticker). Slow (spin-idle scheduler + real
+            //                  GC on emulated hw).
+            //   gostage3test — go/cmd/gostage3: real file I/O against fsd
+            //                  via the go/racccoon package (SYS_NS_RESOLVE
+            //                  + SYS_IPC_CALL, the FS_* verbs) — read a
+            //                  fixture, walk a paginated directory, write
+            //                  + read back + rename + remove under /tmp,
+            //                  build a directory tree. e2fsck must be
+            //                  clean after.
+            //   gostage35test — go/cmd/gostage35: the *standard* os
+            //                  package (os.Open / ReadFile / ReadDir /
+            //                  Create / Rename / Getwd / RemoveAll,
+            //                  os.IsNotExist) routed to fsd through
+            //                  runtime/goos.FS — the go/racccoon blank
+            //                  import + lib/go/racccoon.patch. e2fsck
+            //                  clean after.
+            //   gostage41test — go/cmd/gostage41: os/exec (rfork+SYS_EXEC
+            //                  + SYS_JOIN via runtime/goos.Spawn/Wait) —
+            //                  runs /bin/echo, /bin/false (exit code
+            //                  propagates), a missing command, and
+            //                  another Go binary spawned from Go, all
+            //                  with the child inheriting the console.
+            //   gostage42test — go/cmd/gostage42: os/exec OUTPUT CAPTURE
+            //                  (exec.Cmd.Output / CombinedOutput / a
+            //                  bytes.Buffer Stdout) — the child's stdout
+            //                  is wired to a kernel pipe by rfork (a2),
+            //                  drained by goos.Spawn. Includes a 22 KiB
+            //                  capture past the 4 KiB pipe buffer
+            //                  (/bin/go-spew) and a console-inherit
+            //                  regression check.
+            //
+            // The program prints to the console directly (goos.Printk ->
+            // SYS_PUTCHAR) so its output shows inline above the verdict.
+            char* gt_path;
+            char* gt_name;
+            if (strcmp(cmd, "gostage2test") == 0) {
+                gt_path = "bin/go-gostage2"; gt_name = "gostage2test";
+            } else if (strcmp(cmd, "gostage3test") == 0) {
+                gt_path = "bin/go-gostage3"; gt_name = "gostage3test";
+            } else if (strcmp(cmd, "gostage35test") == 0) {
+                gt_path = "bin/go-gostage35"; gt_name = "gostage35test";
+            } else if (strcmp(cmd, "gostage41test") == 0) {
+                gt_path = "bin/go-gostage41"; gt_name = "gostage41test";
+            } else if (strcmp(cmd, "gostage42test") == 0) {
+                gt_path = "bin/go-gostage42"; gt_name = "gostage42test";
+            } else {
+                gt_path = "bin/go-hello"; gt_name = "gotest";
+            }
+            // gostage35test also checks os.Args — pass it two.
+            char*[2] gt_av;
+            gt_av[0] = "alpha"; gt_av[1] = "beta";
+            bool gt_s35 = strcmp(cmd, "gostage35test") == 0;
+            uint gt_gen = 0;
+            int gt_c = rfork(RFPROC, &gt_gen);
+            if (gt_c < 0) {
+                print("rfork failed\n");
+            } else if (gt_c == 0) {
+                if (gt_s35) {
+                    exec(gt_path, exec_buf(), exec_buf_max(), 0, &gt_av[0], 2);
+                } else {
+                    exec(gt_path, exec_buf(), exec_buf_max(), 0, null, 0);
+                }
+                exitcode(127);
+            } else {
+                int gt_code = join(gt_c, gt_gen);
+                print(gt_name);
+                if (gt_code == 127) {
+                    print(": skipped (no ");
+                    print(gt_path);
+                    print(" — build with TAMAGO set)\n");
+                } else if (gt_code == 0) {
+                    print(": ok\n");
+                } else {
+                    char[16] gt_cs @noinit;
+                    int gt_d = fmt::format_uint((uint)gt_code, &gt_cs[0]);
+                    gt_cs[gt_d] = 0;
+                    print(": FAILED (exit ");
+                    print(&gt_cs[0]);
+                    print(")\n");
+                }
+            }
+        } else if (strcmp(cmd, "goversiontest") == 0) {
+            // Stage 4.4 (docs/go-port-plan.md): the `go` command itself
+            // runs on racccoon. `go version` + `go env GOROOT` — the
+            // cheap check, no $GOROOT/src needed. `go build` is
+            // gobuildtest below. Slow (a ~14 MiB binary off fsd, twice)
+            // — not in the quick sweep. Skips cleanly without /bin/go.
+            uint gv_size = 0; int gv_type = 0;
+            if (fs_stat("/bin/go", &gv_size, &gv_type) < 0) {
+                print("goversiontest: skipped (no /bin/go — build with TAMAGO set)\n");
+            } else {
+                char*[1] gv_ver_av; gv_ver_av[0] = "version";
+                uint gv_g1 = 0;
+                int gv_c1 = rfork(RFPROC, &gv_g1);
+                if (gv_c1 == 0) { exec("/bin/go", exec_buf(), exec_buf_max(), 0, &gv_ver_av[0], 1); exitcode(127); }
+                int gv_rc1 = join(gv_c1, gv_g1);
+
+                char*[2] gv_env_av; gv_env_av[0] = "env"; gv_env_av[1] = "GOROOT";
+                uint gv_g2 = 0;
+                int gv_c2 = rfork(RFPROC, &gv_g2);
+                if (gv_c2 == 0) { exec("/bin/go", exec_buf(), exec_buf_max(), 0, &gv_env_av[0], 2); exitcode(127); }
+                int gv_rc2 = join(gv_c2, gv_g2);
+
+                if (gv_rc1 == 0 && gv_rc2 == 0) {
+                    print("goversiontest: ok\n");
+                } else {
+                    print("goversiontest: FAILED (version exit "); print_uint((uint)gv_rc1);
+                    print(", env exit "); print_uint((uint)gv_rc2); print(")\n");
+                }
+            }
+        } else if (strcmp(cmd, "gobuildtest") == 0) {
+            // Stage 4.4 (docs/go-port-plan.md): `go build` on racccoon.
+            // `cd /gomod` (a one-file module seeded by build.sh),
+            // `/bin/go build -o /tmp/gbt .`, then run /tmp/gbt and check
+            // it printed the expected line. The stdlib closure comes
+            // from the prepopulated /gocache (a host build with the same
+            // cross-toolchain — content-addressed cache keys match), so
+            // only runtime / runtime/goos / main compile on-device;
+            // cmd/link defaults -T/-R for tamago so the output loads.
+            // VERY slow — a fresh QEMU boot plus the on-device compiles
+            // and link, several minutes. Not in the quick sweep.
+            uint gb_sz = 0; int gb_ty = 0;
+            if (fs_stat("/gomod/go.mod", &gb_sz, &gb_ty) < 0) {
+                print("gobuildtest: skipped (no /gomod — build with TAMAGO set)\n");
+            } else {
+                fs_delete("/tmp/gbt");
+                if (chdir("/gomod") != 0) { print("gobuildtest: chdir /gomod failed\n"); }
+                char*[4] gb_av4;
+                gb_av4[0] = "build"; gb_av4[1] = "-o"; gb_av4[2] = "/tmp/gbt"; gb_av4[3] = ".";
+                uint gb_g1 = 0;
+                int gb_c1 = rfork(RFPROC, &gb_g1);
+                if (gb_c1 == 0) { exec("/bin/go", exec_buf(), exec_buf_max(), 0, &gb_av4[0], 4); exitcode(127); }
+                int gb_rc1 = join(gb_c1, gb_g1);
+                chdir("/");
+
+                if (gb_rc1 != 0) {
+                    print("gobuildtest: FAILED (go build exit "); print_uint((uint)gb_rc1); print(")\n");
+                } else {
+                    uint gb_o = 0; int gb_ot = 0;
+                    if (fs_stat("/tmp/gbt", &gb_o, &gb_ot) < 0) {
+                        print("gobuildtest: FAILED (no /tmp/gbt produced)\n");
+                    } else {
+                        uint gb_g2 = 0;
+                        int gb_c2 = rfork(RFPROC, &gb_g2);
+                        if (gb_c2 == 0) { exec("/tmp/gbt", exec_buf(), exec_buf_max(), 0, null, 0); exitcode(127); }
+                        int gb_rc2 = join(gb_c2, gb_g2);
+                        print(gb_rc2 == 0
+                            ? "gobuildtest: ok (go build produced a working binary)\n"
+                            : "gobuildtest: FAILED (built binary exit != 0)\n");
+                    }
+                }
+            }
+        } else if (strcmp(cmd, "gotoolchaintest") == 0) {
+            // Stage 4.3 (docs/go-port-plan.md) — racccoon's OWN go tool
+            // compile + go tool link, running natively on racccoon,
+            // build go/cmd/hello's real source (importing "runtime" and
+            // its ~27 transitive internal/* deps — a real stdlib closure,
+            // not the import-free case gotest's binary already covers)
+            // into a working ELF, then run it. Closes the self-hosting
+            // loop: a binary racccoon's own toolchain produced, running
+            // on racccoon, whose output must match Stage 1's
+            // host-cross-compiled /bin/go-hello byte for byte.
+            //
+            // Needs /lib/go/{importcfg,importcfg.link,pkg/*.a} + /hello.go
+            // (build_go_toolchain.sh, seeded onto disk_ext2.img by
+            // build.sh — gated on TAMAGO like the rest of the Go port,
+            // and only on the 256 MiB ext2 image: go-compile (~22 MiB) +
+            // go-link (~6 MiB) + the ~15 MiB closure don't fit the small
+            // FAT32/dual images). Skips cleanly if they're not there.
+            // Slow (minutes — a fresh QEMU boot, ~30 MB of toolchain
+            // binary loaded off fsd 1124 bytes/IPC-RTT, twice, plus the
+            // ~15 MiB closure at link time) — not part of the quick
+            // regression sweep, run on demand.
+            uint gtc_size = 0; int gtc_type = 0;
+            if (fs_stat("/lib/go/importcfg", &gtc_size, &gtc_type) < 0) {
+                print("gotoolchaintest: skipped (no /lib/go/importcfg — build with TAMAGO set)\n");
+            } else {
+                fs_delete("/tmp/hello.o");
+                fs_delete("/tmp/hello.elf");
+
+                char*[8] gtc_cc_av;
+                gtc_cc_av[0] = "-o"; gtc_cc_av[1] = "/tmp/hello.o"; gtc_cc_av[2] = "-p"; gtc_cc_av[3] = "main";
+                gtc_cc_av[4] = "-complete"; gtc_cc_av[5] = "-importcfg"; gtc_cc_av[6] = "/lib/go/importcfg";
+                gtc_cc_av[7] = "-pack"; // archive format — matches what importcfg.link expects a packagefile to be
+                // "/hello.go" itself is a 9th arg the fixed-size array
+                // above doesn't have room for cleanly — appended via a
+                // second exec() argv slot instead, so the array stays a
+                // single literal.
+                char*[9] gtc_cc_full;
+                for (int gi = 0; gi < 8; gi++) { gtc_cc_full[gi] = gtc_cc_av[gi]; }
+                gtc_cc_full[8] = "/hello.go";
+
+                uint gtc_g1 = 0;
+                int gtc_c1 = rfork(RFPROC, &gtc_g1);
+                if (gtc_c1 == 0) {
+                    exec("bin/go-compile", exec_buf(), exec_buf_max(), 0, &gtc_cc_full[0], 9);
+                    exitcode(127);
+                }
+                int gtc_compile_rc = join(gtc_c1, gtc_g1);
+
+                if (gtc_compile_rc != 0) {
+                    print("gotoolchaintest: FAILED (go-compile exit "); print_uint((uint)gtc_compile_rc); print(")\n");
+                } else {
+                    // -T/-R match scripts/build_go.sh's own link flags —
+                    // every PT_LOAD must land inside [USER_BASE,
+                    // USER_BASE+EXEC_MAX_IMAGE_SIZE); go-link's default
+                    // link address is nowhere near there.
+                    char*[9] gtc_ln_av;
+                    gtc_ln_av[0] = "-o"; gtc_ln_av[1] = "/tmp/hello.elf"; gtc_ln_av[2] = "-importcfg";
+                    gtc_ln_av[3] = "/lib/go/importcfg.link"; gtc_ln_av[4] = "-buildmode=exe";
+                    gtc_ln_av[5] = "-T"; gtc_ln_av[6] = "0x1010000"; gtc_ln_av[7] = "-R";
+                    gtc_ln_av[8] = "0x1000";
+                    char*[10] gtc_ln_full;
+                    for (int gj = 0; gj < 9; gj++) { gtc_ln_full[gj] = gtc_ln_av[gj]; }
+                    gtc_ln_full[9] = "/tmp/hello.o";
+                    uint gtc_g2 = 0;
+                    int gtc_c2 = rfork(RFPROC, &gtc_g2);
+                    if (gtc_c2 == 0) {
+                        exec("bin/go-link", exec_buf(), exec_buf_max(), 0, &gtc_ln_full[0], 10);
+                        exitcode(127);
+                    }
+                    int gtc_link_rc = join(gtc_c2, gtc_g2);
+
+                    if (gtc_link_rc != 0) {
+                        print("gotoolchaintest: FAILED (go-link exit "); print_uint((uint)gtc_link_rc); print(")\n");
+                    } else {
+                        uint gtc_g3 = 0;
+                        int gtc_c3 = rfork(RFPROC, &gtc_g3);
+                        if (gtc_c3 == 0) {
+                            exec("/tmp/hello.elf", exec_buf(), exec_buf_max(), 0, null, 0);
+                            exitcode(127);
+                        }
+                        int gtc_run_rc = join(gtc_c3, gtc_g3);
+                        print(gtc_run_rc == 0 ? "gotoolchaintest: ok\n" : "gotoolchaintest: FAILED (linked binary exit != 0)\n");
+                    }
+                }
+                fs_delete("/tmp/hello.o");
+                fs_delete("/tmp/hello.elf");
+            }
         } else if (strcmp(cmd, "tcctest") == 0) {
             // roadmap §7: /bin/tcc compiles + links /hello.c into a
             // runnable binary. Skips cleanly if tcc isn't on this image
@@ -2070,7 +2329,7 @@ fn void main() {
             uint tt_g1 = 0;
             int tt_c1 = rfork(RFPROC, &tt_g1);
             if (tt_c1 == 0) {
-                exec("bin/tcc", exec_buf(), RUN_EXEC_BUF_MAX, 0, &tt_cc_av[0], 3);
+                exec("bin/tcc", exec_buf(), exec_buf_max(), 0, &tt_cc_av[0], 3);
                 exitcode(127);
             }
             int tt_cc = join(tt_c1, tt_g1);
@@ -2086,7 +2345,7 @@ fn void main() {
                 uint tt_g2 = 0;
                 int tt_c2 = rfork(RFPROC, &tt_g2);
                 if (tt_c2 == 0) {
-                    exec("/tcctmp", exec_buf(), RUN_EXEC_BUF_MAX, 0, &tt_run_av[0], 1);
+                    exec("/tcctmp", exec_buf(), exec_buf_max(), 0, &tt_run_av[0], 1);
                     exitcode(127);
                 }
                 int tt_run = join(tt_c2, tt_g2);
@@ -2118,14 +2377,16 @@ fn void main() {
                 print(" child="); print_uint((uint)mt_code); putchar('\n');
             }
         } else if (strcmp(cmd, "oomtest") == 0) {
-            // Out-of-memory is a -1 to the caller, not a kernel panic.
-            // Fork children that each map their full 16 MiB SYS_MAP
-            // ceiling — on a 64 MiB board that exhausts real RAM after
-            // a few — and confirm: (a) a child's map_pages() then
-            // returns null instead of panicking, (b) rfork() starts
-            // returning -1 rather than panicking in create_process,
-            // (c) the shell is still alive, (d) killing the children
-            // frees it all back so a fresh map_pages() works again.
+            // Lazy SYS_MAP (docs/devlog.md): a map only reserves address
+            // space; real pages are demand-faulted on first touch, and
+            // running out of RAM there kills just the faulting process —
+            // never a kernel panic. Fork "glutton" children that each map
+            // AND write every page of their full per-process ceiling
+            // (16 MiB Duo / 512 MiB QEMU). Two gluttons overcommit any
+            // board's pool, so at least one is OOM-killed mid-touch
+            // (join returns -1) or rfork() refuses to start one. Confirm:
+            // no panic, real pressure, and once the dead gluttons are
+            // reaped the RAM comes back (a fresh 1 MiB glutton survives).
             const int OOM_KIDS = 8;
             int[OOM_KIDS] oom_pid;
             uint[OOM_KIDS] oom_gen;
@@ -2136,46 +2397,69 @@ fn void main() {
                 int c = rfork(RFPROC, &g);
                 if (c < 0) { oom_rfork_refused = true; break; }
                 if (c == 0) {
-                    // Grab as much as the per-process cap allows, a
-                    // page-cluster at a time, then park until killed.
-                    bool hit_null = false;
-                    for (int k = 0; k < 4096; k++) {
-                        if (map_pages(65536) == null) { hit_null = true; break; }
+                    // Reserve to the ceiling a cluster at a time, writing
+                    // one byte per page so the RAM is really committed,
+                    // then park holding it. A fault in the touch loop
+                    // (out of memory) kills just this child — fine.
+                    for (int oom_k = 0; oom_k < 8192; oom_k++) {
+                        char* oom_p = (char*)map_pages(262144); // 256 KiB
+                        if (oom_p == null) break;               // hit the ceiling
+                        for (int oom_q = 0; oom_q < 262144; oom_q += 4096) { oom_p[oom_q] = (char)1; }
                     }
-                    // exit code carries whether *this* child ever saw a
-                    // clean null (vs. still going) — not load-bearing,
-                    // the parent mainly checks it didn't panic.
                     for (;;) { yield(); }
                 }
                 oom_pid[oom_spawned] = c;
                 oom_gen[oom_spawned] = g;
                 oom_spawned++;
             }
-            // Give the children time to actually consume their pages.
-            ulong oom_settle = rdtime() + timebase_hz() / 2;
+            // Let the gluttons commit their pages.
+            ulong oom_settle = rdtime() + timebase_hz();
             while (rdtime() < oom_settle) { yield(); }
-            // The shell itself is obviously still running to print this.
-            // Now a fresh large map from *this* process while RAM is
-            // tight should fail cleanly (null), not panic.
-            void* oom_tight = map_pages(1048576); // 1 MiB
-            // Reap everything and confirm RAM comes back.
-            for (int oi = 0; oi < oom_spawned; oi++) { kill(oom_pid[oi], oom_gen[oi]); }
-            ulong oom_recover = rdtime() + timebase_hz();
-            void* oom_after = null;
-            while (oom_after == null && rdtime() < oom_recover) {
-                yield();
-                oom_after = map_pages(1048576);
+            // Pressure probe: one more child that maps + touches its full
+            // ceiling. With the gluttons holding the pool it can't get its
+            // pages — it faults and the kernel OOM-kills it (join != 7),
+            // or rfork() already refused to start it. Either way: no panic.
+            bool oom_probe_killed = false;
+            uint oom_pg = 0;
+            int oom_probe = rfork(RFPROC, &oom_pg);
+            if (oom_probe < 0) {
+                oom_rfork_refused = true;
+            } else if (oom_probe == 0) {
+                for (int oom_k = 0; oom_k < 8192; oom_k++) {
+                    char* oom_p = (char*)map_pages(262144);
+                    if (oom_p == null) break;
+                    for (int oom_q = 0; oom_q < 262144; oom_q += 4096) { oom_p[oom_q] = (char)1; }
+                }
+                exitcode(7);
+            } else {
+                if (join(oom_probe, oom_pg) != 7) { oom_probe_killed = true; }
             }
-            // Pass = no panic (we got here), RAM pressure was real
-            // (either rfork got refused or the tight map returned null),
-            // and killing the kids recovered enough to map again.
-            bool oom_pressure = oom_rfork_refused || oom_tight == null;
-            if (oom_spawned > 0 && oom_pressure && oom_after != null) {
-                print("oomtest: ok (OOM returned -1/null, no panic, RAM recovered)\n");
+            // Reap the gluttons and confirm RAM comes back.
+            for (int oi = 0; oi < oom_spawned; oi++) { kill(oom_pid[oi], oom_gen[oi]); }
+            ulong oom_recover = rdtime() + timebase_hz() * 3;
+            int oom_after_code = -1;
+            while (oom_after_code != 7 && rdtime() < oom_recover) {
+                yield();
+                uint rg = 0;
+                int rc = rfork(RFPROC, &rg);
+                if (rc == 0) {
+                    char* rp = (char*)map_pages(1048576);
+                    bool oom_rec_ok = rp != null;
+                    if (oom_rec_ok) {
+                        for (int oom_i = 0; oom_i < 1048576; oom_i += 4096) { rp[oom_i] = (char)2; }
+                        rp[1048575] = (char)3;
+                    }
+                    exitcode(oom_rec_ok ? 7 : 1);
+                }
+                if (rc > 0) { oom_after_code = join(rc, rg); }
+            }
+            bool oom_pressure = oom_rfork_refused || oom_probe_killed;
+            if (oom_spawned > 0 && oom_pressure && oom_after_code == 7) {
+                print("oomtest: ok (demand-fault OOM kills the process, no panic, RAM recovered)\n");
             } else {
                 print("oomtest: FAILED spawned="); print_uint((uint)oom_spawned);
                 print(" pressure="); print_uint((uint)oom_pressure);
-                print(" recovered="); print_uint((uint)(oom_after != null));
+                print(" recovered="); print_uint((uint)(oom_after_code == 7));
                 putchar('\n');
             }
         } else if (strcmp(cmd, "faulttest") == 0) {

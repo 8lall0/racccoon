@@ -4,6 +4,906 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-02 — QEMU PLIC un-identity-mapped (it collided with big heaps)
+
+Root cause of the `gobuildtest` failure from the two entries below (the
+on-device `compile` store-faulting at the fixed address `0xC000000`
+every run): **the QEMU PLIC was identity-mapped into every process's
+virtual address space**, kernel-only, at `0x0c000000` — ~192 MiB up,
+right in the middle of the userspace heap range. `create_process` maps
+three PLIC register pages there so `handle_trap`'s `plic_claim()` works
+under whatever page table is active. Fine for 14 years of small
+processes; the Go toolchain's ~448 MiB `SYS_MAP` arena grows straight
+through `0x0c000000`, hits the present-but-`PAGE_U`-clear PTE, and
+store-faults → the kernel kills it. (The *eager* `SYS_MAP` hid this by
+`map_page`-clobbering the PLIC PTE with a user page — which silently
+broke the kernel's own PLIC access from that process. Lazy `SYS_MAP`
+surfaced the latent bug instead of making a worse one.)
+
+Fix: alias the PLIC. `boards/qemu/board.c3` — `PLIC_PHYS_BASE`
+(`0x0c000000`, the mapping target) split from `PLIC_BASE` (now
+`0x7a000000`, virtual — what the kernel dereferences and what
+`create_process` maps at), well above any user allocation and below the
+kernel identity map. New `PLIC_*_PHYS_PAGE` consts; `create_process`
+maps `_PAGE` (virtual) → `_PHYS_PAGE` (physical). `plic_init()` runs
+bare-mode (pre-paging) so it reaches the PLIC through `PLIC_PHYS_BASE`
+directly; `plic_claim`/`plic_complete`/`plic_set_enabled` all run from a
+trap with paging on and go through the alias. The Duo keeps identity
+mapping (`PLIC_*_PHYS_PAGE == PLIC_*_PAGE`) — its PLIC is at
+`0x70000000`, far above any 16 MiB Duo heap.
+
+Verified: `gobuildtest` **passes end-to-end** —
+
+```
+root / # gobuildtest
+hello from go build on racccoon
+sum 1..100 = 5050
+gobuildtest: ok (go build produced a working binary)
+```
+
+`/bin/go build` on racccoon compiles `runtime` + `runtime/goos` + the
+user's `main`, links a RISC-V ELF, and it runs. Slow (~50 min under the
+loaded emulator — `compile` of package `runtime` on-device is the cost),
+but correct. Regression sweep at `-m 2G` all green — FAT32 / ext2 /
+dual / exFAT, and disk I/O (virtio-blk IRQ → PLIC → `fsd` mount) proves
+the alias works: `maptest` / `oomtest` / `faulttest` / `runtest` /
+`elftest` / `gotest` / `gostage2test` / `gostage42test` / `wasmtest` /
+`hardentest` / `chmodtest` / `fspermtest`. Duo kernel builds clean.
+
+---
+
+## 2026-09-02 — QEMU `__free_ram` 768 → 1792 MiB
+
+`src/kernel.ld` reserved a fixed 768 MiB pool regardless of QEMU `-m`,
+which the on-device `go` toolchain overcommits (a ~448 MiB `compile`
+plus `go` holding its own heap live — `compile` got OOM-killed
+mid-build). Raised to **1792 MiB** (`__free_ram_end` at `0xf04e8000`,
+~250 MiB clear under the top of a 2 GiB region; `<= RAM_SIZE`, the
+1920 MiB bitmap ceiling). Boot at `-m 2G` with this value was already
+proven (see the JH7110 2 GiB note earlier in this file).
+
+- `src/kernel.ld` — the `. += 768 MiB` bump → `1792 MiB`.
+- `scripts/launch64*.sh` (all four) — `-m 1G` → `-m 2G`. A bigger
+  `__free_ram` reservation than physical RAM would let the allocator
+  hand out non-existent pages, so `-m 2G` is now the floor for the
+  QEMU kernel. The Duo (`boards/duo/kernel.ld`, real 64 MiB) is
+  untouched.
+- `src/allocation.c3` / `scripts/build_go.sh` / `go/goos/*` comments
+  updated off the old 768 figure.
+
+Regression sweep at `-m 2G`, all green: FAT32 / ext2 / dual / exFAT
+mount; `maptest` / `oomtest` / `faulttest` / `runtest` / `elftest` /
+`gotest` / `gostage2test` / `wasmtest` / `mounttest` (dual) /
+`bigreadtest` (dual). SMP scaffold still prints "boot hart 0 only" on
+the default single-hart boot.
+
+`gobuildtest` still fails — but **not** on RAM now. Every run (768 MiB,
+`racccoon_bigheap` for `go`, and now 1792 MiB) the on-device `compile`
+takes a U-mode store fault at the *exact same* address `0xC000000` and
+the kernel kills it (`go build` then reports the tool as exit 127).
+The address being fixed regardless of pool size rules out OOM — it's a
+structural bug in the demand-fault path or the tamago heap-growth
+hooks, not memory pressure. Needs an instrumented run to pin down;
+separate from this change, which stands on its own (the JH7110 wants
+the bigger pool too).
+
+---
+
+## 2026-09-02 — Multi-core (SMP) scaffold — hart bring-up only
+
+```
+SMP: 4 hart(s) online of 4 (boot hart 0); secondaries parked — no SMP scheduler yet
+```
+
+Not an SMP scheduler — the kernel still assumes it is never preempted
+(one run queue, no locks). This is the bring-up plumbing under it:
+
+- `src/kernel/sbi.c3` — `sbi_hart_start()` (SBI HSM extension, EID
+  `0x48534D`, FID 0).
+- `src/smp.c3` (new) — `boot_hartid` (captured from `a0` in `boot()`,
+  which OpenSBI sets to the boot hart id), a `hart_online[8]` bitmap,
+  one 16 KiB `.bss` boot stack per potential secondary.
+  `smp_start_secondaries()` walks hartids `0..board::SMP_MAX_HARTS`,
+  `sbi_hart_start`s each (skipping ones that answer `INVALID_PARAM` —
+  i.e. don't exist), and bounded-spins for it to check in.
+  `secondary_entry` (naked: `mv sp, a1` from the opaque arg, jump) →
+  `secondary_main`: mask all interrupts with pure-register CSR ops (no
+  `write_csr()` — that bridges through a global shared with the boot
+  hart), set `hart_online[id]`, `wfi` forever.
+- `boot()` (`src/kernel.c3`) stashes `a0` before setting up `sp`;
+  `kernel_main` calls `smp_start_secondaries()` last, after every boot
+  server is up.
+- `board::SMP_MAX_HARTS` — QEMU 8 (a ceiling; `-smp N` is discovered),
+  Duo 1 (its 2nd C906 has no MMU — never a target).
+
+Verified in QEMU: `-smp 4` and `-smp 2` bring every hart up and park
+it; default (`-smp 1`) prints "boot hart 0 only" and is otherwise a
+no-op. `maptest` / `oomtest` / `faulttest` / `gostage2test` /
+`wasmtest` / `hardentest` unchanged across all three. Duo kernel
+builds clean.
+
+Next for real SMP (large, not started): per-hart `current_proc` /
+kernel stack / `sscratch`, a lock around the run queue + allocator +
+`fsd` IPC rendezvous, IPIs for reschedule, and deciding whether
+GOMAXPROCS > 1 is even worth it before the userspace is bigger.
+
+---
+
+## 2026-09-02 — Lazy `SYS_MAP` (demand paging for anonymous maps)
+
+`SYS_MAP` no longer allocates a single physical page. It validates the
+byte count against the per-process ceiling (`board::HEAP_MAX_BYTES`),
+bumps `heap_top`, and returns the base vaddr — that's it. The region
+`[map_floor, heap_top)` is reserved address space; a page fault inside
+it demand-maps one fresh zero page and retries the faulting
+instruction. Running out of RAM at fault time kills just the faulting
+process (the existing U-mode-fault path), never the kernel.
+
+Why: the previous entry flagged the eager 448 MiB `SYS_MAP` the Go
+toolchain arena needs as costing seconds per `compile` launch, and as
+the reason `go`/`asm` had to stay on a 64 MiB heap (a 448 MiB parent
+can't be `rfork`'d in the pool). Both go away when the map is lazy —
+`rfork` copies only *real* leaves, so a lightly-touched 448 MiB
+process forks cheaply.
+
+Kernel changes:
+
+- `src/page.c3` — `try_map_page()` (fallible `map_page`, all allocs via
+  `try_alloc_pages`), `pte_present()` (non-allocating leaf probe).
+  `user_range_valid()` gets a fault-in pre-pass: a syscall handed a
+  pointer into the caller's own untouched lazy region (a fresh Go
+  slice the runtime hasn't written yet) demand-maps it here rather
+  than failing closed.
+- `src/entry.c3` — `try_lazy_fault(scause, stval)`: on a U-mode
+  instruction/load/store page fault at an absent page in
+  `[map_floor, heap_top)`, allocate + `try_map_page` + targeted
+  `sfence.vma`, then return so `handle_trap` re-runs the instruction.
+  Wired in ahead of the "buggy user program / kernel panic" branch.
+  The `SYS_MAP` handler drops its `alloc_pages` loop and its
+  free-RAM / page-table-overhead pre-check.
+- `src/process.c3` — `Process.map_floor` (bottom of the lazy region,
+  set beside `heap_top` in `create_process` / `sys_exec` / `sys_rfork`);
+  `flush_tlb_page(vaddr)` (`sfence.vma a0`).
+
+The `cmd/compile` / `cmd/link` big arena (`racccoon_bigheap`, 448 MiB)
+is now pure address space until touched, so it no longer bloats
+`rfork`. `go` / `asm` still stay on the 64 MiB heap: the QEMU pool is
+768 MiB (`src/kernel.ld` reserves a fixed 768 MiB for `__free_ram`
+regardless of `-m`), and `go` holds its heap live for the whole build
+while a 448 MiB `compile` runs — bumping `go` to 448 MiB overcommits
+that pool and `compile` gets OOM-killed mid-run. Lifting the 768 MiB
+`__free_ram` reservation (the kernel boots fine at `-m 2G`+) is the
+real unblock and a separate change.
+
+Verified in QEMU `-m 2G`: `maptest`, `oomtest` (rewritten for the new
+semantics — gluttons that map *and touch* their whole ceiling, one
+probe that gets OOM-killed at fault time, RAM recovers on reap),
+`faulttest`, `gostage2test` (the GC exercise), `gostage41`/`42`,
+`gotest`, `goversiontest`, `wasmtest`, `hardentest` all green.
+`gobuildtest` (the full on-device `go build`) does not finish in
+~25 min on this host on the pre-change kernel either — the demand-fault
+path it exercises is covered by `gostage2test` + `oomtest`; a clean
+timed run of the whole `go build` still needs a faster host / the Duo.
+
+Not done this session: the `GOOS=racccoon` rename (a fork-wide GOOS
+rename — ~340 files in the Go tree — best done interactively with the
+toolchain rebuild watched); lifting the 768 MiB `__free_ram` cap. Duo
+kernel builds clean. (The SMP scaffold — the other half of the same
+request — landed in the entry above.)
+
+---
+
+## 2026-09-02 — Go Stage 4.4 DONE: `go build` works on racccoon
+
+```
+root /gomod # /bin/go build -o /tmp/hw .
+root /gomod # /tmp/hw
+hello from go build on racccoon
+sum 1..100 = 5050
+```
+
+The `go` command, running on racccoon, drives `compile` / `asm` /
+`link` as subprocesses, compiles `runtime` + `runtime/goos` + the
+user's `main` on-device, links a RISC-V ELF, and the binary runs. The
+stdlib closure comes from a **prepopulated build cache** — a host build
+with the exact same cross-toolchain (`build_go_goroot.sh`), whose
+content-addressed cache keys the on-device build hits (`-trimpath`
+keeps the stdlib keys machine-independent). Same bootstrapping shape as
+`lib/tcc`'s prebuilt `crt1.o`. `gobuildtest` shell builtin (slow, not
+in the quick sweep).
+
+Getting there from the previous entry's groundwork:
+
+- **ext2 directory ops only walked the 12 direct blocks** — committed
+  separately (`fsd/ext2: follow indirect blocks in directory
+  operations`). A ~670-entry `$GOROOT/src/runtime` was truncated to
+  ~506 on `os.ReadDir`, and the missing `preempt_riscv64.s` meant
+  `compile` saw `asyncPreempt` as ABIInternal. `ext2_list` /
+  `ext2_find_in_dir` / `ext2_find_in_root` now iterate every data block
+  via `ext2_resolve_block`.
+- `pathcache.LookPath` on the tool paths always failed
+  (`lp_tamago.go` stubbed it to "no executables"); fsd files reported
+  mode `0644` (no exec bit). Fixed both.
+- `.s` `#include "textflag.h"` / `cgo/abi_riscv64.h` — seed
+  `$GOROOT/pkg/include/*.h` + `$GOROOT/src/runtime/cgo/*.h`.
+- compiling `runtime` OOM'd the on-device `compile`'s 64 MiB Go arena;
+  build tag `racccoon_bigheap` gives `cmd/compile` / `cmd/link` a
+  448 MiB arena (bumping `go` too broke `rfork` — a 448 MiB parent
+  can't be forked in a 768 MiB pool).
+- a bare `go build` linked at Go's default address, which the racccoon
+  loader rejects — `cmd/link` now defaults `-T 0x1010000` / `-R 0x1000`
+  for `GOOS=tamago` riscv64, so the output loads with no `-ldflags`.
+
+`build.sh` seeds `/goroot` (tools + headers + the stdlib source
+closure + the racccoon `runtime/goos` overlay), `/gocache` (the
+prepopulated cache), and `/gomod` (a one-file module for the test);
+`disk_ext2.img` grew 256 → 448 MiB. `racccoon.patch` → 728 lines.
+
+Not done / follow-ups: lazy `SYS_MAP` (the eager 448 MiB map costs a
+few seconds per `compile` launch; also the real fix for the OOM and the
+fork-size limit); `os.ReadDir` still lstats every entry (fsd exposes no
+dirent type — a ~670-stat directory scan); the `GOOS=racccoon` rename.
+
+`go version` / `go env` (4.4 part 1) unaffected. Regressions green:
+runtest / argvtest / pathtest / elftest / gostage35 / gostage41 /
+gostage42 / gotest / goversiontest / dirpacktest / p9realtest /
+p9fswritetest / p9mkdirtest / bigreadtest (dual) / fspermtest /
+chmodtest. Duo kernel builds clean.
+
+---
+
+## 2026-09-02 — Go Stage 4.4: argv[0] in the exec ABI, and `go build` groundwork
+
+**`SYS_EXEC` now carries `argv[0]`.** The racccoon exec ABI packed only
+the real arguments; the goos layer synthesised `os.Args[0] = "go"` for
+every spawned Go binary, so `go tool compile -V=full` reported its name
+as `go` and `cmd/go`'s toolID parser rejected the mismatch. Fixed
+properly (the user picked "carry argv[0] through SYS_EXEC" over
+relaxing the check):
+
+- `user/user.c3` `exec()` packs the resolved program path as blob
+  string 0, then the args; the `SYS_EXEC` count (a4) includes it. The
+  kernel is unchanged — it never parses the blob, just stages it.
+- c3c fork `_nolibc/main_stub.c3` `@main_args` peels string 0 back off
+  as `main_stub_argv0` and hands `main(String[] args)` strings 1.., so
+  every existing c3 command still indexes `args[0]` as its first real
+  argument (runtest / argvtest / pathtest / elftest green).
+- `go/goos/` — `Spawn` packs argv[0], `Args` reads the whole blob as
+  `os.Args`. gostage35's `os.Args` count check still passes.
+
+Now `compile -V=full` says `compile version go1.27.0` and the toolID
+probe passes. `go build` then drove `compile`/`asm`/`link` as
+subprocesses and got most of the way through the stdlib closure before
+each of a run of blockers:
+
+- `pathcache.LookPath` on the tool paths always failed — tamago's
+  `lp_tamago.go` stubs LookPath to "no executables at all". Patched to
+  do the real slash-path `findExecutable` check.
+- fsd files reported mode `0644` (no exec bit) → `findExecutable`
+  rejected the tools → fsd backend now reports regular files `0755`
+  (racccoon has no per-file exec permission).
+- `.s` files `#include "textflag.h"` / `cgo/abi_riscv64.h` — seed
+  `$GOROOT/pkg/include/*.h` and `$GOROOT/src/runtime/cgo/*.h`.
+- compiling package `runtime` OOM'd the on-device `compile` at ~50 MiB
+  in use — the 64 MiB Go arena is too small. Added a build-tag
+  (`racccoon_bigheap`, `racccoon_heap_{small,big}.go`) that gives
+  `cmd/compile` / `cmd/link` a 448 MiB arena; `go` / `asm` / programs
+  stay at 64 MiB (bumping `go` too made `rfork` fail — forking a
+  448 MiB parent needs more RAM than the pool has; the real fix is a
+  lazy `SYS_MAP`).
+
+**Where it stands:** `go build` compiles `internal/*`, drives all three
+tools, gets ~20 packages in, and is currently stuck compiling package
+`runtime` — `preempt.go:351: asyncPreempt is defined as ABIInternal`,
+i.e. `preempt_riscv64.s` isn't reaching the `asm -gensymabis` pass (the
+`.s` file is on the image; something in the runtime asm pipeline —
+`go_asm.h` generation, `-I` paths — isn't right). Next: either fix that
+pipeline, or prepopulate `/gocache` from a host build so the stdlib
+closure is all cache hits and only the link runs on-device (the Stage
+4.3 bootstrapping pattern — being tried now on a throwaway image).
+
+`go version` / `go env` (4.4 part 1) unaffected. Regressions green
+(runtest / argvtest / pathtest / elftest / gostage35 / gostage41 /
+gostage42 / gotest / goversiontest / chmodtest / oomtest). Duo kernel
+builds clean; patch inert for vanilla `GOOS=tamago`. `racccoon.patch`
+→ 702 lines. **The `main_stub.c3` change is in the local `8lall0/c3c`
+fork checkout (`feat-racccoon-support`), committed but not pushed —
+`scripts/build_user.sh` uses that checkout by path.**
+
+---
+
+## 2026-09-01 — Go Stage 4.4 part 1: `go version` / `go env` on racccoon
+
+The `go` command itself runs on racccoon. `go version` →
+`go version go1.27.0 tamago/riscv64`, exit 0. `go env GOROOT` → `/goroot`,
+`go env GOOS GOARCH` → `tamago` / `riscv64`. `goversiontest` builtin.
+
+What it took:
+- **GOROOT.** `scripts/build_go.sh` links `cmd/go` with
+  `-X runtime.defaultGOROOT=/goroot`. `cfg.findGOROOT` falls back to
+  `runtime.GOROOT()` when `os.Executable()`-based detection fails (it
+  does on racccoon), so the baked value wins. `build_go_goroot.sh`
+  assembles the `/goroot` skeleton — `VERSION` + a `go.env` that
+  `cfg.findGOROOT` reads *before* the (empty) process environment,
+  supplying `GOFLAGS=-mod=mod` / `GOPROXY=off` / `GOTOOLCHAIN=local` /
+  `GOCACHE=/gocache` / `GO111MODULE=on` / `CGO_ENABLED=0`.
+- **Telemetry.** `go` was logging `can't start telemetry child
+  process: exec: "tamago": ...` on every invocation (non-fatal, but
+  noise). One-liner in `x/telemetry`'s `DisabledOnPlatform` — add
+  `runtime.GOOS == "tamago"`.
+- **os.Getwd.** Flipped `syscall.ImplementsGetwd` (const → `var =
+  goos.FS != nil`) so `os.Getwd()` uses `syscall.Getwd()` (the fsd
+  cwd) directly instead of the "read `..` and match st_ino" fallback —
+  that fallback needs real inode numbers, which the fsd backend
+  doesn't synthesise (every Stat is ino 0, so `SameFile` matches
+  everything and the walk stops at `/`). Also fixed `getcwd()` in the
+  goos backend: racccoon stores the root cwd as `""` (SYS_GETCWD
+  returns length 0), which the backend was treating as an error
+  instead of `/` — this broke gostage35test's `os.Getwd` check the
+  moment `ImplementsGetwd` went true; fixed, sweep green again.
+
+`go build` — groundwork only, not working yet. It now gets *through*
+GOROOT resolution, module loading, the build cache setup, and the
+compile/link toolID probe before failing. Blockers fixed along the way
+(all in `lib/go/racccoon.patch` / `go/goos/`): file locking
+(`filelock_other.go` `lock`/`unlock` → no-op on tamago — `go` runs one
+process at a time, fsd has no flock); the `GOOS tamago unsupported
+without external GOOSPKG` fatal (`cmd/go/internal/goos` now uses
+`$GOROOT/src/runtime/goos` directly on tamago — the racccoon overlay
+is baked into the seeded GOROOT, no GOOSPKG module to resolve);
+`GOCACHE=off` rejected (needs a real writable dir — `/gocache`);
+`syscall.Ftruncate` not routed to the fsd hook; `goos.FS.Truncate`
+only handling truncate-to-0 (now shrinks via read+rewrite, grows via
+zero-pad). **Still open:** `go tool compile -V=full` reports its name
+as `go` not `compile` — racccoon's exec ABI carries no argv[0], so the
+goos layer synthesises `os.Args[0] = "go"` for every spawned Go binary,
+and `cmd/go`'s toolID parser rejects the mismatch. Fixing that
+properly means carrying argv[0] through `SYS_EXEC` (kernel ABI +
+`exec()` + every c3 caller + `start()`), or relaxing the toolID check.
+Plus: seeding `$GOROOT/src` (the ~10 MiB stdlib closure) + the
+`{compile,link,asm}` tool binaries into `/goroot/pkg/tool/`.
+
+Regressions green (`goversiontest` / gostage35 / gostage41 / gostage42
+/ gotest / chmodtest / wasmtest / oomtest). Duo kernel builds clean;
+the patch is inert for a vanilla `GOOS=tamago` build. `racccoon.patch`
+now 646 lines.
+
+---
+
+## 2026-09-01 — rfork: atomic stdout/stdin pipe wiring (a2 / a4)
+
+Follow-up to the previous entry, and a **correction** to its closing
+note. That note claimed the c3 shell's `>` redirection "intermittently
+fails" — that was a misread of test output: `echo M > f` followed by
+`cat f` prints `M` (from `cat`), and with the intervening command line
+filtered out it looked like `echo` writing to the console. Redirection
+was working. Sorry.
+
+But the race it pointed at **is real**, just rare. After `rfork` returns
+to the shell, the timer-interrupt handler `yield()`s on *every* tick for
+any `pid > 0` (`SCAUSE_SUPERVISOR_TIMER` in `handle_trap` — "real
+preemption, not just when a process yields on its own"). So a tick
+landing in the ~µs window between the fork and the shell's follow-up
+`SYS_PIPE_SETOUT` lets a fast child (`/bin/echo`) exec, write to the
+still-unredirected console, and exit before the shell wires it. ~1 in
+10⁴ per redirect — I never actually caught it, but the window is there,
+and the "cooperative sched, the shell doesn't yield until the pump"
+comment in `shell_run_pipeline` was simply wrong.
+
+Fix: close the window on the c3 side the same way the Go side already
+does. `SYS_RFORK` grew an `a4` (stdin pipe) alongside 113f8ec's `a2`
+(stdout pipe); `rfork_io(flags, gen, stdout_pipe, stdin_pipe)` wraps the
+4-arg form and plain `rfork()` calls it with `-1, -1`. `shell_spawn` /
+`shell_spawn_stage` take the two pipe ids and pass them through;
+`shell_run_pipeline` computes each stage's ends *before* the spawn and
+drops the post-spawn `pipe_setout`/`pipe_setin` entirely. The kernel
+wires `child.stdout_pipe`/`stdin_pipe` and bumps the pipe's
+writer/reader count as part of building the child, before it's
+schedulable. `pipe_valid`-gated, RFMEM-excluded (`threadcreate` leaves
+stale values in a2/a4).
+
+`pipe_setout`/`pipe_setin` (kernel cases + user wrappers) now have no
+callers — left in place, a mid-stream redirect is a legitimate future
+use.
+
+Verified `-m 2G` and `-m 1G`: `echo x > f; cat f`, `a | cat | cat`,
+`cat < f`, gostage42test / 41test / gotest / gostage35test / rforktest /
+chmodtest / oomtest / wasmtest / fsdkilltest / storagekilltest green.
+Duo kernel builds clean.
+
+---
+
+## 2026-09-01 — Go Stage 4.1 follow-up: os/exec output capture
+
+`exec.Cmd.Output` / `CombinedOutput` / a `bytes.Buffer` `Stdout` now
+work on racccoon. `go/cmd/gostage42` + `gostage42test`.
+
+The shape: `os.Pipe()` (patched to call a new `syscall.PipeGoos`)
+reserves a `runtime/goos` capture slot backed by two `goosPipeFile`
+fds; `StartProcess` reads the slot id off the write-end fd in
+`attr.Files`; `goos.Spawn` points the child's console at a kernel pipe
+(`src/pipe.c3`), drains it to EOF, joins, and records the exit code —
+the child runs to completion synchronously (fine here: GOMAXPROCS=1, a
+blocking ecall freezes the whole Go world regardless, so `Wait`
+degrades to a lookup). The pipe's read end serves the drained bytes to
+os/exec's `io.Copy` goroutine once `Start` returns.
+
+**The fix that mattered.** First cut wired the child's stdout with a
+`SYS_PIPE_SETOUT` right after `rfork` — the way the c3 shell's pipeline
+code does. It captured `/bin/echo` (~9 bytes, written and gone before
+the parent's next instruction) but got **0 bytes from `/bin/go-hello`**
+and a false EOF from anything slower. Cause: the Go runtime parks the
+`Spawn` goroutine at the first safepoint after `rfork` and — with
+nothing else runnable — calls `goos.Idle` → `sys_yield`, letting the
+child run *ahead* of the parent's setout. The c3 shell's plain loop
+never yields there, so it always wins that race; Go can't.
+
+Fix: an optional `a2` on `SYS_RFORK` that wires the child's
+`stdout_pipe` **atomically as part of the fork**, before the child is
+schedulable. `pipe_valid` gates it (RFMEM excluded — `threadcreate`
+leaves a stale a2); the c3 `rfork()` wrapper now passes `a2 = -1`. With
+that, `/bin/go-hello` CombinedOutput captures all 169 bytes and a
+22 KiB `/bin/go-spew` stream drains cleanly through the 4 KiB pipe
+buffer (producer blocks, parent's drain loop keeps up).
+
+racccoon gives a process one console stream, so captured output is
+combined stdout+stderr. Not done: stdin-from-pipe (`go` never needs
+it); truly async Start (Start blocks until the child exits).
+
+Regressions green at QEMU `-m 2G` and `-m 1G`: gostage42test / 41test /
+gotest / gostage35test / chmodtest / wasmtest / oomtest / fsdkilltest /
+storagekilltest / fspermtest, plus c3 shell `|` and `rforktest`. Duo
+kernel builds clean. `lib/go/racccoon.patch` regenerated (546 lines;
+adds `os/pipe_tamago.go`, `syscall.PipeGoos` + `goosPipeFile`, the
+`StartProcess` capID resolution, `runtime/goos` Capture* + the `Spawn`
+signature).
+
+**Note added while chasing the setout race — later corrected.** This
+originally claimed the c3 shell's `>` redirection "intermittently
+fails". It doesn't — that was a misread of filtered test output (`cat`'s
+output of the redirected file looked like `echo` writing to the
+console). See the 2026-09-01 "rfork: atomic stdout/stdin pipe wiring"
+entry above: the underlying timer-preemption race is real but rare, and
+that entry closes it on the c3 side via `SYS_RFORK` a2/a4.
+
+---
+
+## 2026-09-01 — JH7110 `-m 2G` blocker: cleared, and the bitmap ceiling raised
+
+The go-port notes carried a "racccoon does not boot with QEMU `-m >= 2G`
+(no output, fails before BSS clear — FDT placement / kernel identity
+map)" blocker, flagged as a must-fix before Orange Pi RV (JH7110, 2 GB)
+bring-up.
+
+**It doesn't reproduce.** The current kernel boots cleanly at `-m 2G`,
+`-m 3G`, `-m 4G`, and `-m 8G` — through to the shell prompt, `gotest`
+green, the full regression sweep (`gostage35test` / `gostage41test` /
+`wasmtest` / `dirpacktest` / `oomtest` / `fsdkilltest` / `fspermtest` /
+`chmodtest`) green at `-m 2G`. It also still boots and runs Go with
+`__free_ram` experimentally bumped to 1792 MiB under `-m 2G`. The
+kernel runs bare-mode all the way through `kernel_main` and never
+touches the FDT (`a1` is ignored; `board::plic_init()` uses static
+constants), so the FDT-placement theory was wrong — the real earlier
+failure was a pre-Stage-2 allocator bug (`RAM_SIZE` vs `__free_ram`
+mismatch) that the Stage 2 rework + allocation rover already fixed.
+
+What *was* still a real ceiling: `src/allocation.c3`'s `RAM_SIZE` — the
+page bitmap's compile-time size — hardcoded at 768 MiB, one constant
+shared by every board. `ram_page_count()` caps allocation to
+`min(real linker span, RAM_SIZE)`, so a board whose `kernel.ld`
+reserved more than 768 MiB (the JH7110 wants ~1.9 GiB of its 2 GiB for
+Go's toolchain) would have silently lost everything past 768 MiB.
+
+Raised to **1920 MiB** — chosen at the medany code-model ceiling
+(`llc -code-model=medium`: every global reference must land within
+±2 GiB of the kernel text PC, so `__free_ram_end` can't sit much past
+~1.9 GiB from a kernel linked at DRAM_BASE + 2 MiB regardless of DRAM
+size), and kept just under 2^31 so the constant stays a plain 32-bit
+int. The bitmap is now 60 KiB of BSS (was 24 KiB) — negligible even on
+the 64 MiB Duo. QEMU (768 MiB pool) and Duo (~59 MiB, `__free_ram_end`
+pinned to `__dram_end`) are behaviourally unchanged: `oomtest` still
+green, `-m 1G` default boot still green, Duo kernel still builds clean.
+`boards/opi-rv/kernel.ld` (on `opi-rv-port`) can now size its pool up
+to the ceiling.
+
+Not done here (documented as a follow-up in `docs/go-port-plan.md`):
+`create_process` / `sys_rfork` / `sys_exec` still identity-map the pool
+at 4 KiB granularity into every process page table — ~4 MiB of page
+tables and ~500 K `map_page` calls per process at a 2 GiB pool. Boots
+fine, but a 2 MiB-megapage or shared-L1 kernel identity map is the
+right long-term fix.
+
+---
+
+## 2026-09-01 — Go Stage 4.4 spike: `cmd/go` runs, needs a GOROOT
+
+Scoping spike, no commit (like the 4.2 spike). `scripts/build_go.sh
+cmd/go` cross-builds the `go` command for tamago/riscv64 — **13.7 MiB**,
+`e_type` 2, text span 0xd4b008, comfortably inside the 32 MiB QEMU
+`EXEC_MAX_IMAGE_SIZE`. Seeded as `/bin/go-go` on a throwaway ext2 image
+and run on racccoon in QEMU:
+
+```
+root / # /bin/go-go version
+can't start telemetry child process: exec: "tamago": executable file not found in $PATH
+go: cannot find GOROOT directory: /tmp/.../scratchpad/tamago-go
+root / # echo V=$status
+V=2
+```
+
+The binary **loads and runs** — `os.Args`, flag parsing, error paths all
+work; it gets far enough to look for its GOROOT and print a real
+diagnostic. Two concrete blockers, both predicted:
+
+1. **GOROOT resolution.** `runtime.defaultGOROOT` is baked at
+   toolchain-build time to the host scratchpad path, which doesn't
+   exist on racccoon. `go` needs `$GOROOT` pointed at an on-device tree
+   holding `pkg/tool/tamago_riscv64/{compile,link,asm}`, `VERSION`, and
+   `src/` (the stdlib source — `go build` reads it to compile the
+   import closure). Options: (a) `GOROOT` env var routed through
+   `envd`/`/env` — cheapest if `os.Getenv` already resolves there;
+   (b) a `go env -w` config file; (c) re-bake `defaultGOROOT` in the
+   patch. (a) or (c) preferred.
+2. **Telemetry child spawn.** `go` tries to `os/exec` a `tamago`
+   helper for telemetry upload; our `Spawn` correctly returns
+   not-found and `go` continues (non-fatal) — but it's noise. Set
+   `GOTELEMETRY=off` / disable the telemetry package in the patch.
+
+Not yet measured: the `$GOROOT/src` seeding cost (~60 MB of stdlib
+source = thousands of small fsd writes, likely minutes on the emulated
+disk), the build-cache `flock` (fsd has no locking — probably needs a
+no-op shim), and module-mode pinning (`GO111MODULE`, `GOPROXY=off`,
+`GOFLAGS=-mod=mod`).
+
+**Bottom line:** Stage 4.4 is mechanically reachable — the `go` binary
+itself is fine. What's left is environment plumbing + a bulk GOROOT
+seed, not a runtime port. The self-hosting *compiler* already works
+(4.3); 4.4 is the ergonomic `go build` wrapper on top.
+
+---
+
+## 2026-09-01 — Go Stage 4.1: os/exec
+
+`os/exec` works on racccoon (first cut). `go/cmd/gostage41` +
+`gostage41test`: runs `/bin/echo` and `/bin/false` (exit codes
+propagate), a missing command (clean error), and **another Go binary
+spawned from a Go program** (`/bin/go-hello`, runs correctly).
+
+Much smaller than a Linux `clone`+`execve` port: `GOOS=tamago`'s
+`syscall` already stubs `StartProcess` / `Wait4` / `WaitStatus`
+("not supported, just enough for package os"), so `lib/go/racccoon.patch`
+just fills them in via two `runtime/goos` hooks (`Spawn` / `Wait`,
+`go/goos/racccoon_exec.go`): the parent reads the target binary and
+packs argv into one buffer (all allocation + fs I/O *before* the fork),
+`rfork(RFPROC)`, then the child does exactly one or two NOSPLIT ecalls
+(optional `SYS_CHDIR`, then `SYS_EXEC`) before its image is replaced —
+no Go allocation or scheduler interaction in the child window. `Wait`
+→ `SYS_JOIN`. `/dev/null` is a reserved fs-backend handle (reads EOF,
+writes discarded) so a `Cmd` with a nil Stdout doesn't fail on open.
+
+First run: the mechanism worked (both commands *ran*, output correct),
+but `cmd.Run()` returned a spurious error for successful commands —
+`WaitStatus` used a made-up `0x100` "exited" bit instead of `wait(2)`'s
+`(status & 0x7f) == 0`, so `ExitStatus()` returned 1 for exit 0. Fixed
+to the standard bit layout.
+
+Not yet: `ProcAttr.Files` pipe redirection — the child inherits the
+parent's console, so `cmd.Stdout = os.Stdout` works but `cmd.Output()`
+(capture into a buffer) doesn't; racccoon has `SYS_PIPE` +
+`SYS_PIPE_SETOUT`/`_SETIN` to wire in. And a spawned Go child's
+`os.Args[0]` is the synthetic `"go"` (argv packed plain).
+
+Regressions green (gostage41test, gotest, gostage35test, chmodtest,
+wasmtest). Duo builds clean.
+
+`gostage41test` is fast (a ~1.4 MiB binary) so it *is* in the quick
+sweep, unlike `gotoolchaintest`.
+
+Also confirmed (host): `cmd/go` builds for `GOOS=tamago GOARCH=riscv64`
+(13.7 MiB) — Stage 4.4's remaining unknown is getting `$GOROOT/src` (the
+stdlib source, for package discovery) onto the disk.
+
+---
+
+## 2026-09-01 — Go Stage 4.3: the self-hosting loop is closed
+
+racccoon's own `go tool compile` + `go tool link`, running natively on
+racccoon, compile and link `go/cmd/hello`'s real source (importing
+`runtime` and its ~27 transitive `internal/*` packages — a real stdlib
+closure) into a working ELF, which then **runs** and produces output
+byte-identical to Stage 1's host-cross-compiled `/bin/go-hello`. A
+racccoon binary, built by racccoon's own toolchain, on racccoon.
+Nothing needed fixing to get there — the whole chain worked once the
+inputs were in place.
+
+- **Disk**: the QEMU ext2 test image grew 16 → 256 MiB
+  (`scripts/build.sh`) — `go-compile` alone is 22 MiB (stripped),
+  `go-link` 6 MiB, the stdlib closure ~15 MiB. 262144 × 1 KiB blocks /
+  8192-per-group = 32 groups, far under `ext2.c3`'s `EXT2_MAX_GROUPS`
+  (2048). The FAT32 + dual images stay small — `build.sh` now skips the
+  big `compile`/`link` binaries for those (they're ext2-only, next to
+  the closure).
+- **`scripts/build_go_toolchain.sh`**: cross-builds `cmd/link`, then
+  captures the exact dependency closure a `go build -a -work` of
+  `go/cmd/hello` produces (28 `packagefile` entries) and rewrites its
+  `importcfg` / `importcfg.link` to racccoon on-device paths
+  (`/lib/go/pkg/*.a`). Same bootstrapping shape as `lib/tcc`'s prebuilt
+  `crt1.o` / `libtcc1.a` — cross-built support objects, not something
+  racccoon's compiler rebuilds from scratch. `build.sh` seeds
+  `/lib/go/{importcfg,importcfg.link,pkg/*.a}` + `/hello.go` onto the
+  ext2 image (gated on `$TAMAGO` like the rest of the port).
+- **`gotoolchaintest`** (shell_test.c3): the exact validated sequence —
+  `go-compile -o /tmp/hello.o -p main -complete -importcfg
+  /lib/go/importcfg -pack /hello.go`, then `go-link -o /tmp/hello.elf
+  -importcfg /lib/go/importcfg.link -buildmode=exe -T 0x1010000 -R
+  0x1000 /tmp/hello.o`, then run it. Passes; ~2–3 min (a QEMU boot +
+  loading ~30 MB of toolchain off fsd 1124 bytes/RTT + the closure) —
+  not in the quick regression sweep, run on demand.
+  - Two shell-side notes surfaced: the interactive line buffer is 128
+    bytes (a fully-flagged hand-typed compile invocation overflows it —
+    the non-essential flags are safe to drop; the builtin passes argv
+    directly so it's unaffected), and `go-compile` needs `-pack` for
+    the output to be the archive format `link`'s `importcfg` expects.
+- **Also probed** (host, not yet run on racccoon): `cmd/go` — the `go`
+  command itself — **builds** for `GOOS=tamago GOARCH=riscv64` with the
+  racccoon overlay, 13.7 MiB stripped. Its whole module/build-cache
+  dependency graph satisfies. Stage 4.4's real gate is `os/exec`
+  (4.1) — `cmd/go` invokes `compile`/`link` as subprocesses.
+  `os/exec` compiles for tamago too but `SYS_CLONE`/`SYS_EXECVE` land
+  in `os_tamago.go`'s `syscall()` dispatcher which only handles
+  `SYS_WRITE` — 4.1 is translating those to `rfork`+`SYS_EXEC` there.
+
+---
+
+## 2026-09-01 — Go on racccoon: research + Stage 0 plan (branch `go-port`)
+
+Scoped what it takes to run Go on racccoon. **Verdict: tractable on the
+JH7110, via tamago.**
+
+Unlike LLVM (own devlog discussion — off the table: needs a C++
+toolchain + runtime racccoon can't host, and hosts a compiler bigger
+than the OS), the Go toolchain has *no external dependency* — `gc` /
+asm / `cmd/link` are pure Go, output is static, `linux/riscv64` is
+first-class. The only hard part is the runtime↔OS contract, and
+**tamago** (`usbarmory/tamago-go`) already did that surgery:
+`GOOS=tamago` is a freestanding runtime — `newosproc`→`goos.Task` (nil ⇒
+single-threaded), no futex (`semasleep` spins with a `goos.Idle` hook),
+no signals (`preemptMSupported = false`, cooperative preemption), no
+mmap (Plan 9 `sbrk` over a flat `bloc` region). All OS interaction is
+externalised to a ~10-hook `runtime/goos` package, pointed at an
+out-of-tree module by the `GOOSPKG` build setting. tamago even ships a
+`linux_user` provider that runs a `GOOS=tamago` binary as an ordinary
+Linux userspace process via raw syscalls — **racccoon is just another
+host for that pattern**, swapping the Linux ABI for racccoon's `ecall`.
+
+racccoon's cooperative userspace scheduler is a good match: tamago's
+idle-hook loop wants exactly a `SYS_YIELD`, and there are no threads.
+
+- `tamago1.27.0` branch matches the installed Go 1.27.0 exactly.
+- Approach: **A)** reuse `GOOS=tamago` + a `GOOSPKG=racccoon` provider
+  module (fastest to first-boot); **B)** later rename to
+  `GOOS=racccoon` and diverge `os`/`syscall` toward real fsd-backed
+  file I/O.
+- Known racccoon gaps, all Stage-1 line items: raise the exec size caps
+  (`EXEC_MAX_IMAGE_SIZE` 1 MiB → ~4 MiB, JH7110-only — a Go static
+  binary is 2–4 MiB), check the ELF loader's 8-segment limit against a
+  Go binary, `goos` provider = `SYS_PUTCHAR`/`SYS_TIMEBASE`/`SYS_EXIT`/
+  `SYS_YIELD`/`SYS_MAP`-arena.
+
+Stage 0 this branch: `docs/go-port-plan.md` (staged plan, Stage 1 boot →
+Stage 3 fsd I/O → Stage 4 toolchain self-host on racccoon → Stage 5
+net). This is a JH7110 goal — the Duo can host at most a Stage-1
+hello-world (GC + compiler need the gigabytes).
+
+**Stage 1, part 1 — exec size caps are now board-specific.** A
+`GOOS=tamago` static riscv64 binary is 1.6 MiB (1.0 MiB stripped), over
+the old flat 1 MiB `EXEC_MAX_IMAGE_SIZE`. Now
+`board::EXEC_MAX_IMAGE_SIZE`: 4 MiB on QEMU/JH7110, unchanged 1 MiB on
+the Duo (64 MiB board, no Go). New `SYS_EXEC_MAX` (51) returns it so the
+shell sizes its own `exec()` receive buffer per-board (`exec_max()` /
+`exec_buf_max()`) instead of the hardcoded `RUN_EXEC_BUF_MAX` — that
+buffer is SYS_MAP'd transiently in the rfork'd child that's about to
+exec(), so the bigger size costs nothing at rest. `src/entry.c3`'s
+`EXEC_MAX_IMAGE_SIZE` and the staging arrays it sizes now come from the
+board. QEMU + Duo build clean; regressions green on both the single-ext2
+and dual images (runtest / elftest / elftest2 / tcctest / wasmtest /
+mounttest / dirpacktest / chmodtest / killtest).
+
+Also confirmed for later stages: userspace `rdtime` already works
+(`user.c3`'s `rdtime()` does `csrr t0, time`) so `goos.Nanotime` needs
+no new syscall; and racccoon *has* thread primitives (`rfork(RFMEM)` +
+`SYS_FUTEX_WAIT`/`_WAKE` keyed on `(addr, page_table)`) — the plan's
+"single-threaded" is a Stage-1 simplification, not a hard limit.
+
+**Stage 1 — a Go program runs on racccoon.** `go/cmd/hello` (println,
+int + hardware-FP math, slice `append`, `map`, `defer`, `panic`/
+`recover`, a `switch`) builds via `scripts/build_go.sh` and executes
+correctly on racccoon in QEMU, clean exit 0, re-runnable. `gotest`
+(shell_test.c3) — skips like tcctest if `/bin/gohello` isn't on the
+image (only built when `TAMAGO` is set). Full regression green on the
+ext2 and dual images (gotest / wasmtest / tcctest / chmodtest / maptest
+/ oomtest / runtest / elftest / mounttest / fspermtest / dirpacktest /
+p9fswritetest / storagekilltest).
+
+What it took:
+- **Toolchain**: tamago-go `tamago1.27.0` (matches Go 1.27.0),
+  `./make.bash` once. `GOOS=tamago GOARCH=riscv64` + `GOOSPKG=racccoon.local/goport`.
+- **Provider `go/goos/`**: `CPUInit` (asm, the tamago rt0 entry)
+  `SYS_MAP`s a 48 MiB arena, publishes its base to `RamStart`/`Bloc`,
+  sets SP, jumps `runtime·rt0_riscv64_tamago`. `Printk`→`SYS_PUTCHAR`,
+  `Exit`→`SYS_EXIT`, `Idle`→`SYS_YIELD` (racccoon userspace is
+  cooperative — exactly what tamago's `semasleep` idle-hook wants),
+  `Nanotime` = `rdtime()` split-scaled by a cached `sys_timebase()`.
+  `Task` nil (single-threaded, `GOMAXPROCS=1`).
+- **Link**: `-ldflags "-T 0x1010000 -R 0x1000"` — text at USER_BASE +
+  64 KiB puts the ELF header exactly at USER_BASE; `-R 0x1000` keeps
+  `-T`'s file offsets non-negative (a bare `-T` with the default
+  64 KiB rounding produced a segment with `p_offset = -0xF000`). Result:
+  ET_EXEC, 3 PT_LOAD all inside `[USER_BASE, USER_BASE+4 MiB)`, 6
+  phdrs, no PT_TLS — the existing racccoon ELF loader
+  (`src/entry.c3`'s `sys_exec`) takes it unchanged.
+- **Kernel, board-gated** (QEMU/JH7110, never the Duo):
+  `board::EXEC_MAX_IMAGE_SIZE` 4 MiB (a `GOOS=tamago` binary is
+  ~1.5 MiB) + `SYS_EXEC_MAX` (51) so the shell sizes its exec buffer;
+  `board::HEAP_MAX_BYTES` 16 → 64 MiB (`SYS_MAP` is eager and the Go
+  arena is ~48 MiB); `src/kernel.ld` `__free_ram` 64 → 112 MiB (QEMU
+  virt has 128 MiB — the arena plus the servers need the room). First
+  symptom of the too-small limits: `user fault … stval=0xffeff7`, a
+  stack store just below USER_BASE because `SYS_MAP` failed and
+  `CPUInit`'s `base(-1) + RamSize` wrapped.
+
+**Stage 2 — the Go runtime under load.** `go/cmd/gostage2`
+(`gostage2test`) passes on racccoon in QEMU:
+- **GC** churns ~48 MiB of garbage in 24 KiB bites with forced
+  `runtime.GC()` — `NumGC` climbs, `HeapAlloc` stays bounded, the
+  ~2 MiB live set survives every cycle.
+- **Goroutines**: 200-way fan-out/fan-in over a buffered channel +
+  `WaitGroup` + `close`/`range`, `select` with `time.After`, a
+  100-goroutine mutex-guarded counter — all correct, cooperative on one
+  M.
+- **Timers**: `time.Sleep(20ms)` advances `time.Now()` in bounds,
+  `time.NewTicker(10ms)` fires 2–20× in 80 ms — the `wakeG` path +
+  `rdtime` `nanotime` + the spin-idle scheduler.
+
+Slow on emulated hardware (spin-idle scheduler + real GC — tens of
+seconds) but correct.
+
+Kernel RAM raised for it (QEMU only, board-gated — the Duo is
+untouched): `scripts/launch64*.sh` pass `-m 1G`; `src/kernel.ld`
+`__free_ram` 112 → 768 MiB (+ `src/allocation.c3` `RAM_SIZE` to match —
+the page bitmap is 24 KiB at that size); `board::HEAP_MAX_BYTES` 64 →
+512 MiB; provider `RamSize` 48 → 128 MiB (eager, with an 8 MiB CPUInit
+fallback). Regressions green (gotest / gostage2test / chmodtest /
+tcctest / wasmtest / oomtest / runtest). Duo kernel builds clean.
+
+**Found a JH7110 blocker along the way**: racccoon does not boot with
+`-m >= 2G` — no output at all, dies before BSS clear. `-m 1G` and below
+are fine. Almost certainly the kernel identity map only covering
+`[__kernel_map_base, __free_ram_end)` while QEMU/OpenSBI place the FDT
+(and their reservations) near the top of RAM. The Orange Pi RV has
+2 GB, so this has to be fixed before that bring-up; noted in
+`docs/go-port-plan.md`, likely folds into the early-MMU work
+`docs/opi-rv-plan.md` already expects.
+
+**Stage 3 — Go does real file I/O against fsd.** `go/racccoon` — a
+package Go programs import for persistent I/O against whatever racccoon
+has mounted, over `SYS_NS_RESOLVE` + `SYS_IPC_CALL` and the `FS_*`
+verbs, mirroring `lib/racccoon-libc/src/rc_fs.c`: `ReadFile` / `WriteFile`
+(both chunked), `Stat`, `ReadDir` (follows FS_LIST pagination), `Mkdir`,
+`Remove`/`RemoveAll`, `Rename`, `Getwd`, `Chdir`. `go/racccoon/
+sys_riscv64.s` has the `nsResolve` / `ipcCall` (5-arg) / `sysGetcwd` /
+`sysChdir` ecalls.
+
+`go/cmd/gostage3` (`gostage3test`) — reads `/hello.txt`, walks `/`,
+`/subdir`, and the 60-entry `/manyfiles` (pagination), writes a 4.8 KB
+file under `/tmp` + reads it back, renames it, makes a directory tree,
+removes everything. 21/21 checks pass on racccoon in QEMU; `e2fsck -fn`
+clean afterward. Regressions green (gotest / gostage3test / chmodtest /
+wasmtest / tcctest / dirpacktest / fspermtest / oomtest /
+storagekilltest). Duo kernel builds clean.
+
+**Stage 3.5 — Go's standard `os` package on fsd.** The stdlib `os` now
+operates on racccoon's filesystem; the only racccoon-specific line in a
+program is a blank import (`import _ "racccoon.local/goport/racccoon"`).
+
+- `lib/go/racccoon.patch` (4 files, ~255 lines, applied to the tamago-go
+  tree by `scripts/setup_tamago.sh`, in-repo like `lib/tcc/racccoon.patch`):
+  an optional `runtime/goos.FS` `FSHook`. When set, `syscall`'s path
+  ops (`Open`/`Read`/`Write`/`Seek`/`Stat`/`Mkdir`/`Unlink`/`Rename`/
+  `ReadDirent`/`Getwd`/`Chdir`) route to it instead of `fs_tamago.go`'s
+  in-memory fs. `nil` = stock tamago, so the patch is inert otherwise.
+- `go/racccoon/osbridge.go` installs the fsd backend in `init`; handles
+  are a small path table (fsd has no server fds); errors map best-effort
+  (`ENOENT` for a failed resolve so `os.IsNotExist` works, `EIO`
+  otherwise).
+- `os.Args`: `CPUInit` (asm) stashes the exec-ABI argc + argv blob;
+  `go/goos`'s `init` parses them and `//go:linkname`-replaces the
+  runtime's hardcoded `{"tamago"}` `argslice` before `os` init reads it.
+  `os.Args[0]` is a synthetic `"go"` (the c3 exec ABI carries no
+  argv[0]).
+
+`go/cmd/gostage35` (`gostage35test`) — `os.ReadFile` / `os.Stat` /
+`os.Open`+`io.ReadAll` / `Seek` / `ReadAt`, `os.IsNotExist`, `os.ReadDir`
+(incl. the 60-entry paginated dir — the dirent synthesis), `os.WriteFile`
+/ `os.Create` / O_TRUNC, `os.Mkdir` / `os.Rename` / `os.Remove` /
+`os.RemoveAll`, `os.Getwd`, `os.Args`. 26/26 pass on racccoon in QEMU;
+`e2fsck -fn` clean. Regressions green (all the go tests + chmod / wasm /
+tcc / dirpack / fsperm / oom / fsdkill). Duo builds clean.
+
+Note: importing `go/racccoon` at all now requires the patched
+toolchain (`osbridge.go` references `goos.FSHook`) — so
+`scripts/setup_tamago.sh` (clone + patch + `make.bash`) is THE setup
+path, and `build_go.sh` warns if `$TAMAGO`'s tree looks unpatched.
+
+Next: Stage 4 — the Go toolchain self-hosting on the JH7110. A
+multi-session effort (`compile` alone is ~20 MiB): 4.0 raise the exec
+caps + speed the fsd read loop, 4.1 `os/exec` → `rfork`+`SYS_EXEC`, 4.2
+`go tool compile` on racccoon, 4.3 `link`, 4.4 the `go` command. See
+docs/go-port-plan.md; the `GOOS=racccoon` rename probably lands by 4.2.
+
+---
+
+## 2026-09-01 — Go: self-installing fsd backend + Stage 4.0 exec headroom
+
+Stage 3.5's fsd backend moved out of `go/racccoon` (a blank import) and
+into `runtime/goos` itself (`go/goos/racccoon_fs.go`, the GOOSPKG
+overlay), where an `init()` installs it. So **every** racccoon Go
+binary now gets `os.*` on the real filesystem with no import of its
+own — which is what `cmd/compile` / `cmd/link` need for Stage 4 (a
+stdlib command can't blank-import a repo module). The `FSHook` contract
+became errno ints instead of `error` (`runtime/goos` is imported by
+`runtime` and must not pull in `errors`); `fs_racccoon.go` maps them to
+`syscall.Errno`. The handle table lost its `sync.Mutex` (no `sync` from
+`runtime/goos`; GOMAXPROCS=1 means nothing yields mid-op). `lib/go/
+racccoon.patch` is now 5 files. `go/racccoon` is a thin typed layer
+over `os` (kept for `gostage3`). `gostage35` dropped its blank import
+entirely — nothing racccoon-specific in it now.
+
+**Stage 4.0 (QEMU):** `board::EXEC_MAX_IMAGE_SIZE` 4 → 32 MiB — a
+stripped `GOOS=tamago cmd/compile` is **23 MiB** (it *builds* for
+tamago/riscv64, ET_EXEC, 3 PT_LOAD, the existing racccoon ELF loader
+takes it structurally). The staging arrays it sizes grow to ~96 KiB
+BSS; `gotest` still passes with the bigger cap. The JH7110 board gets
+the same bump. Not yet done: the `exec()` fsd read loop is 1124
+bytes/IPC RTT, so reading a 23 MiB binary is ~20k round trips (tens of
+seconds on QEMU) — a bulk-read verb or right-sized exec buffer is the
+next optimisation.
+
+`build_go.sh` now also builds stdlib command paths (`build_go.sh
+cmd/compile`) and links with `-s -w` to keep the big binaries under the
+cap. Regressions + the go tests still green.
+
+**Stage 4.2 — `go tool compile` runs on racccoon, first try.** Cross-built
+(`build_go.sh cmd/compile`, no wrapper — the self-installing backend
+means a stdlib command gets `os.*` for free) to a 22 MiB stripped
+binary. On a one-off bigger scratch ext2 image (the committed QEMU
+image is only 16 MiB — real disk sizing is a 4.3+ decision):
+
+- `/bin/go-compile` with no args printed the compiler's actual `-h`
+  usage text (~200 real flags) — the 22 MiB binary loads, the runtime
+  + GC + heap arena come up, `os.Args`/flag parsing works.
+- `/bin/go-compile -p p -o /p.o -lang=go1.24 -nolocalimports -complete
+  /tp.go` against a real two-function `.go` file → **exit 0**, ~30–40 s
+  wall (mostly fixed compiler-startup cost). Pulled `/p.o` off the
+  image and inspected it on the host: a genuine `go object tamago
+  riscv64 go1.27.0` archive with correct `gclocals`/`arginfo`/type
+  metadata. `e2fsck -fn` clean.
+
+No host-assumption fixes were needed anywhere in the chain —
+`os.Open`/`ReadFile` on the source, the full parser/type-checker/SSA/
+codegen running under `GOMAXPROCS=1` on the cooperative scheduler,
+`os.Create`/`Write` on the output all just worked. This was expected to
+be where Stage 4's real debugging starts; instead it validated the
+whole 3.5/4.0 foundation end to end on the first attempt.
+
+Next: 4.3 `go tool link` (needs `runtime.a` + the other stdlib archives
+cross-built and an `importcfg` — real setup, unlike 4.2's single file),
+then 4.1's `os/exec` and 4.4 the `go` command. Real disk sizing (the
+16 MiB QEMU image can't hold `compile` + a stdlib tree) is a decision
+point before 4.3 lands for real — likely JH7110/real-hardware territory.
+
+---
+
 ## 2026-09-01 — `chmod` / `chown` (roadmap §2 closeout)
 
 Closes the last non-"much later" item of the Plan 9 user model: files

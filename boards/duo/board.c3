@@ -78,6 +78,12 @@ const uptr PLIC_CLAIM         = PLIC_BASE + 0x200004 + PLIC_S_CONTEXT * 0x1000;
 const uptr PLIC_PRIORITY_PAGE = PLIC_PRIORITY_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
 const uptr PLIC_ENABLE_PAGE   = PLIC_ENABLE_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
 const uptr PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uptr)~(kernel::PAGE_SIZE - 1);
+// The Duo identity-maps the PLIC (it's at 0x70000000, far above any
+// 16 MiB Duo heap) — _PHYS_PAGE == _PAGE. The QEMU board aliases them
+// apart; see boards/qemu/board.c3's PLIC_BASE comment.
+const uptr PLIC_PRIORITY_PHYS_PAGE = PLIC_PRIORITY_PAGE;
+const uptr PLIC_ENABLE_PHYS_PAGE   = PLIC_ENABLE_PAGE;
+const uptr PLIC_CLAIM_PHYS_PAGE    = PLIC_CLAIM_PAGE;
 
 // SDHCI-compliant SD controller (cvitek,cv180x-sd), sourced from
 // duo-buildroot-sdk's own U-Boot driver (drivers/mmc/cvitek/sdhci-cv180x.c)
@@ -105,6 +111,25 @@ const bool INTERRUPT_DRIVEN_SD = true;
 // `stimecmp` for a real timer interrupt (see entry.c3's enable_timer_
 // interrupts/arm_timer).
 const ulong TIMEBASE_HZ = 25000000;
+
+// SMP: forced to 1. The Milk-V Duo's SoC has a second C906 core, but it
+// has no MMU (it's the "small" core, for RTOS/Arduino-style use) and is
+// never a racccoon target — see docs/devlog.md. src/smp.c3's
+// smp_start_secondaries() is a no-op at this value.
+const uint SMP_MAX_HARTS = 1;
+
+// Largest image SYS_EXEC will install (src/entry.c3's EXEC_MAX_IMAGE_SIZE
+// and the staging arrays it sizes). 1 MiB on the Duo — racccoon's own
+// binaries are 70-105 KiB and a native TinyCC (roadmap §7) is ~640 KiB,
+// so 1 MiB covers everything this 64 MiB board runs. QEMU/JH7110 raise
+// it to 4 MiB for the Go port (boards/qemu/board.c3).
+const EXEC_MAX_IMAGE_SIZE = 1048576;
+
+// Per-process SYS_MAP ceiling (src/entry.c3's HEAP_MAX_BYTES). 16 MiB on
+// the Duo — generous for a wasm linear memory and keeps PROCS_MAX
+// processes all maxing out under the 64 MiB DRAM pool. QEMU/JH7110 raise
+// it (boards/qemu/board.c3) for the Go port.
+const uptr HEAP_MAX_BYTES = 16 * 1024 * 1024;
 
 // One-time SD pad/power/clock bring-up (see user/sdd.c3's sdd_init) needs
 // three more, separate MMIO pages besides SD_MMIO_BASE itself — none of

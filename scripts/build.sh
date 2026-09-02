@@ -12,6 +12,21 @@ fi
 LLC=${LLC:-llc}
 LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
 
+# ext2_seed_tree <hostdir> <destdir-on-image> <image>
+# Recursively copy a host directory into an ext2 image via debugfs
+# (mkdir each subdir, write each file). Used for the on-device GOROOT +
+# build cache (Stage 4.4) — hundreds of small files.
+ext2_seed_tree() {
+  local src="$1" dst="$2" img="$3"
+  debugfs -w -R "mkdir $dst" "$img" > /dev/null 2>&1 || true
+  ( cd "$src" && find . -mindepth 1 -type d ) | sed 's#^\./##' | while read -r d; do
+    debugfs -w -R "mkdir $dst/$d" "$img" > /dev/null 2>&1
+  done
+  ( cd "$src" && find . -type f ) | sed 's#^\./##' | while read -r f; do
+    debugfs -w -R "write $src/$f $dst/$f" "$img" > /dev/null 2>&1
+  done
+}
+
 (
   cd "$(dirname "$0")/.."
 
@@ -51,6 +66,38 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
     fi
     rm -f "$name.wasm.o" "build/wasm/$name.wasm.o" 2>/dev/null
   done
+
+  # Go programs for racccoon (go/cmd/*, via the GOOS=tamago toolchain).
+  # No-op unless TAMAGO points at a tamago-go/bin/go — build_go.sh says
+  # so and exits 0. Seeded as /bin/go-<name> onto the images below;
+  # gotest / gostage{2,3}test (shell_test.c3) skip cleanly if the binary
+  # isn't there, same as tcctest without /bin/tcc. See docs/go-port-plan.md.
+  rm -rf build/go
+  if [ -n "${TAMAGO:-}" ]; then
+    for gd in go/cmd/*/; do
+      [ -e "$gd" ] || continue
+      bash scripts/build_go.sh "$(basename "$gd")" || true
+    done
+
+    # Stage 4 (docs/go-port-plan.md): racccoon's own go tool compile /
+    # go tool link, plus the stdlib object closure they need to link a
+    # real program (build_go_toolchain.sh — cross-built on the host,
+    # same bootstrapping idea as lib/tcc's prebuilt crt1.o/libtcc1.a).
+    # Seeded below under /lib/go/ and /bin/go-{compile,link}.
+    bash scripts/build_go.sh cmd/compile || true
+    bash scripts/build_go.sh cmd/link || true
+    bash scripts/build_go_toolchain.sh || true
+
+    # Stage 4.4: the `go` command runs on racccoon — `go version` /
+    # `go env`, and `go build` (docs/go-port-plan.md). `go.elf` bakes
+    # GOROOT=/goroot; cmd/asm joins compile/link as the third tool;
+    # build_go_goroot.sh assembles /goroot (tools, headers, stdlib
+    # source closure, runtime/goos overlay) + a prepopulated build
+    # cache. All seeded below.
+    bash scripts/build_go.sh cmd/go || true
+    bash scripts/build_go.sh cmd/asm || true
+    bash scripts/build_go_goroot.sh || true
+  fi
 
   # The disk images built below are pristine masters — every one is
   # rm -f'd and rebuilt from scratch on each run, so re-running this
@@ -117,6 +164,13 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # replacement for bin/echod — elftest execs this one specifically,
   # runtest/argvtest/pathtest keep using the flat binary unchanged.
   mcopy -i build/disk.img build/user/echod.elf ::bin/echod.elf
+  # Stage 4's go-compile / go-link are too big for this small FAT32
+  # image (and only meaningfully testable next to the toolchain
+  # closure seeded onto disk_ext2.img) — skip them here.
+  for g in build/go/*.elf; do
+    case "$(basename "$g")" in compile.elf|link.elf|go.elf|gostage*.elf) continue ;; esac
+    [ -e "$g" ] && mcopy -i build/disk.img "$g" "::bin/go-$(basename "$g" .elf)"
+  done
   # bin/{cat,ls,write,rm,mkdir,mv} — the real, argv-taking utilities
   # shell.c3's own /bin/ fallback branch execs (see docs/devlog.md),
   # replacing what used to be hardcoded shell builtins.
@@ -157,12 +211,22 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # (part of e2fsprogs) rather than a loop-mount, so this needs no root
   # either. `-b 1024` keeps the block size comfortably under
   # user/fs/ext2.c3's own EXT2_MAX_BLOCK_SIZE — not required for
-  # correctness on a small image (mke2fs would pick 1024 by default
-  # here anyway), just explicit. Reuses the name "hello.txt" (with
-  # distinct content from disk/hello.txt) so the shell's existing
-  # readfile command exercises either filesystem unchanged.
+  # correctness (mke2fs would pick 1024 by default here anyway), just
+  # explicit. Reuses the name "hello.txt" (with distinct content from
+  # disk/hello.txt) so the shell's existing readfile command exercises
+  # either filesystem unchanged.
+  #
+  # 256 MiB, not the original 16 — the go-port Stage 4 toolchain
+  # binaries (go-compile ~22 MiB, go-link ~6 MiB) plus their stdlib
+  # object closure (~15 MiB, seeded below) no longer fit in 16 MiB.
+  # 262144 1-KiB blocks / 8192 blocks-per-group = 32 groups, nowhere
+  # near ext2.c3's own EXT2_MAX_GROUPS (2048) ceiling.
   rm -f build/disk_ext2.img
-  dd if=/dev/zero of=build/disk_ext2.img bs=1M count=16 status=none
+  # 448 MiB — the Stage 4.4 on-device GOROOT (stdlib source closure +
+  # tool binaries) plus a prepopulated build cache is ~60 MiB on top of
+  # the Stage 4.3 toolchain payload. 458752 1-KiB blocks / 8192 per
+  # group = 56 groups, far under ext2.c3's EXT2_MAX_GROUPS (2048).
+  dd if=/dev/zero of=build/disk_ext2.img bs=1M count=448 status=none
   mke2fs -q -F -b 1024 build/disk_ext2.img
   debugfs -w -R "write disk-ext2/hello.txt hello.txt" build/disk_ext2.img > /dev/null
   # disk-ext2/subdir/ exercises ext2.c3's read-only subdirectory support
@@ -196,6 +260,54 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "sif adm/secret mode 0100600" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_ext2.img > /dev/null
+  for g in build/go/*.elf; do
+    # go.elf is the `go` command itself — seeded as /bin/go with its
+    # /goroot below, not as /bin/go-go.
+    case "$(basename "$g")" in go.elf) continue ;; esac
+    [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_ext2.img > /dev/null
+  done
+  # Stage 4.4 (docs/go-port-plan.md): `/bin/go` + the on-device GOROOT
+  # (build_go_goroot.sh — tools, headers, the stdlib source closure, the
+  # racccoon runtime/goos overlay) + a prepopulated /gocache so
+  # `go build` only compiles runtime / runtime/goos / the user's main
+  # on-device, then links. /gomodcache is the (empty) module cache;
+  # /gomod is a one-file module for gobuildtest.
+  if [ -d build/go/goroot ]; then
+    debugfs -w -R "write build/go/go.elf bin/go" build/disk_ext2.img > /dev/null
+    ext2_seed_tree build/go/goroot goroot build/disk_ext2.img
+    ext2_seed_tree build/go/gocache gocache build/disk_ext2.img
+    debugfs -w -R "mkdir gomodcache" build/disk_ext2.img > /dev/null
+    debugfs -w -R "mkdir gomod" build/disk_ext2.img > /dev/null
+    printf 'module gobuildtest\n\ngo 1.27\n' > build/go/gomod_go.mod
+    cat > build/go/gomod_main.go <<'GOEOF'
+package main
+
+func main() {
+	println("hello from go build on racccoon")
+	s := 0
+	for i := 1; i <= 100; i++ {
+		s += i
+	}
+	println("sum 1..100 =", s)
+}
+GOEOF
+    debugfs -w -R "write build/go/gomod_go.mod gomod/go.mod" build/disk_ext2.img > /dev/null
+    debugfs -w -R "write build/go/gomod_main.go gomod/main.go" build/disk_ext2.img > /dev/null
+  fi
+  # Stage 4 (docs/go-port-plan.md): the stdlib object closure + importcfg
+  # go-compile/go-link need to build+link go/cmd/hello entirely on-device
+  # (build_go_toolchain.sh). /lib/go/pkg/*.a, /lib/go/importcfg{,.link},
+  # /hello.go. No-op (dir doesn't exist) without TAMAGO.
+  if [ -d build/go/toolchain ]; then
+    debugfs -w -R "mkdir lib/go" build/disk_ext2.img > /dev/null
+    debugfs -w -R "mkdir lib/go/pkg" build/disk_ext2.img > /dev/null
+    for a in build/go/toolchain/pkg/*.a; do
+      [ -e "$a" ] && debugfs -w -R "write $a lib/go/pkg/$(basename "$a")" build/disk_ext2.img > /dev/null
+    done
+    debugfs -w -R "write build/go/toolchain/importcfg lib/go/importcfg" build/disk_ext2.img > /dev/null
+    debugfs -w -R "write build/go/toolchain/importcfg.link lib/go/importcfg.link" build/disk_ext2.img > /dev/null
+    debugfs -w -R "write build/go/toolchain/hello.go hello.go" build/disk_ext2.img > /dev/null
+  fi
   for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_ext2.img > /dev/null
   done
@@ -266,6 +378,11 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "write build/adm_users_fixture adm/users" build/disk_dual_root_part.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_root_part.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_root_part.img > /dev/null
+  # Same exclusion as the FAT32 image above — too big for this partition.
+  for g in build/go/*.elf; do
+    case "$(basename "$g")" in compile.elf|link.elf|go.elf|gostage*.elf) continue ;; esac
+    [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_dual_root_part.img > /dev/null
+  done
   for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_root_part.img > /dev/null
   done
@@ -289,6 +406,11 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   debugfs -w -R "mkdir bin" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.bin bin/echod" build/disk_dual_ext2_part.img > /dev/null
   debugfs -w -R "write build/user/echod.elf bin/echod.elf" build/disk_dual_ext2_part.img > /dev/null
+  # Same exclusion as the FAT32 image above — too big for this partition.
+  for g in build/go/*.elf; do
+    case "$(basename "$g")" in compile.elf|link.elf|go.elf|gostage*.elf) continue ;; esac
+    [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_dual_ext2_part.img > /dev/null
+  done
   for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_ext2_part.img > /dev/null
   done

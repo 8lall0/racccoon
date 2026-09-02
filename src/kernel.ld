@@ -53,6 +53,28 @@ SECTIONS {
 
     . = ALIGN(4096);
     __free_ram = .;
-    . += 64 * 1024 * 1024; /* 64MB */
+    . += 1792 * 1024 * 1024; /* 1792MB. QEMU virt is launched with -m 2G
+                               (scripts/launch64*.sh); kernel links at
+                               DRAM_BASE+2MB, __free_ram_end lands ~0xF0400000,
+                               ~250MB clear under the 0x100000000 top of a
+                               2GB region — room for QEMU/OpenSBI's FDT and
+                               reservations. History: 64MB -> 768MB (-m 1G,
+                               eager Go arena) -> here. The on-device `go`
+                               toolchain (a ~448MB `compile` + `link`, plus
+                               `go` holding its own heap live) overcommitted
+                               768MB and got OOM-killed; 1792MB gives it real
+                               headroom. Boot at -m 2G with this value was
+                               already proven (docs/go-port-plan.md). Must be
+                               <= src/allocation.c3's RAM_SIZE (the
+                               page-bitmap ceiling, 1920MB); the two need
+                               not be equal — ram_page_count() caps the
+                               allocator to whichever is smaller. The Duo's
+                               boards/duo/kernel.ld pins its own to the real
+                               64MB DRAM; the JH7110 / Orange Pi RV board
+                               reserves close to the 1920MB ceiling out of
+                               its 2GB. The kernel boots fine at QEMU -m 2G
+                               / 4G / 8G — the old "-m >= 2G won't boot"
+                               blocker cleared with the Stage 2 allocator
+                               rework; see docs/go-port-plan.md. */
     __free_ram_end = .;
 }

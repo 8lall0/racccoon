@@ -4,12 +4,26 @@ import panic;
 
 const PAGE_SIZE = 4096;
 
-// Must match kernel.ld's `__free_ram` reservation (`. += 64 * 1024 * 1024;`).
-// __free_ram/__free_ram_end are linker symbols — only their *addresses* are
-// known, and only at link time — so the bitmap's size can't be derived from
-// them directly; it needs its own compile-time-constant mirror of the same
-// number.
-const RAM_SIZE = 64 * 1024 * 1024;
+// The page bitmap's ceiling — it must be >= the largest `__free_ram`
+// reservation any board's kernel.ld makes, NOT necessarily equal to any
+// one of them. __free_ram/__free_ram_end are linker symbols — only their
+// *addresses* are known, and only at link time — so the bitmap's size
+// can't be derived from them directly; it needs its own compile-time
+// constant, and it's one binary's constant shared by every board (a
+// per-board `board::RAM_SIZE` would circular-import board <-> kernel).
+// ram_page_count() caps the allocator to each board's *real* linker span,
+// so a board whose pool is smaller than this just leaves the bitmap's
+// tail words unused: QEMU's src/kernel.ld reserves 1792 MiB, the Duo's
+// ~59 MiB, the JH7110 / Orange Pi RV up to this ceiling out of its 2 GiB
+// DRAM (docs/opi-rv-plan.md, docs/go-port-plan.md — Go's toolchain wants
+// the headroom). 1920 MiB / 4 KiB / 8 = 60 KiB of BSS, negligible even on
+// the 64 MiB Duo. The medany code model the kernel is built with
+// (scripts/build.sh, llc -code-model=medium) sets this ceiling: every
+// global reference must land within +/-2 GiB of the kernel text PC, so
+// __free_ram_end can't run much past ~1.9 GiB from a kernel linked at
+// DRAM_BASE + 2 MiB regardless of how much DRAM the board has. Kept just
+// under 2^31 so the constant stays a plain 32-bit int.
+const RAM_SIZE = 1920 * 1024 * 1024;
 
 const BITS_PER_WORD = 32;
 const TOTAL_PAGES   = RAM_SIZE / PAGE_SIZE;
@@ -21,11 +35,12 @@ uint[TOTAL_PAGES / BITS_PER_WORD] bitmap;
 
 // The actual number of allocatable pages: the real distance between the
 // linker's __free_ram and __free_ram_end, in pages, capped at
-// TOTAL_PAGES (the bitmap's size). On QEMU src/kernel.ld makes that
-// span exactly RAM_SIZE; on the Duo boards/duo/kernel.ld pins
-// __free_ram_end to the real 64 MiB DRAM window minus the kernel image,
-// the stack, and the reserved top 768 KiB — ~59 MiB, ~1280 pages short
-// of TOTAL_PAGES. Scanning past this hands out addresses beyond
+// TOTAL_PAGES (the bitmap's size). QEMU's src/kernel.ld reserves
+// 1792 MiB, still under TOTAL_PAGES, so a few bitmap tail words go
+// unused there; the
+// Duo's boards/duo/kernel.ld pins __free_ram_end to the real 64 MiB DRAM
+// window minus the kernel image, the stack, and the reserved top 768 KiB
+// — ~59 MiB. Scanning past the real span hands out addresses beyond
 // physical DRAM; the zero-fill in try_alloc_pages then faults → panic.
 // Only ever hit by something that genuinely exhausts RAM (oomtest).
 fn uint ram_page_count()
@@ -76,13 +91,23 @@ fn uint free_page_count()
 // Addresses are uptr (pointer-sized), not uint: on RV64 a plain uint is
 // only 32 bits, too narrow to hold a real physical address once pointers
 // are 64-bit — see docs/devlog.md for the RV64 port this was widened for.
-fn uptr try_alloc_pages(uint n)
+// Allocation rover: alloc_scan starts here, not at page 0. Without it a
+// run of sequential single-page allocs — SYS_MAP's eager per-page loop
+// for a Go process mapping a ~64 MiB heap arena — is O(n²): the k-th
+// alloc rescans the k already-set bits from the bottom. With the rover
+// it's amortized O(1). free_page() lowers it so reclaimed space is
+// reused. Same technique as fat32.c3's fat32_alloc_hint.
+uint alloc_rover = 0;
+
+// Claim the first free run of `n` contiguous pages in [lo, hi) (a run
+// never crosses hi). Sets the bits, zero-fills, advances alloc_rover
+// past the run, returns the physical base — or 0 if no such run.
+fn uptr alloc_scan(uint lo, uint hi, uint n)
 {
 	uint run_start = 0;
 	uint run_len   = 0;
-	uint limit     = ram_page_count();
 
-	for (uint i = 0; i < limit; i++)
+	for (uint i = lo; i < hi; i++)
 	{
 		if (bit_is_set(i))
 		{
@@ -102,6 +127,7 @@ fn uptr try_alloc_pages(uint n)
 			{
 				set_bit(j);
 			}
+			alloc_rover = i + 1;
 
 			uptr paddr = (uptr)&__free_ram + (uptr)(run_start * PAGE_SIZE);
 			mem::set((void*)paddr, 0, (sz)(n * PAGE_SIZE));
@@ -110,6 +136,21 @@ fn uptr try_alloc_pages(uint n)
 	}
 
 	return 0;
+}
+
+fn uptr try_alloc_pages(uint n)
+{
+	uint limit = ram_page_count();
+	if (alloc_rover >= limit) alloc_rover = 0;
+
+	// Scan from the rover to the end, then wrap once to cover
+	// [0, rover) — a page freed below the rover is still found.
+	uptr paddr = alloc_scan(alloc_rover, limit, n);
+	if (paddr == 0 && alloc_rover > 0)
+	{
+		paddr = alloc_scan(0, alloc_rover, n);
+	}
+	return paddr;
 }
 
 // Infallible alloc — panics on exhaustion. For the boot-time paths
@@ -150,4 +191,8 @@ fn void free_pages(uptr paddr, uint n)
 	{
 		clear_bit(j);
 	}
+	// Pull the rover back so the just-freed pages are reused before the
+	// scan runs off the end again (a Go process exiting frees its whole
+	// arena — the next one should land right back in it).
+	if (start_idx < alloc_rover) alloc_rover = start_idx;
 }

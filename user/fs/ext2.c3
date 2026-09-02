@@ -484,9 +484,16 @@ fn bool ext2_find_in_root(char* name, uint* out_inode, uint* out_entry_sector, u
 
 	uint name_len = ext2_strlen(name);
 
-	for (uint b = 0; b < 12; b++)
+	// Indirect blocks too — see ext2_find_in_dir / ext2_list.
+	uint root_blocks = (root.size + ext2_block_size - 1) / ext2_block_size;
+	Ext2_block_cache rcache @noinit;
+	rcache.leaf_block_num    = 0xFFFFFFFF;
+	rcache.mid_block_num     = 0xFFFFFFFF;
+	rcache.double_top_loaded = false;
+	rcache.triple_top_loaded = false;
+	for (uint b = 0; b < root_blocks; b++)
 	{
-		uint block = root.block[b];
+		uint block = ext2_resolve_block(&root, b, &rcache);
 		if (block == 0) continue; // sparse — unused direct pointer
 
 		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
@@ -557,9 +564,20 @@ fn bool ext2_find_in_dir(uint dir_inode_num, char* name, uint* out_inode, uint* 
 
 	uint name_len = ext2_strlen(name);
 
-	for (uint b = 0; b < 12; b++)
+	// Walk every data block, not just the 12 direct pointers — a
+	// directory with more than ~470 small entries (a seeded
+	// $GOROOT/src/runtime) spills into the indirect blocks, and a
+	// direct-only scan silently fails to find (hence stat/open/cat) any
+	// entry past that. Same fix as ext2_list.
+	uint dir_blocks = (dir.size + ext2_block_size - 1) / ext2_block_size;
+	Ext2_block_cache fcache @noinit;
+	fcache.leaf_block_num    = 0xFFFFFFFF;
+	fcache.mid_block_num     = 0xFFFFFFFF;
+	fcache.double_top_loaded = false;
+	fcache.triple_top_loaded = false;
+	for (uint b = 0; b < dir_blocks; b++)
 	{
-		uint block = dir.block[b];
+		uint block = ext2_resolve_block(&dir, b, &fcache);
 		if (block == 0) continue;
 
 		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
@@ -2322,9 +2340,19 @@ fn bool ext2_list(char* path, char* out_buf, int max_entries, uint start, int* o
 
 	int count = 0;
 	uint seen = 0;
-	for (uint b = 0; b < 12 && count < max_entries; b++)
+	// A directory's entries can spill past the 12 direct blocks into the
+	// indirect blocks (a $GOROOT/src/runtime with ~670 entries needs
+	// ~27 blocks) — walk every data block via ext2_resolve_block, same as
+	// ext2_read does for files, not just dir.block[0..11].
+	uint dir_blocks = (dir.size + ext2_block_size - 1) / ext2_block_size;
+	Ext2_block_cache lcache @noinit;
+	lcache.leaf_block_num    = 0xFFFFFFFF;
+	lcache.mid_block_num     = 0xFFFFFFFF;
+	lcache.double_top_loaded = false;
+	lcache.triple_top_loaded = false;
+	for (uint b = 0; b < dir_blocks && count < max_entries; b++)
 	{
-		uint block = dir.block[b];
+		uint block = ext2_resolve_block(&dir, b, &lcache);
 		if (block == 0) continue;
 
 		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;

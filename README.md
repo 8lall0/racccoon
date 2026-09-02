@@ -1,14 +1,23 @@
 # Racccoon
 
 Racccoon (yes, with three `c`s — for [C3](https://c3-lang.org/)) is a small
-microkernel for 64-bit RISC-V (`rv64imac`, integer-only — floating point is
-stubbed), written entirely in C3 with no libc.
+microkernel for 64-bit RISC-V (`rv64imafdc`, hardware floating point),
+written entirely in C3 with no libc.
 
 It began as a walk through [OS in 1,000 Lines](https://operating-system-in-1000-lines.vercel.app/en/)
 as an experiment in how far C3 can be pushed for kernel and bare-metal work.
 It has since grown well past 1,000 lines and past the tutorial: a preemptive
 microkernel with user-space drivers, a Plan 9-style IPC and namespace layer,
 three filesystems, a USB host stack, and a port to real hardware.
+
+> **This is a vibecoded experiment.** Almost all of it was written by an LLM
+> agent, at my direction, as a way to explore architectural choices — a
+> Plan 9-style microkernel, path-based (not fd-based) filesystem IPC,
+> everything-is-a-user-server, board abstraction as the only platform seam,
+> language toolchains (TinyCC, Go) self-hosting on top — and to see how a
+> from-scratch OS holds up under that workflow. It is not audited, not
+> hardened, and not meant for anything real. Treat the code as a sketch of
+> the ideas, not a reference implementation of them.
 
 ## Targets
 
@@ -94,8 +103,11 @@ docs/         devlog.md — a running log of every work session
 
 ## Status
 
-An active experiment, not a product. Interfaces change freely, there is no
-stable ABI, and "it boots on my Duo" is the bar for the hardware paths. The
-[devlog](docs/devlog.md) is the real record of what was done and why.
+An active experiment, not a product — see the note at the top. Interfaces
+change freely, there is no stable ABI, and "it boots on my Duo" is the bar for
+the hardware paths. Correctness is checked by a regression suite of shell
+builtins run in QEMU (and, for the hardware paths, on a real Duo), not by
+formal review. The [devlog](docs/devlog.md) is the real record of what was
+done and why — each entry is one agent session.
 
 MIT licensed.
