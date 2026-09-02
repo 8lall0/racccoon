@@ -4,6 +4,53 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-03 — Plan 9 /bin, part 1: namespace path rewriting
+
+Design doc `docs/bin-layout.md` first: no arch dir (both boards are
+riscv64; `/riscv64` reserved, not created), no `/sbin` (privilege is
+server checks + namespace, not a directory), `/bin` stays the whole
+search path, user builds go to `/usr/$user/bin`, and **`/bin` becomes a
+union** — `bind -ac /usr/$user/bin /bin` at login. This entry is the
+first of four steps toward that.
+
+**`Mount` (`src/process.c3`) gains `target` + `flags`.** A binding was
+`{prefix -> server_pid}`; now it can also rewrite the path — after
+`prefix` is stripped, `target` is prepended before the server sees the
+remainder. `""` target = identity = the exact old behaviour, which is
+every boot-seeded mount. `NS_MOUNTS_MAX` 8 -> 16 (union members need the
+room), `NS_TARGET_MAX` 64.
+
+**`SYS_NS_TRANSLATE` (52).** `(path, member, out, cap)` -> writes the
+server-relative path for union member `member` and returns the serving
+pid. `ns_translate_core` + an `ns_prefix_covers` helper that also
+matches a path that *is* the mount point (`ls /bin` consults a
+`bind ... /bin/`), and re-inserts the `/` between a non-empty target
+and the remainder. The union-aware successor to
+`SYS_NS_RESOLVE` + caller-side strip.
+
+**`SYS_NS_BIND` gains a flags arg** (bit 0 = `-a`, bit 2 = `-c`) and
+captures the rewrite target via `ns_translate_core`, so binds compose
+(`bind` onto an already-bound prefix carries its target forward). Plain
+`bind` still replaces; `-a`/`-c` land in P2's union walk.
+
+**`user/user.c3`:** `ns_translate()` / `ns_bind_flags()` wrappers, a
+`fs_server_for()` shorthand, and all ~12 `fs_*` wrappers migrated off
+`ns_resolve` + manual `&path[prefix_len]`. `ns_resolve` stays for the
+pid-only callers (`p9_call_path`, `fs_cache_stats`).
+
+Verified QEMU `-m 2G`: `bind /subdir /aliased` then cat / ls / `echo >`
+write-through all hit `/subdir`; a `/tmp/bd` <-> `/scratch` bind round
+trips both ways; binds compose. Full battery green — `p9*` `nstest`
+`mounttest` `chmodtest` `permtest` `fspermtest` `sandboxtest`
+`maptest` `runtest` `elftest` `wasmtest` `bigreadtest` `fscachestat`
+`gostage3` `gostage35` `gostage41` on ext2 + dual. (`tcctest` still the
+pre-existing `\x17` failure.)
+
+Next: P2 — a mount point holds an ordered member list, `bind -a` /
+`bind -b`, `fs_list` merges the union, reads walk members first-hit.
+
+---
+
 ## 2026-09-02 — IPC: 8 KiB messages, multi-sector diskd, conditional FP save
 
 Three of the four IPC follow-ups the read-cache entry flagged — #1, #2,

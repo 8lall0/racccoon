@@ -63,6 +63,7 @@ const int SYS_STDIN_ISATTY  = 48; // 1 = console, 0 = pipe — see src/entry.c3'
 const int SYS_TIMEBASE      = 49; // the `time` CSR tick rate (Hz) — see src/entry.c3's case
 const int SYS_GETPID        = 50; // the caller's own pid — see src/entry.c3's case
 const int SYS_EXEC_MAX      = 51; // board::EXEC_MAX_IMAGE_SIZE — the largest image SYS_EXEC will install (varies by board: 1 MiB Duo, 4 MiB QEMU/JH7110) — see src/entry.c3's case
+const int SYS_NS_TRANSLATE  = 52; // union-aware path resolution — see src/entry.c3's case + ns_translate() below
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -772,8 +773,35 @@ fn int ns_list(char* out_buf, int max_records) @export("ns_list") {
 // path instead of a posted srv name. Same per-process, exact-prefix,
 // idempotent semantics. -1 if `source_path` resolves nowhere or the
 // namespace is full. Backs the shell's `bind` builtin.
+// flags: 0 = replace whatever's at new_prefix; 1 = `bind -a` (add as a
+// union member searched after the existing ones); 4 = `bind -c` (this
+// member receives file/dir creation). Combine 1|4 for `bind -ac`.
+fn int ns_bind_flags(char* new_prefix, char* source_path, uint flags) @export("ns_bind_flags") {
+    return syscall4(SYS_NS_BIND, (long)new_prefix, (long)source_path, (long)flags, 0);
+}
 fn int ns_bind(char* new_prefix, char* source_path) @export("ns_bind") {
-    return syscall(SYS_NS_BIND, (long)new_prefix, (long)source_path, 0);
+    return ns_bind_flags(new_prefix, source_path, 0);
+}
+
+// Union-aware path resolution: writes the server-relative path for
+// `member` (0 = first/highest-priority binding at the longest matching
+// prefix; higher = the `bind -a` extras, in bind order) into `out`
+// (capacity `out_max`), returns the serving pid. -1 = nothing matched,
+// or `member` is past the last one, or the rewrite didn't fit.
+// Supersedes ns_resolve()+manual-strip in the fs_* wrappers: it also
+// applies any `bind` path rewrite. member 0 on a plain identity mount
+// reproduces the old behaviour byte for byte.
+fn int ns_translate(char* path, int member, char* out, int out_max) @export("ns_translate") {
+    return syscall4(SYS_NS_TRANSLATE, (long)path, (long)member, (long)out, (long)out_max);
+}
+
+// The member-0 shorthand every single-target fs_* wrapper wants: resolve
+// an already-absolute path to (serving pid, server-relative path). `out`
+// must be >= FS_XLATE_MAX bytes. -1 = resolves nowhere. fs_list() and the
+// exec search walk higher union members with ns_translate() directly.
+const int FS_XLATE_MAX = 160;
+fn int fs_server_for(char* abspath, char* out) {
+    return ns_translate(abspath, 0, out, FS_XLATE_MAX);
 }
 
 // Map `nbytes` (rounded up to whole pages) of fresh zero-filled RW
@@ -1356,18 +1384,17 @@ const int FS_LIST_PAGE_MAX = (int)((FS_MSG_MAX - 4) / FS_LIST_ENTRY_SIZE);
 
 fn int fs_read(char* filename, char* buf, int len) @export("fs_read") {
     char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
-    uint prefix_len = 0;
-    int fsd_pid = ns_resolve(filename, &prefix_len);
+    // ns_translate strips the matched mount's own prefix and applies any
+    // `bind` path rewrite before the name ever reaches the wire — the ""
+    // catch-all is prefix "" / target "" so this is byte-for-byte the old
+    // behaviour there, but a non-empty prefix (the second fsd's "/mnt/fs2/")
+    // or a rewriting bind ("/bin" -> "/usr/glenda/bin") is now handled in
+    // one place. fsd.c3's backends still only ever see bare names (see
+    // user/fsd.c3's header comment — this is where that guarantee holds).
+    char[FS_XLATE_MAX] _sb @noinit;
+    int fsd_pid = fs_server_for(filename, &_sb[0]);
     if (fsd_pid < 0) return -1;
-    // Strip the matched mount's own prefix before it ever reaches the
-    // wire — the "" catch-all's own prefix length is always 0 (a no-op
-    // here, same behavior as before this existed), but a non-empty
-    // prefix like the second fsd's "/2/" (src/process.c3) would
-    // otherwise leak into the plain, bare filename fsd.c3's backends
-    // expect (see user/fsd.c3's own header comment — every backend only
-    // ever deals in bare names, this is the one place that guarantee
-    // gets upheld).
-    char* stripped = &filename[prefix_len];
+    char* stripped = &_sb[0];
 
     char[FS_MSG_MAX] req @noinit;
     int i = 0;
@@ -1400,10 +1427,10 @@ fn int fs_read(char* filename, char* buf, int len) @export("fs_read") {
 // relies on this to know when to stop looping.
 fn int fs_read_at(char* filename, char* buf, int len, uint offset) @export("fs_read_at") {
     char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
-    uint prefix_len = 0;
-    int fsd_pid = ns_resolve(filename, &prefix_len);
+    char[FS_XLATE_MAX] _sb @noinit;
+    int fsd_pid = fs_server_for(filename, &_sb[0]);
     if (fsd_pid < 0) return -1;
-    char* stripped = &filename[prefix_len];
+    char* stripped = &_sb[0];
 
     char[FS_MSG_MAX] req @noinit;
     int i = 0;
@@ -1433,11 +1460,12 @@ fn int fs_read_at(char* filename, char* buf, int len, uint offset) @export("fs_r
 
 fn int fs_write(char* filename, char* buf, int len) @export("fs_write") {
     char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
-    uint prefix_len = 0;
-    int fsd_pid = ns_resolve(filename, &prefix_len);
+    char[FS_XLATE_MAX] _sb @noinit;
+    int fsd_pid = fs_server_for(filename, &_sb[0]);
     if (fsd_pid < 0) return -1;
-    // See fs_read's own comment on why this strips the matched prefix.
-    char* stripped = &filename[prefix_len];
+    // ns_translate strips the mount prefix + applies any bind rewrite;
+    // see fs_read's own comment.
+    char* stripped = &_sb[0];
 
     char[FS_MSG_MAX] req @noinit;
     int i = 0;
@@ -1473,10 +1501,10 @@ fn int fs_write(char* filename, char* buf, int len) @export("fs_write") {
 // wire-format comment.
 fn int fs_write_at(char* filename, char* buf, int len, uint offset) @export("fs_write_at") {
     char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
-    uint prefix_len = 0;
-    int fsd_pid = ns_resolve(filename, &prefix_len);
+    char[FS_XLATE_MAX] _sb @noinit;
+    int fsd_pid = fs_server_for(filename, &_sb[0]);
     if (fsd_pid < 0) return -1;
-    char* stripped = &filename[prefix_len];
+    char* stripped = &_sb[0];
 
     char[FS_MSG_MAX] req @noinit;
     int i = 0;
@@ -1513,8 +1541,7 @@ fn int fs_write_at(char* filename, char* buf, int len, uint offset) @export("fs_
 // Resolves the fsd serving "/" (the primary/ext2 mount). Returns 0 on
 // success. Introspection only — see user/fs/fsd.c3's fs_cache_init.
 fn int fs_cache_stats(ulong* out_hits, ulong* out_misses) @export("fs_cache_stats") {
-    uint prefix_len = 0;
-    int fsd_pid = ns_resolve("/", &prefix_len);
+    int fsd_pid = ns_resolve("/", null);
     if (fsd_pid < 0) return -1;
     char[16] req @noinit;
     uint reply_verb = 0;
@@ -1528,10 +1555,10 @@ fn int fs_cache_stats(ulong* out_hits, ulong* out_misses) @export("fs_cache_stat
 
 fn int fs_stat(char* filename, uint* out_size, int* out_type) @export("fs_stat") {
     char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
-    uint prefix_len = 0;
-    int fsd_pid = ns_resolve(filename, &prefix_len);
+    char[FS_XLATE_MAX] _sb @noinit;
+    int fsd_pid = fs_server_for(filename, &_sb[0]);
     if (fsd_pid < 0) return -1;
-    char* stripped = &filename[prefix_len];
+    char* stripped = &_sb[0];
 
     char[FS_MSG_MAX] req @noinit;
     int i = 0;
@@ -1555,11 +1582,12 @@ fn int fs_stat(char* filename, uint* out_size, int* out_type) @export("fs_stat")
 
 fn int fs_delete_impl(char* filename, uint recursive) {
     char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
-    uint prefix_len = 0;
-    int fsd_pid = ns_resolve(filename, &prefix_len);
+    char[FS_XLATE_MAX] _sb @noinit;
+    int fsd_pid = fs_server_for(filename, &_sb[0]);
     if (fsd_pid < 0) return -1;
-    // See fs_read's own comment on why this strips the matched prefix.
-    char* stripped = &filename[prefix_len];
+    // ns_translate strips the mount prefix + applies any bind rewrite;
+    // see fs_read's own comment.
+    char* stripped = &_sb[0];
 
     char[FS_MSG_MAX] req @noinit;
     int i = 0;
@@ -1603,10 +1631,10 @@ fn int fs_delete_recursive(char* filename) @export("fs_delete_recursive") {
 // comment for each record's layout.
 fn int fs_list(char* dirname, char* out_buf, int max_entries) @export("fs_list") {
     char[100] _ap @noinit; fs_abspath(dirname, &_ap[0]); dirname = &_ap[0]; // cwd-relative -> absolute
-    uint prefix_len = 0;
-    int fsd_pid = ns_resolve(dirname, &prefix_len);
+    char[FS_XLATE_MAX] _sb @noinit;
+    int fsd_pid = fs_server_for(dirname, &_sb[0]);
     if (fsd_pid < 0) return -1;
-    char* stripped = &dirname[prefix_len];
+    char* stripped = &_sb[0];
 
     int total = 0;
     for (;;) {
@@ -1647,10 +1675,10 @@ fn int fs_list(char* dirname, char* out_buf, int max_entries) @export("fs_list")
 // on-disk state, no undo besides a subsequent fs_delete.
 fn int fs_mkdir(char* dirname) @export("fs_mkdir") {
     char[100] _ap @noinit; fs_abspath(dirname, &_ap[0]); dirname = &_ap[0]; // cwd-relative -> absolute
-    uint prefix_len = 0;
-    int fsd_pid = ns_resolve(dirname, &prefix_len);
+    char[FS_XLATE_MAX] _sb @noinit;
+    int fsd_pid = fs_server_for(dirname, &_sb[0]);
     if (fsd_pid < 0) return -1;
-    char* stripped = &dirname[prefix_len];
+    char* stripped = &_sb[0];
 
     char[FS_MSG_MAX] req @noinit;
     int i = 0;
@@ -1674,10 +1702,10 @@ fn int fs_mkdir(char* dirname) @export("fs_mkdir") {
 // FS_CHMOD's own wire-format comment and docs/roadmap.md §2.
 fn int fs_chattr(char* path, uint verb, uint arg) {
     char[100] _ap @noinit; fs_abspath(path, &_ap[0]); path = &_ap[0]; // cwd-relative -> absolute
-    uint prefix_len = 0;
-    int fsd_pid = ns_resolve(path, &prefix_len);
+    char[FS_XLATE_MAX] _sb @noinit;
+    int fsd_pid = fs_server_for(path, &_sb[0]);
     if (fsd_pid < 0) return -1;
-    char* stripped = &path[prefix_len];
+    char* stripped = &_sb[0];
 
     char[FS_MSG_MAX] req @noinit;
     int i = 0;
@@ -1717,16 +1745,16 @@ fn int fs_chown(char* path, uint uid) @export("fs_chown") {
 fn int fs_rename(char* old_path, char* new_path) @export("fs_rename") {
     char[100] _apo @noinit; fs_abspath(old_path, &_apo[0]); old_path = &_apo[0];
     char[100] _apn @noinit; fs_abspath(new_path, &_apn[0]); new_path = &_apn[0];
-    uint old_prefix_len = 0;
-    int old_fsd_pid = ns_resolve(old_path, &old_prefix_len);
+    char[FS_XLATE_MAX] _osb @noinit;
+    int old_fsd_pid = fs_server_for(old_path, &_osb[0]);
     if (old_fsd_pid < 0) return -1;
-    uint new_prefix_len = 0;
-    int new_fsd_pid = ns_resolve(new_path, &new_prefix_len);
+    char[FS_XLATE_MAX] _nsb @noinit;
+    int new_fsd_pid = fs_server_for(new_path, &_nsb[0]);
     if (new_fsd_pid < 0) return -1;
     if (old_fsd_pid != new_fsd_pid) return -1;
 
-    char* old_stripped = &old_path[old_prefix_len];
-    char* new_stripped = &new_path[new_prefix_len];
+    char* old_stripped = &_osb[0];
+    char* new_stripped = &_nsb[0];
 
     char[FS_MSG_MAX] req @noinit;
     int i = 0;

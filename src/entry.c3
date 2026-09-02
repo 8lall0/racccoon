@@ -106,6 +106,7 @@ const SYS_STDIN_ISATTY  = 48; // 1 if the caller's stdin is the console, 0 if a 
 const SYS_TIMEBASE      = 49; // board::TIMEBASE_HZ — the `time` CSR's tick rate, so userspace can turn an rdtime() delta into wall-clock seconds (QEMU 10MHz vs Duo 25MHz)
 const SYS_GETPID        = 50; // the caller's own pid — a c3 program gets its children's pids from rfork() but never its own; the C libc's getpid() needs it (temp-file names, etc.)
 const SYS_EXEC_MAX      = 51; // board::EXEC_MAX_IMAGE_SIZE — the shell reads this to size its own exec() receive buffer per-board instead of hardcoding a constant
+const SYS_NS_TRANSLATE  = 52; // a0 = path, a1 = union member index, a2 = out buf, a4 = out cap — writes the server-relative path for that member, returns the serving pid (-1 = no match); the union-aware successor to SYS_NS_RESOLVE + caller-side prefix strip
 
 // Per-process SYS_MAP ceiling: the bump pointer can't grow more than this
 // past USER_BASE. Board-specific (board::HEAP_MAX_BYTES): 16 MiB on the
@@ -1942,6 +1943,121 @@ fn void sys_ns_resolve(Trap_frame* f) @noinline
 		}
 }
 
+// True if `path` sits under mount prefix `prefix`: a normal
+// str_starts_with, plus the case where `prefix` ends in '/' and `path`
+// is exactly `prefix` without that slash (so `ls /bin` consults a
+// `bind ... /bin/` union, not just `ls /bin/x`). *rem_out gets the
+// offset into `path` where the server-relative remainder begins.
+fn bool ns_prefix_covers(char* path, char* prefix, int* rem_out) @noinline
+{
+	int plen = 0;
+	while (prefix[plen] != 0) plen++;
+	if (str_starts_with(path, prefix))
+	{
+		*rem_out = plen;
+		return true;
+	}
+	if (plen > 0 && prefix[plen - 1] == '/')
+	{
+		int i = 0;
+		while (i < plen - 1 && path[i] != 0 && path[i] == prefix[i]) i++;
+		if (i == plen - 1 && path[i] == 0)
+		{
+			*rem_out = i; // remainder is ""
+			return true;
+		}
+	}
+	return false;
+}
+
+// Resolve `path` through `proc`'s namespace and write the
+// server-relative path for union member `member` (0 = first/highest
+// priority, higher = the `bind -a` extras in bind order) into `out`
+// (capacity `out_max`). Returns the serving pid, or -1 if nothing
+// matches / `member` is past the last member at the winning prefix /
+// the rewrite doesn't fit. `member` 0 with an identity (target == "")
+// mount reproduces the old ns_resolve()+strip behaviour exactly.
+fn int ns_translate_core(Process* proc, char* path, int member, char* out, int out_max) @noinline
+{
+	// Pass 1: longest covering prefix length.
+	int best_len = -1;
+	for (int m = 0; m < NS_MOUNTS_MAX; m++)
+	{
+		if (proc.namespace[m].server_pid == 0) continue;
+		Process* t = proc_by_pid(proc.namespace[m].server_pid);
+		if (!t || t.generation != proc.namespace[m].server_generation) continue;
+		int rem = 0;
+		if (!ns_prefix_covers(path, &proc.namespace[m].prefix[0], &rem)) continue;
+		int plen = 0;
+		while (proc.namespace[m].prefix[plen] != 0) plen++;
+		if (plen > best_len) best_len = plen;
+	}
+	if (best_len < 0) return -1;
+
+	// Pass 2: the `member`-th live mount whose prefix length == best_len,
+	// in array order (= bind order).
+	int seen = 0;
+	for (int m = 0; m < NS_MOUNTS_MAX; m++)
+	{
+		if (proc.namespace[m].server_pid == 0) continue;
+		Process* t = proc_by_pid(proc.namespace[m].server_pid);
+		if (!t || t.generation != proc.namespace[m].server_generation) continue;
+		int rem = 0;
+		if (!ns_prefix_covers(path, &proc.namespace[m].prefix[0], &rem)) continue;
+		int plen = 0;
+		while (proc.namespace[m].prefix[plen] != 0) plen++;
+		if (plen != best_len) continue;
+		if (seen != member) { seen++; continue; }
+
+		char* tgt = &proc.namespace[m].target[0];
+		int o = 0;
+		for (int k = 0; tgt[k] != 0; k++)
+		{
+			if (o >= out_max - 1) return -1;
+			out[o++] = tgt[k];
+		}
+		// A rewriting bind's prefix ends in '/' (shell_ns_prefix), so `rem`
+		// lands just past that slash — mid-component. Put the separator back
+		// between a non-empty target and a non-empty remainder. Identity
+		// mounts (target "") keep the path verbatim, slash and all, exactly
+		// as the old ns_resolve()+strip did.
+		if (o > 0 && out[o - 1] != '/' && path[rem] != 0 && path[rem] != '/')
+		{
+			if (o >= out_max - 1) return -1;
+			out[o++] = '/';
+		}
+		for (int k = rem; path[k] != 0; k++)
+		{
+			if (o >= out_max - 1) return -1;
+			out[o++] = path[k];
+		}
+		out[o] = 0;
+		return proc.namespace[m].server_pid;
+	}
+	return -1;
+}
+
+// SYS_NS_TRANSLATE: a0 = path, a1 = union member index, a2 = out buf,
+// a4 = out cap. Writes the server-relative path for that member into
+// the buffer, returns the serving pid (-1 = no match / member past the
+// end / doesn't fit). The union-aware successor to SYS_NS_RESOLVE +
+// caller-side prefix strip — see user/user.c3's fs_* wrappers.
+fn void sys_ns_translate(Trap_frame* f) @noinline
+{
+	char* nt_path = (char*)(uptr)f.a0;
+	int   nt_member = (int)(iptr)f.a1;
+	char* nt_out  = (char*)(uptr)f.a2;
+	int   nt_max  = (int)(iptr)f.a4;
+	if (nt_max < 0) nt_max = 0;
+	if (!user_range_valid(current_proc.page_table, (uptr)nt_path, NS_PREFIX_MAX, false)
+		|| !user_range_valid(current_proc.page_table, (uptr)nt_out, (ulong)nt_max, true))
+	{
+		f.a0 = (ulong)(-1);
+		return;
+	}
+	f.a0 = (ulong)(iptr)ns_translate_core(current_proc, nt_path, nt_member, nt_out, nt_max);
+}
+
 // join: block until the target pid/generation is gone (exited or slot reused).
 // (was inline in handle_syscall; extracted 2026-08-29.)
 fn void sys_join(Trap_frame* f) @noinline
@@ -2318,6 +2434,8 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			sys_ipc_poll(f);
 		case SYS_NS_RESOLVE:
 			sys_ns_resolve(f);
+		case SYS_NS_TRANSLATE:
+			sys_ns_translate(f);
 		case SYS_DISKD_INFO:
 			// diskd-only, called once at its own startup — see
 			// setup_diskd_mappings in process.c3 for why these addresses
@@ -2445,56 +2563,70 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// is identical.
 			char* nb_prefix = (char*)(uptr)f.a0;
 			char* nb_src    = (char*)(uptr)f.a1;
+			uint  nb_flags  = (uint)f.a2; // bit0 = -a (union add), bit2 = -c (create here); 0 = replace
 			if (!user_range_valid(current_proc.page_table, (uptr)nb_prefix, NS_PREFIX_MAX, false)
 				|| !user_range_valid(current_proc.page_table, (uptr)nb_src, NS_PREFIX_MAX, false))
 			{
 				f.a0 = (ulong)(-1);
 				break;
 			}
-			int  nb_pid  = 0;
-			uint nb_gen  = 0;
-			int  nb_best = -1;
+			// Resolve the source through the caller's own namespace —
+			// ns_translate_core hands back both the serving pid and the
+			// rewritten (target-composed) path, so `bind`s compose: binding
+			// onto an already-bound prefix carries its target forward.
+			char[NS_TARGET_MAX] nb_target @noinit;
+			int nb_pid = ns_translate_core(current_proc, nb_src, 0, &nb_target[0], NS_TARGET_MAX);
+			if (nb_pid <= 0) { f.a0 = (ulong)(-1); break; }
+			uint nb_gen = 0;
+			{
+				Process* nb_tp = proc_by_pid(nb_pid);
+				if (!nb_tp) { f.a0 = (ulong)(-1); break; }
+				nb_gen = nb_tp.generation;
+			}
+
+			bool nb_add    = (nb_flags & 1) != 0;   // -a: a new union member, keep the existing ones
+			bool nb_create = (nb_flags & 4) != 0;   // -c: this member takes creates
+
+			// Plain `bind` (no -a) replaces the whole union at `prefix`;
+			// `bind -a` keeps it and appends. `bind -c` marks the new member
+			// the create target and clears that flag on any sibling kept.
+			if (!nb_add)
+			{
+				for (int m = 0; m < NS_MOUNTS_MAX; m++)
+				{
+					if (current_proc.namespace[m].server_pid == 0) continue;
+					if (str_eq(&current_proc.namespace[m].prefix[0], nb_prefix))
+					{
+						current_proc.namespace[m].server_pid = 0;
+					}
+				}
+			}
+			else if (nb_create)
+			{
+				for (int m = 0; m < NS_MOUNTS_MAX; m++)
+				{
+					if (current_proc.namespace[m].server_pid == 0) continue;
+					if (str_eq(&current_proc.namespace[m].prefix[0], nb_prefix))
+					{
+						current_proc.namespace[m].flags &= ~MNT_CREATE;
+					}
+				}
+			}
+
+			// A fresh slot. First-free scan runs low->high and successive
+			// binds climb, so a union's array order == bind order == search
+			// order.
+			int nb_free = -1;
 			for (int m = 0; m < NS_MOUNTS_MAX; m++)
 			{
-				if (current_proc.namespace[m].server_pid == 0) continue;
-				Process* nb_t = proc_by_pid(current_proc.namespace[m].server_pid);
-				if (!nb_t || nb_t.generation != current_proc.namespace[m].server_generation) continue;
-				char* nb_pfx = &current_proc.namespace[m].prefix[0];
-				if (!str_starts_with(nb_src, nb_pfx)) continue;
-				int nb_len = 0;
-				while (nb_pfx[nb_len] != 0) nb_len++;
-				if (nb_len > nb_best)
-				{
-					nb_best = nb_len;
-					nb_pid  = current_proc.namespace[m].server_pid;
-					nb_gen  = current_proc.namespace[m].server_generation;
-				}
+				if (current_proc.namespace[m].server_pid == 0) { nb_free = m; break; }
 			}
-			if (nb_pid == 0) { f.a0 = (ulong)(-1); break; }
-			int  nb_free = -1;
-			bool nb_done = false;
-			for (int m = 0; m < NS_MOUNTS_MAX; m++)
-			{
-				if (current_proc.namespace[m].server_pid == 0)
-				{
-					if (nb_free == -1) nb_free = m;
-					continue;
-				}
-				if (str_eq(&current_proc.namespace[m].prefix[0], nb_prefix))
-				{
-					current_proc.namespace[m].server_pid = nb_pid;
-					current_proc.namespace[m].server_generation = nb_gen;
-					nb_done = true;
-					break;
-				}
-			}
-			if (!nb_done)
-			{
-				if (nb_free == -1) { f.a0 = (ulong)(-1); break; }
-				str_copy(&current_proc.namespace[nb_free].prefix[0], nb_prefix, NS_PREFIX_MAX);
-				current_proc.namespace[nb_free].server_pid = nb_pid;
-				current_proc.namespace[nb_free].server_generation = nb_gen;
-			}
+			if (nb_free == -1) { f.a0 = (ulong)(-1); break; }
+			str_copy(&current_proc.namespace[nb_free].prefix[0], nb_prefix, NS_PREFIX_MAX);
+			current_proc.namespace[nb_free].server_pid = nb_pid;
+			current_proc.namespace[nb_free].server_generation = nb_gen;
+			str_copy(&current_proc.namespace[nb_free].target[0], &nb_target[0], NS_TARGET_MAX);
+			current_proc.namespace[nb_free].flags = nb_create ? MNT_CREATE : 0;
 			f.a0 = 0;
 		case SYS_MAP:
 			// a0 = byte count. Reserve that many bytes (rounded up to

@@ -201,7 +201,7 @@ fn int shell_readline(char* buf, int cap)
 // way the boot-time root mount's "" does. Used by the mount / bind /
 // unmount builtins.
 const int SH_NS_PREFIX_MAX = 32; // must match src/process.c3's NS_PREFIX_MAX
-const int NS_LIST_RECS     = 8;  // must match src/process.c3's NS_MOUNTS_MAX
+const int NS_LIST_RECS     = 16; // must match src/process.c3's NS_MOUNTS_MAX
 
 fn void shell_ns_prefix(char* in, char* out)
 {

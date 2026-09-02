@@ -222,14 +222,17 @@ int procd_pid = 0;
 // every process can already reach regardless of board.
 int envd_pid = 0;
 
-const NS_MOUNTS_MAX = 8;   // Five static entries at boot ("/srv/echo/" ->
+const NS_MOUNTS_MAX = 16;  // Five static entries at boot ("/srv/echo/" ->
                             // echod, "" -> fsd, "/2/" -> fsd2, "/proc/" ->
-                            // procd, "/env/" -> envd) plus real headroom
-                            // for SYS_NS_MOUNT (below) to add
-                            // dynamically-posted ones at runtime — was 5
-                            // (one spare) before dynamic mounting existed
-                            // to actually use the room.
+                            // procd, "/env/" -> envd) plus headroom for
+                            // SYS_NS_MOUNT / SYS_NS_BIND to add runtime ones
+                            // — including union members (`bind -a`, several
+                            // entries sharing one prefix), which want more
+                            // than the old 8 gave. Was 8, was 5.
 const NS_PREFIX_MAX = 32;  // Longest path prefix a mount entry can match.
+const NS_TARGET_MAX = 64;  // Longest rewrite target (Mount.target) — deeper
+                            // than a prefix (`/usr/somelongname/bin`), so its
+                            // own size, not NS_PREFIX_MAX's.
 
 // A small, kernel-global (not per-process — discoverable *by name*,
 // unlike Mount below) registry of servers that have posted themselves via
@@ -276,11 +279,27 @@ Srv_entry[SRV_MAX] srv_table;
 // a live match on both pid and generation before handing server_pid
 // back, the same "this exact instance, not a reused slot" distinction
 // SYS_JOIN already relies on for its own, different purpose.
+// MNT_CREATE: in a union (several Mounts sharing one prefix), this is the
+// member that receives file/dir creation — Plan 9's `bind -c`. At most one
+// per prefix; when none is flagged, creation falls to the first member.
+const uint MNT_CREATE = 1;
+
 struct Mount
 {
 	char[NS_PREFIX_MAX] prefix;
 	int                 server_pid;
 	uint                server_generation;
+	// Path rewrite: after `prefix` is stripped from a resolving path, this
+	// is prepended before the server sees the remainder. "" (the common
+	// case, every boot-seeded mount) = identity, i.e. exactly the old
+	// "strip the prefix, send the bare remainder" behaviour. Non-empty for
+	// a `bind <path> <prefix>` that aliases one subtree onto another
+	// within the same server — see docs/bin-layout.md.
+	char[NS_TARGET_MAX] target;
+	// Union support: several Mount entries may share one `prefix`; array
+	// order is search order. flags carries MNT_CREATE. 0 for a plain
+	// single mount.
+	uint                flags;
 }
 // 8192 was enough for the syscall-only trap path (getchar/putchar), but the
 // file-system call chain (handle_syscall -> fs_lookup/fs_flush ->
@@ -1214,6 +1233,17 @@ fn Process* create_process(void* image, uint image_size)
 	for (int m = 5; m < NS_MOUNTS_MAX; m++)
 	{
 		proc.namespace[m].server_pid = 0;
+	}
+
+	// Every boot-seeded mount is a plain, identity binding (no rewrite, no
+	// union). Explicit, not relied-on zero-init — a reused procs[] slot
+	// could otherwise leak a previous occupant's `bind` target/flags. Any
+	// process wanting a rewriting or union mount adds it at runtime via
+	// SYS_NS_BIND.
+	for (int m = 0; m < NS_MOUNTS_MAX; m++)
+	{
+		proc.namespace[m].target[0] = 0;
+		proc.namespace[m].flags = 0;
 	}
 
 	proc.fs_partition_start = 0; // meaningful only once setup_fsd_mappings() sets it
