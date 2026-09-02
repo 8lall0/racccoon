@@ -855,6 +855,22 @@ fn void main() {
             } else {
                 print("p9mkdirtest: FAILED\n");
             }
+        } else if (strcmp(cmd, "fscachestat") == 0) {
+            // fsd sector read cache (user/fs/fsd.c3). Prints the running
+            // hit/miss counters; run it before and after a read-heavy
+            // command (a Go build, cat of a big file) to see the effect.
+            ulong fc_hits = 0; ulong fc_misses = 0;
+            if (fs_cache_stats(&fc_hits, &fc_misses) != 0) {
+                print("fscachestat: FAILED (fsd didn't answer)\n");
+            } else {
+                ulong fc_total = fc_hits + fc_misses;
+                print("fscachestat: "); print_uint((uint)fc_hits); print(" hit / ");
+                print_uint((uint)fc_misses); print(" miss");
+                if (fc_total > 0) {
+                    print(" ("); print_uint((uint)((fc_hits * 100) / fc_total)); print("% hit)");
+                }
+                putchar('\n');
+            }
         } else if (strcmp(cmd, "hardentest") == 0) {
             // Regression guard for src/page.c3's user_range_valid() and
             // its call sites in src/entry.c3: proves a syscall given a

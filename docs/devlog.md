@@ -4,6 +4,43 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-02 — fsd: a sector read cache
+
+The fsd read path was `ext2_read_block` → `fs_read_sector` (one 512 B
+sector) → `diskd_rw` → an IPC + a single-sector virtio op, with zero
+caching (`fsd.c3`'s own comment: *"no caching at boot — every FS_READ
+walks the tree"*). Loading `/bin/go` (13.6 MB) ≈ 26k round trips; the
+Go toolchain re-reads compile/link/asm and re-walks `$GOROOT`'s
+inode-table + directory blocks on every build.
+
+`user/fs/fsd.c3`: a **direct-mapped 1024-entry (512 KiB) sector read
+cache** below `fs_read_sector` / `fs_write_sector`.
+- Tags in a small static array; the 512 B payloads in a lazily-backed
+  `SYS_MAP` region (so the `.bin` doesn't carry 512 KiB of zeros and a
+  cold slot costs no real RAM). Keyed on the partition-relative sector;
+  `fsd2` is a separate process with its own cache.
+- Write-through: `diskd_rw` stays the single enforcement point for the
+  reserved-sector / write-disabled checks; a successful write refreshes
+  the slot, a *failed* write that had the slot drops it (paranoia for a
+  write that reached the platter then lost its reply).
+- `FS_CACHE_STATS` verb (31) + `fs_cache_stats()` + a `fscachestat`
+  shell builtin for hit/miss introspection.
+
+Verified QEMU `-m 2G` on FAT32 / ext2 / dual: `gotest` / `gostage3` /
+`gostage35` / `maptest` / `oomtest` / `faulttest` / `runtest` /
+`elftest` / `chmodtest` / `wasmtest` / `mounttest` / `bigreadtest` /
+`p9fswritetest`. Measured hit rate ~67–74 % on a mixed
+`gostage35 + dirpack + gotest` run (higher for `go build`, which is
+almost all re-reads).
+
+IPC-side follow-ups evaluated, not done: raise `MSG_MAX` 1128 → ~8 KiB
+(trivial — 16 inboxes × 8 KiB = 128 KiB kernel BSS — ~7× fewer
+shell↔fsd bulk round trips); a multi-sector `diskd` protocol (needs the
+bigger `MSG_MAX`; ~15× fewer fsd↔diskd trips, the cold-load fix);
+conditional FP save in `yield()`. See docs / memory.
+
+---
+
 ## 2026-09-02 — Go: native dirent types (no more lstat-per-entry)
 
 First divergence of racccoon's `os`/`syscall` from tamago's stubs.

@@ -85,6 +85,40 @@ const uint DISKD_WRITE   = 211;
 const uint DISKD_MSG_MAX = 516;
 const uint SECTOR_SIZE   = 512;
 
+// --- read cache -----------------------------------------------------
+// Direct-mapped sector cache below fs_read_sector/fs_write_sector.
+// Without it, every FS_READ walks the tree and every walk step is one
+// IPC + one single-sector virtio op to diskd — loading /bin/go (13.6
+// MiB) is ~26k round trips. The Go toolchain re-reads compile/link/asm
+// and re-walks $GOROOT's inode-table + directory blocks constantly, so
+// nearly all of that is a cache hit after the first pass.
+//
+// The tags are a small static array; the 512-byte payloads live in a
+// lazily-backed SYS_MAP region (fs_cache_init) so the fsd .bin doesn't
+// carry 512 KiB of zeros and a cold slot costs no real RAM. Keyed on
+// the partition-relative sector (fsd only ever touches one partition;
+// fsd2 is a separate process with its own cache). Write-through:
+// diskd_rw stays the single enforcement point for the reserved-sector /
+// write-disabled checks, and a successful write refreshes the slot — so
+// the cache can never be staler than the disk (fsd is the sole writer,
+// diskd doesn't cache, a diskd respawn leaves disk contents unchanged).
+const uint FS_CACHE_ENTRIES = 1024;               // * 512 B = 512 KiB
+const uint FS_CACHE_EMPTY   = 0xFFFFFFFF;
+
+uint[FS_CACHE_ENTRIES] fs_cache_tag;              // relative sector, or FS_CACHE_EMPTY
+char* fs_cache_data;                              // FS_CACHE_ENTRIES * SECTOR_SIZE, or null
+ulong fs_cache_hits;
+ulong fs_cache_misses;
+
+fn void fs_cache_init()
+{
+	for (uint i = 0; i < FS_CACHE_ENTRIES; i++) fs_cache_tag[i] = FS_CACHE_EMPTY;
+	void* region = map_pages(FS_CACHE_ENTRIES * SECTOR_SIZE);
+	// SYS_MAP returns (uptr)-1 on failure (bad size / per-process
+	// ceiling). Anything else is a valid lazily-backed region.
+	fs_cache_data = (uptr)region == (uptr)0xFFFFFFFFFFFFFFFF ? null : (char*)region;
+}
+
 // The storage driver's pid (diskd on QEMU, sdd on the Duo). fsd learns
 // it from SYS_FS_PARTITION_INFO at mount, and re-queries it if the
 // driver respawns (see g_diskd_pid / diskd_rw below) — no fixed slot.
@@ -467,15 +501,54 @@ fn bool diskd_rw(char* buf, uint sector, bool is_write)
 // backend — neither FAT32 nor ext2 touches fs_partition_start directly.
 fn bool fs_read_sector(uint sector, char* buf)
 {
+	if (fs_cache_data != null)
+	{
+		uint idx = sector % FS_CACHE_ENTRIES;
+		char* slot = &fs_cache_data[(uptr)idx * SECTOR_SIZE];
+		if (fs_cache_tag[idx] == sector)
+		{
+			for (uint i = 0; i < SECTOR_SIZE; i++) buf[i] = slot[i];
+			fs_cache_hits++;
+			return true;
+		}
+		if (!diskd_rw(buf, fs_partition_start + sector, false)) return false;
+		for (uint i = 0; i < SECTOR_SIZE; i++) slot[i] = buf[i];
+		fs_cache_tag[idx] = sector;
+		fs_cache_misses++;
+		return true;
+	}
 	return diskd_rw(buf, fs_partition_start + sector, false);
 }
 
 // Write counterpart to fs_read_sector — every filesystem-level write in
 // this process (data, FAT/inode-table entries, directory entries) goes
 // through this, which goes through diskd_rw()'s reserved-sector check.
+// Write-through: on success the cache slot is refreshed so a later read
+// of the same sector sees the new data (diskd_rw is atomic per sector —
+// it either wrote the whole sector or returned false and touched
+// nothing, so the slot and the disk never disagree).
 fn bool fs_write_sector(uint sector, char* buf)
 {
-	return diskd_rw(buf, fs_partition_start + sector, true);
+	bool ok = diskd_rw(buf, fs_partition_start + sector, true);
+	if (fs_cache_data != null)
+	{
+		uint idx = sector % FS_CACHE_ENTRIES;
+		if (ok)
+		{
+			char* slot = &fs_cache_data[(uptr)idx * SECTOR_SIZE];
+			for (uint i = 0; i < SECTOR_SIZE; i++) slot[i] = buf[i];
+			fs_cache_tag[idx] = sector;
+		}
+		else if (fs_cache_tag[idx] == sector)
+		{
+			// A rejected write leaves the disk unchanged, but a write
+			// that reached the platter then lost its reply (driver died
+			// past the point of no return, retry didn't reconnect) would
+			// not — drop the slot so the next read goes to disk.
+			fs_cache_tag[idx] = FS_CACHE_EMPTY;
+		}
+	}
+	return ok;
 }
 
 // --- Mount-time backend dispatch --------------------------------------
@@ -740,6 +813,10 @@ fn uint fsd_requester_uid(int from)
 
 fn void main(String[] args)
 {
+	// Read cache — before fs_mount() so its superblock / inode-table /
+	// protected-file-chain reads populate it too (those blocks stay hot).
+	fs_cache_init();
+
 	if (args.len == 1)
 	{
 		// Dynamic mount (e.g. "usbd" — usbd.c3's own srv_post()-ed name;
@@ -1078,6 +1155,15 @@ fn void main(String[] args)
 				*result_field = result;
 				ipc_reply(from, P9_REMOVE, &buf, 4, from_gen);
 			}
+			continue;
+		}
+
+		if (verb == FS_CACHE_STATS)
+		{
+			ulong* stat_out = (ulong*)&buf;
+			stat_out[0] = fs_cache_hits;
+			stat_out[1] = fs_cache_misses;
+			ipc_reply(from, FS_CACHE_STATS, &buf, 16, from_gen);
 			continue;
 		}
 

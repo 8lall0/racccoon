@@ -1322,6 +1322,10 @@ const uint FS_STAT = 28;
 // give your file away). See docs/roadmap.md §2.
 const uint FS_CHMOD = 29;
 const uint FS_CHOWN = 30;
+// FS_CACHE_STATS: no request payload. Reply: byte 0..7 = cache hits
+// (u64), byte 8..15 = misses (u64). Introspection for fsd's sector read
+// cache — see user/fs/fsd.c3's fs_cache_init.
+const uint FS_CACHE_STATS = 31;
 // Sentinel offset for FS_WRITE_AT meaning "append at the file's current
 // end" — fsd resolves it per-backend before dispatching.
 const uint FS_OFFSET_APPEND = 0xFFFFFFFF;
@@ -1503,6 +1507,23 @@ fn int fs_write_at(char* filename, char* buf, int len, uint offset) @export("fs_
 // returns 0 and fills *out_size (0 for a directory) and *out_type
 // (0 = file, 1 = directory), either of which may be null. Returns -1 if
 // nothing resolves there. See FS_STAT's own wire-format comment.
+// Reads fsd's sector-read-cache hit/miss counters (FS_CACHE_STATS).
+// Resolves the fsd serving "/" (the primary/ext2 mount). Returns 0 on
+// success. Introspection only — see user/fs/fsd.c3's fs_cache_init.
+fn int fs_cache_stats(ulong* out_hits, ulong* out_misses) @export("fs_cache_stats") {
+    uint prefix_len = 0;
+    int fsd_pid = ns_resolve("/", &prefix_len);
+    if (fsd_pid < 0) return -1;
+    char[16] req @noinit;
+    uint reply_verb = 0;
+    int from = p9_call(fsd_pid, FS_CACHE_STATS, &req, 16, &req, 16, &reply_verb);
+    if (from <= 0 || reply_verb != FS_CACHE_STATS) return -1;
+    ulong* fields = (ulong*)&req;
+    if (out_hits != null) *out_hits = fields[0];
+    if (out_misses != null) *out_misses = fields[1];
+    return 0;
+}
+
 fn int fs_stat(char* filename, uint* out_size, int* out_type) @export("fs_stat") {
     char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
     uint prefix_len = 0;
