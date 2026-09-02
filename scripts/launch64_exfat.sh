@@ -20,7 +20,7 @@ cp ../build/disk_exfat.img ../build/disk_exfat.run.img
 
 qemu-system-riscv64 \
   -machine virt \
-  -m 1G \
+  -m 2G \
   -bios default \
   -nographic \
   -serial mon:stdio \

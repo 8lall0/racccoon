@@ -19,7 +19,7 @@ cp ../build/disk_dual.img ../build/disk_dual.run.img
 
 qemu-system-riscv64 \
   -machine virt \
-  -m 1G \
+  -m 2G \
   -bios default \
   -nographic \
   -serial mon:stdio \

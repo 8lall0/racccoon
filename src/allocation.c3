@@ -13,7 +13,7 @@ const PAGE_SIZE = 4096;
 // per-board `board::RAM_SIZE` would circular-import board <-> kernel).
 // ram_page_count() caps the allocator to each board's *real* linker span,
 // so a board whose pool is smaller than this just leaves the bitmap's
-// tail words unused: QEMU's src/kernel.ld reserves 768 MiB, the Duo's
+// tail words unused: QEMU's src/kernel.ld reserves 1792 MiB, the Duo's
 // ~59 MiB, the JH7110 / Orange Pi RV up to this ceiling out of its 2 GiB
 // DRAM (docs/opi-rv-plan.md, docs/go-port-plan.md — Go's toolchain wants
 // the headroom). 1920 MiB / 4 KiB / 8 = 60 KiB of BSS, negligible even on
@@ -35,8 +35,9 @@ uint[TOTAL_PAGES / BITS_PER_WORD] bitmap;
 
 // The actual number of allocatable pages: the real distance between the
 // linker's __free_ram and __free_ram_end, in pages, capped at
-// TOTAL_PAGES (the bitmap's size). QEMU's src/kernel.ld reserves 768 MiB,
-// well under TOTAL_PAGES, so the bitmap's tail words go unused there; the
+// TOTAL_PAGES (the bitmap's size). QEMU's src/kernel.ld reserves
+// 1792 MiB, still under TOTAL_PAGES, so a few bitmap tail words go
+// unused there; the
 // Duo's boards/duo/kernel.ld pins __free_ram_end to the real 64 MiB DRAM
 // window minus the kernel image, the stack, and the reserved top 768 KiB
 // — ~59 MiB. Scanning past the real span hands out addresses beyond

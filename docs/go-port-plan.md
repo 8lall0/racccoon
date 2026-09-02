@@ -137,10 +137,11 @@ Slow (spin-idle scheduler + real GC on emulated hardware — tens of
 seconds), but correct.
 
 Kernel RAM raised for this (QEMU only, board-gated):
-- `scripts/launch64*.sh` now pass `-m 1G`; `src/kernel.ld` `__free_ram`
-  → 768 MiB.
-- `board::HEAP_MAX_BYTES` → 512 MiB; provider `RamSize` → 128 MiB
-  (eager, with a CPUInit 8 MiB fallback if a board refuses it).
+- `scripts/launch64*.sh` pass `-m 2G`; `src/kernel.ld` `__free_ram`
+  → 1792 MiB (was 768 MiB / `-m 1G`; raised 2026-09-02 so the on-device
+  `go` toolchain has real headroom — see that devlog entry).
+- `board::HEAP_MAX_BYTES` → 512 MiB; provider `RamSize` → build-tag
+  selected (64 MiB / 448 MiB), lazy since 2026-09-02.
 
 **JH7110 2 GiB — cleared (2026-09-01).** The old "racccoon does not
 boot with `-m >= 2G`" note no longer reproduces: the current kernel
@@ -158,9 +159,10 @@ pool was ceilinged there regardless of its own `kernel.ld`. Raised to
 sit within ±2 GiB of the kernel text PC, so `__free_ram_end` can't run
 much past ~1.9 GiB from a kernel at DRAM_BASE + 2 MiB anyway). Bitmap
 is now 60 KiB of BSS; `ram_page_count()` still caps the allocator to
-each board's real linker span, so QEMU (768 MiB) and Duo (~59 MiB) are
-behaviourally unchanged. The Orange Pi RV board (`opi-rv-port` branch)
-can now size `boards/opi-rv/kernel.ld` up to that ceiling.
+each board's real linker span, so QEMU (1792 MiB since 2026-09-02, was
+768) and Duo (~59 MiB) track their own `kernel.ld`. The Orange Pi RV
+board (`opi-rv-port` branch) can now size `boards/opi-rv/kernel.ld` up
+to that ceiling.
 
 Follow-up (not blocking): `create_process` / `sys_rfork` / `sys_exec`
 identity-map the whole pool at 4 KiB granularity into *every* process
@@ -416,15 +418,13 @@ unknowns. Staged:
   - `cmd/compile` / `cmd/link` built with `-tags racccoon_bigheap`
     (448 MiB Go arena — compiling `runtime` OOM'd 64 MiB). Lazy
     `SYS_MAP` (2026-09-02 devlog) makes that arena free until touched,
-    so it no longer bloats `rfork` — but `go` / `asm` stay on 64 MiB:
-    the QEMU `__free_ram` pool is a fixed 768 MiB and `go` holds its
-    heap live while `compile` runs.
+    so it no longer bloats `rfork`; `src/kernel.ld`'s pool went
+    768 → 1792 MiB (same day) so it fits alongside `go`. `go` / `asm`
+    stay on 64 MiB.
   - `cmd/link` defaults `-T 0x1010000` / `-R 0x1000` for tamago
     riscv64, so a bare `go build` output is racccoon-loadable.
 
-  Follow-ups: lift the 768 MiB `src/kernel.ld` `__free_ram` cap (kernel
-  boots fine at `-m 2G`+) so the toolchain has real headroom, then a
-  clean timed `gobuildtest` run; `os.ReadDir` lstats every entry (fsd
+  Follow-ups: `os.ReadDir` lstats every entry (fsd
   has no dirent type).
 
 Likely wants the `GOOS=racccoon` rename around 4.3–4.4 (own identity,

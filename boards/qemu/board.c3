@@ -191,16 +191,16 @@ const uint SMP_MAX_HARTS = 8;
 
 // Largest image SYS_EXEC will install (src/entry.c3's EXEC_MAX_IMAGE_SIZE
 // and the ~96 KiB staging arrays it sizes at this value). 32 MiB on QEMU
-// — RAM is plentiful (768 MiB free_ram) and Stage 4 of the Go port runs
-// `go tool compile`, a ~20 MiB GOOS=tamago binary (docs/go-port-plan.md).
+// — RAM is plentiful (1792 MiB free_ram) and Stage 4 of the Go port runs
+// `go tool compile`, a ~23 MiB GOOS=tamago binary (docs/go-port-plan.md).
 // Ordinary Go programs are 1.5-2 MiB, the C toolchain ~640 KiB. The Duo
 // keeps 1 MiB (boards/duo/board.c3) — 64 MiB DRAM, no Go.
 const EXEC_MAX_IMAGE_SIZE = 33554432;
 
 // Per-process SYS_MAP ceiling (src/entry.c3's HEAP_MAX_BYTES). 512 MiB
-// on QEMU — the free_ram window is 768 MiB (src/kernel.ld, -m 1G), and a
-// Go process eagerly SYS_MAPs a ~128 MiB heap arena with room for the GC
-// to cycle (docs/go-port-plan.md). The Duo keeps 16 MiB
+// on QEMU — the free_ram window is 1792 MiB (src/kernel.ld, -m 2G), and
+// a Go process reserves a 64/448 MiB heap arena (lazy since 2026-09-02,
+// docs/devlog.md) with room for the GC to cycle. The Duo keeps 16 MiB
 // (boards/duo/board.c3) — 64 MiB DRAM total.
 const uptr HEAP_MAX_BYTES = 512 * 1024 * 1024;
 

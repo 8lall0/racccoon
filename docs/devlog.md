@@ -4,6 +4,43 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-02 — QEMU `__free_ram` 768 → 1792 MiB
+
+`src/kernel.ld` reserved a fixed 768 MiB pool regardless of QEMU `-m`,
+which the on-device `go` toolchain overcommits (a ~448 MiB `compile`
+plus `go` holding its own heap live — `compile` got OOM-killed
+mid-build). Raised to **1792 MiB** (`__free_ram_end` at `0xf04e8000`,
+~250 MiB clear under the top of a 2 GiB region; `<= RAM_SIZE`, the
+1920 MiB bitmap ceiling). Boot at `-m 2G` with this value was already
+proven (see the JH7110 2 GiB note earlier in this file).
+
+- `src/kernel.ld` — the `. += 768 MiB` bump → `1792 MiB`.
+- `scripts/launch64*.sh` (all four) — `-m 1G` → `-m 2G`. A bigger
+  `__free_ram` reservation than physical RAM would let the allocator
+  hand out non-existent pages, so `-m 2G` is now the floor for the
+  QEMU kernel. The Duo (`boards/duo/kernel.ld`, real 64 MiB) is
+  untouched.
+- `src/allocation.c3` / `scripts/build_go.sh` / `go/goos/*` comments
+  updated off the old 768 figure.
+
+Regression sweep at `-m 2G`, all green: FAT32 / ext2 / dual / exFAT
+mount; `maptest` / `oomtest` / `faulttest` / `runtest` / `elftest` /
+`gotest` / `gostage2test` / `wasmtest` / `mounttest` (dual) /
+`bigreadtest` (dual). SMP scaffold still prints "boot hart 0 only" on
+the default single-hart boot.
+
+`gobuildtest` still fails — but **not** on RAM now. Every run (768 MiB,
+`racccoon_bigheap` for `go`, and now 1792 MiB) the on-device `compile`
+takes a U-mode store fault at the *exact same* address `0xC000000` and
+the kernel kills it (`go build` then reports the tool as exit 127).
+The address being fixed regardless of pool size rules out OOM — it's a
+structural bug in the demand-fault path or the tamago heap-growth
+hooks, not memory pressure. Needs an instrumented run to pin down;
+separate from this change, which stands on its own (the JH7110 wants
+the bigger pool too).
+
+---
+
 ## 2026-09-02 — Multi-core (SMP) scaffold — hart bring-up only
 
 ```

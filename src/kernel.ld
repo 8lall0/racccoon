@@ -53,19 +53,19 @@ SECTIONS {
 
     . = ALIGN(4096);
     __free_ram = .;
-    . += 768 * 1024 * 1024; /* 768MB. QEMU virt is launched with -m 1G
+    . += 1792 * 1024 * 1024; /* 1792MB. QEMU virt is launched with -m 2G
                                (scripts/launch64*.sh); kernel links at
-                               DRAM_BASE+2MB, and QEMU/OpenSBI keep the FDT
-                               and their own reservations near the top of
-                               RAM, so 768MB leaves clear margin under 1GB.
-                               Was 64MB; raised for the Go heap arena. Since
-                               SYS_MAP is lazy (docs/devlog.md 2026-09-02)
-                               the arena is only address space until touched
-                               — but the on-device `go` toolchain still
-                               overcommits 768MB, so raising this (and moving
-                               the launch scripts to -m 2G) is a pending
-                               follow-up. Must be <= src/allocation.c3's
-                               RAM_SIZE (the
+                               DRAM_BASE+2MB, __free_ram_end lands ~0xF0400000,
+                               ~250MB clear under the 0x100000000 top of a
+                               2GB region — room for QEMU/OpenSBI's FDT and
+                               reservations. History: 64MB -> 768MB (-m 1G,
+                               eager Go arena) -> here. The on-device `go`
+                               toolchain (a ~448MB `compile` + `link`, plus
+                               `go` holding its own heap live) overcommitted
+                               768MB and got OOM-killed; 1792MB gives it real
+                               headroom. Boot at -m 2G with this value was
+                               already proven (docs/go-port-plan.md). Must be
+                               <= src/allocation.c3's RAM_SIZE (the
                                page-bitmap ceiling, 1920MB); the two need
                                not be equal — ram_page_count() caps the
                                allocator to whichever is smaller. The Duo's
