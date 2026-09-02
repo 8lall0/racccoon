@@ -759,10 +759,12 @@ fn int ns_mount_wait(char* prefix, char* srv_name, ulong max_attempts) @export("
     return syscall(SYS_NS_MOUNT_WAIT, (long)prefix, (long)srv_name, (long)max_attempts);
 }
 
-// Copy this process's own namespace (mount table) out. Each 36-byte
-// record is a 32-byte null-padded path prefix followed by the server
-// pid as 4 little-endian bytes. Returns the record count, or -1 on a
-// bad buffer. Backs the shell's `namespace` builtin.
+// Copy this process's own namespace (mount table) out. Each 100-byte
+// record: [0..31] null-padded prefix, [32..35] server pid LE, [36]
+// flags (bit 0 = MNT_CREATE), [37..99] null-padded rewrite target
+// ("" = identity). Union members share a prefix and appear as separate
+// records in search order. Returns the record count, or -1 on a bad
+// buffer. Backs the shell's `namespace` builtin.
 fn int ns_list(char* out_buf, int max_records) @export("ns_list") {
     return syscall(SYS_NS_LIST, (long)out_buf, (long)max_records, 0);
 }
@@ -795,11 +797,14 @@ fn int ns_translate(char* path, int member, char* out, int out_max) @export("ns_
     return syscall4(SYS_NS_TRANSLATE, (long)path, (long)member, (long)out, (long)out_max);
 }
 
-// The member-0 shorthand every single-target fs_* wrapper wants: resolve
-// an already-absolute path to (serving pid, server-relative path). `out`
-// must be >= FS_XLATE_MAX bytes. -1 = resolves nowhere. fs_list() and the
-// exec search walk higher union members with ns_translate() directly.
+// Resolve an already-absolute path to (serving pid, server-relative
+// path). `out` must be >= FS_XLATE_MAX bytes. member: 0 = the first
+// union member, higher = the `bind -a` extras, -1 = the member that
+// receives creation (the `bind -c` one, else member 0). -1 return =
+// resolves nowhere / member past the end. Read-ish wrappers loop mi from
+// 0; write-ish ones pass -1.
 const int FS_XLATE_MAX = 160;
+const int FS_CREATE_MEMBER = -1;
 fn int fs_server_for(char* abspath, char* out) {
     return ns_translate(abspath, 0, out, FS_XLATE_MAX);
 }
@@ -1385,39 +1390,41 @@ const int FS_LIST_PAGE_MAX = (int)((FS_MSG_MAX - 4) / FS_LIST_ENTRY_SIZE);
 fn int fs_read(char* filename, char* buf, int len) @export("fs_read") {
     char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
     // ns_translate strips the matched mount's own prefix and applies any
-    // `bind` path rewrite before the name ever reaches the wire — the ""
-    // catch-all is prefix "" / target "" so this is byte-for-byte the old
-    // behaviour there, but a non-empty prefix (the second fsd's "/mnt/fs2/")
-    // or a rewriting bind ("/bin" -> "/usr/glenda/bin") is now handled in
-    // one place. fsd.c3's backends still only ever see bare names (see
-    // user/fsd.c3's header comment — this is where that guarantee holds).
-    char[FS_XLATE_MAX] _sb @noinit;
-    int fsd_pid = fs_server_for(filename, &_sb[0]);
-    if (fsd_pid < 0) return -1;
-    char* stripped = &_sb[0];
+    // `bind` path rewrite before the name ever reaches the wire, AND (member
+    // index) walks a union: `bind -a`'d members are tried in order, first
+    // hit wins. The non-union case ends after member 0 (member 1 doesn't
+    // resolve) — one IPC, exactly as before. fsd.c3's backends still only
+    // ever see bare names (user/fsd.c3's header comment).
+    int last = -1;
+    for (int mi = 0; ; mi++) {
+        char[FS_XLATE_MAX] _sb @noinit;
+        int fsd_pid = ns_translate(filename, mi, &_sb[0], FS_XLATE_MAX);
+        if (fsd_pid < 0) return last;
+        char* stripped = &_sb[0];
 
-    char[FS_MSG_MAX] req @noinit;
-    int i = 0;
-    while (stripped[i] != 0 && i < 99) {
-        req[i] = stripped[i];
-        i++;
+        char[FS_MSG_MAX] req @noinit;
+        int i = 0;
+        while (stripped[i] != 0 && i < 99) {
+            req[i] = stripped[i];
+            i++;
+        }
+        req[i] = 0;
+        uint* len_field = (uint*)&req[100];
+        *len_field = (uint)len;
+
+        uint reply_verb = 0;
+        int from = p9_call(fsd_pid, FS_READ, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
+        if (from <= 0 || reply_verb != FS_READ) { last = -1; continue; }
+
+        int* result_len_field = (int*)&req;
+        int result_len = *result_len_field;
+        if (result_len < 0) { last = result_len; continue; } // not in this member — try the next
+        if (result_len > len) result_len = len;
+        for (int j = 0; j < result_len; j++) {
+            buf[j] = req[4 + j];
+        }
+        return result_len;
     }
-    req[i] = 0;
-    uint* len_field = (uint*)&req[100];
-    *len_field = (uint)len;
-
-    uint reply_verb = 0;
-    int from = p9_call(fsd_pid, FS_READ, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
-    if (from <= 0 || reply_verb != FS_READ) return -1;
-
-    int* result_len_field = (int*)&req;
-    int result_len = *result_len_field;
-    if (result_len < 0) return result_len;
-    if (result_len > len) result_len = len;
-    for (int j = 0; j < result_len; j++) {
-        buf[j] = req[4 + j];
-    }
-    return result_len;
 }
 
 // Same shape as fs_read() above, plus offset — chunked reads for files
@@ -1427,44 +1434,53 @@ fn int fs_read(char* filename, char* buf, int len) @export("fs_read") {
 // relies on this to know when to stop looping.
 fn int fs_read_at(char* filename, char* buf, int len, uint offset) @export("fs_read_at") {
     char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
-    char[FS_XLATE_MAX] _sb @noinit;
-    int fsd_pid = fs_server_for(filename, &_sb[0]);
-    if (fsd_pid < 0) return -1;
-    char* stripped = &_sb[0];
+    // Union walk (see fs_read). A member that has the file replies >= 0
+    // (0 = clean EOF, which exec() relies on); -1 = not in this member,
+    // move on. A member-1 file costs one wasted member-0 IPC per chunk —
+    // acceptable; system binaries live in member 0.
+    int last = -1;
+    for (int mi = 0; ; mi++) {
+        char[FS_XLATE_MAX] _sb @noinit;
+        int fsd_pid = ns_translate(filename, mi, &_sb[0], FS_XLATE_MAX);
+        if (fsd_pid < 0) return last;
+        char* stripped = &_sb[0];
 
-    char[FS_MSG_MAX] req @noinit;
-    int i = 0;
-    while (stripped[i] != 0 && i < 99) {
-        req[i] = stripped[i];
-        i++;
+        char[FS_MSG_MAX] req @noinit;
+        int i = 0;
+        while (stripped[i] != 0 && i < 99) {
+            req[i] = stripped[i];
+            i++;
+        }
+        req[i] = 0;
+        uint* len_field = (uint*)&req[100];
+        *len_field = (uint)len;
+        uint* offset_field = (uint*)&req[104];
+        *offset_field = offset;
+
+        uint reply_verb = 0;
+        int from = p9_call(fsd_pid, FS_READ_AT, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
+        if (from <= 0 || reply_verb != FS_READ_AT) { last = -1; continue; }
+
+        int* result_len_field = (int*)&req;
+        int result_len = *result_len_field;
+        if (result_len < 0) { last = result_len; continue; }
+        if (result_len > len) result_len = len;
+        for (int j = 0; j < result_len; j++) {
+            buf[j] = req[4 + j];
+        }
+        return result_len;
     }
-    req[i] = 0;
-    uint* len_field = (uint*)&req[100];
-    *len_field = (uint)len;
-    uint* offset_field = (uint*)&req[104];
-    *offset_field = offset;
-
-    uint reply_verb = 0;
-    int from = p9_call(fsd_pid, FS_READ_AT, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
-    if (from <= 0 || reply_verb != FS_READ_AT) return -1;
-
-    int* result_len_field = (int*)&req;
-    int result_len = *result_len_field;
-    if (result_len < 0) return result_len;
-    if (result_len > len) result_len = len;
-    for (int j = 0; j < result_len; j++) {
-        buf[j] = req[4 + j];
-    }
-    return result_len;
 }
 
 fn int fs_write(char* filename, char* buf, int len) @export("fs_write") {
     char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
+    // Create-or-truncate goes to the union's create member (the `bind -c`
+    // one, or member 0 when there's no union — identical to the old
+    // behaviour there). So `> /bin/x` in a `bind -ac /usr/$u/bin /bin`
+    // union lands in /usr/$u/bin, not the root-owned system /bin.
     char[FS_XLATE_MAX] _sb @noinit;
-    int fsd_pid = fs_server_for(filename, &_sb[0]);
+    int fsd_pid = ns_translate(filename, FS_CREATE_MEMBER, &_sb[0], FS_XLATE_MAX);
     if (fsd_pid < 0) return -1;
-    // ns_translate strips the mount prefix + applies any bind rewrite;
-    // see fs_read's own comment.
     char* stripped = &_sb[0];
 
     char[FS_MSG_MAX] req @noinit;
@@ -1501,8 +1517,12 @@ fn int fs_write(char* filename, char* buf, int len) @export("fs_write") {
 // wire-format comment.
 fn int fs_write_at(char* filename, char* buf, int len, uint offset) @export("fs_write_at") {
     char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
+    // Offset writes assume the file already exists; direct them at the
+    // create member (== member 0 without a union). A file that lives only
+    // in a lower union member isn't reachable this way — rare enough to
+    // leave for later.
     char[FS_XLATE_MAX] _sb @noinit;
-    int fsd_pid = fs_server_for(filename, &_sb[0]);
+    int fsd_pid = ns_translate(filename, FS_CREATE_MEMBER, &_sb[0], FS_XLATE_MAX);
     if (fsd_pid < 0) return -1;
     char* stripped = &_sb[0];
 
@@ -1555,60 +1575,64 @@ fn int fs_cache_stats(ulong* out_hits, ulong* out_misses) @export("fs_cache_stat
 
 fn int fs_stat(char* filename, uint* out_size, int* out_type) @export("fs_stat") {
     char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
-    char[FS_XLATE_MAX] _sb @noinit;
-    int fsd_pid = fs_server_for(filename, &_sb[0]);
-    if (fsd_pid < 0) return -1;
-    char* stripped = &_sb[0];
+    for (int mi = 0; ; mi++) {                       // union walk — first member with the file
+        char[FS_XLATE_MAX] _sb @noinit;
+        int fsd_pid = ns_translate(filename, mi, &_sb[0], FS_XLATE_MAX);
+        if (fsd_pid < 0) return -1;
+        char* stripped = &_sb[0];
 
-    char[FS_MSG_MAX] req @noinit;
-    int i = 0;
-    while (stripped[i] != 0 && i < 99) {
-        req[i] = stripped[i];
-        i++;
+        char[FS_MSG_MAX] req @noinit;
+        int i = 0;
+        while (stripped[i] != 0 && i < 99) {
+            req[i] = stripped[i];
+            i++;
+        }
+        req[i] = 0;
+
+        uint reply_verb = 0;
+        int from = p9_call(fsd_pid, FS_STAT, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
+        if (from <= 0 || reply_verb != FS_STAT) continue;
+
+        int* result_field = (int*)&req;
+        if (*result_field < 0) continue;            // not in this member — try the next
+        uint* size_field = (uint*)&req[4];
+        if (out_size != null) *out_size = *size_field;
+        if (out_type != null) *out_type = (int)((uint)req[8] & 0xFF);
+        return 0;
     }
-    req[i] = 0;
-
-    uint reply_verb = 0;
-    int from = p9_call(fsd_pid, FS_STAT, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
-    if (from <= 0 || reply_verb != FS_STAT) return -1;
-
-    int* result_field = (int*)&req;
-    if (*result_field < 0) return -1;
-    uint* size_field = (uint*)&req[4];
-    if (out_size != null) *out_size = *size_field;
-    if (out_type != null) *out_type = (int)((uint)req[8] & 0xFF);
-    return 0;
 }
 
 fn int fs_delete_impl(char* filename, uint recursive) {
     char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
-    char[FS_XLATE_MAX] _sb @noinit;
-    int fsd_pid = fs_server_for(filename, &_sb[0]);
-    if (fsd_pid < 0) return -1;
-    // ns_translate strips the mount prefix + applies any bind rewrite;
-    // see fs_read's own comment.
-    char* stripped = &_sb[0];
+    int last = -1;
+    for (int mi = 0; ; mi++) {                       // union walk — delete from the member that has it
+        char[FS_XLATE_MAX] _sb @noinit;
+        int fsd_pid = ns_translate(filename, mi, &_sb[0], FS_XLATE_MAX);
+        if (fsd_pid < 0) return last;
+        char* stripped = &_sb[0];
 
-    char[FS_MSG_MAX] req @noinit;
-    int i = 0;
-    while (stripped[i] != 0 && i < 99) {
-        req[i] = stripped[i];
-        i++;
+        char[FS_MSG_MAX] req @noinit;
+        int i = 0;
+        while (stripped[i] != 0 && i < 99) {
+            req[i] = stripped[i];
+            i++;
+        }
+        req[i] = 0;
+        // Explicit, not left @noinit: fsd.c3 now reads this byte as the
+        // recursive flag (see the wire-format comment above) — garbage
+        // here would risk a plain fs_delete() being silently treated as
+        // recursive.
+        uint* recursive_field = (uint*)&req[100];
+        *recursive_field = recursive;
+
+        uint reply_verb = 0;
+        int from = p9_call(fsd_pid, FS_DELETE, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
+        if (from <= 0 || reply_verb != FS_DELETE) { last = -1; continue; }
+
+        int* result_field = (int*)&req;
+        if (*result_field < 0) { last = *result_field; continue; }
+        return *result_field;
     }
-    req[i] = 0;
-    // Explicit, not left @noinit: fsd.c3 now reads this byte as the
-    // recursive flag (see the wire-format comment above) — garbage
-    // here would risk a plain fs_delete() being silently treated as
-    // recursive.
-    uint* recursive_field = (uint*)&req[100];
-    *recursive_field = recursive;
-
-    uint reply_verb = 0;
-    int from = p9_call(fsd_pid, FS_DELETE, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
-    if (from <= 0 || reply_verb != FS_DELETE) return -1;
-
-    int* result_field = (int*)&req;
-    return *result_field;
 }
 
 fn int fs_delete(char* filename) @export("fs_delete") {
@@ -1631,40 +1655,58 @@ fn int fs_delete_recursive(char* filename) @export("fs_delete_recursive") {
 // comment for each record's layout.
 fn int fs_list(char* dirname, char* out_buf, int max_entries) @export("fs_list") {
     char[100] _ap @noinit; fs_abspath(dirname, &_ap[0]); dirname = &_ap[0]; // cwd-relative -> absolute
-    char[FS_XLATE_MAX] _sb @noinit;
-    int fsd_pid = fs_server_for(dirname, &_sb[0]);
-    if (fsd_pid < 0) return -1;
-    char* stripped = &_sb[0];
 
     int total = 0;
-    for (;;) {
-        // One IPC per page, each carrying the running start index at
-        // byte 104 (the same wire slot FS_READ_AT's offset uses — every
-        // other verb ignores it). fsd fills up to FS_LIST_PAGE_MAX
-        // records; a short page means we've reached the end.
-        char[FS_MSG_MAX] req @noinit;
-        int i = 0;
-        while (stripped[i] != 0 && i < 99) { req[i] = stripped[i]; i++; }
-        req[i] = 0;
-        uint* start_field = (uint*)&req[104];
-        *start_field = (uint)total;
+    bool found_dir = false; // did at least one member resolve to a real directory?
+    for (int mi = 0; ; mi++) {
+        char[FS_XLATE_MAX] _sb @noinit;
+        int fsd_pid = ns_translate(dirname, mi, &_sb[0], FS_XLATE_MAX);
+        if (fsd_pid < 0) break;
+        char* stripped = &_sb[0];
 
-        uint reply_verb = 0;
-        int from = p9_call(fsd_pid, FS_LIST, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
-        if (from <= 0 || reply_verb != FS_LIST) return total > 0 ? total : -1;
+        int member_start = total; // where this member's entries begin in out_buf
+        int page_at = 0;
+        for (;;) {
+            // One IPC per page, running start index at byte 104. fsd fills
+            // up to FS_LIST_PAGE_MAX records; a short page = end.
+            char[FS_MSG_MAX] req @noinit;
+            int i = 0;
+            while (stripped[i] != 0 && i < 99) { req[i] = stripped[i]; i++; }
+            req[i] = 0;
+            uint* start_field = (uint*)&req[104];
+            *start_field = (uint)page_at;
 
-        int page = *(int*)&req;
-        if (page < 0) return total > 0 ? total : page;
+            uint reply_verb = 0;
+            int from = p9_call(fsd_pid, FS_LIST, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
+            if (from <= 0 || reply_verb != FS_LIST) break;
 
-        int room = max_entries - total;
-        int take = page < room ? page : room;
-        for (int j = 0; j < take * (int)FS_LIST_ENTRY_SIZE; j++) {
-            out_buf[total * (int)FS_LIST_ENTRY_SIZE + j] = req[4 + j];
+            int page = *(int*)&req;
+            if (page < 0) break; // this member has no such directory — skip it
+            found_dir = true;
+
+            for (int e = 0; e < page && total < max_entries; e++) {
+                char* rec = &req[4 + e * (int)FS_LIST_ENTRY_SIZE];
+                // union dedup: skip a name an earlier member already listed
+                bool dup = false;
+                for (int p = 0; p < member_start && !dup; p++) {
+                    char* prev = &out_buf[p * (int)FS_LIST_ENTRY_SIZE];
+                    bool same = true;
+                    for (int k = 0; k < (int)FS_LIST_NAME_MAX && same; k++) {
+                        if (prev[k] != rec[k]) same = false;
+                        if (prev[k] == 0 && rec[k] == 0) break;
+                    }
+                    if (same) dup = true;
+                }
+                if (dup) continue;
+                char* dst = &out_buf[total * (int)FS_LIST_ENTRY_SIZE];
+                for (int k = 0; k < (int)FS_LIST_ENTRY_SIZE; k++) dst[k] = rec[k];
+                total++;
+            }
+            page_at += page;
+            if (page < FS_LIST_PAGE_MAX || total >= max_entries) break;
         }
-        total += take;
-
-        if (page < FS_LIST_PAGE_MAX || total >= max_entries) break;
     }
+    if (!found_dir) return -1;
     return total;
 }
 
@@ -1676,7 +1718,7 @@ fn int fs_list(char* dirname, char* out_buf, int max_entries) @export("fs_list")
 fn int fs_mkdir(char* dirname) @export("fs_mkdir") {
     char[100] _ap @noinit; fs_abspath(dirname, &_ap[0]); dirname = &_ap[0]; // cwd-relative -> absolute
     char[FS_XLATE_MAX] _sb @noinit;
-    int fsd_pid = fs_server_for(dirname, &_sb[0]);
+    int fsd_pid = ns_translate(dirname, FS_CREATE_MEMBER, &_sb[0], FS_XLATE_MAX); // new dir -> create member
     if (fsd_pid < 0) return -1;
     char* stripped = &_sb[0];
 
@@ -1702,8 +1744,10 @@ fn int fs_mkdir(char* dirname) @export("fs_mkdir") {
 // FS_CHMOD's own wire-format comment and docs/roadmap.md §2.
 fn int fs_chattr(char* path, uint verb, uint arg) {
     char[100] _ap @noinit; fs_abspath(path, &_ap[0]); path = &_ap[0]; // cwd-relative -> absolute
+    // union walk — chmod/chown the member that actually has the file
+    for (int mi = 0; ; mi++) {
     char[FS_XLATE_MAX] _sb @noinit;
-    int fsd_pid = fs_server_for(path, &_sb[0]);
+    int fsd_pid = ns_translate(path, mi, &_sb[0], FS_XLATE_MAX);
     if (fsd_pid < 0) return -1;
     char* stripped = &_sb[0];
 
@@ -1719,10 +1763,12 @@ fn int fs_chattr(char* path, uint verb, uint arg) {
 
     uint reply_verb = 0;
     int from = p9_call(fsd_pid, verb, &req, FS_MSG_MAX, &req, FS_MSG_MAX, &reply_verb);
-    if (from <= 0 || reply_verb != verb) return -1;
+    if (from <= 0 || reply_verb != verb) { continue; }
 
     int* result_field = (int*)&req;
+    if (*result_field < 0) { continue; } // not in this member — try the next
     return *result_field;
+    }
 }
 
 fn int fs_chmod(char* path, uint mode) @export("fs_chmod") {
@@ -1745,11 +1791,14 @@ fn int fs_chown(char* path, uint uid) @export("fs_chown") {
 fn int fs_rename(char* old_path, char* new_path) @export("fs_rename") {
     char[100] _apo @noinit; fs_abspath(old_path, &_apo[0]); old_path = &_apo[0];
     char[100] _apn @noinit; fs_abspath(new_path, &_apn[0]); new_path = &_apn[0];
+    // Source resolves at member 0, destination at the create member —
+    // identical (same pid, same path) when there's no union. Renaming a
+    // file that lives only in a lower union member isn't handled yet.
     char[FS_XLATE_MAX] _osb @noinit;
-    int old_fsd_pid = fs_server_for(old_path, &_osb[0]);
+    int old_fsd_pid = ns_translate(old_path, 0, &_osb[0], FS_XLATE_MAX);
     if (old_fsd_pid < 0) return -1;
     char[FS_XLATE_MAX] _nsb @noinit;
-    int new_fsd_pid = fs_server_for(new_path, &_nsb[0]);
+    int new_fsd_pid = ns_translate(new_path, FS_CREATE_MEMBER, &_nsb[0], FS_XLATE_MAX);
     if (new_fsd_pid < 0) return -1;
     if (old_fsd_pid != new_fsd_pid) return -1;
 

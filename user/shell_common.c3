@@ -202,6 +202,8 @@ fn int shell_readline(char* buf, int cap)
 // unmount builtins.
 const int SH_NS_PREFIX_MAX = 32; // must match src/process.c3's NS_PREFIX_MAX
 const int NS_LIST_RECS     = 16; // must match src/process.c3's NS_MOUNTS_MAX
+const int NS_LIST_REC      = 100; // SYS_NS_LIST record size — must match entry.c3's NS_LIST_REC_SIZE
+                                  // (32 prefix + 4 pid LE + 1 flags + 63 target)
 
 fn void shell_ns_prefix(char* in, char* out)
 {
@@ -445,7 +447,7 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
         } else if (strcmp(cmd, "namespace") == 0 || strcmp(cmd, "ns") == 0) {
             // The current process's mount table — this shell's own, the
             // one every command it spawns inherits a copy of.
-            char[NS_LIST_RECS * 36] nsb @noinit;
+            char[NS_LIST_RECS * NS_LIST_REC] nsb @noinit;
             int nc = ns_list(&nsb[0], NS_LIST_RECS);
             if (nc < 0) {
                 print("namespace: failed\n");
@@ -453,14 +455,18 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
                 return true;
             }
             for (int e = 0; e < nc; e++) {
-                char* rec = &nsb[e * 36];
+                char* rec = &nsb[e * NS_LIST_REC];
                 uint pid = ((uint)rec[32] & 0xff)
                          | (((uint)rec[33] & 0xff) << 8)
                          | (((uint)rec[34] & 0xff) << 16)
                          | (((uint)rec[35] & 0xff) << 24);
+                uint flags = (uint)rec[36] & 0xff;
+                char* tgt = &rec[37];
                 print(rec[0] != 0 ? rec : "/");
                 print("\t-> pid ");
                 print_uint(pid);
+                if (tgt[0] != 0) { print(" = "); print(tgt); }
+                if ((flags & 1) != 0) { print(" (create)"); }
                 putchar('\n');
             }
             return true;
@@ -487,21 +493,32 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
             }
             return true;
         } else if (strcmp(cmd, "bind") == 0) {
-            // bind <source> <dir> — make <dir> resolve to whatever
-            // currently serves <source>. Builtin for the same reason as
-            // mount above.
-            if (cmd_argc < 2) {
-                print("usage: bind <source> <dir>\n");
+            // bind [-a] [-c] <source> <dir> — make <dir> resolve to
+            // whatever currently serves <source>. -a: add as a union
+            // member (searched after the existing ones) instead of
+            // replacing. -c: this member receives creation. Builtin for
+            // the same reason as mount above.
+            uint bflags = 0;
+            int bi = 0;
+            while (bi < cmd_argc && cmd_argv[bi][0] == '-' && cmd_argv[bi][1] != 0) {
+                for (int bk = 1; cmd_argv[bi][bk] != 0; bk++) {
+                    if (cmd_argv[bi][bk] == 'a') { bflags |= 1; }
+                    if (cmd_argv[bi][bk] == 'c') { bflags |= 4; }
+                }
+                bi++;
+            }
+            if (cmd_argc - bi < 2) {
+                print("usage: bind [-a] [-c] <source> <dir>\n");
                 g_shell_status = 1;
                 return true;
             }
             char[SH_NS_PREFIX_MAX] bp @noinit;
-            shell_ns_prefix(cmd_argv[1], &bp[0]);
+            shell_ns_prefix(cmd_argv[bi + 1], &bp[0]);
             char[100] bsrc @noinit;
-            shell_resolve_path(cmd_argv[0], &bsrc[0]);
-            if (ns_bind(&bp[0], bsrc[0] != 0 ? &bsrc[0] : "/") < 0) {
+            shell_resolve_path(cmd_argv[bi], &bsrc[0]);
+            if (ns_bind_flags(&bp[0], bsrc[0] != 0 ? &bsrc[0] : "/", bflags) < 0) {
                 print("bind: ");
-                print(cmd_argv[0]);
+                print(cmd_argv[bi]);
                 print(": resolves nowhere, or the namespace is full\n");
                 g_shell_status = 1;
             }

@@ -4,6 +4,47 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-03 — Plan 9 /bin, part 2: union mounts
+
+`bind -a` / `bind -c`, and every `fs_*` wrapper made union-aware.
+
+**Namespace.** Several `Mount` entries may now share one prefix (array
+order = search order). `SYS_NS_BIND` takes a flags arg: bit 0 = `-a`
+(add a member, keep the existing ones), bit 2 = `-c` (this member
+receives new files). Plain `bind` still replaces the whole union.
+`ns_translate` member `-1` resolves to the create member (the `-c` one,
+or member 0 when nothing's flagged), computed in `ns_translate_core`.
+`SYS_NS_LIST` records grew 36 → 100 bytes (+ flags byte + rewrite
+target), so `namespace` prints `prefix -> pid = target (create)`.
+
+**`user/user.c3`.** `fs_read` / `fs_read_at` / `fs_stat` /
+`fs_delete_impl` / `fs_chattr` walk members `0..N`, first non-negative
+reply wins — a `< 0` means "not in this member, try the next". The walk
+ends after member 0 when there's no union (member 1 doesn't resolve),
+so the non-union path is one IPC exactly as before. `fs_write` /
+`fs_write_at` / `fs_mkdir` / `fs_rename`-dest target `ns_translate(-1)`
+(the create member; identical to member 0 without a union). `fs_list`
+lists every member and merges, first occurrence of a name winning; the
+O(n²) dedup only runs when a union is actually present.
+
+**Shell.** `bind [-a] [-c] <src> <dir>` flag parsing; `namespace`
+shows targets + a `(create)` marker.
+
+Verified QEMU `-m 2G`: a 2-member union (`bind` + `bind -ac`) — `ls`
+merges and de-dups, `cat` serves the shadowing member (member 0 wins),
+`echo > /uni/c.txt` lands in the `-c` member, `rm` deletes through the
+union. Full battery (p9*/ns/chmod/perm/fsperm/sandbox/map/run/elf/wasm/
+gostage3/35/41/bigread) green with a proper boot settle. One false
+alarm chased down: the *first* `echo >` redirect right after boot
+wedged fsd — `sleep 12` in the harness isn't long enough for netd's
+DHCP + self-tests + the fs2 mount; 20 s+ settle is clean. Not a logic
+bug.
+
+Next: P3 — seed `/usr/$user/bin`, `bind -ac` it onto `/bin` at login,
+point the toolchains' `-o` there.
+
+---
+
 ## 2026-09-03 — Plan 9 /bin, part 1: namespace path rewriting
 
 Design doc `docs/bin-layout.md` first: no arch dir (both boards are

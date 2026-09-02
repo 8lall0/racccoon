@@ -1972,11 +1972,13 @@ fn bool ns_prefix_covers(char* path, char* prefix, int* rem_out) @noinline
 
 // Resolve `path` through `proc`'s namespace and write the
 // server-relative path for union member `member` (0 = first/highest
-// priority, higher = the `bind -a` extras in bind order) into `out`
-// (capacity `out_max`). Returns the serving pid, or -1 if nothing
-// matches / `member` is past the last member at the winning prefix /
-// the rewrite doesn't fit. `member` 0 with an identity (target == "")
-// mount reproduces the old ns_resolve()+strip behaviour exactly.
+// priority, higher = the `bind -a` extras in bind order; -1 = the
+// member that receives creation, i.e. the MNT_CREATE one or member 0 if
+// none is flagged) into `out` (capacity `out_max`). Returns the serving
+// pid, or -1 if nothing matches / `member` is past the last member at
+// the winning prefix / the rewrite doesn't fit. `member` 0 on an
+// identity (target == "") mount reproduces the old ns_resolve()+strip
+// behaviour exactly.
 fn int ns_translate_core(Process* proc, char* path, int member, char* out, int out_max) @noinline
 {
 	// Pass 1: longest covering prefix length.
@@ -1993,6 +1995,28 @@ fn int ns_translate_core(Process* proc, char* path, int member, char* out, int o
 		if (plen > best_len) best_len = plen;
 	}
 	if (best_len < 0) return -1;
+
+	// member -1: resolve to the create member's own index. Scan the
+	// best_len members in order; the MNT_CREATE one wins, else the first.
+	if (member < 0)
+	{
+		int idx = 0;
+		int scanned = 0;
+		for (int m = 0; m < NS_MOUNTS_MAX; m++)
+		{
+			if (proc.namespace[m].server_pid == 0) continue;
+			Process* ct = proc_by_pid(proc.namespace[m].server_pid);
+			if (!ct || ct.generation != proc.namespace[m].server_generation) continue;
+			int crem = 0;
+			if (!ns_prefix_covers(path, &proc.namespace[m].prefix[0], &crem)) continue;
+			int cplen = 0;
+			while (proc.namespace[m].prefix[cplen] != 0) cplen++;
+			if (cplen != best_len) continue;
+			if ((proc.namespace[m].flags & MNT_CREATE) != 0) { idx = scanned; break; }
+			scanned++;
+		}
+		member = idx;
+	}
 
 	// Pass 2: the `member`-th live mount whose prefix length == best_len,
 	// in array order (= bind order).
@@ -2518,17 +2542,19 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			f.a0 = (ulong)(iptr)unmount_result;
 		case SYS_NS_LIST:
-			// Copies the caller's own namespace out — one 36-byte record
-			// per live mount: the 32-byte null-padded path prefix, then
-			// the server pid as 4 little-endian bytes. Same per-process,
-			// "resolution is always relative to whoever's asking" scope as
-			// SYS_NS_RESOLVE, and the same generation check drops entries
-			// whose server has since exited. Returns the record count.
+			// Copies the caller's own namespace out — one NS_LIST_REC_SIZE
+			// (100) byte record per live mount: [0..31] null-padded prefix,
+			// [32..35] server pid LE, [36] flags (MNT_CREATE), [37..99]
+			// null-padded rewrite target. Same per-process scope as
+			// SYS_NS_RESOLVE; the generation check drops dead servers.
+			// Returns the record count. Union members share a prefix and
+			// list as separate records, in search order.
+			const int NS_LIST_REC_SIZE = 100;
 			char* nl_buf = (char*)(uptr)f.a0;
 			int nl_max = (int)(iptr)f.a1;
 			if (nl_max < 0) nl_max = 0;
 			if (nl_max > NS_MOUNTS_MAX) nl_max = NS_MOUNTS_MAX;
-			if (!user_range_valid(current_proc.page_table, (uptr)nl_buf, (ulong)(nl_max * 36), true))
+			if (!user_range_valid(current_proc.page_table, (uptr)nl_buf, (ulong)(nl_max * NS_LIST_REC_SIZE), true))
 			{
 				f.a0 = (ulong)(-1);
 				break;
@@ -2539,16 +2565,20 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				if (current_proc.namespace[m].server_pid == 0) continue;
 				Process* nl_t = proc_by_pid(current_proc.namespace[m].server_pid);
 				if (!nl_t || nl_t.generation != current_proc.namespace[m].server_generation) continue;
-				char* nl_dst = &nl_buf[nl_count * 36];
+				char* nl_dst = &nl_buf[nl_count * NS_LIST_REC_SIZE];
+				for (int z = 0; z < NS_LIST_REC_SIZE; z++) nl_dst[z] = 0;
 				char* nl_src = &current_proc.namespace[m].prefix[0];
 				int nl_k = 0;
 				while (nl_k < 31 && nl_src[nl_k] != 0) { nl_dst[nl_k] = nl_src[nl_k]; nl_k++; }
-				while (nl_k < 32) { nl_dst[nl_k] = 0; nl_k++; }
 				int nl_pid = current_proc.namespace[m].server_pid;
 				nl_dst[32] = (char)(nl_pid & 0xff);
 				nl_dst[33] = (char)((nl_pid >> 8) & 0xff);
 				nl_dst[34] = (char)((nl_pid >> 16) & 0xff);
 				nl_dst[35] = (char)((nl_pid >> 24) & 0xff);
+				nl_dst[36] = (char)(current_proc.namespace[m].flags & 0xff);
+				char* nl_tgt = &current_proc.namespace[m].target[0];
+				int nl_j = 0;
+				while (nl_j < 62 && nl_tgt[nl_j] != 0) { nl_dst[37 + nl_j] = nl_tgt[nl_j]; nl_j++; }
 				nl_count++;
 			}
 			f.a0 = (ulong)(iptr)nl_count;
