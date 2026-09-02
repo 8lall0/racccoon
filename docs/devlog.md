@@ -100,8 +100,11 @@ probe that gets OOM-killed at fault time, RAM recovers on reap),
 path it exercises is covered by `gostage2test` + `oomtest`; a clean
 timed run of the whole `go build` still needs a faster host / the Duo.
 
-Not done this session: the `GOOS=racccoon` rename; multi-core (SMP)
-scaffold; lifting the 768 MiB `__free_ram` cap. Duo kernel builds clean.
+Not done this session: the `GOOS=racccoon` rename (a fork-wide GOOS
+rename — ~340 files in the Go tree — best done interactively with the
+toolchain rebuild watched); lifting the 768 MiB `__free_ram` cap. Duo
+kernel builds clean. (The SMP scaffold — the other half of the same
+request — landed in the entry above.)
 
 ---
 
