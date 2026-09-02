@@ -60,10 +60,17 @@ func main() {
 	// --- os.ReadDir (dirents through the hook) ---
 	des, err := os.ReadDir("/")
 	names := map[string]bool{}
+	dirs := map[string]bool{}
 	for _, d := range des {
 		names[d.Name()] = true
+		dirs[d.Name()] = d.IsDir()
 	}
 	check("os.ReadDir / (hello.txt, subdir, bin)", err == nil && names["hello.txt"] && names["subdir"] && names["bin"])
+	// d.IsDir() must be right straight off the dirent — the goos backend
+	// fills Dirent.Type from fsd's FS_LIST type byte, so os doesn't lstat
+	// every entry (lib/go/racccoon.patch, 2026-09-02).
+	check("os.ReadDir / entry types (subdir=dir, hello.txt=file)",
+		dirs["subdir"] && dirs["bin"] && !dirs["hello.txt"])
 
 	sub, err := os.ReadDir("/subdir")
 	check("os.ReadDir /subdir has nested.txt", err == nil && len(sub) == 1 && sub[0].Name() == "nested.txt")

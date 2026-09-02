@@ -4,6 +4,31 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-02 — Go: native dirent types (no more lstat-per-entry)
+
+First divergence of racccoon's `os`/`syscall` from tamago's stubs.
+tamago's `direntType` returns "unknown" for every dir entry, so
+`os.ReadDir` / `os.(*File).ReadDir` `lstat` every name to get its
+mode — on racccoon each `lstat` is an fsd IPC round trip, so a
+~670-entry `$GOROOT/src/runtime` scan was ~670 of them.
+
+fsd's `FS_LIST` reply already carries a per-entry type byte (0 file /
+1 dir), and the goos dir backend already reads it. Now it propagates:
+`syscall.Dirent` gets a `Type` field, `syscall/fsgoos_racccoon.go`'s
+`goosPutDirent` fills it from the backend's `isDir`, and
+`os/dirent_racccoon.go`'s `direntType` decodes it to `ModeDir` / `0`.
+racccoon has no symlinks or device nodes, so the type is always known
+— `os` never falls back to `lstat` for a listing.
+
+`lib/go/racccoon.patch` grows by that (a new `os/dirent_racccoon.go`
+hunk; `Dirent.Type` in `syscall_racccoon.go`; the fill in
+`fsgoos_racccoon.go`). `gostage35test` gains an `os.ReadDir` entry-type
+assertion. Verified QEMU `-m 2G`: `gostage35test` / `gostage3test` /
+`gotest` / `gostage2test` / `gostage41test` / `goversiontest` /
+`maptest` / `oomtest` / `wasmtest`.
+
+---
+
 ## 2026-09-02 — `GOOS=racccoon`: the Go toolchain is a racccoon fork now
 
 ```

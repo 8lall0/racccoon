@@ -1,5 +1,5 @@
 diff --git a/src/cmd/go/internal/goos/goos.go b/src/cmd/go/internal/goos/goos.go
-index cb0fef21..d89e9f4f 100644
+index 05bd1b60..011a6959 100644
 --- a/src/cmd/go/internal/goos/goos.go
 +++ b/src/cmd/go/internal/goos/goos.go
 @@ -27,6 +27,7 @@ import (
@@ -23,7 +23,7 @@ index cb0fef21..d89e9f4f 100644
  		// fallback to Linux userspace goos defined in GOROOT/src/runtime/goos
  		if os.Getenv("GOHOSTOS") == "linux" && (cfg.Goarch == "amd64" || cfg.Goarch == "arm" || cfg.Goarch == "arm64" || cfg.Goarch == "loong64" || cfg.Goarch == "riscv64") {
 diff --git a/src/cmd/go/internal/lockedfile/internal/filelock/filelock_other.go b/src/cmd/go/internal/lockedfile/internal/filelock/filelock_other.go
-index b16709ed..94051399 100644
+index b16709ed..62741fdb 100644
 --- a/src/cmd/go/internal/lockedfile/internal/filelock/filelock_other.go
 +++ b/src/cmd/go/internal/lockedfile/internal/filelock/filelock_other.go
 @@ -9,6 +9,7 @@ package filelock
@@ -59,7 +59,7 @@ index b16709ed..94051399 100644
  		Op:   "Unlock",
  		Path: f.Name(),
 diff --git a/src/cmd/link/internal/ld/main.go b/src/cmd/link/internal/ld/main.go
-index 19ed197a..05a8ded0 100644
+index 19ed197a..2e26308d 100644
 --- a/src/cmd/link/internal/ld/main.go
 +++ b/src/cmd/link/internal/ld/main.go
 @@ -244,6 +244,21 @@ func Main(arch *sys.Arch, theArch Arch) {
@@ -85,7 +85,7 @@ index 19ed197a..05a8ded0 100644
  		Errorf("-aslr=false is only allowed for -buildmode=c-shared")
  		usage()
 diff --git a/src/cmd/vendor/golang.org/x/telemetry/internal/telemetry/dir.go b/src/cmd/vendor/golang.org/x/telemetry/internal/telemetry/dir.go
-index 0673be56..cdcb353b 100644
+index 0673be56..e63b6cf1 100644
 --- a/src/cmd/vendor/golang.org/x/telemetry/internal/telemetry/dir.go
 +++ b/src/cmd/vendor/golang.org/x/telemetry/internal/telemetry/dir.go
 @@ -159,5 +159,6 @@ const DisabledOnPlatform = false ||
@@ -95,8 +95,33 @@ index 0673be56..cdcb353b 100644
 +	runtime.GOOS == "racccoon" || // racccoon (lib/go/racccoon.patch): no telemetry child / config dir
  	runtime.GOOS == "plan9" || // https://github.com/golang/go/issues/57540#issuecomment-1470766639
  	runtime.GOARCH == "mips" || runtime.GOARCH == "mipsle" // mips lacks cross-process 64-bit atomics
+diff --git a/src/os/dirent_racccoon.go b/src/os/dirent_racccoon.go
+index 31778c2a..c6e34a83 100644
+--- a/src/os/dirent_racccoon.go
++++ b/src/os/dirent_racccoon.go
+@@ -26,5 +26,19 @@ func direntNamlen(buf []byte) (uint64, bool) {
+ }
+ 
+ func direntType(buf []byte) FileMode {
+-	return ^FileMode(0) // unknown
++	// racccoon (lib/go/racccoon.patch): the goos dir backend fills
++	// Dirent.Type from fsd's per-entry type byte, so os.ReadDir /
++	// (*File).ReadDir get the mode without an lstat per name. racccoon
++	// has only regular files and directories.
++	off := unsafe.Offsetof(syscall.Dirent{}.Type)
++	if int(off) >= len(buf) {
++		return ^FileMode(0)
++	}
++	switch buf[off] {
++	case syscall.DT_DIR:
++		return ModeDir
++	case syscall.DT_REG:
++		return 0
++	}
++	return ^FileMode(0) // unknown -> os falls back to lstat
+ }
 diff --git a/src/os/exec/lp_racccoon.go b/src/os/exec/lp_racccoon.go
-index cf7ac99e..e0e0b043 100644
+index d76ae134..94493c38 100644
 --- a/src/os/exec/lp_racccoon.go
 +++ b/src/os/exec/lp_racccoon.go
 @@ -8,17 +8,45 @@ package exec
@@ -148,7 +173,7 @@ index cf7ac99e..e0e0b043 100644
  }
  
 diff --git a/src/os/pipe_racccoon.go b/src/os/pipe_racccoon.go
-index 442f0cdf..0d0635f2 100644
+index c67f8f41..6c3c64ac 100644
 --- a/src/os/pipe_racccoon.go
 +++ b/src/os/pipe_racccoon.go
 @@ -9,8 +9,16 @@ package os
@@ -172,7 +197,7 @@ index 442f0cdf..0d0635f2 100644
 +	return newFile(fds[0], "|0", kindNoPoll, false), newFile(fds[1], "|1", kindNoPoll, false), nil
  }
 diff --git a/src/runtime/goos/linux_user.go b/src/runtime/goos/linux_user.go
-index fac5dfe1..4edaef78 100644
+index 9b66a401..da65ed53 100644
 --- a/src/runtime/goos/linux_user.go
 +++ b/src/runtime/goos/linux_user.go
 @@ -58,6 +58,53 @@ var (
@@ -230,7 +255,7 @@ index fac5dfe1..4edaef78 100644
  func CPUInit()
  func sys_exit_group(code int32)
 diff --git a/src/runtime/os_racccoon.go b/src/runtime/os_racccoon.go
-index 6d57f5f9..7060f5da 100644
+index e4814874..48680b7b 100644
 --- a/src/runtime/os_racccoon.go
 +++ b/src/runtime/os_racccoon.go
 @@ -50,6 +50,18 @@ func getgp() (gp uintptr) {
@@ -252,12 +277,121 @@ index 6d57f5f9..7060f5da 100644
  func goenvs()                        {}
  func sigsave(p *sigset)              {}
  func msigrestore(sigmask sigset)     {}
+diff --git a/src/syscall/fs_racccoon.go b/src/syscall/fs_racccoon.go
+index 55aea4cc..501ab344 100644
+--- a/src/syscall/fs_racccoon.go
++++ b/src/syscall/fs_racccoon.go
+@@ -368,6 +368,9 @@ func (f *fsysFile) read(b []byte) (int, error) {
+ }
+ 
+ func ReadDirent(fd int, buf []byte) (int, error) {
++	if gf, ok := fdToGoosFile(fd); ok {
++		return gf.readDirent(buf)
++	}
+ 	f, err := fdToFsysFile(fd)
+ 	if err != nil {
+ 		return 0, err
+@@ -518,6 +521,9 @@ func (f *fsysFile) pwriteLocked(b []byte, offset int64) (int, error) {
+ // Standard Unix system calls.
+ 
+ func Open(path string, openmode int, perm uint32) (fd int, err error) {
++	if goos.FS != nil {
++		return goosOpen(path, openmode, perm)
++	}
+ 	fsinit()
+ 	fs.mu.Lock()
+ 	defer fs.mu.Unlock()
+@@ -529,6 +535,9 @@ func Open(path string, openmode int, perm uint32) (fd int, err error) {
+ }
+ 
+ func Mkdir(path string, perm uint32) error {
++	if goos.FS != nil {
++		return goosErrno(goos.FS.Mkdir(path, perm))
++	}
+ 	fs.mu.Lock()
+ 	defer fs.mu.Unlock()
+ 	_, err := fs.open(path, O_CREATE|O_EXCL, perm&0777|S_IFDIR)
+@@ -536,11 +545,24 @@ func Mkdir(path string, perm uint32) error {
+ }
+ 
+ func Getcwd(buf []byte) (n int, err error) {
++	if goos.FS != nil {
++		wd, e := goos.FS.Getwd()
++		if e != 0 {
++			return 0, goosErrno(e)
++		}
++		if len(wd) >= len(buf) {
++			return 0, ERANGE
++		}
++		return copy(buf, wd), nil
++	}
+ 	// Force package os to default to the old algorithm using .. and directory reads.
+ 	return 0, ENOSYS
+ }
+ 
+ func Stat(path string, st *Stat_t) error {
++	if goos.FS != nil {
++		return goosStat(path, st)
++	}
+ 	fsinit()
+ 	fs.mu.Lock()
+ 	defer fs.mu.Unlock()
+@@ -557,6 +579,9 @@ func Lstat(path string, st *Stat_t) error {
+ }
+ 
+ func unlink(path string, isdir bool) error {
++	if goos.FS != nil {
++		return goosErrno(goos.FS.Remove(path, isdir))
++	}
+ 	fsinit()
+ 	fs.mu.Lock()
+ 	defer fs.mu.Unlock()
+@@ -723,6 +748,9 @@ func (fs *fsys) subtreeContains(dir, p *inode) bool {
+ }
+ 
+ func Rename(from, to string) error {
++	if goos.FS != nil {
++		return goosErrno(goos.FS.Rename(from, to))
++	}
+ 	fsinit()
+ 	fs.mu.Lock()
+ 	defer fs.mu.Unlock()
+@@ -814,6 +842,9 @@ func (fs *fsys) truncate(ip *inode, length int64) error {
+ }
+ 
+ func Truncate(path string, length int64) error {
++	if goos.FS != nil {
++		return goosErrno(goos.FS.Truncate(path, length))
++	}
+ 	fsinit()
+ 	fs.mu.Lock()
+ 	defer fs.mu.Unlock()
+@@ -825,6 +856,9 @@ func Truncate(path string, length int64) error {
+ }
+ 
+ func Ftruncate(fd int, length int64) error {
++	if gf, ok := fdToGoosFile(fd); ok {
++		return gf.ftruncate(length)
++	}
+ 	f, err := fdToFsysFile(fd)
+ 	if err != nil {
+ 		return err
+@@ -835,6 +869,9 @@ func Ftruncate(fd int, length int64) error {
+ }
+ 
+ func Chdir(path string) error {
++	if goos.FS != nil {
++		return goosErrno(goos.FS.Chdir(path))
++	}
+ 	fsinit()
+ 	return chdir(path)
+ }
 diff --git a/src/syscall/fsgoos_racccoon.go b/src/syscall/fsgoos_racccoon.go
 new file mode 100644
-index 00000000..2ca776e2
+index 00000000..7d65df14
 --- /dev/null
 +++ b/src/syscall/fsgoos_racccoon.go
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,278 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -423,17 +557,31 @@ index 00000000..2ca776e2
 +	return goosErrno(goos.FS.Close(f.h))
 +}
 +
-+func goosPutDirent(rec []byte, ino int64, name string) {
++// Dirent field offsets — byte-poked (rec may not be aligned for a
++// *Dirent cast, same caveat fs_racccoon.go's dir reader notes).
++const (
++	direntOffIno    = 0
++	direntOffReclen = 16
++	direntOffType   = 18
++	direntOffName   = 20
++)
++
++func goosPutDirent(rec []byte, ino int64, name string, isDir bool) {
 +	for i := 0; i < direntSize; i++ {
 +		rec[i] = 0
 +	}
 +	u := uint64(ino)
 +	for i := 0; i < 8; i++ {
-+		rec[i] = byte(u >> (8 * i))
++		rec[direntOffIno+i] = byte(u >> (8 * i))
 +	}
-+	rec[16] = byte(direntSize & 0xff)
-+	rec[17] = byte((direntSize >> 8) & 0xff)
-+	copy(rec[18:direntSize], name)
++	rec[direntOffReclen] = byte(direntSize & 0xff)
++	rec[direntOffReclen+1] = byte((direntSize >> 8) & 0xff)
++	if isDir {
++		rec[direntOffType] = DT_DIR
++	} else {
++		rec[direntOffType] = DT_REG
++	}
++	copy(rec[direntOffName:direntSize], name)
 +}
 +
 +func (f *goosFile) readDirent(buf []byte) (int, error) {
@@ -449,7 +597,8 @@ index 00000000..2ca776e2
 +	}
 +	n := 0
 +	for f.dpos < len(f.dents) && len(buf) >= direntSize {
-+		goosPutDirent(buf[:direntSize], int64(f.dpos+1), f.dents[f.dpos])
++		isDir := f.dpos < len(f.dentsD) && f.dentsD[f.dpos]
++		goosPutDirent(buf[:direntSize], int64(f.dpos+1), f.dents[f.dpos], isDir)
 +		buf = buf[direntSize:]
 +		n += direntSize
 +		f.dpos++
@@ -521,120 +670,11 @@ index 00000000..2ca776e2
 +	}
 +	return nil
 +}
-diff --git a/src/syscall/fs_racccoon.go b/src/syscall/fs_racccoon.go
-index 55aea4cc..501ab344 100644
---- a/src/syscall/fs_racccoon.go
-+++ b/src/syscall/fs_racccoon.go
-@@ -368,6 +368,9 @@ func (f *fsysFile) read(b []byte) (int, error) {
- }
- 
- func ReadDirent(fd int, buf []byte) (int, error) {
-+	if gf, ok := fdToGoosFile(fd); ok {
-+		return gf.readDirent(buf)
-+	}
- 	f, err := fdToFsysFile(fd)
- 	if err != nil {
- 		return 0, err
-@@ -518,6 +521,9 @@ func (f *fsysFile) pwriteLocked(b []byte, offset int64) (int, error) {
- // Standard Unix system calls.
- 
- func Open(path string, openmode int, perm uint32) (fd int, err error) {
-+	if goos.FS != nil {
-+		return goosOpen(path, openmode, perm)
-+	}
- 	fsinit()
- 	fs.mu.Lock()
- 	defer fs.mu.Unlock()
-@@ -529,6 +535,9 @@ func Open(path string, openmode int, perm uint32) (fd int, err error) {
- }
- 
- func Mkdir(path string, perm uint32) error {
-+	if goos.FS != nil {
-+		return goosErrno(goos.FS.Mkdir(path, perm))
-+	}
- 	fs.mu.Lock()
- 	defer fs.mu.Unlock()
- 	_, err := fs.open(path, O_CREATE|O_EXCL, perm&0777|S_IFDIR)
-@@ -536,11 +545,24 @@ func Mkdir(path string, perm uint32) error {
- }
- 
- func Getcwd(buf []byte) (n int, err error) {
-+	if goos.FS != nil {
-+		wd, e := goos.FS.Getwd()
-+		if e != 0 {
-+			return 0, goosErrno(e)
-+		}
-+		if len(wd) >= len(buf) {
-+			return 0, ERANGE
-+		}
-+		return copy(buf, wd), nil
-+	}
- 	// Force package os to default to the old algorithm using .. and directory reads.
- 	return 0, ENOSYS
- }
- 
- func Stat(path string, st *Stat_t) error {
-+	if goos.FS != nil {
-+		return goosStat(path, st)
-+	}
- 	fsinit()
- 	fs.mu.Lock()
- 	defer fs.mu.Unlock()
-@@ -557,6 +579,9 @@ func Lstat(path string, st *Stat_t) error {
- }
- 
- func unlink(path string, isdir bool) error {
-+	if goos.FS != nil {
-+		return goosErrno(goos.FS.Remove(path, isdir))
-+	}
- 	fsinit()
- 	fs.mu.Lock()
- 	defer fs.mu.Unlock()
-@@ -723,6 +748,9 @@ func (fs *fsys) subtreeContains(dir, p *inode) bool {
- }
- 
- func Rename(from, to string) error {
-+	if goos.FS != nil {
-+		return goosErrno(goos.FS.Rename(from, to))
-+	}
- 	fsinit()
- 	fs.mu.Lock()
- 	defer fs.mu.Unlock()
-@@ -814,6 +842,9 @@ func (fs *fsys) truncate(ip *inode, length int64) error {
- }
- 
- func Truncate(path string, length int64) error {
-+	if goos.FS != nil {
-+		return goosErrno(goos.FS.Truncate(path, length))
-+	}
- 	fsinit()
- 	fs.mu.Lock()
- 	defer fs.mu.Unlock()
-@@ -825,6 +856,9 @@ func Truncate(path string, length int64) error {
- }
- 
- func Ftruncate(fd int, length int64) error {
-+	if gf, ok := fdToGoosFile(fd); ok {
-+		return gf.ftruncate(length)
-+	}
- 	f, err := fdToFsysFile(fd)
- 	if err != nil {
- 		return err
-@@ -835,6 +869,9 @@ func Ftruncate(fd int, length int64) error {
- }
- 
- func Chdir(path string) error {
-+	if goos.FS != nil {
-+		return goosErrno(goos.FS.Chdir(path))
-+	}
- 	fsinit()
- 	return chdir(path)
- }
 diff --git a/src/syscall/syscall_racccoon.go b/src/syscall/syscall_racccoon.go
-index d7ab81f1..2f626f97 100644
+index 3342e51f..901c0d91 100644
 --- a/src/syscall/syscall_racccoon.go
 +++ b/src/syscall/syscall_racccoon.go
-@@ -10,6 +10,7 @@ import (
+@@ -10,18 +10,35 @@ import (
  	errorspkg "errors"
  	"internal/oserror"
  	"internal/strconv"
@@ -642,7 +682,36 @@ index d7ab81f1..2f626f97 100644
  	"sync"
  	"unsafe"
  )
-@@ -239,8 +240,13 @@ var ForkLock sync.RWMutex
+ 
+ //sys	write(fd int, p []byte) (n int, err error) = SYS_WRITE
+ 
+-const direntSize = 8 + 8 + 2 + 256
++const direntSize = 8 + 8 + 2 + 1 + 1 + 256
+ 
++// d_type values, matching the "0 = file, 1 = directory" byte fsd's
++// FS_LIST reply carries (user/user.c3). racccoon has no symlinks or
++// device nodes, so Type is always known for a real entry.
++const (
++	DT_UNKNOWN = 0xff
++	DT_REG     = 0
++	DT_DIR     = 1
++)
++
++// racccoon (lib/go/racccoon.patch): `Type` added — the goos dir backend
++// fills it from fsd's per-entry type byte so os.ReadDir / (*File).ReadDir
++// don't lstat every name (each lstat is an fsd IPC round trip; a
++// ~670-entry $GOROOT/src/runtime scan was ~670 of them).
++// os/dirent_racccoon.go's direntType reads it.
+ type Dirent struct {
+ 	Ino    int64
+ 	Off    int64
+ 	Reclen uint16
++	Type   uint8
++	_      uint8
+ 	Name   [256]byte
+ }
+ 
+@@ -239,8 +256,13 @@ var ForkLock sync.RWMutex
  
  type WaitStatus uint32
  
@@ -658,7 +727,7 @@ index d7ab81f1..2f626f97 100644
  func (w WaitStatus) Signaled() bool     { return false }
  func (w WaitStatus) Signal() Signal     { return 0 }
  func (w WaitStatus) CoreDump() bool     { return false }
-@@ -282,9 +288,21 @@ func Sysctl(key string) (string, error) {
+@@ -282,9 +304,21 @@ func Sysctl(key string) (string, error) {
  
  // Unimplemented Unix midden heap.
  
@@ -683,7 +752,7 @@ index d7ab81f1..2f626f97 100644
  func Getegid() int                      { return 1 }
  func Geteuid() int                      { return 1 }
  func Getgid() int                       { return 1 }
-@@ -298,10 +316,40 @@ func Sendfile(outfd int, infd int, offset *int64, count int) (written int, err e
+@@ -298,10 +332,40 @@ func Sendfile(outfd int, infd int, offset *int64, count int) (written int, err e
  	return 0, ENOSYS
  }
  func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle uintptr, err error) {
