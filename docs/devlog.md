@@ -44,7 +44,8 @@ them is a follow-up.
 
 Verified QEMU `-m 2G`: `gotest` / `gostage2test` / `gostage41test` /
 `gostage42test` / `goversiontest` (reports `racccoon/riscv64`) /
-`maptest` / `oomtest` / `wasmtest`. `gobuildtest` re-running.
+`maptest` / `oomtest` / `wasmtest`, and `gobuildtest` end-to-end
+(`go build` → running binary, ~50 min under the loaded emulator).
 
 ---
 
