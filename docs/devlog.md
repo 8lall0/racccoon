@@ -4,6 +4,35 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-03 — Plan 9 /bin, part 4: the wide regression sweep
+
+Ran the union `/bin` work (P1–P3, `198086f` / `35a47fc` / `33a419b`)
+across the FAT32 and dual-partition images.
+
+**FAT32 (`disk.img`):** `runtest` `argvtest` `pathtest` `lfntest`
+`p9test` `hotplugtest` all pass. The login `bind` shows in
+`namespace` and is harmless where `/usr/root/bin` doesn't exist.
+
+**Dual (`disk_dual.img`):** `mounttest` `bigreadtest` `nstest`
+`runtest2` `elftest2` `p9realtest` pass. `gostage2test` /
+`gostage42test` skip (the dual root partition excludes the `gostage*`
+binaries by size).
+
+**`argvtest` / `argvtest2` are flaky on the dual image — and fail the
+same way at `07de755`, before any of this work.** Both do a delicate
+`rfork` + IPC-rendezvous + `exec`-with-notify + `P9_TREAD` + `kill`
+dance and check the child's argv round-tripped; `argvtest2` failed
+4/4, `argvtest` ~1/3, at HEAD *and* at `07de755`. `runtest2` /
+`elftest2` (same exec, no argv check) are solid. So this is a
+pre-existing race in those two tests' harness, not a `/bin`-union
+regression — filed for a separate look. The P1–P3 regressions that
+passed (`gostage41` etc.) are real; the earlier "argvtest2 green" notes
+were single lucky runs.
+
+**Not run:** real Duo (no card).
+
+---
+
 ## 2026-09-03 — Plan 9 /bin, part 3: the /bin union goes live
 
 `/bin` is now a real union: the physical `/bin` plus `/usr/$user/bin`,
