@@ -4,6 +4,65 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-02 — Go Stage 4.4 DONE: `go build` works on racccoon
+
+```
+root /gomod # /bin/go build -o /tmp/hw .
+root /gomod # /tmp/hw
+hello from go build on racccoon
+sum 1..100 = 5050
+```
+
+The `go` command, running on racccoon, drives `compile` / `asm` /
+`link` as subprocesses, compiles `runtime` + `runtime/goos` + the
+user's `main` on-device, links a RISC-V ELF, and the binary runs. The
+stdlib closure comes from a **prepopulated build cache** — a host build
+with the exact same cross-toolchain (`build_go_goroot.sh`), whose
+content-addressed cache keys the on-device build hits (`-trimpath`
+keeps the stdlib keys machine-independent). Same bootstrapping shape as
+`lib/tcc`'s prebuilt `crt1.o`. `gobuildtest` shell builtin (slow, not
+in the quick sweep).
+
+Getting there from the previous entry's groundwork:
+
+- **ext2 directory ops only walked the 12 direct blocks** — committed
+  separately (`fsd/ext2: follow indirect blocks in directory
+  operations`). A ~670-entry `$GOROOT/src/runtime` was truncated to
+  ~506 on `os.ReadDir`, and the missing `preempt_riscv64.s` meant
+  `compile` saw `asyncPreempt` as ABIInternal. `ext2_list` /
+  `ext2_find_in_dir` / `ext2_find_in_root` now iterate every data block
+  via `ext2_resolve_block`.
+- `pathcache.LookPath` on the tool paths always failed
+  (`lp_tamago.go` stubbed it to "no executables"); fsd files reported
+  mode `0644` (no exec bit). Fixed both.
+- `.s` `#include "textflag.h"` / `cgo/abi_riscv64.h` — seed
+  `$GOROOT/pkg/include/*.h` + `$GOROOT/src/runtime/cgo/*.h`.
+- compiling `runtime` OOM'd the on-device `compile`'s 64 MiB Go arena;
+  build tag `racccoon_bigheap` gives `cmd/compile` / `cmd/link` a
+  448 MiB arena (bumping `go` too broke `rfork` — a 448 MiB parent
+  can't be forked in a 768 MiB pool).
+- a bare `go build` linked at Go's default address, which the racccoon
+  loader rejects — `cmd/link` now defaults `-T 0x1010000` / `-R 0x1000`
+  for `GOOS=tamago` riscv64, so the output loads with no `-ldflags`.
+
+`build.sh` seeds `/goroot` (tools + headers + the stdlib source
+closure + the racccoon `runtime/goos` overlay), `/gocache` (the
+prepopulated cache), and `/gomod` (a one-file module for the test);
+`disk_ext2.img` grew 256 → 448 MiB. `racccoon.patch` → 728 lines.
+
+Not done / follow-ups: lazy `SYS_MAP` (the eager 448 MiB map costs a
+few seconds per `compile` launch; also the real fix for the OOM and the
+fork-size limit); `os.ReadDir` still lstats every entry (fsd exposes no
+dirent type — a ~670-stat directory scan); the `GOOS=racccoon` rename.
+
+`go version` / `go env` (4.4 part 1) unaffected. Regressions green:
+runtest / argvtest / pathtest / elftest / gostage35 / gostage41 /
+gostage42 / gotest / goversiontest / dirpacktest / p9realtest /
+p9fswritetest / p9mkdirtest / bigreadtest (dual) / fspermtest /
+chmodtest. Duo kernel builds clean.
+
+---
+
 ## 2026-09-02 — Go Stage 4.4: argv[0] in the exec ABI, and `go build` groundwork
 
 **`SYS_EXEC` now carries `argv[0]`.** The racccoon exec ABI packed only

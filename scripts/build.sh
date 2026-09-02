@@ -12,6 +12,21 @@ fi
 LLC=${LLC:-llc}
 LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
 
+# ext2_seed_tree <hostdir> <destdir-on-image> <image>
+# Recursively copy a host directory into an ext2 image via debugfs
+# (mkdir each subdir, write each file). Used for the on-device GOROOT +
+# build cache (Stage 4.4) — hundreds of small files.
+ext2_seed_tree() {
+  local src="$1" dst="$2" img="$3"
+  debugfs -w -R "mkdir $dst" "$img" > /dev/null 2>&1 || true
+  ( cd "$src" && find . -mindepth 1 -type d ) | sed 's#^\./##' | while read -r d; do
+    debugfs -w -R "mkdir $dst/$d" "$img" > /dev/null 2>&1
+  done
+  ( cd "$src" && find . -type f ) | sed 's#^\./##' | while read -r f; do
+    debugfs -w -R "write $src/$f $dst/$f" "$img" > /dev/null 2>&1
+  done
+}
+
 (
   cd "$(dirname "$0")/.."
 
@@ -73,11 +88,14 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
     bash scripts/build_go.sh cmd/link || true
     bash scripts/build_go_toolchain.sh || true
 
-    # Stage 4.4 part 1: the `go` command itself (`go version` / `go env`
-    # run on racccoon; `go build` is groundwork — docs/go-port-plan.md).
-    # `go.elf` bakes GOROOT=/goroot; build_go_goroot.sh assembles the
-    # /goroot skeleton (VERSION + go.env). Seeded as /bin/go below.
+    # Stage 4.4: the `go` command runs on racccoon — `go version` /
+    # `go env`, and `go build` (docs/go-port-plan.md). `go.elf` bakes
+    # GOROOT=/goroot; cmd/asm joins compile/link as the third tool;
+    # build_go_goroot.sh assembles /goroot (tools, headers, stdlib
+    # source closure, runtime/goos overlay) + a prepopulated build
+    # cache. All seeded below.
     bash scripts/build_go.sh cmd/go || true
+    bash scripts/build_go.sh cmd/asm || true
     bash scripts/build_go_goroot.sh || true
   fi
 
@@ -204,7 +222,11 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # 262144 1-KiB blocks / 8192 blocks-per-group = 32 groups, nowhere
   # near ext2.c3's own EXT2_MAX_GROUPS (2048) ceiling.
   rm -f build/disk_ext2.img
-  dd if=/dev/zero of=build/disk_ext2.img bs=1M count=256 status=none
+  # 448 MiB — the Stage 4.4 on-device GOROOT (stdlib source closure +
+  # tool binaries) plus a prepopulated build cache is ~60 MiB on top of
+  # the Stage 4.3 toolchain payload. 458752 1-KiB blocks / 8192 per
+  # group = 56 groups, far under ext2.c3's EXT2_MAX_GROUPS (2048).
+  dd if=/dev/zero of=build/disk_ext2.img bs=1M count=448 status=none
   mke2fs -q -F -b 1024 build/disk_ext2.img
   debugfs -w -R "write disk-ext2/hello.txt hello.txt" build/disk_ext2.img > /dev/null
   # disk-ext2/subdir/ exercises ext2.c3's read-only subdirectory support
@@ -244,20 +266,33 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
     case "$(basename "$g")" in go.elf) continue ;; esac
     [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_ext2.img > /dev/null
   done
-  # Stage 4.4 part 1 (docs/go-port-plan.md): the `go` command + its
-  # baked GOROOT skeleton. /goroot/{VERSION,go.env}; /gocache +
-  # /gomodcache are the writable dirs go.env points GOCACHE/GOMODCACHE
-  # at (go build needs a real cache dir — GOCACHE=off is rejected).
+  # Stage 4.4 (docs/go-port-plan.md): `/bin/go` + the on-device GOROOT
+  # (build_go_goroot.sh — tools, headers, the stdlib source closure, the
+  # racccoon runtime/goos overlay) + a prepopulated /gocache so
+  # `go build` only compiles runtime / runtime/goos / the user's main
+  # on-device, then links. /gomodcache is the (empty) module cache;
+  # /gomod is a one-file module for gobuildtest.
   if [ -d build/go/goroot ]; then
     debugfs -w -R "write build/go/go.elf bin/go" build/disk_ext2.img > /dev/null
-    debugfs -w -R "mkdir goroot" build/disk_ext2.img > /dev/null
-    debugfs -w -R "mkdir goroot/pkg" build/disk_ext2.img > /dev/null
-    debugfs -w -R "mkdir goroot/pkg/tool" build/disk_ext2.img > /dev/null
-    debugfs -w -R "mkdir goroot/pkg/tool/tamago_riscv64" build/disk_ext2.img > /dev/null
-    debugfs -w -R "write build/go/goroot/VERSION goroot/VERSION" build/disk_ext2.img > /dev/null
-    debugfs -w -R "write build/go/goroot/go.env goroot/go.env" build/disk_ext2.img > /dev/null
-    debugfs -w -R "mkdir gocache" build/disk_ext2.img > /dev/null
+    ext2_seed_tree build/go/goroot goroot build/disk_ext2.img
+    ext2_seed_tree build/go/gocache gocache build/disk_ext2.img
     debugfs -w -R "mkdir gomodcache" build/disk_ext2.img > /dev/null
+    debugfs -w -R "mkdir gomod" build/disk_ext2.img > /dev/null
+    printf 'module gobuildtest\n\ngo 1.27\n' > build/go/gomod_go.mod
+    cat > build/go/gomod_main.go <<'GOEOF'
+package main
+
+func main() {
+	println("hello from go build on racccoon")
+	s := 0
+	for i := 1; i <= 100; i++ {
+		s += i
+	}
+	println("sum 1..100 =", s)
+}
+GOEOF
+    debugfs -w -R "write build/go/gomod_go.mod gomod/go.mod" build/disk_ext2.img > /dev/null
+    debugfs -w -R "write build/go/gomod_main.go gomod/main.go" build/disk_ext2.img > /dev/null
   fi
   # Stage 4 (docs/go-port-plan.md): the stdlib object closure + importcfg
   # go-compile/go-link need to build+link go/cmd/hello entirely on-device

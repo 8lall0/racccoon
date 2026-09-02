@@ -58,6 +58,32 @@ index b16709ed..94051399 100644
  	return &fs.PathError{
  		Op:   "Unlock",
  		Path: f.Name(),
+diff --git a/src/cmd/link/internal/ld/main.go b/src/cmd/link/internal/ld/main.go
+index 19ed197a..05a8ded0 100644
+--- a/src/cmd/link/internal/ld/main.go
++++ b/src/cmd/link/internal/ld/main.go
+@@ -244,6 +244,21 @@ func Main(arch *sys.Arch, theArch Arch) {
+ 		ctxt.HeadType.Set(buildcfg.GOOS)
+ 	}
+ 
++	// racccoon (lib/go/racccoon.patch): a GOOS=tamago ELF loads into a
++	// racccoon process at USER_BASE (0x1000000); the loader needs the
++	// ELF header at USER_BASE and every PT_LOAD inside the exec window,
++	// so default -T to USER_BASE+64KiB and -R to the page size when the
++	// caller didn't set them (scripts/build_go.sh passes these
++	// explicitly; an on-device `go build` relies on this default).
++	if buildcfg.GOOS == "tamago" && ctxt.Arch.Family == sys.RISCV64 {
++		if *FlagTextAddr == -1 {
++			*FlagTextAddr = 0x1010000
++		}
++		if *FlagRound == -1 {
++			*FlagRound = 0x1000
++		}
++	}
++
+ 	if !*flagAslr && ctxt.BuildMode != BuildModeCShared {
+ 		Errorf("-aslr=false is only allowed for -buildmode=c-shared")
+ 		usage()
 diff --git a/src/cmd/vendor/golang.org/x/telemetry/internal/telemetry/dir.go b/src/cmd/vendor/golang.org/x/telemetry/internal/telemetry/dir.go
 index 0673be56..cdcb353b 100644
 --- a/src/cmd/vendor/golang.org/x/telemetry/internal/telemetry/dir.go

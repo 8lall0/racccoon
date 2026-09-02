@@ -2163,13 +2163,11 @@ fn void main() {
                 }
             }
         } else if (strcmp(cmd, "goversiontest") == 0) {
-            // Stage 4.4 part 1 (docs/go-port-plan.md): the `go` command
-            // itself runs on racccoon. `go version` + `go env GOROOT`
-            // (the cheap milestone — no $GOROOT/src / tools needed, just
-            // the /goroot/{VERSION,go.env} skeleton baked GOROOT=/goroot
-            // resolves to). `go build` is groundwork, not wired here.
-            // Slow (a ~14 MiB binary off fsd, twice) — not in the quick
-            // sweep. Skips cleanly without /bin/go.
+            // Stage 4.4 (docs/go-port-plan.md): the `go` command itself
+            // runs on racccoon. `go version` + `go env GOROOT` — the
+            // cheap check, no $GOROOT/src needed. `go build` is
+            // gobuildtest below. Slow (a ~14 MiB binary off fsd, twice)
+            // — not in the quick sweep. Skips cleanly without /bin/go.
             uint gv_size = 0; int gv_type = 0;
             if (fs_stat("/bin/go", &gv_size, &gv_type) < 0) {
                 print("goversiontest: skipped (no /bin/go — build with TAMAGO set)\n");
@@ -2191,6 +2189,48 @@ fn void main() {
                 } else {
                     print("goversiontest: FAILED (version exit "); print_uint((uint)gv_rc1);
                     print(", env exit "); print_uint((uint)gv_rc2); print(")\n");
+                }
+            }
+        } else if (strcmp(cmd, "gobuildtest") == 0) {
+            // Stage 4.4 (docs/go-port-plan.md): `go build` on racccoon.
+            // `cd /gomod` (a one-file module seeded by build.sh),
+            // `/bin/go build -o /tmp/gbt .`, then run /tmp/gbt and check
+            // it printed the expected line. The stdlib closure comes
+            // from the prepopulated /gocache (a host build with the same
+            // cross-toolchain — content-addressed cache keys match), so
+            // only runtime / runtime/goos / main compile on-device;
+            // cmd/link defaults -T/-R for tamago so the output loads.
+            // VERY slow — a fresh QEMU boot plus the on-device compiles
+            // and link, several minutes. Not in the quick sweep.
+            uint gb_sz = 0; int gb_ty = 0;
+            if (fs_stat("/gomod/go.mod", &gb_sz, &gb_ty) < 0) {
+                print("gobuildtest: skipped (no /gomod — build with TAMAGO set)\n");
+            } else {
+                fs_delete("/tmp/gbt");
+                if (chdir("/gomod") != 0) { print("gobuildtest: chdir /gomod failed\n"); }
+                char*[4] gb_av4;
+                gb_av4[0] = "build"; gb_av4[1] = "-o"; gb_av4[2] = "/tmp/gbt"; gb_av4[3] = ".";
+                uint gb_g1 = 0;
+                int gb_c1 = rfork(RFPROC, &gb_g1);
+                if (gb_c1 == 0) { exec("/bin/go", exec_buf(), exec_buf_max(), 0, &gb_av4[0], 4); exitcode(127); }
+                int gb_rc1 = join(gb_c1, gb_g1);
+                chdir("/");
+
+                if (gb_rc1 != 0) {
+                    print("gobuildtest: FAILED (go build exit "); print_uint((uint)gb_rc1); print(")\n");
+                } else {
+                    uint gb_o = 0; int gb_ot = 0;
+                    if (fs_stat("/tmp/gbt", &gb_o, &gb_ot) < 0) {
+                        print("gobuildtest: FAILED (no /tmp/gbt produced)\n");
+                    } else {
+                        uint gb_g2 = 0;
+                        int gb_c2 = rfork(RFPROC, &gb_g2);
+                        if (gb_c2 == 0) { exec("/tmp/gbt", exec_buf(), exec_buf_max(), 0, null, 0); exitcode(127); }
+                        int gb_rc2 = join(gb_c2, gb_g2);
+                        print(gb_rc2 == 0
+                            ? "gobuildtest: ok (go build produced a working binary)\n"
+                            : "gobuildtest: FAILED (built binary exit != 0)\n");
+                    }
                 }
             }
         } else if (strcmp(cmd, "gotoolchaintest") == 0) {

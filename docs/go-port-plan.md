@@ -390,20 +390,37 @@ unknowns. Staged:
   fallback needs real st_ino, which the fsd backend fakes as 0);
   `getcwd()` in `go/goos` now returns `/` for the empty root cwd.
 
-  **4.4 part 2 — `go build` — groundwork, not working.** Gets through
-  GOROOT / module load / build-cache / toolID probe. Fixed on the way:
-  filelock → no-op on tamago; `GOOS tamago unsupported without GOOSPKG`
-  fatal (`cmd/go/internal/goos` uses `$GOROOT/src/runtime/goos`
-  directly on tamago — seed the racccoon overlay there, no GOOSPKG);
-  `GOCACHE=off` rejected → real `/gocache` dir; `syscall.Ftruncate`
-  routed to the fsd hook; `goos.FS.Truncate` generalised (shrink =
-  read+rewrite, grow = zero-pad). **Open:** `compile -V=full` reports
-  its name as `go` (racccoon exec ABI has no argv[0]; the goos layer
-  synthesises `os.Args[0]="go"`), which `cmd/go`'s toolID parser
-  rejects — needs argv[0] carried through `SYS_EXEC` (kernel + `exec()`
-  + c3 callers + `start()`) or a relaxed toolID check. Plus seeding
-  `$GOROOT/src` (~10 MiB closure) + `{compile,link,asm}` into
-  `/goroot/pkg/tool/tamago_riscv64/`.
+  **4.4 part 2 — `go build` — DONE.** `/bin/go build -o /tmp/x .` in
+  `/gomod` on racccoon compiles `runtime` / `runtime/goos` / the user's
+  `main`, links a RISC-V ELF, and it runs. `gobuildtest` builtin
+  (slow). The stdlib closure is a **prepopulated `/gocache`** — a host
+  build with the same cross-toolchain, `-trimpath` so the stdlib cache
+  keys are machine-independent (the Stage 4.3 bootstrap idea).
+  `build_go_goroot.sh` assembles `/goroot` (compile/link/asm + the asm
+  `#include` headers + the stdlib source closure + the racccoon
+  `runtime/goos` overlay); `build.sh` seeds it + `/gocache` + `/gomod`;
+  `disk_ext2.img` 256 → 448 MiB.
+  - argv[0] in `SYS_EXEC` (see the 2026-09-02 devlog entry) — fixes
+    `compile -V=full` reporting its name as `go`.
+  - `lp_tamago.go` LookPath was stubbed to always fail; fsd files
+    reported mode `0644` (no exec bit) → both fixed.
+  - **ext2 directory ops only walked the 12 direct blocks** — a
+    ~670-entry `$GOROOT/src/runtime` truncated on `os.ReadDir` /
+    silently missing from `stat`. `ext2_list` / `ext2_find_in_dir` /
+    `ext2_find_in_root` now walk indirect blocks (commit `1675dc7` —
+    fixes `ls`/`stat`/`cat` of any big dir, not just Go).
+  - filelock → no-op on tamago; `cmd/go/internal/goos` uses
+    `$GOROOT/src/runtime/goos` directly on tamago (no GOOSPKG on
+    device); `GOCACHE=off` rejected → real `/gocache`;
+    `syscall.Ftruncate` → fsd hook; `goos.FS.Truncate` generalised.
+  - `cmd/compile` / `cmd/link` built with `-tags racccoon_bigheap`
+    (448 MiB Go arena — compiling `runtime` OOM'd 64 MiB).
+  - `cmd/link` defaults `-T 0x1010000` / `-R 0x1000` for tamago
+    riscv64, so a bare `go build` output is racccoon-loadable.
+
+  Follow-ups: lazy `SYS_MAP` (the eager 448 MiB map is a few seconds
+  per `compile`; also the real fix for the OOM + fork-size limit);
+  `os.ReadDir` lstats every entry (fsd has no dirent type).
 
 Likely wants the `GOOS=racccoon` rename around 4.3–4.4 (own identity,
 room for `os`/`syscall` to diverge further) — apply tamago's patchset
