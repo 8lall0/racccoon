@@ -425,9 +425,8 @@ unknowns. Staged:
     riscv64, so a bare `go build` output is racccoon-loadable.
   - The QEMU PLIC was un-identity-mapped (2026-09-02 devlog) — a
     448 MiB heap grew through its identity address at `0x0c000000` and
-    store-faulted. `compile` now grows past it cleanly; the full
-    on-device `go build` still needs a faster host to time end-to-end
-    (`compile` alone runs > 25 min on the dev host).
+    store-faulted. With that fixed, `gobuildtest` **passes end-to-end**
+    (`go build` → running binary), ~50 min under the loaded emulator.
 
   Follow-ups: `os.ReadDir` lstats every entry (fsd
   has no dirent type).

@@ -32,12 +32,21 @@ trap with paging on and go through the alias. The Duo keeps identity
 mapping (`PLIC_*_PHYS_PAGE == PLIC_*_PAGE`) — its PLIC is at
 `0x70000000`, far above any 16 MiB Duo heap.
 
-Verified: instrumented run shows `compile`'s heap grow cleanly past
-`0xC000000` to 300+ MiB with no fault (the build itself is still too
-slow to finish end-to-end on this host — `compile` alone runs > 25 min
-here). Regression sweep at `-m 2G` all green — FAT32 / ext2 / dual /
-exFAT, and disk I/O (virtio-blk IRQ → PLIC → `fsd` mount) proves the
-alias works: `maptest` / `oomtest` / `faulttest` / `runtest` /
+Verified: `gobuildtest` **passes end-to-end** —
+
+```
+root / # gobuildtest
+hello from go build on racccoon
+sum 1..100 = 5050
+gobuildtest: ok (go build produced a working binary)
+```
+
+`/bin/go build` on racccoon compiles `runtime` + `runtime/goos` + the
+user's `main`, links a RISC-V ELF, and it runs. Slow (~50 min under the
+loaded emulator — `compile` of package `runtime` on-device is the cost),
+but correct. Regression sweep at `-m 2G` all green — FAT32 / ext2 /
+dual / exFAT, and disk I/O (virtio-blk IRQ → PLIC → `fsd` mount) proves
+the alias works: `maptest` / `oomtest` / `faulttest` / `runtest` /
 `elftest` / `gotest` / `gostage2test` / `gostage42test` / `wasmtest` /
 `hardentest` / `chmodtest` / `fspermtest`. Duo kernel builds clean.
 
