@@ -60,7 +60,13 @@ extern char[] _binary_gpiod_bin_end @cname("_binary_gpiod_bin_end");
 
 fn void boot() @naked @export("boot") @section(".text.boot") @noinline @nostrip @used
 {
+	// OpenSBI enters S-mode here with a0 = the boot hart's id, a1 = the
+	// DTB address. Stash a0 for src/smp.c3 before setting up the stack —
+	// secondary harts are started separately (sbi_hart_start), they land
+	// at secondary_entry, not here.
 	asm(`
+        la t0, boot_hartid_raw
+        sd a0, 0(t0)
         la sp, __stack_top
         j kernel_main
     `);
@@ -325,6 +331,13 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		supervisor_register("gpiod", (char*)&_binary_gpiod_bin_start, (char*)&_binary_gpiod_bin_end,
 			SVC_KIND_GPIOD, 0, false, true, null, gpiod_proc);
 	}
+
+	// Multi-core scaffold (src/smp.c3): enumerate + start whatever harts
+	// the board allows, each of which announces itself and parks. No-op
+	// on a single-hart boot (default QEMU, the Duo). Deliberately last —
+	// the boot servers above must all be up first, since a secondary
+	// today does nothing but wfi and a real scheduler isn't wired in.
+	smp_start_secondaries();
 
 	// Single call site for create_process(shell) below (a *respawn*
 	// only now — the initial spawn is explicit above), used once idle

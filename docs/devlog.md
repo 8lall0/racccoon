@@ -4,6 +4,46 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-02 — Multi-core (SMP) scaffold — hart bring-up only
+
+```
+SMP: 4 hart(s) online of 4 (boot hart 0); secondaries parked — no SMP scheduler yet
+```
+
+Not an SMP scheduler — the kernel still assumes it is never preempted
+(one run queue, no locks). This is the bring-up plumbing under it:
+
+- `src/kernel/sbi.c3` — `sbi_hart_start()` (SBI HSM extension, EID
+  `0x48534D`, FID 0).
+- `src/smp.c3` (new) — `boot_hartid` (captured from `a0` in `boot()`,
+  which OpenSBI sets to the boot hart id), a `hart_online[8]` bitmap,
+  one 16 KiB `.bss` boot stack per potential secondary.
+  `smp_start_secondaries()` walks hartids `0..board::SMP_MAX_HARTS`,
+  `sbi_hart_start`s each (skipping ones that answer `INVALID_PARAM` —
+  i.e. don't exist), and bounded-spins for it to check in.
+  `secondary_entry` (naked: `mv sp, a1` from the opaque arg, jump) →
+  `secondary_main`: mask all interrupts with pure-register CSR ops (no
+  `write_csr()` — that bridges through a global shared with the boot
+  hart), set `hart_online[id]`, `wfi` forever.
+- `boot()` (`src/kernel.c3`) stashes `a0` before setting up `sp`;
+  `kernel_main` calls `smp_start_secondaries()` last, after every boot
+  server is up.
+- `board::SMP_MAX_HARTS` — QEMU 8 (a ceiling; `-smp N` is discovered),
+  Duo 1 (its 2nd C906 has no MMU — never a target).
+
+Verified in QEMU: `-smp 4` and `-smp 2` bring every hart up and park
+it; default (`-smp 1`) prints "boot hart 0 only" and is otherwise a
+no-op. `maptest` / `oomtest` / `faulttest` / `gostage2test` /
+`wasmtest` / `hardentest` unchanged across all three. Duo kernel
+builds clean.
+
+Next for real SMP (large, not started): per-hart `current_proc` /
+kernel stack / `sscratch`, a lock around the run queue + allocator +
+`fsd` IPC rendezvous, IPIs for reschedule, and deciding whether
+GOMAXPROCS > 1 is even worth it before the userspace is bigger.
+
+---
+
 ## 2026-09-02 — Lazy `SYS_MAP` (demand paging for anonymous maps)
 
 `SYS_MAP` no longer allocates a single physical page. It validates the

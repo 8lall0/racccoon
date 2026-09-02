@@ -182,6 +182,13 @@ const uint IRQ_ETH       = 0;
 // used for kernel-side.
 const ulong TIMEBASE_HZ = 10000000;
 
+// Ceiling on the harts src/smp.c3's scaffold will try to bring up. QEMU
+// virt exposes exactly as many as `-smp N` (default 1); the kernel
+// probes via SBI HSM and silently skips hartids that don't answer, so
+// this is just an upper bound — 8 covers any reasonable `-smp`. The
+// secondaries only announce themselves and park (no SMP scheduler yet).
+const uint SMP_MAX_HARTS = 8;
+
 // Largest image SYS_EXEC will install (src/entry.c3's EXEC_MAX_IMAGE_SIZE
 // and the ~96 KiB staging arrays it sizes at this value). 32 MiB on QEMU
 // — RAM is plentiful (768 MiB free_ram) and Stage 4 of the Go port runs

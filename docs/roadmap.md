@@ -759,6 +759,27 @@ self-contained compiler and small Unix utilities.
 
 ---
 
+## 8. Multi-core (SMP)
+
+**Scaffold DONE** (2026-09-02 devlog) — `src/smp.c3` + SBI HSM
+`sbi_hart_start`. `smp_start_secondaries()` (called last from
+`kernel_main`) enumerates harts up to `board::SMP_MAX_HARTS`, starts
+each into `secondary_main`, which announces itself and parks in `wfi`.
+QEMU `-smp N` discovered at runtime; Duo forced to 1 (no-MMU 2nd core).
+No behaviour change — the secondaries do nothing yet.
+
+**Real SMP — not started, large.** The kernel currently relies on
+"kernel code is never preempted" (one run queue, no locks anywhere —
+allocator, `fsd` IPC rendezvous, `procs[]`). A real scheduler needs:
+per-hart `current_proc` / kernel stack / `sscratch`; a lock (or
+lock-free discipline) around the run queue, the page allocator, and IPC
+rendezvous; IPIs (SBI `sbi_send_ipi`) for cross-hart reschedule; and a
+decision on whether GOMAXPROCS > 1 / parallel builds are worth it
+before the userspace is bigger. Likely lands on the JH7110 (4 cores),
+not QEMU.
+
+---
+
 ## Sequencing
 
 ```

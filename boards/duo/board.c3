@@ -106,6 +106,12 @@ const bool INTERRUPT_DRIVEN_SD = true;
 // interrupts/arm_timer).
 const ulong TIMEBASE_HZ = 25000000;
 
+// SMP: forced to 1. The Milk-V Duo's SoC has a second C906 core, but it
+// has no MMU (it's the "small" core, for RTOS/Arduino-style use) and is
+// never a racccoon target — see docs/devlog.md. src/smp.c3's
+// smp_start_secondaries() is a no-op at this value.
+const uint SMP_MAX_HARTS = 1;
+
 // Largest image SYS_EXEC will install (src/entry.c3's EXEC_MAX_IMAGE_SIZE
 // and the staging arrays it sizes). 1 MiB on the Duo — racccoon's own
 // binaries are 70-105 KiB and a native TinyCC (roadmap §7) is ~640 KiB,

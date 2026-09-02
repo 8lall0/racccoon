@@ -58,10 +58,14 @@ SECTIONS {
                                DRAM_BASE+2MB, and QEMU/OpenSBI keep the FDT
                                and their own reservations near the top of
                                RAM, so 768MB leaves clear margin under 1GB.
-                               Was 64MB; raised so a Go process can eagerly
-                               SYS_MAP a large heap arena (SYS_MAP is not
-                               lazy) with GC headroom — docs/go-port-plan.md.
-                               Must be <= src/allocation.c3's RAM_SIZE (the
+                               Was 64MB; raised for the Go heap arena. Since
+                               SYS_MAP is lazy (docs/devlog.md 2026-09-02)
+                               the arena is only address space until touched
+                               — but the on-device `go` toolchain still
+                               overcommits 768MB, so raising this (and moving
+                               the launch scripts to -m 2G) is a pending
+                               follow-up. Must be <= src/allocation.c3's
+                               RAM_SIZE (the
                                page-bitmap ceiling, 1920MB); the two need
                                not be equal — ram_page_count() caps the
                                allocator to whichever is smaller. The Duo's
