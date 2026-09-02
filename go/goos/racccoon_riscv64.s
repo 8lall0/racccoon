@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build tamago && riscv64
+//go:build racccoon && riscv64
 
 // Adapted from tamago-go src/runtime/goos/linux_user_riscv64.s.
 // racccoon ecall ABI: syscall number in A3 (not A7 like Linux); args in
@@ -27,10 +27,10 @@
 #define SYS_MAP          47
 #define SYS_TIMEBASE     49
 
-// CPUInit is the provider entry point _rt0_riscv64_tamago jumps to. It
+// CPUInit is the provider entry point _rt0_riscv64_racccoon jumps to. It
 // carves the runtime's RAM out of a fresh SYS_MAP region, sets the
 // stack pointer to the top of it, publishes the base to ·RamStart and
-// ·Bloc, then hands control to the tamago rt0.
+// ·Bloc, then hands control to the racccoon rt0.
 //
 // Runs before the Go world starts: no allocation, no g.
 TEXT ·CPUInit(SB),NOSPLIT|NOFRAME,$0
@@ -66,7 +66,7 @@ mapped:
 	MOV	·RamStackOffset(SB), T2
 	SUB	T2, X2
 
-	JMP	runtime·rt0_riscv64_tamago(SB)
+	JMP	runtime·rt0_riscv64_racccoon(SB)
 
 // func sys_putchar(c *byte)
 TEXT ·sys_putchar(SB),NOSPLIT,$0-8

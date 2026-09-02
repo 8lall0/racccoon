@@ -2,7 +2,7 @@
 # Builds a Go program for racccoon and emits a static riscv64 ELF the
 # racccoon exec path loads. See docs/go-port-plan.md.
 #
-# GOOS=tamago + the runtime/goos provider in go/ (GOOSPKG), linked so
+# GOOS=racccoon + the runtime/goos provider in go/ (GOOSPKG), linked so
 # every PT_LOAD segment sits inside [USER_BASE, USER_BASE + 4 MiB):
 #   -T 0x1010000  text start (USER_BASE + 64 KiB, headers land at USER_BASE)
 #   -R 0x1000     segment rounding = page size, so -T's file offsets stay sane
@@ -44,7 +44,7 @@ GOROOT_SRC="$("$TAMAGO" env GOROOT 2>/dev/null)/src"
 if [ -f "$GOROOT_SRC/runtime/goos/linux_user.go" ] && \
    ! grep -q "FSHook" "$GOROOT_SRC/runtime/goos/linux_user.go" 2>/dev/null; then
   echo "build_go.sh: note — \$TAMAGO tree is missing lib/go/racccoon.patch"
-  echo "  (os.* -> fsd won't work; run scripts/setup_tamago.sh). Building anyway."
+  echo "  (os.* -> fsd won't work; run scripts/setup_go.sh). Building anyway."
 fi
 
 # -s -w keeps the big Stage-4 binaries (compile ~23 MiB) under the exec cap.
@@ -68,7 +68,7 @@ case "$1" in
 esac
 
 cd "$REPO/go"
-GOOS=tamago GOARCH=riscv64 CGO_ENABLED=0 \
+GOOS=racccoon GOARCH=riscv64 CGO_ENABLED=0 \
 GOOSPKG=racccoon.local/goport GOFLAGS=-mod=mod \
   "$TAMAGO" build \
   ${BUILD_TAGS:+-tags "$BUILD_TAGS"} \

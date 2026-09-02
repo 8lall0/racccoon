@@ -14,7 +14,7 @@ index cb0fef21..d89e9f4f 100644
  		}
  
  		dir = filepath.Join(dir, "goos")
-+	} else if runtime.GOOS == "tamago" {
++	} else if runtime.GOOS == "racccoon" {
 +		// racccoon (lib/go/racccoon.patch): the `go` command runs
 +		// on-device, and the racccoon runtime/goos overlay is baked
 +		// straight into this GOROOT — no GOOSPKG module to resolve.
@@ -42,7 +42,7 @@ index b16709ed..94051399 100644
 +// needed — `go` runs one process at a time and fsd has no flock. A
 +// no-op lock keeps modload / the build cache working.
  func lock(f File, lt lockType) error {
-+	if runtime.GOOS == "tamago" {
++	if runtime.GOOS == "racccoon" {
 +		return nil
 +	}
  	return &fs.PathError{
@@ -52,7 +52,7 @@ index b16709ed..94051399 100644
  }
  
  func unlock(f File) error {
-+	if runtime.GOOS == "tamago" {
++	if runtime.GOOS == "racccoon" {
 +		return nil
 +	}
  	return &fs.PathError{
@@ -66,13 +66,13 @@ index 19ed197a..05a8ded0 100644
  		ctxt.HeadType.Set(buildcfg.GOOS)
  	}
  
-+	// racccoon (lib/go/racccoon.patch): a GOOS=tamago ELF loads into a
++	// racccoon (lib/go/racccoon.patch): a GOOS=racccoon ELF loads into a
 +	// racccoon process at USER_BASE (0x1000000); the loader needs the
 +	// ELF header at USER_BASE and every PT_LOAD inside the exec window,
 +	// so default -T to USER_BASE+64KiB and -R to the page size when the
 +	// caller didn't set them (scripts/build_go.sh passes these
 +	// explicitly; an on-device `go build` relies on this default).
-+	if buildcfg.GOOS == "tamago" && ctxt.Arch.Family == sys.RISCV64 {
++	if buildcfg.GOOS == "racccoon" && ctxt.Arch.Family == sys.RISCV64 {
 +		if *FlagTextAddr == -1 {
 +			*FlagTextAddr = 0x1010000
 +		}
@@ -92,13 +92,13 @@ index 0673be56..cdcb353b 100644
  	// These platforms fundamentally can't be supported:
  	runtime.GOOS == "js" || // #60971
  	runtime.GOOS == "wasip1" || // #60971
-+	runtime.GOOS == "tamago" || // racccoon (lib/go/racccoon.patch): no telemetry child / config dir
++	runtime.GOOS == "racccoon" || // racccoon (lib/go/racccoon.patch): no telemetry child / config dir
  	runtime.GOOS == "plan9" || // https://github.com/golang/go/issues/57540#issuecomment-1470766639
  	runtime.GOARCH == "mips" || runtime.GOARCH == "mipsle" // mips lacks cross-process 64-bit atomics
-diff --git a/src/os/exec/lp_tamago.go b/src/os/exec/lp_tamago.go
+diff --git a/src/os/exec/lp_racccoon.go b/src/os/exec/lp_racccoon.go
 index cf7ac99e..e0e0b043 100644
---- a/src/os/exec/lp_tamago.go
-+++ b/src/os/exec/lp_tamago.go
+--- a/src/os/exec/lp_racccoon.go
++++ b/src/os/exec/lp_racccoon.go
 @@ -8,17 +8,45 @@ package exec
  
  import (
@@ -147,10 +147,10 @@ index cf7ac99e..e0e0b043 100644
  	return "", &Error{file, ErrNotFound}
  }
  
-diff --git a/src/os/pipe_tamago.go b/src/os/pipe_tamago.go
+diff --git a/src/os/pipe_racccoon.go b/src/os/pipe_racccoon.go
 index 442f0cdf..0d0635f2 100644
---- a/src/os/pipe_tamago.go
-+++ b/src/os/pipe_tamago.go
+--- a/src/os/pipe_racccoon.go
++++ b/src/os/pipe_racccoon.go
 @@ -9,8 +9,16 @@ package os
  import "syscall"
  
@@ -161,9 +161,9 @@ index 442f0cdf..0d0635f2 100644
 +// the pair reserves a runtime/goos capture slot, StartProcess points the
 +// spawned child's console at a kernel pipe, and reads from r return the
 +// child's combined output once it has exited. Without the racccoon
-+// backend (a vanilla GOOS=tamago build) it stays unsupported.
++// backend (a vanilla GOOS=racccoon build) it stays unsupported.
  func Pipe() (r *File, w *File, err error) {
--	// GOOS=tamago does not have pipes.
+-	// GOOS=racccoon does not have pipes.
 -	return nil, nil, NewSyscallError("pipe", syscall.ENOSYS)
 +	var fds [2]int
 +	if e := syscall.PipeGoos(fds[:]); e != nil {
@@ -180,7 +180,7 @@ index fac5dfe1..4edaef78 100644
  )
  
 +// FS, when set by a GOOSPKG provider (or any imported package), replaces
-+// syscall's in-memory filesystem (syscall/fs_tamago.go) with a
++// syscall's in-memory filesystem (syscall/fs_racccoon.go) with a
 +// host-backed one, so package os operates on real, persistent storage.
 +// nil (the default) keeps the in-memory fs. See docs/go-port-plan.md in
 +// the racccoon tree.
@@ -188,12 +188,12 @@ index fac5dfe1..4edaef78 100644
 +
 +// Args, when set by a GOOSPKG provider, returns the process argument
 +// vector for os.Args (the runtime's goargs() otherwise hardcodes
-+// {"tamago"}). Keep in sync with go/goos/racccoon_user.go.
++// {"racccoon"}). Keep in sync with go/goos/racccoon_user.go.
 +var Args func() []string
 +
 +// Spawn / Wait / Capture* are the os/exec bridge (syscall.StartProcess /
 +// Wait4 / os.Pipe, lib/go/racccoon.patch). A GOOSPKG provider replaces
-+// this whole file, so these stubs only apply to a vanilla GOOS=tamago
++// this whole file, so these stubs only apply to a vanilla GOOS=racccoon
 +// build, where process creation stays unsupported.
 +//
 +// capID on Spawn selects an output-capture slot (>= 0) or console
@@ -229,15 +229,15 @@ index fac5dfe1..4edaef78 100644
  // defined in linux_user*.s
  func CPUInit()
  func sys_exit_group(code int32)
-diff --git a/src/runtime/os_tamago.go b/src/runtime/os_tamago.go
+diff --git a/src/runtime/os_racccoon.go b/src/runtime/os_racccoon.go
 index 6d57f5f9..7060f5da 100644
---- a/src/runtime/os_tamago.go
-+++ b/src/runtime/os_tamago.go
+--- a/src/runtime/os_racccoon.go
++++ b/src/runtime/os_racccoon.go
 @@ -50,6 +50,18 @@ func getgp() (gp uintptr) {
  type sigset struct{}
  type gsignalStack struct{}
  
-+// goargs() in schedinit hardcoded argslice to {"tamago"} before any
++// goargs() in schedinit hardcoded argslice to {"racccoon"} before any
 +// package init could run. runtime/goos init has since run, so a
 +// GOOSPKG provider's Args hook (the exec ABI) is now reachable —
 +// refresh argslice before package os reads it into os.Args.
@@ -252,21 +252,21 @@ index 6d57f5f9..7060f5da 100644
  func goenvs()                        {}
  func sigsave(p *sigset)              {}
  func msigrestore(sigmask sigset)     {}
-diff --git a/src/syscall/fs_racccoon.go b/src/syscall/fs_racccoon.go
+diff --git a/src/syscall/fsgoos_racccoon.go b/src/syscall/fsgoos_racccoon.go
 new file mode 100644
 index 00000000..2ca776e2
 --- /dev/null
-+++ b/src/syscall/fs_racccoon.go
++++ b/src/syscall/fsgoos_racccoon.go
 @@ -0,0 +1,263 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
 +
-+//go:build tamago
++//go:build racccoon
 +
 +// When runtime/goos.FS is set (racccoon_fs.go's init installs it for
 +// GOARCH=riscv64), every path-based filesystem syscall below routes to
-+// that host backend instead of fs_tamago.go's in-memory filesystem.
++// that host backend instead of fs_racccoon.go's in-memory filesystem.
 +// nil FS keeps the in-memory behaviour unchanged. See docs/go-port-plan.md
 +// in the racccoon tree.
 +
@@ -521,10 +521,10 @@ index 00000000..2ca776e2
 +	}
 +	return nil
 +}
-diff --git a/src/syscall/fs_tamago.go b/src/syscall/fs_tamago.go
+diff --git a/src/syscall/fs_racccoon.go b/src/syscall/fs_racccoon.go
 index 55aea4cc..501ab344 100644
---- a/src/syscall/fs_tamago.go
-+++ b/src/syscall/fs_tamago.go
+--- a/src/syscall/fs_racccoon.go
++++ b/src/syscall/fs_racccoon.go
 @@ -368,6 +368,9 @@ func (f *fsysFile) read(b []byte) (int, error) {
  }
  
@@ -630,10 +630,10 @@ index 55aea4cc..501ab344 100644
  	fsinit()
  	return chdir(path)
  }
-diff --git a/src/syscall/syscall_tamago.go b/src/syscall/syscall_tamago.go
+diff --git a/src/syscall/syscall_racccoon.go b/src/syscall/syscall_racccoon.go
 index d7ab81f1..2f626f97 100644
---- a/src/syscall/syscall_tamago.go
-+++ b/src/syscall/syscall_tamago.go
+--- a/src/syscall/syscall_racccoon.go
++++ b/src/syscall/syscall_racccoon.go
 @@ -10,6 +10,7 @@ import (
  	errorspkg "errors"
  	"internal/oserror"
@@ -670,7 +670,7 @@ index d7ab81f1..2f626f97 100644
 +// match inodes" fallback — that fallback needs real st_ino values,
 +// which the fsd backend doesn't synthesise (every Stat returns ino 0,
 +// so SameFile matches everything and the walk stops at "/"). A vanilla
-+// GOOS=tamago build keeps the old behaviour.
++// GOOS=racccoon build keeps the old behaviour.
 +var ImplementsGetwd = goos.FS != nil
 +
 +func Getwd() (wd string, err error) {

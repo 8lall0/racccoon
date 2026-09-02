@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build tamago && riscv64
+//go:build racccoon && riscv64
 
 // Package racccoon is a thin convenience layer over package os for
 // racccoon Go programs. The actual bridge to the fsd server lives in

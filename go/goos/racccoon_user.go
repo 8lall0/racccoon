@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build tamago && riscv64
+//go:build racccoon && riscv64
 
-// Package goos is the runtime/goos implementation for GOOS=tamago Go
+// Package goos is the runtime/goos implementation for GOOS=racccoon Go
 // binaries running as racccoon userspace processes, selected via the
 // GOOSPKG build setting (see docs/go-port-plan.md).
 //
@@ -124,7 +124,7 @@ func GetRandomData(b []byte) {
 }
 
 // FS routes package os's filesystem operations to racccoon's fsd server
-// instead of GOOS=tamago's in-memory fs. It is installed by
+// instead of GOOS=racccoon's in-memory fs. It is installed by
 // racccoon_fs.go's init(), so every racccoon Go binary gets real
 // filesystem access with no import of its own. The syscall-side call
 // sites are a small toolchain patch (lib/go/racccoon.patch); keep this

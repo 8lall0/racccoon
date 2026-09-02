@@ -2063,7 +2063,7 @@ fn void main() {
             print(wt_ok == 0 ? "wasmtest: ok\n" : "wasmtest: FAILED\n");
         } else if (strcmp(cmd, "gotest") == 0 || strcmp(cmd, "gostage2test") == 0 || strcmp(cmd, "gostage3test") == 0 || strcmp(cmd, "gostage35test") == 0 || strcmp(cmd, "gostage41test") == 0 || strcmp(cmd, "gostage42test") == 0) {
             // Go on racccoon (docs/go-port-plan.md). /bin/go-* are
-            // GOOS=tamago static riscv64 binaries built by
+            // GOOS=racccoon static riscv64 binaries built by
             // scripts/build_go.sh from go/cmd/*, loaded through
             // SYS_EXEC's ELF path. Same rfork -> exec -> join(code) shape
             // as wasmtest; skip cleanly (exit 127) if the binary isn't on
@@ -2199,7 +2199,7 @@ fn void main() {
             // from the prepopulated /gocache (a host build with the same
             // cross-toolchain — content-addressed cache keys match), so
             // only runtime / runtime/goos / main compile on-device;
-            // cmd/link defaults -T/-R for tamago so the output loads.
+            // cmd/link defaults -T/-R for racccoon/riscv64 so the output loads.
             // VERY slow — a fresh QEMU boot plus the on-device compiles
             // and link, several minutes. Not in the quick sweep.
             uint gb_sz = 0; int gb_ty = 0;

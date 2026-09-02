@@ -2,7 +2,7 @@ package main
 
 // Stage 4.1 for Go on racccoon (docs/go-port-plan.md): os/exec, backed
 // by rfork(RFPROC) + SYS_EXEC + SYS_JOIN (runtime/goos.Spawn/Wait, via
-// a syscall_tamago.go patch). First cut: the child inherits the
+// a syscall_racccoon.go patch). First cut: the child inherits the
 // parent's console — an explicit cmd.Stdout/Stderr = os.Stdout/os.Stderr
 // works; pipe capture (cmd.Output) does not yet.
 

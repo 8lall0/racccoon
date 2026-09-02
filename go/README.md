@@ -1,22 +1,23 @@
-# `go/` — Go on racccoon (`GOOSPKG` provider)
+# `go/` — Go on racccoon (`GOOS=racccoon` overlay)
 
 **Stage 0 scaffold.** See `docs/go-port-plan.md` for the full plan.
 
 This module (`racccoon.local/goport`) is the `runtime/goos`
-implementation that lets a `GOOS=tamago GOARCH=riscv64` Go binary run as
+implementation that lets a `GOOS=racccoon` Go binary run as
 a racccoon userspace process. It is a thin adaptation of tamago-go's own
 `src/runtime/goos/linux_user*` — the same hooks, wired to racccoon's
 `ecall` ABI instead of Linux's.
 
-## Why tamago
+## Why fork tamago
 
 The Go toolchain has no external dependency (unlike LLVM). The only hard
 part is the runtime↔OS contract, and tamago
 (`github.com/usbarmory/tamago-go`) already stripped the OS assumptions
 for `GOOS=tamago`: single-threaded, no futex, no signals, no mmap, all
 OS interaction behind a ~10-hook `runtime/goos` package pointed at an
-out-of-tree module by `GOOSPKG`. racccoon is just another host for that
-pattern.
+out-of-tree module by `GOOSPKG`. `GOOS=racccoon` is that GOOS renamed
+(`scripts/rename_goos.sh`, 2026-09-02) so racccoon has its own identity;
+this module is the `runtime/goos` overlay for it.
 
 ## Layout
 
@@ -29,13 +30,12 @@ go/
     racccoon_riscv64.s      CPUInit + the ecall stubs
 ```
 
-## Building (once the toolchain exists)
+## Building
 
 ```
-git clone https://github.com/usbarmory/tamago-go -b tamago1.27.0
-cd tamago-go/src && ./make.bash
-export TAMAGO=$PWD/../bin/go
-bash scripts/build_go.sh test/go-src/hello.go
+bash scripts/setup_go.sh            # clone + rename_goos.sh + patch + make.bash
+export TAMAGO=third_party/tamago-go/bin/go
+bash scripts/build_go.sh hello
 ```
 
 ## Stage 0 status / TODO

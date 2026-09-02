@@ -4,6 +4,50 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-02 — `GOOS=racccoon`: the Go toolchain is a racccoon fork now
+
+```
+root / # go version
+go version go1.27.0 racccoon/riscv64
+```
+
+The Go port ran on `GOOS=tamago` + `GOOSPKG=racccoon.local/goport`.
+`racccoon` is now a first-class GOOS: `go tool dist list` shows
+`racccoon/riscv64`, `GOOS=racccoon GOARCH=riscv64 go build` works,
+`runtime.GOOS == "racccoon"`.
+
+`scripts/rename_goos.sh` (new) transforms a fresh `usbarmory/tamago-go`
+checkout: renames ~74 `*_tamago*` source files, `tamago`→`racccoon` in
+every `//go:build` constraint and every quoted GOOS literal
+(tree-wide — a bare `"tamago"` in Go source is only ever the GOOS),
+`IsTamago`→`IsRacccoon` / `Htamago`→`Hracccoon` / `GOOS_tamago`→
+`GOOS_racccoon`, the `rt0_<arch>_tamago` runtime entry symbols, and
+`internal/syslist` / `cmd/dist` / `internal/platform` / `objabi`
+`HeadType` / the linker's overlay-symbol list. `scripts/setup_go.sh`
+(was `setup_tamago.sh`) runs that, then `lib/go/racccoon.patch`, then
+`make.bash`. Verified from a clean clone end-to-end.
+
+Bigger than the plan doc's "~15 substantive files" guess — the runtime
+weaves `goos.IsTamago` into `malloc.go` / `mpagealloc.go` / `mheap.go`
+compile-time const-expressions (with a `goos_overlay` GOOSPKG import),
+so ~50 substantive files. Mostly three seds + a batch `git mv`, and
+`make.bash` catches the rest.
+
+Repo side: `go/goos/*` build tags `tamago`→`racccoon`; the runtime rt0
+symbol our `racccoon_riscv64.s` jumps to; `GOOS=racccoon` +
+`pkg/tool/racccoon_riscv64` in the build scripts; `lib/go/racccoon.patch`
+regenerated (the new-file helper renamed `fs_racccoon.go` →
+`fsgoos_racccoon.go` to avoid colliding with the renamed
+`fs_tamago.go`). The `GOOSPKG` overlay (`go/` module) is kept — this is
+identity only; `os`/`syscall` still carry tamago's stubs, diverging
+them is a follow-up.
+
+Verified QEMU `-m 2G`: `gotest` / `gostage2test` / `gostage41test` /
+`gostage42test` / `goversiontest` (reports `racccoon/riscv64`) /
+`maptest` / `oomtest` / `wasmtest`. `gobuildtest` re-running.
+
+---
+
 ## 2026-09-02 — QEMU PLIC un-identity-mapped (it collided with big heaps)
 
 Root cause of the `gobuildtest` failure from the two entries below (the

@@ -48,7 +48,7 @@ echo "==> Capturing go/cmd/hello's stdlib closure (host go build -work)..."
 # per-package importcfg file this script reads below.
 BUILD_LOG="$WORK_PARENT/build.log"
 ( cd "$REPO/go" && \
-  GOOS=tamago GOARCH=riscv64 GOOSPKG=racccoon.local/goport GOFLAGS=-mod=mod \
+  GOOS=racccoon GOARCH=riscv64 GOOSPKG=racccoon.local/goport GOFLAGS=-mod=mod \
   TMPDIR="$WORK_PARENT" \
   "$TAMAGO" build -a -work -o "$WORK_PARENT/hello.elf" \
     -ldflags "-T 0x1010000 -R 0x1000" ./cmd/hello \

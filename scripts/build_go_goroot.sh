@@ -27,7 +27,7 @@ TGSRC="$TGROOT/src"
 OUT="$REPO/build/go/goroot"
 CACHE="$REPO/build/go/gocache"
 rm -rf "$OUT" "$CACHE"
-mkdir -p "$OUT/pkg/tool/tamago_riscv64" "$OUT/pkg/include" "$OUT/src/runtime/goos"
+mkdir -p "$OUT/pkg/tool/racccoon_riscv64" "$OUT/pkg/include" "$OUT/src/runtime/goos"
 
 cp "$TGROOT/VERSION" "$OUT/VERSION"
 
@@ -47,9 +47,9 @@ GO111MODULE=on
 CGO_ENABLED=0
 EOF
 
-cp "$REPO/build/go/compile.elf" "$OUT/pkg/tool/tamago_riscv64/compile"
-cp "$REPO/build/go/link.elf"    "$OUT/pkg/tool/tamago_riscv64/link"
-cp "$REPO/build/go/asm.elf"     "$OUT/pkg/tool/tamago_riscv64/asm"
+cp "$REPO/build/go/compile.elf" "$OUT/pkg/tool/racccoon_riscv64/compile"
+cp "$REPO/build/go/link.elf"    "$OUT/pkg/tool/racccoon_riscv64/link"
+cp "$REPO/build/go/asm.elf"     "$OUT/pkg/tool/racccoon_riscv64/asm"
 
 # assembly #include headers
 cp "$TGROOT"/pkg/include/*.h "$OUT/pkg/include/" 2>/dev/null || true
@@ -60,7 +60,7 @@ cp "$TGSRC"/runtime/cgo/*.h "$OUT/src/runtime/cgo/" 2>/dev/null || true
 # PATCHED tamago tree, so syscall/os/runtime are racccoon-aware), minus
 # test files. runtime/goos is the racccoon overlay, not the vanilla
 # linux_user.go.
-DEPS="$(cd "$REPO/go" && GOOS=tamago GOARCH=riscv64 CGO_ENABLED=0 \
+DEPS="$(cd "$REPO/go" && GOOS=racccoon GOARCH=riscv64 CGO_ENABLED=0 \
   GOOSPKG=racccoon.local/goport GOFLAGS=-mod=mod \
   "$TAMAGO" list -deps ./cmd/hello 2>/dev/null | grep -v 'racccoon.local/goport')"
 DEPS="$DEPS internal/goexperiment internal/buildcfg go/build/constraint"
@@ -80,7 +80,7 @@ cp "$REPO"/go/goos/*.go "$REPO"/go/goos/*.s "$OUT/src/runtime/goos/"
 # the same toolchain. -trimpath keeps the stdlib cache keys
 # machine-independent so the on-device build hits them.
 mkdir -p "$CACHE"
-( cd "$REPO/go" && GOOS=tamago GOARCH=riscv64 CGO_ENABLED=0 \
+( cd "$REPO/go" && GOOS=racccoon GOARCH=riscv64 CGO_ENABLED=0 \
   GOOSPKG=racccoon.local/goport GOFLAGS=-mod=mod GOCACHE="$CACHE" \
   "$TAMAGO" build -trimpath -o /dev/null ./cmd/hello ) 2>/dev/null || \
   echo "build_go_goroot.sh: host cache-prime build failed (go build on-device will be slow)"

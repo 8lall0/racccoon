@@ -52,16 +52,22 @@ patching beyond building tamago-go once. `os`/`syscall`/`net` stay in
 tamago's stubbed state. Fastest path to a Go binary running on racccoon
 — validates the ELF loader, the heap region, and the scheduler match.
 
-**Step B — rename to `GOOS=racccoon`.** Apply tamago's patchset to a
-Go tree and `sed` `tamago`→`racccoon` across the GOOS plumbing
-(`internal/goos`, `go/build`, `cmd/dist`, the `*_tamago.go` build-tag
-files — ~15 substantive files, ~130 mechanical `testdata_*` renames).
-Gives racccoon its own identity and lets `os`/`syscall` diverge toward
-real **fsd-backed file I/O** without fighting tamago's bare-metal
-assumptions.
+**Step B — rename to `GOOS=racccoon`. DONE (2026-09-02).**
+`scripts/rename_goos.sh` transforms a fresh `usbarmory/tamago-go`
+checkout: rename ~74 `*_tamago*` source files, `tamago`→`racccoon` in
+every `//go:build` constraint and quoted GOOS literal, `IsTamago`→
+`IsRacccoon` / `Htamago`→`Hracccoon` / `GOOS_tamago`→`GOOS_racccoon`,
+and the `rt0_<arch>_tamago` entry symbols. `scripts/setup_go.sh` runs
+that, then `lib/go/racccoon.patch`, then `make.bash`. `go tool dist
+list` now shows `racccoon/riscv64`; `GOOS=racccoon GOARCH=riscv64 go
+build` works. The `GOOSPKG=racccoon.local/goport` overlay (the `go/`
+module) is kept — the rename is identity only, not a divergence of
+`os`/`syscall` yet. Turned out ~50 substantive files, not the ~15
+estimated (the runtime weaves `goos.IsTamago` into `malloc.go` /
+`mpagealloc.go` / `mheap.go` const-expressions, plus the objabi
+`HeadType` and the linker's overlay-symbol list).
 
-Do A first, prove Stage 1–2, then B. Same incrementalism as the OPI RV
-port and every racccoon feature.
+Step A was done first (Stages 0–4.4); B is a pure rename on top.
 
 ## Known racccoon-side gaps (Stage 1 line items)
 
@@ -210,7 +216,7 @@ just work (including the Stage-4 toolchain binaries).
   package is imported by `runtime`; GOMAXPROCS=1 means nothing yields
   mid-op). Its `init()` installs itself into `goos.FS`.
 - **`lib/go/racccoon.patch`** (5 files, applied to the tamago-go tree by
-  `scripts/setup_tamago.sh`, carried in-repo like `lib/tcc/racccoon.patch`):
+  `scripts/setup_go.sh`, carried in-repo like `lib/tcc/racccoon.patch`):
   an optional `runtime/goos.FS` `FSHook` (errno ints, not `error` — the
   package can't pull in `errors`). When set, `syscall`'s
   `Open`/`Read`/`Write`/`Seek`/`Stat`/`Mkdir`/`Unlink`/`Rename`/
@@ -431,11 +437,10 @@ unknowns. Staged:
   Follow-ups: `os.ReadDir` lstats every entry (fsd
   has no dirent type).
 
-Likely wants the `GOOS=racccoon` rename around 4.3–4.4 (own identity,
-room for `os`/`syscall` to diverge further) — apply tamago's patchset
-to a Go tree, `sed` `tamago`→`racccoon` across the GOOS plumbing (~15
-substantive files, ~130 mechanical `testdata_*` renames), fold in
-`lib/go/racccoon.patch`.
+**`GOOS=racccoon` rename — DONE (2026-09-02).** See "The two-step
+approach → Step B" above: `scripts/rename_goos.sh` + `setup_go.sh`.
+`os`/`syscall` divergence from tamago's stubs is still a follow-up (the
+rename is identity only).
 
 ### Stage 5 — network (later)
 
