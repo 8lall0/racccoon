@@ -2998,7 +2998,9 @@ fn bool try_lazy_fault(ulong scause, ulong stval) @noinline
 	uptr page = addr & ~(uptr)(PAGE_SIZE - 1);
 	// Present already => this is a permission fault, not a demand fault
 	// (SYS_MAP pages are R|W|U, so it shouldn't be, but don't paper over
-	// it) — hand it back to the real-fault path.
+	// it) — hand it back to the real-fault path. NB the PLIC's kernel-only
+	// pages used to alias into this range on QEMU and land here; they're
+	// mapped high now (boards/qemu/board.c3 PLIC_BASE).
 	if (pte_present(current_proc.page_table, page))
 	{
 		return false;

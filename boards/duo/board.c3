@@ -78,6 +78,12 @@ const uptr PLIC_CLAIM         = PLIC_BASE + 0x200004 + PLIC_S_CONTEXT * 0x1000;
 const uptr PLIC_PRIORITY_PAGE = PLIC_PRIORITY_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
 const uptr PLIC_ENABLE_PAGE   = PLIC_ENABLE_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
 const uptr PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uptr)~(kernel::PAGE_SIZE - 1);
+// The Duo identity-maps the PLIC (it's at 0x70000000, far above any
+// 16 MiB Duo heap) — _PHYS_PAGE == _PAGE. The QEMU board aliases them
+// apart; see boards/qemu/board.c3's PLIC_BASE comment.
+const uptr PLIC_PRIORITY_PHYS_PAGE = PLIC_PRIORITY_PAGE;
+const uptr PLIC_ENABLE_PHYS_PAGE   = PLIC_ENABLE_PAGE;
+const uptr PLIC_CLAIM_PHYS_PAGE    = PLIC_CLAIM_PAGE;
 
 // SDHCI-compliant SD controller (cvitek,cv180x-sd), sourced from
 // duo-buildroot-sdk's own U-Boot driver (drivers/mmc/cvitek/sdhci-cv180x.c)

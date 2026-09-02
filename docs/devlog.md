@@ -4,6 +4,45 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-02 — QEMU PLIC un-identity-mapped (it collided with big heaps)
+
+Root cause of the `gobuildtest` failure from the two entries below (the
+on-device `compile` store-faulting at the fixed address `0xC000000`
+every run): **the QEMU PLIC was identity-mapped into every process's
+virtual address space**, kernel-only, at `0x0c000000` — ~192 MiB up,
+right in the middle of the userspace heap range. `create_process` maps
+three PLIC register pages there so `handle_trap`'s `plic_claim()` works
+under whatever page table is active. Fine for 14 years of small
+processes; the Go toolchain's ~448 MiB `SYS_MAP` arena grows straight
+through `0x0c000000`, hits the present-but-`PAGE_U`-clear PTE, and
+store-faults → the kernel kills it. (The *eager* `SYS_MAP` hid this by
+`map_page`-clobbering the PLIC PTE with a user page — which silently
+broke the kernel's own PLIC access from that process. Lazy `SYS_MAP`
+surfaced the latent bug instead of making a worse one.)
+
+Fix: alias the PLIC. `boards/qemu/board.c3` — `PLIC_PHYS_BASE`
+(`0x0c000000`, the mapping target) split from `PLIC_BASE` (now
+`0x7a000000`, virtual — what the kernel dereferences and what
+`create_process` maps at), well above any user allocation and below the
+kernel identity map. New `PLIC_*_PHYS_PAGE` consts; `create_process`
+maps `_PAGE` (virtual) → `_PHYS_PAGE` (physical). `plic_init()` runs
+bare-mode (pre-paging) so it reaches the PLIC through `PLIC_PHYS_BASE`
+directly; `plic_claim`/`plic_complete`/`plic_set_enabled` all run from a
+trap with paging on and go through the alias. The Duo keeps identity
+mapping (`PLIC_*_PHYS_PAGE == PLIC_*_PAGE`) — its PLIC is at
+`0x70000000`, far above any 16 MiB Duo heap.
+
+Verified: instrumented run shows `compile`'s heap grow cleanly past
+`0xC000000` to 300+ MiB with no fault (the build itself is still too
+slow to finish end-to-end on this host — `compile` alone runs > 25 min
+here). Regression sweep at `-m 2G` all green — FAT32 / ext2 / dual /
+exFAT, and disk I/O (virtio-blk IRQ → PLIC → `fsd` mount) proves the
+alias works: `maptest` / `oomtest` / `faulttest` / `runtest` /
+`elftest` / `gotest` / `gostage2test` / `gostage42test` / `wasmtest` /
+`hardentest` / `chmodtest` / `fspermtest`. Duo kernel builds clean.
+
+---
+
 ## 2026-09-02 — QEMU `__free_ram` 768 → 1792 MiB
 
 `src/kernel.ld` reserved a fixed 768 MiB pool regardless of QEMU `-m`,

@@ -25,7 +25,28 @@ import sbi;
 // a fixed 32-bit uint); the *registers themselves* stay 32-bit values
 // (irq numbers, priority, enable bitmask) — PLIC register width is
 // fixed by the hardware spec, independent of hart XLEN.
-const uptr PLIC_BASE = 0x0c000000;
+// Physical base of QEMU virt's PLIC.
+const uptr PLIC_PHYS_BASE = 0x0c000000;
+
+// PLIC_BASE is the *virtual* base the kernel dereferences the PLIC
+// through (all the PLIC_* register constants below derive from it), and
+// the base of the three kernel-only pages create_process maps into
+// every process's page table.
+//
+// NOT identity-mapped to PLIC_PHYS_BASE: 0x0c000000 is only ~192 MiB
+// up, right in the middle of the userspace virtual range (USER_BASE
+// 0x1000000 + a per-process heap up to board::HEAP_MAX_BYTES). A
+// process with a big enough SYS_MAP region — the on-device Go
+// toolchain's ~448 MiB arena — grows straight into the identity-mapped
+// PLIC pages and store-faults on a present-but-kernel-only PTE (found
+// 2026-09-02, docs/devlog.md). The old eager SYS_MAP hid this by
+// clobbering the PLIC PTE with a user page, which silently broke the
+// kernel's own plic_claim() from that process's context. Aliasing the
+// PLIC up here — well above any user allocation, well below the kernel
+// identity map at 0x80200000 — keeps it clear of both. The Duo
+// (boards/duo/board.c3) keeps identity mapping: its PLIC is already at
+// 0x70000000, far above any 16 MiB Duo heap.
+const uptr PLIC_BASE = 0x7a000000;
 
 // No T-Head MAEE-style PTE attribute quirk on QEMU's generic SiFive-style
 // core — see boards/duo/board.c3's PTE_EXTRA_BITS for what this is and
@@ -53,10 +74,15 @@ const uptr PLIC_CLAIM         = PLIC_BASE + 0x200004 + PLIC_S_CONTEXT * 0x1000;
 // Page-aligned bases of the distinct pages the registers above fall in
 // (PLIC_ENABLE_BASE and PLIC_THRESHOLD/PLIC_CLAIM aren't page-aligned
 // themselves), for process.c3's create_process to map into every
-// process's page table.
+// process's page table — _PAGE is the virtual page it maps at,
+// _PHYS_PAGE the physical PLIC page it points to. (On the Duo the two
+// are equal; here they differ — see PLIC_BASE's comment.)
 const uptr PLIC_PRIORITY_PAGE = PLIC_PRIORITY_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
 const uptr PLIC_ENABLE_PAGE   = PLIC_ENABLE_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
 const uptr PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uptr)~(kernel::PAGE_SIZE - 1);
+const uptr PLIC_PRIORITY_PHYS_PAGE = (PLIC_PRIORITY_PAGE - PLIC_BASE) + PLIC_PHYS_BASE;
+const uptr PLIC_ENABLE_PHYS_PAGE   = (PLIC_ENABLE_PAGE - PLIC_BASE) + PLIC_PHYS_BASE;
+const uptr PLIC_CLAIM_PHYS_PAGE    = (PLIC_CLAIM_PAGE - PLIC_BASE) + PLIC_PHYS_BASE;
 
 // QEMU's virt board always has virtio-blk attached (see scripts/launch64.sh) —
 // diskd/fsd get spawned and the shell has real file access.
@@ -206,18 +232,26 @@ const uptr HEAP_MAX_BYTES = 512 * 1024 * 1024;
 
 fn void plic_init()
 {
+	// Runs from kernel_main *before* the first switch_context — i.e.
+	// bare-mode, satp still 0, so vaddr == paddr and the PLIC alias
+	// (PLIC_BASE, virtual, not mapped yet) would hit nothing. Use the
+	// physical addresses directly here; plic_claim/plic_complete/
+	// plic_set_enabled all run later from inside a trap, with some
+	// process's page table active, so they go through the alias.
+	uptr poff = PLIC_PHYS_BASE - PLIC_BASE;
+
 	// Priority must be > 0 for the PLIC to ever forward the interrupt at
 	// all (0 means "never interrupt", regardless of enable bits).
-	uint* priority = (uint*)(PLIC_PRIORITY_BASE + 4 * IRQ_VIRTIO_BLK);
+	uint* priority = (uint*)(PLIC_PRIORITY_BASE + poff + 4 * IRQ_VIRTIO_BLK);
 	mem::store(priority, 1u, 4, true);
 
 	// Enable this IRQ for our S-mode context.
-	uint* enable = (uint*)PLIC_ENABLE_BASE;
+	uint* enable = (uint*)(PLIC_ENABLE_BASE + poff);
 	mem::store(enable, (1u << IRQ_VIRTIO_BLK), 4, true);
 
 	// Threshold 0: forward any interrupt with priority > 0 (i.e. all of
 	// them, since we only ever set priority 1).
-	uint* threshold = (uint*)PLIC_THRESHOLD;
+	uint* threshold = (uint*)(PLIC_THRESHOLD + poff);
 	mem::store(threshold, 0u, 4, true);
 }
 

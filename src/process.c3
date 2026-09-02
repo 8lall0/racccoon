@@ -1077,10 +1077,13 @@ fn Process* create_process(void* image, uint image_size)
 	// bare-mode boot code — since it's S-mode code reached from inside a
 	// trap, not something any one process specifically owns (unlike the
 	// virtio-blk MMIO above, which now belongs to diskd alone). Three
-	// separate pages, not a range — see plic.c3.
-	map_device_page(page_table, board::PLIC_PRIORITY_PAGE, board::PLIC_PRIORITY_PAGE, PAGE_R | PAGE_W);
-	map_device_page(page_table, board::PLIC_ENABLE_PAGE, board::PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
-	map_device_page(page_table, board::PLIC_CLAIM_PAGE, board::PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
+	// separate pages, not a range — see plic.c3. Kernel-only (no PAGE_U).
+	// _PAGE is the virtual page, _PHYS_PAGE the PLIC physical page — equal
+	// on the Duo, aliased apart on QEMU so the PLIC stays clear of large
+	// user heaps (see boards/qemu/board.c3's PLIC_BASE comment).
+	map_device_page(page_table, board::PLIC_PRIORITY_PAGE, board::PLIC_PRIORITY_PHYS_PAGE, PAGE_R | PAGE_W);
+	map_device_page(page_table, board::PLIC_ENABLE_PAGE, board::PLIC_ENABLE_PHYS_PAGE, PAGE_R | PAGE_W);
+	map_device_page(page_table, board::PLIC_CLAIM_PAGE, board::PLIC_CLAIM_PHYS_PAGE, PAGE_R | PAGE_W);
 
 	// Copy the process image into freshly allocated user pages, page by page.
 	char* img = image;

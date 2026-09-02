@@ -423,6 +423,11 @@ unknowns. Staged:
     stay on 64 MiB.
   - `cmd/link` defaults `-T 0x1010000` / `-R 0x1000` for tamago
     riscv64, so a bare `go build` output is racccoon-loadable.
+  - The QEMU PLIC was un-identity-mapped (2026-09-02 devlog) — a
+    448 MiB heap grew through its identity address at `0x0c000000` and
+    store-faulted. `compile` now grows past it cleanly; the full
+    on-device `go build` still needs a faster host to time end-to-end
+    (`compile` alone runs > 25 min on the dev host).
 
   Follow-ups: `os.ReadDir` lstats every entry (fsd
   has no dirent type).
