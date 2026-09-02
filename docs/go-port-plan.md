@@ -414,13 +414,18 @@ unknowns. Staged:
     device); `GOCACHE=off` rejected → real `/gocache`;
     `syscall.Ftruncate` → fsd hook; `goos.FS.Truncate` generalised.
   - `cmd/compile` / `cmd/link` built with `-tags racccoon_bigheap`
-    (448 MiB Go arena — compiling `runtime` OOM'd 64 MiB).
+    (448 MiB Go arena — compiling `runtime` OOM'd 64 MiB). Lazy
+    `SYS_MAP` (2026-09-02 devlog) makes that arena free until touched,
+    so it no longer bloats `rfork` — but `go` / `asm` stay on 64 MiB:
+    the QEMU `__free_ram` pool is a fixed 768 MiB and `go` holds its
+    heap live while `compile` runs.
   - `cmd/link` defaults `-T 0x1010000` / `-R 0x1000` for tamago
     riscv64, so a bare `go build` output is racccoon-loadable.
 
-  Follow-ups: lazy `SYS_MAP` (the eager 448 MiB map is a few seconds
-  per `compile`; also the real fix for the OOM + fork-size limit);
-  `os.ReadDir` lstats every entry (fsd has no dirent type).
+  Follow-ups: lift the 768 MiB `src/kernel.ld` `__free_ram` cap (kernel
+  boots fine at `-m 2G`+) so the toolchain has real headroom, then a
+  clean timed `gobuildtest` run; `os.ReadDir` lstats every entry (fsd
+  has no dirent type).
 
 Likely wants the `GOOS=racccoon` rename around 4.3–4.4 (own identity,
 room for `os`/`syscall` to diverge further) — apply tamago's patchset

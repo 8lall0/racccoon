@@ -2377,14 +2377,16 @@ fn void main() {
                 print(" child="); print_uint((uint)mt_code); putchar('\n');
             }
         } else if (strcmp(cmd, "oomtest") == 0) {
-            // Out-of-memory is a -1 to the caller, not a kernel panic.
-            // Fork children that each map their full 16 MiB SYS_MAP
-            // ceiling — on a 64 MiB board that exhausts real RAM after
-            // a few — and confirm: (a) a child's map_pages() then
-            // returns null instead of panicking, (b) rfork() starts
-            // returning -1 rather than panicking in create_process,
-            // (c) the shell is still alive, (d) killing the children
-            // frees it all back so a fresh map_pages() works again.
+            // Lazy SYS_MAP (docs/devlog.md): a map only reserves address
+            // space; real pages are demand-faulted on first touch, and
+            // running out of RAM there kills just the faulting process —
+            // never a kernel panic. Fork "glutton" children that each map
+            // AND write every page of their full per-process ceiling
+            // (16 MiB Duo / 512 MiB QEMU). Two gluttons overcommit any
+            // board's pool, so at least one is OOM-killed mid-touch
+            // (join returns -1) or rfork() refuses to start one. Confirm:
+            // no panic, real pressure, and once the dead gluttons are
+            // reaped the RAM comes back (a fresh 1 MiB glutton survives).
             const int OOM_KIDS = 8;
             int[OOM_KIDS] oom_pid;
             uint[OOM_KIDS] oom_gen;
@@ -2395,46 +2397,69 @@ fn void main() {
                 int c = rfork(RFPROC, &g);
                 if (c < 0) { oom_rfork_refused = true; break; }
                 if (c == 0) {
-                    // Grab as much as the per-process cap allows, a
-                    // page-cluster at a time, then park until killed.
-                    bool hit_null = false;
-                    for (int k = 0; k < 4096; k++) {
-                        if (map_pages(65536) == null) { hit_null = true; break; }
+                    // Reserve to the ceiling a cluster at a time, writing
+                    // one byte per page so the RAM is really committed,
+                    // then park holding it. A fault in the touch loop
+                    // (out of memory) kills just this child — fine.
+                    for (int oom_k = 0; oom_k < 8192; oom_k++) {
+                        char* oom_p = (char*)map_pages(262144); // 256 KiB
+                        if (oom_p == null) break;               // hit the ceiling
+                        for (int oom_q = 0; oom_q < 262144; oom_q += 4096) { oom_p[oom_q] = (char)1; }
                     }
-                    // exit code carries whether *this* child ever saw a
-                    // clean null (vs. still going) — not load-bearing,
-                    // the parent mainly checks it didn't panic.
                     for (;;) { yield(); }
                 }
                 oom_pid[oom_spawned] = c;
                 oom_gen[oom_spawned] = g;
                 oom_spawned++;
             }
-            // Give the children time to actually consume their pages.
-            ulong oom_settle = rdtime() + timebase_hz() / 2;
+            // Let the gluttons commit their pages.
+            ulong oom_settle = rdtime() + timebase_hz();
             while (rdtime() < oom_settle) { yield(); }
-            // The shell itself is obviously still running to print this.
-            // Now a fresh large map from *this* process while RAM is
-            // tight should fail cleanly (null), not panic.
-            void* oom_tight = map_pages(1048576); // 1 MiB
-            // Reap everything and confirm RAM comes back.
-            for (int oi = 0; oi < oom_spawned; oi++) { kill(oom_pid[oi], oom_gen[oi]); }
-            ulong oom_recover = rdtime() + timebase_hz();
-            void* oom_after = null;
-            while (oom_after == null && rdtime() < oom_recover) {
-                yield();
-                oom_after = map_pages(1048576);
+            // Pressure probe: one more child that maps + touches its full
+            // ceiling. With the gluttons holding the pool it can't get its
+            // pages — it faults and the kernel OOM-kills it (join != 7),
+            // or rfork() already refused to start it. Either way: no panic.
+            bool oom_probe_killed = false;
+            uint oom_pg = 0;
+            int oom_probe = rfork(RFPROC, &oom_pg);
+            if (oom_probe < 0) {
+                oom_rfork_refused = true;
+            } else if (oom_probe == 0) {
+                for (int oom_k = 0; oom_k < 8192; oom_k++) {
+                    char* oom_p = (char*)map_pages(262144);
+                    if (oom_p == null) break;
+                    for (int oom_q = 0; oom_q < 262144; oom_q += 4096) { oom_p[oom_q] = (char)1; }
+                }
+                exitcode(7);
+            } else {
+                if (join(oom_probe, oom_pg) != 7) { oom_probe_killed = true; }
             }
-            // Pass = no panic (we got here), RAM pressure was real
-            // (either rfork got refused or the tight map returned null),
-            // and killing the kids recovered enough to map again.
-            bool oom_pressure = oom_rfork_refused || oom_tight == null;
-            if (oom_spawned > 0 && oom_pressure && oom_after != null) {
-                print("oomtest: ok (OOM returned -1/null, no panic, RAM recovered)\n");
+            // Reap the gluttons and confirm RAM comes back.
+            for (int oi = 0; oi < oom_spawned; oi++) { kill(oom_pid[oi], oom_gen[oi]); }
+            ulong oom_recover = rdtime() + timebase_hz() * 3;
+            int oom_after_code = -1;
+            while (oom_after_code != 7 && rdtime() < oom_recover) {
+                yield();
+                uint rg = 0;
+                int rc = rfork(RFPROC, &rg);
+                if (rc == 0) {
+                    char* rp = (char*)map_pages(1048576);
+                    bool oom_rec_ok = rp != null;
+                    if (oom_rec_ok) {
+                        for (int oom_i = 0; oom_i < 1048576; oom_i += 4096) { rp[oom_i] = (char)2; }
+                        rp[1048575] = (char)3;
+                    }
+                    exitcode(oom_rec_ok ? 7 : 1);
+                }
+                if (rc > 0) { oom_after_code = join(rc, rg); }
+            }
+            bool oom_pressure = oom_rfork_refused || oom_probe_killed;
+            if (oom_spawned > 0 && oom_pressure && oom_after_code == 7) {
+                print("oomtest: ok (demand-fault OOM kills the process, no panic, RAM recovered)\n");
             } else {
                 print("oomtest: FAILED spawned="); print_uint((uint)oom_spawned);
                 print(" pressure="); print_uint((uint)oom_pressure);
-                print(" recovered="); print_uint((uint)(oom_after != null));
+                print(" recovered="); print_uint((uint)(oom_after_code == 7));
                 putchar('\n');
             }
         } else if (strcmp(cmd, "faulttest") == 0) {

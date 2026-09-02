@@ -40,16 +40,17 @@ var (
 	// Bloc before the Go world starts.
 	RamStart uint
 	// RamSize is the SYS_MAP region for the whole Go heap + g0 stack.
-	// SYS_MAP is eager (every page really allocated + zeroed at startup),
-	// so this trades startup cost for GC headroom. Initialised from
-	// ramSizeBytes — a build-tag-selected const (racccoon_heap_*.go), so
-	// its slot in .data is set at link time and CPUInit (which runs
-	// before any Go init) reads the right value. Default 64 MiB is
-	// plenty for programs and the `go` command; `-tags racccoon_bigheap`
-	// picks 448 MiB for cmd/compile / cmd/link, which peak far past
-	// 64 MiB compiling package runtime. Fits under QEMU's
-	// board::HEAP_MAX_BYTES (512 MiB). CPUInit falls back to 8 MiB if a
-	// board refuses the map.
+	// SYS_MAP is lazy (docs/devlog.md): the call only reserves address
+	// space and bumps the ceiling — real pages are demand-faulted on
+	// first touch — so a big arena costs nothing until the GC actually
+	// grows into it. Initialised from ramSizeBytes — a build-tag-selected
+	// const (racccoon_heap_*.go), so its slot in .data is set at link
+	// time and CPUInit (which runs before any Go init) reads the right
+	// value. Default 64 MiB is plenty for programs and the `go` command;
+	// `-tags racccoon_bigheap` picks 448 MiB for cmd/compile / cmd/link,
+	// which peak far past 64 MiB building package runtime. Fits under
+	// QEMU's board::HEAP_MAX_BYTES (512 MiB). CPUInit falls back to
+	// 8 MiB if a board refuses the map.
 	RamSize        uint = ramSizeBytes
 	RamStackOffset uint = 0x1000
 

@@ -315,6 +315,15 @@ struct Process
 	// per process (HEAP_MAX_BYTES) so a runaway map can't OOM the kernel.
 	uptr heap_top;
 
+	// The bottom of the lazily-mapped SYS_MAP region: heap_top's value
+	// right after the image + argv are mapped. SYS_MAP hands out address
+	// space between map_floor and heap_top without allocating any
+	// physical pages; a page fault in [map_floor, heap_top) demand-maps
+	// one zero page (entry.c3's try_lazy_fault). Everything below
+	// map_floor (the image, argv) is eagerly mapped, so a fault there is
+	// a real bug. Set by create_process / sys_exec alongside heap_top.
+	uptr map_floor;
+
 	// FP register file save slot: f0-f31 as raw 64-bit bit patterns
 	// [0..31], then fcsr [32]. Written by fp_save() / read by fp_restore()
 	// (below), which yield() calls to bracket every switch_context —
@@ -755,6 +764,20 @@ fn void flush_tlb() @naked @noinline
     `);
 }
 
+// Targeted flush for a single just-mapped page (a0 = its virtual
+// address) — the lazy-SYS_MAP demand-fault path (entry.c3) runs on
+// every touched page of a Go arena, so a global sfence.vma each time
+// would be a real cost. Making a previously-invalid PTE valid still
+// needs a flush: the RISC-V spec permits an implementation to cache the
+// non-leaf walk or a negative result.
+fn void flush_tlb_page(uptr vaddr) @naked @noinline
+{
+	asm(`
+        sfence.vma a0
+        ret
+    `);
+}
+
 // --- FP register file save/restore ----------------------------------------
 // a0 = &Process.fp_area (ulong[33]: f0-f31 at 8*0..8*31, fcsr at 8*32).
 // Opaque asm — block asm{} doesn't recognise fsd/fld/frcsr/fscsr. Called
@@ -1081,6 +1104,7 @@ fn Process* create_process(void* image, uint image_size)
 	// includes .bss + the 64KB user stack — see user/user.ld). A
 	// create_process()'d process has no argv; sys_exec sets its own.
 	proc.heap_top = (uptr)USER_BASE + (uptr)((image_size + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE);
+	proc.map_floor = proc.heap_top; // lazy SYS_MAP: nothing above here is mapped yet
 	// create_process() never has a "parent" in the fork sense (a fresh
 	// boot-time spawn or a shell respawn, not an existing process
 	// splitting in two) — explicit, not relied-on zero-init, since a

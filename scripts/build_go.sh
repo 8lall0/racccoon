@@ -59,7 +59,11 @@ case "$1" in
     EXTRA_LDFLAGS="-X runtime.defaultGOROOT=/goroot" ;;
   cmd/compile|cmd/link)
     # these peak far past the default 64 MiB Go arena compiling package
-    # runtime on-device (racccoon_heap_big.go). go/asm stay small.
+    # runtime on-device (racccoon_heap_big.go). Since lazy SYS_MAP
+    # (docs/devlog.md) the 448 MiB arena is only address space until
+    # touched, so it no longer bloats rfork — but `go` / `asm` still
+    # stay on the default heap: the QEMU pool is 768 MiB (src/kernel.ld)
+    # and `go` holds its heap live while a 448 MiB `compile` runs.
     BUILD_TAGS="racccoon_bigheap" ;;
 esac
 

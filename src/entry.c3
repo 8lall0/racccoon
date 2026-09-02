@@ -6,6 +6,12 @@ import board;
 import sbi;
 
 const SCAUSE_ECALL             = 8;
+// Synchronous page-fault causes (RISC-V privileged spec table): a fetch,
+// load, or store/AMO through a PTE that's invalid or lacks permission.
+// try_lazy_fault (handle_trap) uses these to demand-map a SYS_MAP page.
+const SCAUSE_INST_PAGE_FAULT   = 12;
+const SCAUSE_LOAD_PAGE_FAULT   = 13;
+const SCAUSE_STORE_PAGE_FAULT  = 15;
 // RV64 port: the interrupt bit is scause's MSB — bit 63 on RV64, not
 // bit 31 as on RV32. This is a real correctness-critical difference,
 // not just a width bump; getting it wrong silently misclassifies every
@@ -749,6 +755,7 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		// region — including any pages the parent SYS_MAP'd — matches the
 		// parent's at fork time. Continue the bump pointer from there.
 		child.heap_top = current_proc.heap_top;
+		child.map_floor = current_proc.map_floor;
 		// FP state: the child inherits the parent's, exactly (fork copy
 		// semantics). The live f-registers still hold the parent's values
 		// here — kernel_entry saves GPRs only and the handler is
@@ -1237,6 +1244,7 @@ fn void sys_exec(Trap_frame* f) @noinline
 		// argv. Any pages the *old* image had SYS_MAP'd were freed with
 		// every other PAGE_U leaf in the page-table clear above.
 		current_proc.heap_top = exec_argv_base + (uptr)(argv_page_count * PAGE_SIZE);
+		current_proc.map_floor = current_proc.heap_top; // lazy SYS_MAP region starts empty
 
 		// This process's own page table entries for USER_BASE just
 		// changed, but unlike a normal process switch, satp itself
@@ -2489,14 +2497,17 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			f.a0 = 0;
 		case SYS_MAP:
-			// a0 = byte count. Map that many bytes (rounded up to whole
-			// pages) of fresh zero-filled RW+U memory at current_proc.
-			// heap_top, bump it, return the base vaddr — or -1 on a bad
-			// size, the per-process ceiling, or not enough free RAM.
-			// No unmap: proc_destroy / sys_exit walk every PAGE_U leaf
-			// and free it, so a SYS_MAP'd region is reclaimed on exit
-			// for free. Inlined per the "complex fn from the switch"
-			// caution (docs/devlog.md) — it's small.
+			// a0 = byte count. Reserve that many bytes (rounded up to
+			// whole pages) of RW+U address space at current_proc.heap_top,
+			// bump it, return the base vaddr — or -1 on a bad size or the
+			// per-process ceiling. LAZY: no physical page is allocated
+			// here. A page fault in [map_floor, heap_top) demand-maps one
+			// zero page (try_lazy_fault, handle_trap's exception branch);
+			// running out of RAM there kills just the faulting process.
+			// No unmap: proc_destroy / sys_exit walk every PAGE_U leaf and
+			// free it, so whatever a SYS_MAP'd region actually touched is
+			// reclaimed on exit for free. rfork copies only real leaves,
+			// so forking a process with a big-but-untouched map is cheap.
 			ulong map_bytes = f.a0;
 			if (map_bytes == 0 || map_bytes > HEAP_MAX_BYTES)
 			{
@@ -2505,25 +2516,11 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			uint map_pages_n = (uint)((map_bytes + PAGE_SIZE - 1) / PAGE_SIZE);
 			uptr map_base = current_proc.heap_top;
-			// The free-page pre-check must also cover the L1/L0 page-table
-			// pages map_page() allocates as the mapped range crosses each
-			// 2 MiB / 1 GiB boundary — the old check only counted the leaf
-			// pages, so a large-enough SYS_MAP could still hit the OOM
-			// panic inside walk_to_leaf_table. `n/256 + 4` is a generous
-			// ceiling (one L0 table per 512 leaves, plus slack). The whole
-			// loop runs without preemption, so the count stays valid.
-			uint map_overhead = map_pages_n / 256 + 4;
 			if (map_base == 0
-				|| map_base + (uptr)map_pages_n * PAGE_SIZE - (uptr)USER_BASE > HEAP_MAX_BYTES
-				|| (uptr)free_page_count() < (uptr)(map_pages_n + map_overhead))
+				|| map_base + (uptr)map_pages_n * PAGE_SIZE - (uptr)USER_BASE > HEAP_MAX_BYTES)
 			{
 				f.a0 = (ulong)(-1);
 				break;
-			}
-			for (uint mp = 0; mp < map_pages_n; mp++)
-			{
-				uptr map_phys = alloc_pages(1); // free was pre-checked, incl. page-table overhead
-				map_page(current_proc.page_table, map_base + (uptr)mp * PAGE_SIZE, map_phys, PAGE_U | PAGE_R | PAGE_W);
 			}
 			current_proc.heap_top = map_base + (uptr)map_pages_n * PAGE_SIZE;
 			f.a0 = (ulong)map_base;
@@ -2973,6 +2970,53 @@ fn void service_pending_external_irq() @noinline
 	}
 }
 
+// Lazy SYS_MAP: a page fault at `stval` inside the current process's
+// [map_floor, heap_top) reservation demand-maps one fresh zero page.
+// Returns true if it handled the fault (execution should retry the
+// faulting instruction); false for anything else — a fault outside the
+// lazy region, a permission fault on an already-present page, a fault
+// from S-mode, or an out-of-memory allocation failure (the caller then
+// tears the process down, which is the right response to a process that
+// touched more mapped memory than the machine has).
+fn bool try_lazy_fault(ulong scause, ulong stval) @noinline
+{
+	if (scause != SCAUSE_INST_PAGE_FAULT
+		&& scause != SCAUSE_LOAD_PAGE_FAULT
+		&& scause != SCAUSE_STORE_PAGE_FAULT)
+	{
+		return false;
+	}
+	if ((read_reg("sstatus") & SSTATUS_SPP) != 0 || current_proc.pid == 0)
+	{
+		return false;
+	}
+	uptr addr = (uptr)stval;
+	if (addr < current_proc.map_floor || addr >= current_proc.heap_top)
+	{
+		return false;
+	}
+	uptr page = addr & ~(uptr)(PAGE_SIZE - 1);
+	// Present already => this is a permission fault, not a demand fault
+	// (SYS_MAP pages are R|W|U, so it shouldn't be, but don't paper over
+	// it) — hand it back to the real-fault path.
+	if (pte_present(current_proc.page_table, page))
+	{
+		return false;
+	}
+	uptr phys = try_alloc_pages(1); // zero-filled
+	if (phys == 0)
+	{
+		return false;
+	}
+	if (!try_map_page(current_proc.page_table, page, phys, PAGE_U | PAGE_R | PAGE_W))
+	{
+		free_pages(phys, 1);
+		return false;
+	}
+	flush_tlb_page(page);
+	return true;
+}
+
 fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 {
 	ulong scause  = read_reg("scause");
@@ -3073,14 +3117,21 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 			current_proc.saved_sepc = user_pc + 4;
 		}
 	}
+	else if (try_lazy_fault(scause, stval))
+	{
+		// A demand fault on a lazily-reserved SYS_MAP page — one zero
+		// page was just mapped in. Fall through to write_sepc (which
+		// still points at the faulting instruction) + sret to retry it.
+	}
 	else
 	{
-		// Not an interrupt, not an ecall — a synchronous exception:
-		// a page fault, an illegal instruction, a misaligned access, a
-		// breakpoint. If it came from U-mode (sstatus.SPP == 0), it's a
-		// buggy user program — tear down just that process and move on,
-		// the same way SYS_EXIT / the watchdog do. Only an exception
-		// from S-mode is a genuine kernel bug worth a panic.
+		// Not an interrupt, not an ecall, not a lazy-map fault — a
+		// synchronous exception: an unrelated page fault, an illegal
+		// instruction, a misaligned access, a breakpoint. If it came
+		// from U-mode (sstatus.SPP == 0), it's a buggy user program —
+		// tear down just that process and move on, the same way
+		// SYS_EXIT / the watchdog do. Only an exception from S-mode is a
+		// genuine kernel bug worth a panic.
 		//
 		// This is also what lets a userspace interpreter (/bin/wasm)
 		// treat an out-of-bounds computed address as a clean process

@@ -4,6 +4,67 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-02 — Lazy `SYS_MAP` (demand paging for anonymous maps)
+
+`SYS_MAP` no longer allocates a single physical page. It validates the
+byte count against the per-process ceiling (`board::HEAP_MAX_BYTES`),
+bumps `heap_top`, and returns the base vaddr — that's it. The region
+`[map_floor, heap_top)` is reserved address space; a page fault inside
+it demand-maps one fresh zero page and retries the faulting
+instruction. Running out of RAM at fault time kills just the faulting
+process (the existing U-mode-fault path), never the kernel.
+
+Why: the previous entry flagged the eager 448 MiB `SYS_MAP` the Go
+toolchain arena needs as costing seconds per `compile` launch, and as
+the reason `go`/`asm` had to stay on a 64 MiB heap (a 448 MiB parent
+can't be `rfork`'d in the pool). Both go away when the map is lazy —
+`rfork` copies only *real* leaves, so a lightly-touched 448 MiB
+process forks cheaply.
+
+Kernel changes:
+
+- `src/page.c3` — `try_map_page()` (fallible `map_page`, all allocs via
+  `try_alloc_pages`), `pte_present()` (non-allocating leaf probe).
+  `user_range_valid()` gets a fault-in pre-pass: a syscall handed a
+  pointer into the caller's own untouched lazy region (a fresh Go
+  slice the runtime hasn't written yet) demand-maps it here rather
+  than failing closed.
+- `src/entry.c3` — `try_lazy_fault(scause, stval)`: on a U-mode
+  instruction/load/store page fault at an absent page in
+  `[map_floor, heap_top)`, allocate + `try_map_page` + targeted
+  `sfence.vma`, then return so `handle_trap` re-runs the instruction.
+  Wired in ahead of the "buggy user program / kernel panic" branch.
+  The `SYS_MAP` handler drops its `alloc_pages` loop and its
+  free-RAM / page-table-overhead pre-check.
+- `src/process.c3` — `Process.map_floor` (bottom of the lazy region,
+  set beside `heap_top` in `create_process` / `sys_exec` / `sys_rfork`);
+  `flush_tlb_page(vaddr)` (`sfence.vma a0`).
+
+The `cmd/compile` / `cmd/link` big arena (`racccoon_bigheap`, 448 MiB)
+is now pure address space until touched, so it no longer bloats
+`rfork`. `go` / `asm` still stay on the 64 MiB heap: the QEMU pool is
+768 MiB (`src/kernel.ld` reserves a fixed 768 MiB for `__free_ram`
+regardless of `-m`), and `go` holds its heap live for the whole build
+while a 448 MiB `compile` runs — bumping `go` to 448 MiB overcommits
+that pool and `compile` gets OOM-killed mid-run. Lifting the 768 MiB
+`__free_ram` reservation (the kernel boots fine at `-m 2G`+) is the
+real unblock and a separate change.
+
+Verified in QEMU `-m 2G`: `maptest`, `oomtest` (rewritten for the new
+semantics — gluttons that map *and touch* their whole ceiling, one
+probe that gets OOM-killed at fault time, RAM recovers on reap),
+`faulttest`, `gostage2test` (the GC exercise), `gostage41`/`42`,
+`gotest`, `goversiontest`, `wasmtest`, `hardentest` all green.
+`gobuildtest` (the full on-device `go build`) does not finish in
+~25 min on this host on the pre-change kernel either — the demand-fault
+path it exercises is covered by `gostage2test` + `oomtest`; a clean
+timed run of the whole `go build` still needs a faster host / the Duo.
+
+Not done this session: the `GOOS=racccoon` rename; multi-core (SMP)
+scaffold; lifting the 768 MiB `__free_ram` cap. Duo kernel builds clean.
+
+---
+
 ## 2026-09-02 — Go Stage 4.4 DONE: `go build` works on racccoon
 
 ```
