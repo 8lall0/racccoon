@@ -36,6 +36,43 @@ diskd's poll rare, doesn't remove it).
 No code yet. Next: `ringbench` microbench (P0) to measure the real
 per-op delta, then P1.
 
+### P0 done — `ringbench` builtin + baseline
+
+`ringbench [bytes] [iters]` (test shell): writes `/tmp/rbench` once,
+primes the fsd cache, then times N `fs_read_at`s of a fully-cached file
+— pure client↔fsd `SYS_IPC_CALL` round-trip cost, no disk. (Bug found
+on the way, same one synhist hit: `SYS_PROF` returns pre-reset totals
+then zeroes, so the post-loop read *is* the delta — don't subtract the
+reset snapshot or it underflows against the boot-time totals.)
+
+Baseline (QEMU TCG, `-m 2G`, host-load-dependent so read the shape not
+the absolutes):
+
+```
+payload   wall/op        ipc_calls/op   switches/op
+64 B      ~190–460 µs     1.00           3.00
+512 B     ~205–490 µs     1.00           3.00
+4096 B    ~330–590 µs     1.00           3.00
+7168 B    ~810 µs         1.00           3.00
+```
+
+Findings:
+- A cached read round-trip is **exactly 1 `SYS_IPC_CALL` + 3 context
+  switches** (shell→fsd, fsd recv/reply internal, fsd→shell). The
+  rendezvous is already tight for the 2-party case — the ring's
+  switch savings per *isolated* read are modest.
+- Payload cost scales **~30–50 ns/byte** — the two `mem::copy`s through
+  the 8 KiB kernel bounce buffer. At 4 KiB that's ~150–200 µs, roughly
+  a third of the call even in isolation. This is pure overhead the
+  ring's shared data arena removes outright (zero-copy).
+- So the ring's wins are: (1) **zero-copy** — kill the 30–50 ns/byte;
+  (2) **batching** — a `go build` exec-image load is thousands of 8 KiB
+  reads = thousands of (ipc_call + 3 switches + 2 copies); one ring
+  submit+kick+drain instead; (3) **Phase 1's diskd poll storm** (~330 M
+  syscalls), which this client-side bench doesn't even touch.
+
+Re-run `ringbench` after each ring phase to track the delta.
+
 ---
 
 ## 2026-09-03 — fsd cache: 4-way, 8 MiB (was 512 KiB direct-mapped)

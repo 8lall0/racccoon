@@ -36,6 +36,22 @@ fn void thread_body(void* arg) {
     exit();
 }
 
+// ringbench's read/write buffer — a global for the same stack-budget
+// reason bigread_buf above is one (the shell's own stack can't hold an
+// 8 KiB frame-local on top of everything else a builtin nests).
+char[8192] ringbench_buf;
+
+// ringbench (below) prints per-operation counters as X.YY without a
+// float in sight: total * 100 / iters, then split.
+fn void ringbench_perop(ulong total, ulong iters) {
+    ulong h = iters > 0 ? (total * 100) / iters : 0;
+    print_uint((uint)(h / 100));
+    putchar('.');
+    uint frac = (uint)(h % 100);
+    if (frac < 10) { putchar('0'); }
+    print_uint(frac);
+}
+
 // exfatgrow's listing buffer — global for the same stack-budget reason
 // bigread_buf above is (FS_LIST_ENTRY_SIZE * a generous entry count).
 char[40 * 36] exfatgrow_listbuf;
@@ -903,6 +919,69 @@ fn void main() {
                 print("  sys "); print_uint((uint)sv); print(": ");
                 print_uint((uint)(sd / 1000)); print("k  (");
                 print_uint((uint)(rate / 1000)); print("k/s)\n");
+            }
+        } else if (strcmp(cmd, "ringbench") == 0) {
+            // P0 of the IPC-rings work (docs/ipc-rings.md): the number the
+            // ring data-plane has to beat — the current client->fsd read
+            // round-trip cost over SYS_IPC_CALL. `ringbench [bytes]
+            // [iters]`, defaults 4096 / 20000. The file is written once
+            // and the fsd cache is primed first, so the loop measures
+            // pure IPC round-trip overhead (rendezvous + 2 bounce copies
+            // + context switches), not disk.
+            int rb_bytes = 4096;
+            int rb_iters = 20000;
+            if (cmd_argc > 0) {
+                int rb_v = 0; char* rb_cp = cmd_argv[0];
+                while (*rb_cp >= '0' && *rb_cp <= '9') { rb_v = rb_v * 10 + (int)(*rb_cp - '0'); rb_cp++; }
+                if (rb_v > 0) { rb_bytes = rb_v; }
+            }
+            if (cmd_argc > 1) {
+                int rb_v = 0; char* rb_cp = cmd_argv[1];
+                while (*rb_cp >= '0' && *rb_cp <= '9') { rb_v = rb_v * 10 + (int)(*rb_cp - '0'); rb_cp++; }
+                if (rb_v > 0) { rb_iters = rb_v; }
+            }
+            if (rb_bytes < 1) { rb_bytes = 1; }
+            if (rb_bytes > 7168) { rb_bytes = 7168; } // headroom under MSG_MAX for the fsd reply framing
+
+            for (int rb_i = 0; rb_i < rb_bytes; rb_i++) { ringbench_buf[rb_i] = (char)(rb_i & 0x7F); }
+            if (fs_write("/tmp/rbench", &ringbench_buf[0], rb_bytes) != rb_bytes) {
+                print("ringbench: setup write failed\n");
+            } else {
+                fs_read_at("/tmp/rbench", &ringbench_buf[0], rb_bytes, 0); // prime the fsd cache
+
+                // SYS_PROF returns the PRE-reset totals, then zeroes — so
+                // after this reset call the odometer is 0 and the single
+                // post-loop read below IS the delta. (Subtracting the
+                // reset snapshot underflows against the huge boot-time
+                // totals — the same trap synhist hit.)
+                ulong[4] rb_pr @noinit;
+                prof_read(&rb_pr[0], 1);
+                ulong rb_t0 = rdtime();
+                int rb_bad = 0;
+                for (int rb_i = 0; rb_i < rb_iters; rb_i++) {
+                    if (fs_read_at("/tmp/rbench", &ringbench_buf[0], rb_bytes, 0) != rb_bytes) { rb_bad++; }
+                }
+                ulong rb_wall = rdtime() - rb_t0;
+                prof_read(&rb_pr[0], 0);
+
+                ulong rb_hz  = timebase_hz();
+                ulong rb_ns  = 1000000000;
+                ulong rb_it  = (ulong)rb_iters;
+                ulong rb_calls    = rb_pr[0];
+                ulong rb_yields   = rb_pr[2];
+                ulong rb_switches = rb_pr[3];
+                ulong rb_nsop = (rb_hz > 0) ? (rb_wall * rb_ns) / (rb_it * rb_hz) : 0;
+
+                print("ringbench: "); print_uint((uint)rb_bytes); print("B x ");
+                print_uint((uint)rb_iters); print(" fs_read_at via SYS_IPC_CALL\n");
+                print("  wall       ");
+                print_uint((uint)(rb_hz > 0 ? rb_wall / rb_hz : 0)); print("s  ");
+                print_uint((uint)rb_nsop); print(" ns/op\n");
+                print("  ipc_calls  "); ringbench_perop(rb_calls, rb_it); print(" /op\n");
+                print("  switches   "); ringbench_perop(rb_switches, rb_it); print(" /op\n");
+                print("  yields     "); ringbench_perop(rb_yields, rb_it); print(" /op\n");
+                if (rb_bad > 0) { print("  WARN short reads: "); print_uint((uint)rb_bad); putchar('\n'); }
+                fs_delete("/tmp/rbench");
             }
         } else if (strcmp(cmd, "hardentest") == 0) {
             // Regression guard for src/page.c3's user_range_valid() and

@@ -152,13 +152,19 @@ single-message path needs.
 
 ## Phased plan
 
-### Phase 0 — this doc + a bench (host)
+### Phase 0 — this doc + a bench  — **DONE**
 
 - `docs/ipc-rings.md` (this file).
-- A microbench builtin `ringbench` (like `synhist`): time N=100k
-  round trips of a 4 KiB read via `SYS_IPC_CALL` vs. via a ring, print
-  ns/op and switches/op. Establishes the real per-op delta before
-  committing to the big refactor.
+- `ringbench [bytes] [iters]` builtin (test shell) — times N `fs_read_at`s
+  of a fully-cached file, i.e. pure client↔fsd `SYS_IPC_CALL` round-trip
+  cost. Baseline (see devlog 2026-09-03): **1 ipc_call + 3 context
+  switches per cached read**, payload copy **~30–50 ns/byte** (the two
+  8 KiB bounce copies). Re-run after each ring phase.
+- Takeaway that shaped the plan: the rendezvous is already tight for an
+  isolated 2-party read (3 switches). The ring earns its keep through
+  **zero-copy** (kill the ns/byte), **batching** (one kick for a whole
+  exec image instead of thousands of round trips), and **Phase 1's
+  diskd poll storm** — not through shaving switches off one read.
 
 ### Phase 1 — fsd ↔ diskd ring  ← start here
 
