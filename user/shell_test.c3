@@ -2340,12 +2340,17 @@ fn void main() {
                 gb_av4[0] = "build"; gb_av4[1] = "-o"; gb_av4[2] = "/tmp/gbt"; gb_av4[3] = ".";
 
                 // Profile the build itself (docs: "profile go build").
-                ulong[4] gb_p0 @noinit; ulong[4] gb_p1 @noinit;
+                ulong[4] gb_p1 @noinit;
                 ulong[64] gb_hist @noinit;     // per-syscall counts — chasing the diskd poll storm
                 ulong gb_ch0 = 0; ulong gb_cm0 = 0;
                 fs_cache_stats(&gb_ch0, &gb_cm0);
-                prof_hist(&gb_hist[0], 1);      // reset the histogram (returns pre-reset totals; ignore)
-                prof_read(&gb_p0[0], 1);        // reset the odometer
+                // SYS_PROF / SYS_PROF_HIST return the PRE-reset totals then
+                // zero — so after these reset calls the odometer is 0 and
+                // the single post-build read IS the delta. (Subtracting the
+                // reset snapshot underflows against the huge boot-time
+                // totals — the trap ringbench / synhist both hit.)
+                prof_hist(&gb_hist[0], 1);
+                prof_read(&gb_p1[0], 1);
                 ulong gb_wt0 = rdtime();
 
                 uint gb_g1 = 0;
@@ -2365,14 +2370,14 @@ fn void main() {
 
                 ulong gb_hz = timebase_hz();
                 ulong gb_wall = gb_wt1 - gb_wt0;
-                ulong gb_ipc_t = gb_p1[1] - gb_p0[1];
+                ulong gb_ipc_t = gb_p1[1];
                 print("gobuildtest prof: wall=");
                 print_uint((uint)(gb_hz > 0 ? gb_wall / gb_hz : 0)); print("s ipc_calls=");
-                print_uint((uint)(gb_p1[0] - gb_p0[0])); print(" ipc_time=");
+                print_uint((uint)gb_p1[0]); print(" ipc_time=");
                 print_uint((uint)(gb_hz > 0 ? gb_ipc_t / gb_hz : 0)); print("s (");
                 print_uint((uint)(gb_wall > 0 ? (gb_ipc_t * 100) / gb_wall : 0)); print("% x-wall) yields=");
-                print_uint((uint)(gb_p1[2] - gb_p0[2])); print(" switches=");
-                print_uint((uint)(gb_p1[3] - gb_p0[3])); print(" cache=");
+                print_uint((uint)gb_p1[2]); print(" switches=");
+                print_uint((uint)gb_p1[3]); print(" cache=");
                 print_uint((uint)(gb_ch1 - gb_ch0)); print("h/");
                 print_uint((uint)(gb_cm1 - gb_cm0)); print("m\n");
                 print("gobuildtest prof: syscalls=");

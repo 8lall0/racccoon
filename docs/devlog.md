@@ -4,6 +4,47 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-03 — IPC rings P1 step 2: fsd↔diskd shared arena
+
+`disk_arena` — one 32 KiB physically-contiguous run, identity-mapped by
+`setup_diskd_mappings` / `setup_fsd_mappings` into diskd and the primary
+fsd. `SYS_DISK_ARENA_INFO` (56) hands back `(paddr, size)`, gated to the
+two recorded pids. New diskd verbs `DISKD_{READ,WRITE,READ_MULTI}_ARENA`
+(213–215): request `{sector, count, arena_off}` (12 B), reply `{status}`
+(4 B); the virtio data descriptor points at `arena_paddr + arena_off`
+so the device DMAs straight into the shared region. fsd's `diskd_rw` /
+`diskd_read_multi` use them when `g_arena_ok` (primary only — fsd2 and
+usbrw keep the inline verbs). Payload copies per multi-sector read:
+2 kernel bounce + 1 diskd + 1 fsd  →  0 + 0 + 1.
+
+**Measured — wall-neutral, as steps 1 and 2 both are.**
+
+```
+                  wall    ipc_calls   syscalls   cache      switches
+pre-step-1       ~1345 s  1.47 M      348 M      38 %       (5.4M, buggy)
+step 1           1320 s   1.47 M      23 M       38 %       (buggy)
+step 1 + 2       1496 s   1.47 M      21 M       38 %       53 M (real)
+```
+
+The wall spread (1320–1496 s) is TCG + host-load noise — no trend.
+`ipc_calls` and the cache pattern don't move one count between versions,
+because **neither step reduces the round-trip *count*** (1.47 M): step 1
+cut syscall count (cheap syscalls → wall-neutral), step 2 cut copy bytes
+(also under the noise floor). 53 M switches / 1.47 M calls ≈ **36
+context switches per round trip** — dominated by the cooperative
+`yield()` loops (`driver_irq_wait`, `sys_ipc_call`'s 3 phases) spinning
+while QEMU posts the completion IRQ. (`gobuildtest` prof math fixed —
+was subtracting the pre-reset `SYS_PROF` snapshot, same bug as ringbench
+/ synhist; the 53 M is the first trustworthy switch count.)
+
+Kept because: correct, tested (bigwrite/bigread/mount/stage6/gostage3 +
+dual), −15× syscalls, and the shared-region substrate the batched
+submission (step 3) needs. To move wall time, step 3 must cut the
+round-trip *count* — bigger reads per `FS_READ_AT` via a client↔fsd
+arena.
+
+---
+
 ## 2026-09-03 — IPC rings: design doc (lever #5)
 
 `docs/ipc-rings.md` — the design for zero-copy / batched IPC rings, the

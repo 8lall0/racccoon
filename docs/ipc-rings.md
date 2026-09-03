@@ -175,8 +175,39 @@ The storm is gone (`sys10 = 0`, `sys55` at ~1/completion). All fs tests
 pass. Small on its own (~2 % wall — each poll was cheap), but removes a
 pathological pattern and is a prerequisite for the ring's own wait.
 
-**Step 2 (next):** the shared SQ/CQ + data arena — the zero-copy +
-batching + virtqueue-depth win below.
+**Step 2 (next):** a shared data *arena* between diskd and the primary
+fsd — the zero-copy half, without the full SQ/CQ machinery yet.
+
+Deliberately minimal: keep the existing blocking-IPC control flow
+(`p9_call` / `ipc_recv` / generation checks / respawn retry) exactly as
+is, and only move the *payload* out of the 8 KiB kernel bounce buffer
+into a shared region.
+
+- Kernel allocates one physically-contiguous `disk_arena` (32 KiB,
+  cacheable `map_page` — consistent with `diskd_req_paddr`, and
+  virtio-blk is QEMU-only so no real DMA-coherency issue), identity-
+  mapped into diskd (hands the paddr to a virtio descriptor) and into
+  the primary fsd (plain r/w). `setup_diskd_mappings` /
+  `setup_fsd_mappings` both map it (so a supervisor respawn re-maps it
+  for free); allocated once, on the first of those calls.
+  `SYS_DISK_ARENA_INFO` (56) returns `(paddr, size)`, gated to the two
+  recorded pids.
+- diskd learns three new verbs — `DISKD_READ_ARENA` (213),
+  `DISKD_WRITE_ARENA` (214), `DISKD_READ_MULTI_ARENA` (215) — request
+  `{u32 sector, u32 count, u32 arena_off}` (12 B), reply `{status}`
+  (4 B). The virtio data descriptor points at `arena_paddr + arena_off`
+  instead of `&req.data`: the device DMAs straight into the shared
+  region, no `mem::copy` into/out of `req.data`. The old inline verbs
+  (210–212) stay for fsd2 and USB-MSC (`usbrw.c3`), which don't get the
+  arena.
+- fsd's `diskd_rw` / `diskd_read_multi` use the arena verbs when
+  `g_arena_ok`: a write places bytes in the arena first; a read copies
+  arena→caller after. Net payload copies per multi-sector read: today
+  2 kernel bounce copies + 1 diskd copy + 1 fsd copy; after: 0 + 0 + 1.
+
+Not in step 2 (still on the list): batched submission (fsd issues N
+ops per kick), virtqueue depth > 1, the general `SYS_RING_ATTACH` for
+arbitrary peers (that's Phase 2, client↔fsd).
 
 The hottest, simplest edge: two C3 processes, no language bindings, and
 it kills the poll storm.

@@ -36,6 +36,20 @@ const uint DISKD_READ_MULTI = 212; // request: read `count` consecutive sectors
 const uint DISKD_MAX_SECTORS = 15;
 const uint DISKD_MSG_MAX = 8192;
 
+// Arena-mode verbs (docs/ipc-rings.md Phase 1, step 2). Same semantics as
+// their inline counterparts above, but the sector payload lives in the
+// shared disk arena (SYS_DISK_ARENA_INFO), not the IPC message: the
+// virtio data descriptor points straight at `arena_paddr + arena_off`,
+// so the device DMAs into the region the primary fsd reads — no copy
+// into/out of req.data, no 8 KiB bounce through the kernel. Request is
+// [0..3] sector, [4..7] count (1 for the single verbs), [8..11]
+// arena_off; reply is byte 0 = status only. Only the primary fsd uses
+// these; fsd2 and usbrw.c3 keep the inline verbs (they aren't mapped to
+// the arena).
+const uint DISKD_READ_ARENA        = 213;
+const uint DISKD_WRITE_ARENA       = 214;
+const uint DISKD_READ_MULTI_ARENA  = 215;
+
 const uint SECTOR_SIZE      = 512;
 const uint VIRTIO_BLK_PADDR = 0x10001000;
 
@@ -64,6 +78,13 @@ Virtio_virtq*   vq;
 Virtio_blk_req* req;
 uptr            req_paddr;
 
+// The fsd<->diskd shared payload arena (docs/ipc-rings.md P1 step 2) —
+// identity-mapped, so arena_paddr doubles as the virtual address. 0 if
+// the kernel didn't hand one back (older kernel); the arena verbs then
+// just never arrive and the inline path is unaffected.
+uptr arena_paddr;
+uint arena_size;
+
 fn void diskd_init()
 {
 	uptr vq_paddr;
@@ -73,6 +94,10 @@ fn void diskd_init()
 	}
 	vq  = (Virtio_virtq*)vq_paddr;
 	req = (Virtio_blk_req*)req_paddr;
+
+	arena_paddr = 0;
+	arena_size  = 0;
+	disk_arena_info(&arena_paddr, &arena_size); // -1 (leaves both 0) on an older kernel
 
 	if (reg_read32(VIRTIO_REG_MAGIC) != 0x74726976)
 	{
@@ -133,15 +158,18 @@ fn void main()
 		// pid >= 1, so ipc_reply()'s generation check below is safe to
 		// rely on unconditionally.
 		if (from == 0) continue;
-		if (verb != DISKD_READ && verb != DISKD_WRITE && verb != DISKD_READ_MULTI) continue;
+		bool is_arena = (verb == DISKD_READ_ARENA || verb == DISKD_WRITE_ARENA || verb == DISKD_READ_MULTI_ARENA);
+		bool is_inline = (verb == DISKD_READ || verb == DISKD_WRITE || verb == DISKD_READ_MULTI);
+		if (!is_arena && !is_inline) continue;
 
-		bool is_write = (verb == DISKD_WRITE);
+		bool is_write = (verb == DISKD_WRITE || verb == DISKD_WRITE_ARENA);
+		bool is_multi = (verb == DISKD_READ_MULTI || verb == DISKD_READ_MULTI_ARENA);
 		uint* sector_ptr = (uint*)&buf;
 		uint sector = *sector_ptr;
 
-		// DISKD_READ_MULTI: byte 4..7 = count, clamped to the buffer.
+		// count: byte 4..7 for the multi verbs, else one sector.
 		uint count = 1;
-		if (verb == DISKD_READ_MULTI)
+		if (is_multi)
 		{
 			uint* count_ptr = (uint*)&buf[4];
 			count = *count_ptr;
@@ -150,9 +178,28 @@ fn void main()
 		}
 		uint xfer = count * SECTOR_SIZE;
 
+		// Arena mode: byte 8..11 = the offset into the shared arena the
+		// device DMAs to/from directly. Bounds-checked here (fsd is
+		// trusted, but a stale/corrupt request must not make the device
+		// scribble outside the region). data_paddr is where the sector
+		// bytes live for the virtio data descriptor.
+		uptr data_paddr = (uptr)(uptr)&req.data;
+		if (is_arena)
+		{
+			uint* arena_off_ptr = (uint*)&buf[8];
+			uint arena_off = *arena_off_ptr;
+			if (arena_paddr == 0 || (ulong)arena_off + (ulong)xfer > (ulong)arena_size)
+			{
+				buf[0] = 1; // status != 0 -> fsd treats it as a failed op
+				ipc_reply(from, verb, &buf, 4, from_gen);
+				continue;
+			}
+			data_paddr = arena_paddr + arena_off;
+		}
+
 		req.sector = (ulong)sector;
 		req.type   = is_write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
-		if (is_write)
+		if (is_write && !is_arena)
 		{
 			char* src = &buf[4];
 			mem::copy(&req.data, src, SECTOR_SIZE);
@@ -163,7 +210,7 @@ fn void main()
 		vq.descs[0].flags = VIRTQ_DESC_F_NEXT;
 		vq.descs[0].next  = 1;
 
-		vq.descs[1].addr  = (ulong)(uptr)&req.data;
+		vq.descs[1].addr  = (ulong)data_paddr;
 		vq.descs[1].len   = xfer;
 		vq.descs[1].flags = VIRTQ_DESC_F_NEXT | (is_write ? (ushort)0 : VIRTQ_DESC_F_WRITE);
 		vq.descs[1].next  = 2;
@@ -196,15 +243,16 @@ fn void main()
 		if (isr != 0) { reg_write32(VIRTIO_REG_INTERRUPT_ACK, isr); }
 
 		buf[0] = req.status;
-		if (!is_write)
+		if (!is_write && !is_arena)
 		{
 			char* dst = &buf[4];
 			mem::copy(dst, &req.data, xfer);
 		}
-		// Reply only as long as the payload needs — a single sector's
-		// 516 bytes for DISKD_READ, 4 + count*512 for the multi read, 4
-		// for a write ack. Keeps the kernel's per-message copy small.
-		int reply_len = is_write ? 4 : (int)(4 + xfer);
+		// Reply only as long as the payload needs. Arena mode: status
+		// only (4 bytes) — the data already went straight to the shared
+		// region. Inline: a single sector's 516 bytes for DISKD_READ,
+		// 4 + count*512 for the multi read, 4 for a write ack.
+		int reply_len = (is_write || is_arena) ? 4 : (int)(4 + xfer);
 		ipc_reply(from, verb, &buf, reply_len, from_gen);
 	}
 }

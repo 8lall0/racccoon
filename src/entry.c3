@@ -110,6 +110,7 @@ const SYS_NS_TRANSLATE  = 52; // a0 = path, a1 = union member index, a2 = out bu
 const SYS_PROF          = 53; // a0 = out buf (>= 32 bytes: 4 LE u64 — ipc_calls, ipc_ticks, yields, switches), a1 = reset flag — cheap on-device profiling odometer (gobuildtest)
 const SYS_PROF_HIST     = 54; // DIAGNOSTIC (temporary): a0 = out buf (512 bytes = 64 LE u64, indexed by syscall number), a1 = reset flag — the `synhist` builtin, chasing the go-build syscall storm
 const SYS_DRIVER_IRQ_WAIT = 55; // interrupt-driven driver: block until this driver's pending device-completion notify (driver_irq_pending) is set, hand-draining the PLIC each pass — one syscall per completion in place of diskd's per-sector SYS_IPC_POLL spin (docs/ipc-rings.md P1). Returns 0, or -1 if not a routed driver.
+const SYS_DISK_ARENA_INFO = 56; // diskd + primary fsd only: a0 -> arena paddr, a1 -> arena size (u32). The fsd<->diskd shared payload region (docs/ipc-rings.md P1 step 2) — identity-mapped into both by setup_diskd_mappings / setup_fsd_mappings. Returns 0, or -1 for any other caller / before it's allocated.
 
 // Per-process SYS_MAP ceiling: the bump pointer can't grow more than this
 // past USER_BASE. Board-specific (board::HEAP_MAX_BYTES): 16 MiB on the
@@ -2564,6 +2565,25 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			*diskd_vq_out  = diskd_vq_paddr;
 			*diskd_req_out = diskd_req_paddr;
+		case SYS_DISK_ARENA_INFO:
+			// diskd + the primary fsd only — the two processes
+			// setup_diskd_mappings / setup_fsd_mappings identity-mapped
+			// the arena into (docs/ipc-rings.md P1 step 2). a0 -> paddr
+			// (uptr), a1 -> size (u32), same out-pointer convention as
+			// SYS_DISKD_INFO above.
+			uptr* da_paddr_out = (uptr*)(uptr)f.a0;
+			uint* da_size_out  = (uint*)(uptr)f.a1;
+			if (disk_arena_paddr == 0
+				|| (current_proc.pid != disk_arena_diskd_pid && current_proc.pid != disk_arena_fsd_pid)
+				|| !user_range_valid(current_proc.page_table, (uptr)da_paddr_out, 8, true)
+				|| !user_range_valid(current_proc.page_table, (uptr)da_size_out, 4, true))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			*da_paddr_out = disk_arena_paddr;
+			*da_size_out  = disk_arena_size;
+			f.a0 = 0;
 		case SYS_FS_PARTITION_INFO:
 			// fsd-only, called once at its own startup — a0 is an
 			// out-pointer, same convention as SYS_DISKD_INFO above.

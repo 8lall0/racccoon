@@ -86,6 +86,27 @@ const uint DISKD_READ_MULTI  = 212; // read N consecutive sectors in one op
 const uint DISKD_MAX_SECTORS = 15;  // must match user/block/diskd.c3
 const uint DISKD_MSG_MAX     = 8192;
 
+// Arena-mode verbs (docs/ipc-rings.md P1 step 2) — same semantics, but
+// the sector payload rides in the kernel-mapped shared arena (g_arena)
+// instead of the IPC message: the virtio device DMAs straight into the
+// region this process reads. Request [0..3] sector, [4..7] count,
+// [8..11] arena_off; reply byte 0 = status. Only the primary fsd is
+// mapped to the arena (g_arena_ok); fsd2 and the dynamic USB instance
+// keep the inline verbs above. Must match user/block/diskd.c3.
+const uint DISKD_READ_ARENA        = 213;
+const uint DISKD_WRITE_ARENA       = 214;
+const uint DISKD_READ_MULTI_ARENA  = 215;
+
+// The fsd<->diskd shared payload arena — identity-mapped by the kernel
+// into this process (SYS_DISK_ARENA_INFO), so g_arena_base is both the
+// pointer and the physical address diskd's descriptor uses. g_arena_ok
+// gates every arena-mode call; false for fsd2 / dynamic / an older
+// kernel, which then use the inline verbs unchanged. fsd issues one
+// diskd op at a time, so a single arena slice at offset 0 is enough.
+char* g_arena_base   = null;
+uint  g_arena_size   = 0;
+bool  g_arena_ok     = false;
+
 // One shared static scratch for every diskd request/reply. fsd handles
 // one client request at a time and issues one diskd op at a time within
 // it, so this is safe and keeps an 8 KiB buffer off the deep
@@ -526,17 +547,37 @@ fn bool diskd_rw(char* buf, uint sector, bool is_write)
 	char* req = &g_disk_io_buf[0];
 	uint* sector_field = (uint*)req;
 	*sector_field = sector;
-	if (is_write)
+
+	// Arena mode: payload rides in g_arena, request is just
+	// {sector, count=1, arena_off=0} (12 bytes), reply is status only.
+	// Inline mode: {sector}{data} in the 516-byte message as before.
+	uint verb;
+	int  req_len;
+	if (g_arena_ok)
 	{
-		for (uint i = 0; i < SECTOR_SIZE; i++)
+		uint* count_field = (uint*)&req[4];
+		uint* aoff_field  = (uint*)&req[8];
+		*count_field = 1;
+		*aoff_field  = 0;
+		req_len = 12;
+		verb = is_write ? DISKD_WRITE_ARENA : DISKD_READ_ARENA;
+		if (is_write)
 		{
-			req[4 + i] = buf[i];
+			for (uint i = 0; i < SECTOR_SIZE; i++) g_arena_base[i] = buf[i];
+		}
+	}
+	else
+	{
+		req_len = 516;
+		verb = is_write ? DISKD_WRITE : DISKD_READ;
+		if (is_write)
+		{
+			for (uint i = 0; i < SECTOR_SIZE; i++) req[4 + i] = buf[i];
 		}
 	}
 
-	uint verb = is_write ? DISKD_WRITE : DISKD_READ;
 	uint reply_verb = 0;
-	int from = p9_call(g_diskd_pid, verb, req, 516, req, DISKD_MSG_MAX, &reply_verb);
+	int from = p9_call(g_diskd_pid, verb, req, req_len, req, DISKD_MSG_MAX, &reply_verb);
 	if (from <= 0 && !g_fsd_dynamic)
 	{
 		// The storage driver may have died and been respawned —
@@ -559,7 +600,9 @@ fn bool diskd_rw(char* buf, uint sector, bool is_write)
 		{
 			g_diskd_pid = rr_pid;
 			reply_verb = 0;
-			from = p9_call(g_diskd_pid, verb, req, 516, req, DISKD_MSG_MAX, &reply_verb);
+			// req still holds the request bytes (the aborted call wrote no
+			// reply); an arena write's payload is in g_arena, untouched.
+			from = p9_call(g_diskd_pid, verb, req, req_len, req, DISKD_MSG_MAX, &reply_verb);
 		}
 	}
 	if (from <= 0 || reply_verb != verb) return false;
@@ -567,9 +610,12 @@ fn bool diskd_rw(char* buf, uint sector, bool is_write)
 	char status = req[0];
 	if (!is_write)
 	{
+		// Arena mode: the sector landed in g_arena via the device DMA.
+		// Inline mode: it's at req[4..] in the reply message.
+		char* src = g_arena_ok ? g_arena_base : &req[4];
 		for (uint i = 0; i < SECTOR_SIZE; i++)
 		{
-			buf[i] = req[4 + i];
+			buf[i] = src[i];
 		}
 	}
 	return status == 0;
@@ -608,22 +654,32 @@ fn bool diskd_read_multi(char* buf, uint abs_sector, uint count)
 	*sector_field = abs_sector;
 	*count_field  = count;
 
+	uint mverb   = g_arena_ok ? DISKD_READ_MULTI_ARENA : DISKD_READ_MULTI;
+	int  mreqlen = 8;
+	if (g_arena_ok)
+	{
+		uint* aoff_field = (uint*)&req[8];
+		*aoff_field = 0;
+		mreqlen = 12;
+	}
+
 	uint reply_verb = 0;
-	int from = p9_call(g_diskd_pid, DISKD_READ_MULTI, req, 8, req, DISKD_MSG_MAX, &reply_verb);
+	int from = p9_call(g_diskd_pid, mverb, req, mreqlen, req, DISKD_MSG_MAX, &reply_verb);
 	if (from <= 0)
 	{
 		// Could be a driver respawn; let the per-sector path (diskd_rw)
 		// handle the re-query + retry, and just report failure here.
 		return false;
 	}
-	if (reply_verb != DISKD_READ_MULTI)
+	if (reply_verb != mverb)
 	{
 		g_diskd_multi_ok = false;
 		return false;
 	}
 	if (req[0] != 0) return false;
 	uint n = count * SECTOR_SIZE;
-	for (uint i = 0; i < n; i++) buf[i] = req[4 + i];
+	char* msrc = g_arena_ok ? g_arena_base : &req[4];
+	for (uint i = 0; i < n; i++) buf[i] = msrc[i];
 	return true;
 }
 
@@ -754,6 +810,22 @@ fn void fs_mount(bool dynamic_mode, char* dynamic_self_name)
 		// instance resolves its own backend by name instead — see
 		// g_diskd_pid's comment and the srv_post path below.)
 		if (resolved_storage > 0) { g_diskd_pid = resolved_storage; }
+
+		// The primary fsd shares diskd's payload arena (docs/ipc-rings.md
+		// P1 step 2). fsd2 (is_secondary) isn't mapped to it and keeps
+		// the inline verbs. -1 (older kernel) leaves g_arena_ok false.
+		if (!is_secondary)
+		{
+			uptr arena_paddr = 0;
+			uint arena_sz = 0;
+			if (disk_arena_info(&arena_paddr, &arena_sz) == 0
+				&& arena_paddr != 0 && arena_sz >= DISKD_MAX_SECTORS * SECTOR_SIZE)
+			{
+				g_arena_base = (char*)arena_paddr; // identity-mapped
+				g_arena_size = arena_sz;
+				g_arena_ok   = true;
+			}
+		}
 	}
 
 	// ext2 first: its magic is a specific 16-bit value at a fixed byte

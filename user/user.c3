@@ -67,6 +67,7 @@ const int SYS_NS_TRANSLATE  = 52; // union-aware path resolution — see src/ent
 const int SYS_PROF          = 53; // on-device profiling odometer — see src/entry.c3's case
 const int SYS_PROF_HIST     = 54; // DIAGNOSTIC per-syscall histogram — see src/entry.c3's case + ns_translate() below
 const int SYS_DRIVER_IRQ_WAIT = 55; // interrupt-driven driver completion-wait, in-kernel — see src/entry.c3's case + driver_irq_wait() below
+const int SYS_DISK_ARENA_INFO = 56; // diskd + primary fsd: base+size of the shared payload arena — see src/entry.c3's case + disk_arena_info() below
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -1159,6 +1160,16 @@ fn int p9_call_path(char* path, uint verb, char* data, int len, char* reply_buf,
 // store actually writes, corrupting whatever's next on diskd's stack.
 fn int diskd_info(uptr* vq_paddr_out, uptr* req_paddr_out) @export("diskd_info") {
     return syscall(SYS_DISKD_INFO, (long)vq_paddr_out, (long)req_paddr_out, 0);
+}
+
+// diskd + primary fsd only: the physical base + size of the shared
+// payload arena the kernel identity-mapped into both (docs/ipc-rings.md
+// P1 step 2, src/entry.c3's SYS_DISK_ARENA_INFO). Sector data for the
+// DISKD_*_ARENA verbs lives here instead of in the IPC message.
+// Returns 0, or -1 for any other caller. uptr*/uint* sizing matches the
+// kernel's stores (see diskd_info's own comment).
+fn int disk_arena_info(uptr* paddr_out, uint* size_out) @export("disk_arena_info") {
+    return syscall(SYS_DISK_ARENA_INFO, (long)paddr_out, (long)size_out, 0);
 }
 
 // fsd-only. start_sector_out: board::FS_PARTITION_START_SECTOR (board is

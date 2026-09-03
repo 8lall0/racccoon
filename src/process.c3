@@ -50,6 +50,39 @@ const MSG_MAX = 8192;
 uptr diskd_vq_paddr;
 uptr diskd_req_paddr;
 
+// The fsd<->diskd shared data arena (docs/ipc-rings.md Phase 1, step 2).
+// One physically-contiguous run, identity-mapped (vaddr == paddr) into
+// BOTH diskd (which hands `disk_arena_paddr + off` to a virtio data
+// descriptor) and the *primary* fsd (plain cacheable r/w). Sector
+// payloads for the DISKD_*_ARENA verbs travel here instead of through
+// the 8 KiB kernel IPC bounce buffer — the device DMAs straight into
+// the region fsd reads. Allocated lazily on the first
+// setup_diskd_mappings / setup_fsd_mappings call (diskd is spawned
+// first), re-mapped for free on a supervisor respawn since both setup
+// functions map it every time. 0 until then. Cacheable map_page(), same
+// as diskd_vq_paddr/diskd_req_paddr and for the same reason — virtio-blk
+// is QEMU-only (board::HAS_VIRTIO_BLOCK), no real DMA-coherency effect.
+const uint DISK_ARENA_PAGES = 8; // 32 KiB — 64 sectors, room past DISKD_MAX_SECTORS (15)
+uptr disk_arena_paddr;
+uint disk_arena_size;
+int  disk_arena_diskd_pid;
+int  disk_arena_fsd_pid;
+
+// Allocate the arena once, then identity-map it into `proc`. Shared by
+// setup_diskd_mappings and setup_fsd_mappings (primary only).
+fn void map_disk_arena(Process* proc)
+{
+	if (disk_arena_paddr == 0)
+	{
+		disk_arena_paddr = alloc_pages(DISK_ARENA_PAGES);
+		disk_arena_size  = DISK_ARENA_PAGES * PAGE_SIZE;
+	}
+	for (uint off = 0; off < disk_arena_size; off += PAGE_SIZE)
+	{
+		map_page(proc.page_table, disk_arena_paddr + off, disk_arena_paddr + off, PAGE_U | PAGE_R | PAGE_W);
+	}
+}
+
 // sdd (see user/sdd.c3) is Duo's real-hardware counterpart to diskd,
 // mutually exclusive with it at runtime (board::HAS_SD_BLOCK/
 // HAS_VIRTIO_BLOCK, kernel.c3). Its PLIC source is routed via the
@@ -1286,6 +1319,17 @@ fn void setup_fsd_mappings(Process* proc, uint partition_start, bool is_secondar
 {
 	proc.fs_partition_start = partition_start;
 	proc.is_secondary_fs = is_secondary;
+
+	// The primary fsd (only) shares diskd's payload arena — the hot
+	// virtio-blk path (docs/ipc-rings.md P1 step 2). fsd2 keeps the
+	// inline-IPC diskd verbs (it's the rarely-hot /mnt/fs2 partition, and
+	// a single shared arena with two producers would need locking). Maps
+	// every call, so a supervisor respawn re-establishes it for free.
+	if (!is_secondary)
+	{
+		map_disk_arena(proc);
+		disk_arena_fsd_pid = proc.pid;
+	}
 }
 
 // Called once, right after create_process() spawns diskd (see kernel.c3),
@@ -1331,6 +1375,10 @@ fn void setup_diskd_mappings(Process* proc)
 	irq_route_register(board::IRQ_VIRTIO_BLK, proc.pid, false);
 	diskd_vq_paddr  = vq_paddr;
 	diskd_req_paddr = req_paddr;
+
+	// The fsd<->diskd shared payload arena (docs/ipc-rings.md P1 step 2).
+	map_disk_arena(proc);
+	disk_arena_diskd_pid = proc.pid;
 }
 
 // Called once, right after create_process() spawns sdd (see kernel.c3),
