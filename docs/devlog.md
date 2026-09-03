@@ -73,6 +73,39 @@ Findings:
 
 Re-run `ringbench` after each ring phase to track the delta.
 
+### P1 step 1 — diskd completion-wait moved into the kernel
+
+`SYS_DRIVER_IRQ_WAIT` (55): the same PLIC-hand-draining poll loop diskd
+used to run in userspace as `for(;;){ ipc_poll_type(...) }` — one
+`SYS_IPC_POLL` per pass, tens–hundreds of passes per virtio-blk
+completion, ~330 M syscalls over a `go build` — now a single syscall
+whose internal `yield()`s aren't syscalls. Same safety argument as
+`SYS_IPC_POLL` (never enables interrupts, hand-drains the PLIC every
+pass, stays `PROC_RUNNABLE` so it keeps draining its own source); the
+one new wrinkle — the process is now parked mid-trap across the yields —
+is fine because the sscratch hazard needs a *nested trap* to build a
+frame, and nothing here enables the interrupts that cause one. Every
+other blocking syscall already yields mid-trap.
+
+diskd: the whole poll loop → `driver_irq_wait();`. `gobuildtest` gained
+a `syscalls=/sys10=/sys55=` readout off `SYS_PROF_HIST`.
+
+Verified (QEMU ext2, fresh image): `bigwritetest` (400 KiB
+double-indirect write), `chmodtest`, `p9fswritetest`, `stage6test`,
+`tcctest`, `elftest`, `wasmtest`, `gostage2test` (full Go runtime) —
+all pass. A partial `go build` against the stale Sept-2 gbt image
+confirmed **`sys10(ipc_poll)` = 0** and `sys55` taking its place at
+~1/completion. (That image's `go` toolchain is too old to finish a
+build against current master — pre-dates the `/bin` union + `ns_translate`
+work — so the wall-time delta needs a rebuilt gbt image.)
+
+Analytically this step alone is small — each `SYS_IPC_POLL` was cheap
+(`service_pending_external_irq` + return), so 330 M × ~100 ns ≈ ~30 s of
+a ~1345 s build, ~2 %. The pathological syscall *count* is gone, which
+matters for the profile's legibility and for SMP later, but the headline
+Phase 1 win is still the shared-memory ring (zero-copy arena + virtqueue
+depth > 1).
+
 ---
 
 ## 2026-09-03 — fsd cache: 4-way, 8 MiB (was 512 KiB direct-mapped)

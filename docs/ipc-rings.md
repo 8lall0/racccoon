@@ -166,7 +166,17 @@ single-message path needs.
   exec image instead of thousands of round trips), and **Phase 1's
   diskd poll storm** — not through shaving switches off one read.
 
-### Phase 1 — fsd ↔ diskd ring  ← start here
+### Phase 1 — fsd ↔ diskd ring  ← in progress
+
+**Step 1 (done):** `SYS_DRIVER_IRQ_WAIT` — diskd's userspace completion
+poll-spin (`for(;;){ ipc_poll_type() }`, ~330 M `SYS_IPC_POLL`/build)
+moved into one kernel syscall whose internal `yield()`s aren't syscalls.
+The storm is gone (`sys10 = 0`, `sys55` at ~1/completion). All fs tests
+pass. Small on its own (~2 % wall — each poll was cheap), but removes a
+pathological pattern and is a prerequisite for the ring's own wait.
+
+**Step 2 (next):** the shared SQ/CQ + data arena — the zero-copy +
+batching + virtqueue-depth win below.
 
 The hottest, simplest edge: two C3 processes, no language bindings, and
 it kills the poll storm.

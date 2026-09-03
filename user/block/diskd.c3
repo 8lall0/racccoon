@@ -174,23 +174,16 @@ fn void main()
 
 		virtq_kick(0);
 
-		// Poll (never block) for the kernel's synthetic completion notify
-		// (see src/entry.c3's handle_trap) instead of wfi or a blocking
-		// ipc_recv — see SYS_IPC_POLL's comment in src/entry.c3 for why a
-		// blocking wait here is genuinely unsafe (nested-trap frame
-		// corruption via sscratch), not just less efficient. Spinning in
-		// user-mode code between polls keeps interrupts naturally
-		// deliverable the whole time. Safe to reuse this same inbox
-		// slot: it was just drained by the recv above, and nothing else
-		// can legitimately arrive here as long as callers keep to one
-		// outstanding disk request at a time (the same v1 discipline the
-		// IPC layer itself already relies on).
-		for (;;)
-		{
-			uint notify_verb = 0;
-			int r = ipc_poll_type(&buf, 0, &notify_verb);
-			if (r != -1 && notify_verb == DISKD_IRQ_NOTIFY) break;
-		}
+		// Wait for the virtio-blk completion IRQ. This used to be a tight
+		// userspace `for(;;){ ipc_poll_type(...) }` spin — one SYS_IPC_POLL
+		// per pass, tens to hundreds of passes per completion, ~330M
+		// syscalls over a `go build` (docs/ipc-rings.md Phase 1). It's now
+		// one SYS_DRIVER_IRQ_WAIT: the same PLIC-hand-draining poll loop,
+		// but the passes happen inside the kernel where the yield()s aren't
+		// syscalls. Still not a true blocking wait — see that syscall's
+		// comment in src/entry.c3 for why (sscratch nested-trap hazard,
+		// global SIE-off storms) and why the in-kernel loop is safe anyway.
+		driver_irq_wait();
 
 		// Clear the device's interrupt-status bits so QEMU drops the
 		// (legacy virtio-mmio, level-triggered) IRQ line. Nothing else

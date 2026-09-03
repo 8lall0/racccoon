@@ -66,6 +66,7 @@ const int SYS_EXEC_MAX      = 51; // board::EXEC_MAX_IMAGE_SIZE — the largest 
 const int SYS_NS_TRANSLATE  = 52; // union-aware path resolution — see src/entry.c3's case
 const int SYS_PROF          = 53; // on-device profiling odometer — see src/entry.c3's case
 const int SYS_PROF_HIST     = 54; // DIAGNOSTIC per-syscall histogram — see src/entry.c3's case + ns_translate() below
+const int SYS_DRIVER_IRQ_WAIT = 55; // interrupt-driven driver completion-wait, in-kernel — see src/entry.c3's case + driver_irq_wait() below
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -502,6 +503,16 @@ fn int ipc_recv(char* buf, int len) @export("ipc_recv") {
 // it specifically — a blocking recv there is unsafe).
 fn int ipc_poll_type(char* buf, int len, uint* out_type) @export("ipc_poll_type") {
     return syscall(SYS_IPC_POLL, (long)buf, len, (long)out_type);
+}
+
+// Interrupt-driven driver completion-wait: block until this driver's
+// pending device-completion notify fires, hand-draining the PLIC each
+// pass inside the one syscall (see src/entry.c3's SYS_DRIVER_IRQ_WAIT).
+// diskd's old `for(;;){ ipc_poll_type(...) }` spin was one syscall per
+// pass, ~330M/run over a `go build`; this is one syscall per completion.
+// Returns 0, or -1 if the caller doesn't own a routed IRQ.
+fn int driver_irq_wait() @export("driver_irq_wait") {
+    return syscall(SYS_DRIVER_IRQ_WAIT, 0, 0, 0);
 }
 
 // --- 9P-lite: a tiny message-oriented protocol layered directly on top

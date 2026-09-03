@@ -109,6 +109,7 @@ const SYS_EXEC_MAX      = 51; // board::EXEC_MAX_IMAGE_SIZE — the shell reads 
 const SYS_NS_TRANSLATE  = 52; // a0 = path, a1 = union member index, a2 = out buf, a4 = out cap — writes the server-relative path for that member, returns the serving pid (-1 = no match); the union-aware successor to SYS_NS_RESOLVE + caller-side prefix strip
 const SYS_PROF          = 53; // a0 = out buf (>= 32 bytes: 4 LE u64 — ipc_calls, ipc_ticks, yields, switches), a1 = reset flag — cheap on-device profiling odometer (gobuildtest)
 const SYS_PROF_HIST     = 54; // DIAGNOSTIC (temporary): a0 = out buf (512 bytes = 64 LE u64, indexed by syscall number), a1 = reset flag — the `synhist` builtin, chasing the go-build syscall storm
+const SYS_DRIVER_IRQ_WAIT = 55; // interrupt-driven driver: block until this driver's pending device-completion notify (driver_irq_pending) is set, hand-draining the PLIC each pass — one syscall per completion in place of diskd's per-sector SYS_IPC_POLL spin (docs/ipc-rings.md P1). Returns 0, or -1 if not a routed driver.
 
 // Per-process SYS_MAP ceiling: the bump pointer can't grow more than this
 // past USER_BASE. Board-specific (board::HEAP_MAX_BYTES): 16 MiB on the
@@ -1879,6 +1880,53 @@ fn void sys_ipc_poll(Trap_frame* f) @noinline
 		}
 }
 
+// Interrupt-driven driver completion-wait, in the kernel (docs/ipc-rings.md
+// Phase 1). diskd's old completion-wait was a userspace `for(;;){
+// ipc_poll_type(...) }` spin — one SYS_IPC_POLL per pass, tens to hundreds
+// of passes per virtio-blk completion, ~330M syscalls over a `go build`.
+// This is the same loop moved inside one syscall: the internal yield()s
+// aren't syscalls, so the count collapses to one per completion.
+//
+// Safety is the same argument SYS_IPC_POLL's own comment makes, with one
+// addition. This never enables interrupts; it hand-drains the PLIC
+// (service_pending_external_irq) every pass, so it makes progress even
+// while sstatus.SIE is globally clear for a cooperative-blocking storm —
+// the device completion is picked up by the poll, not by a taken trap.
+// The one difference from the userspace spin: this process is now parked
+// mid-trap across the yield()s (the spin never was). That is safe because
+// switch_context's fixed-sscratch reset only corrupts a frame if a NESTED
+// TRAP builds one at that address — and nothing here enables the
+// interrupts that would cause a nested trap. Every other blocking syscall
+// (SYS_IPC_RECV, SYS_JOIN, ...) already yields mid-trap the same way.
+//
+// Stays PROC_RUNNABLE throughout: this process is the one draining its own
+// PLIC source, so it must keep getting scheduled — going PROC_BLOCKED
+// would need someone else to drain the PLIC and wake it, which nothing is
+// guaranteed to do. Same as the old userspace spin, which was RUNNABLE too.
+fn void sys_driver_irq_wait(Trap_frame* f) @noinline
+{
+	// Only meaningful for a process that owns a routed IRQ. A non-driver
+	// caller would spin forever waiting for a notify nothing sets — fail
+	// it fast instead.
+	if (irq_route_by_pid(current_proc.pid) == null)
+	{
+		f.a0 = (ulong)(-1);
+		return;
+	}
+	for (;;)
+	{
+		service_pending_external_irq();
+		if (current_proc.driver_irq_pending)
+		{
+			current_proc.driver_irq_pending = false;
+			current_proc.ipc_progress++; // a device completion is progress — see Process.ipc_progress
+			f.a0 = 0;
+			return;
+		}
+		yield();
+	}
+}
+
 // namespace resolve: walk this process's mount table for the longest prefix match, return the server pid (live generation checked).
 // (was inline in handle_syscall; extracted 2026-08-29.)
 fn void sys_ns_resolve(Trap_frame* f) @noinline
@@ -2462,6 +2510,8 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			sys_ipc_recv_gen(f);
 		case SYS_IPC_POLL:
 			sys_ipc_poll(f);
+		case SYS_DRIVER_IRQ_WAIT:
+			sys_driver_irq_wait(f);
 		case SYS_NS_RESOLVE:
 			sys_ns_resolve(f);
 		case SYS_NS_TRANSLATE:

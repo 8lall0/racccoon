@@ -2341,8 +2341,10 @@ fn void main() {
 
                 // Profile the build itself (docs: "profile go build").
                 ulong[4] gb_p0 @noinit; ulong[4] gb_p1 @noinit;
+                ulong[64] gb_hist @noinit;     // per-syscall counts — chasing the diskd poll storm
                 ulong gb_ch0 = 0; ulong gb_cm0 = 0;
                 fs_cache_stats(&gb_ch0, &gb_cm0);
+                prof_hist(&gb_hist[0], 1);      // reset the histogram (returns pre-reset totals; ignore)
                 prof_read(&gb_p0[0], 1);        // reset the odometer
                 ulong gb_wt0 = rdtime();
 
@@ -2353,9 +2355,13 @@ fn void main() {
 
                 ulong gb_wt1 = rdtime();
                 prof_read(&gb_p1[0], 0);
+                prof_hist(&gb_hist[0], 0);      // gb_hist now holds the build's per-syscall counts
                 ulong gb_ch1 = 0; ulong gb_cm1 = 0;
                 fs_cache_stats(&gb_ch1, &gb_cm1);
                 chdir("/");
+
+                ulong gb_sc_total = 0;
+                for (int gb_sv = 0; gb_sv < 64; gb_sv++) { gb_sc_total += gb_hist[gb_sv]; }
 
                 ulong gb_hz = timebase_hz();
                 ulong gb_wall = gb_wt1 - gb_wt0;
@@ -2369,6 +2375,10 @@ fn void main() {
                 print_uint((uint)(gb_p1[3] - gb_p0[3])); print(" cache=");
                 print_uint((uint)(gb_ch1 - gb_ch0)); print("h/");
                 print_uint((uint)(gb_cm1 - gb_cm0)); print("m\n");
+                print("gobuildtest prof: syscalls=");
+                print_uint((uint)(gb_sc_total / 1000)); print("k  sys10(ipc_poll)=");
+                print_uint((uint)(gb_hist[10] / 1000)); print("k  sys55(irq_wait)=");
+                print_uint((uint)(gb_hist[55] / 1000)); print("k\n");
 
                 if (gb_rc1 != 0) {
                     print("gobuildtest: FAILED (go build exit "); print_uint((uint)gb_rc1); print(")\n");
