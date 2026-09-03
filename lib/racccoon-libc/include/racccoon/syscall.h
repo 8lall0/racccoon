@@ -13,6 +13,7 @@
 #define RC_SYS_GETCHAR          2
 #define RC_SYS_EXIT             3
 #define RC_SYS_NS_RESOLVE       8
+#define RC_SYS_NS_TRANSLATE    52
 #define RC_SYS_RFORK            11
 #define RC_SYS_JOIN             13
 #define RC_SYS_PROC_INFO       17

@@ -15,6 +15,16 @@ static int rc_ns_resolve(const char *path, unsigned *prefix_len_out)
 	return (int)__rc_syscall3((long)path, (long)prefix_len_out, 0, RC_SYS_NS_RESOLVE);
 }
 
+/* Union-aware path resolution — applies any `bind` rewrite (the /bin
+ * union at login, e.g.) that rc_ns_resolve + a manual prefix strip
+ * would silently drop. member 0 = the first/highest-priority binding.
+ * Writes the server-relative path into `out` (cap bytes), returns pid. */
+extern long __rc_syscall4(long, long, long, long, long);
+static int rc_ns_translate(const char *path, int member, char *out, int cap)
+{
+	return (int)__rc_syscall4((long)path, member, (long)out, cap, RC_SYS_NS_TRANSLATE);
+}
+
 static int rc_getcwd(char *buf, int cap)
 {
 	return (int)__rc_syscall3((long)buf, cap, 0, RC_SYS_GETCWD);
@@ -58,17 +68,15 @@ void __rc_abspath(const char *rel, char *out)
 	out[o] = 0;
 }
 
-/* Resolve `path` (already absolute) to (fsd pid, stripped remainder
- * copied into `stripped` >= 100 bytes). Returns fsd pid or -1. */
+/* Resolve `path` (already absolute) to (fsd pid, server-relative path
+ * copied into `stripped` >= 100 bytes). Via SYS_NS_TRANSLATE so a
+ * `bind` path rewrite (the /bin union at login) is applied — the old
+ * rc_ns_resolve + manual strip dropped it, so /bin/<tool> resolved to a
+ * bare "<tool>" the root fsd couldn't find. Returns fsd pid or -1. */
 static int resolve_stripped(const char *abspath, char *stripped)
 {
-	unsigned prefix = 0;
-	int pid = rc_ns_resolve(abspath, &prefix);
-	if (pid < 0) return -1;
-	const char *s = abspath + prefix;
-	int i = 0;
-	while (s[i] && i < 99) { stripped[i] = s[i]; i++; }
-	stripped[i] = 0;
+	int pid = rc_ns_translate(abspath, 0, stripped, 100);
+	if (pid < 0) { stripped[0] = 0; return -1; }
 	return pid;
 }
 

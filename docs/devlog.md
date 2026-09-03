@@ -4,6 +4,43 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-03 — libc: two regressions the exec/ns changes left behind
+
+Both landed features (`tcctest`, `stage6test`) were broken by changes
+that updated the C3 and Go sides of an ABI but not the C library.
+
+**`tcctest` — the `\x17` failure.** `tcc /hello.c -o …` died with
+`bin/tcc:0: error: unrecognized character \x17` — tcc was opening its
+own path (`bin/tcc`) as an input source file and choking on a byte of
+its own ELF. Commit `2606c2e` (go-port Stage 4.4) put the program path
+into the exec blob as string 0 and bumped `SYS_EXEC`'s count, and
+updated the c3c fork's `@main_args` + the Go `runtime/goos` to match —
+but `lib/racccoon-libc`'s crt0 was never touched. So its c3-packed
+branch still synthesised a placeholder `argv[0]` *and* shifted every
+blob string up one, landing the path in `argv[1]`.
+`lib/racccoon-libc/src/libc_start.c`: that branch now takes blob string
+0 as `argv[0]` directly — no placeholder, no shift (the truly-empty
+blob still gets a synthetic `argv[0]`).
+
+**`stage6test` — `/bin/exiter` not found.** `execve("/bin/exiter", …)`
+failed because `lib/racccoon-libc/src/rc_fs.c`'s `resolve_stripped()`
+used `SYS_NS_RESOLVE` + a manual prefix strip — exactly the pattern
+P3 replaced in `user/user.c3` and `go/goos/racccoon_fs.go`. Once
+`/bin` became a `bind` union at login, that stripped `/bin/exiter`
+down to a bare `exiter` the root fsd couldn't find. Now it calls a new
+`nsTranslate` stub (`RC_SYS_NS_TRANSLATE`, 52, member 0), so the bind
+rewrite is applied.
+
+Verified QEMU: `ctest` `malloctest` `stage3`–`stage7` `tcctest` (×2)
+`stage6test` all pass, plus `runtest` `argvtest` `pathtest` `elftest`
+`wasmtest` `chmodtest` `gostage3` `gostage41`. `tcc` self-host
+(roadmap §7) is un-broken.
+
+(`argvtest`/`argvtest2` flakiness on the dual image is still open — a
+separate IPC-rendezvous race, tracked in memory.)
+
+---
+
 ## 2026-09-03 — Plan 9 /bin, part 4: the wide regression sweep
 
 Ran the union `/bin` work (P1–P3, `198086f` / `35a47fc` / `33a419b`)

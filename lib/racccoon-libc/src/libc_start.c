@@ -11,9 +11,13 @@
  *
  * Two producers put blobs there, told apart by the first byte:
  *   - a c3 program's exec() (the shell, most /bin tools): a plain
- *     "arg1\0arg2\0…" blob, argc = the count, NO program name (a c3
- *     program's args[0] is its first real argument) — __libc_start
- *     synthesises a placeholder argv[0].
+ *     "argv0\0arg1\0…" blob, argc = the count. Since the 2026-09-02
+ *     exec-ABI change (user/user.c3 exec()) blob string 0 IS the
+ *     program path = argv[0], and argc counts it — so we use it
+ *     directly, no synthetic placeholder, no +1 shift. (Before that
+ *     change the blob held only the real args and this synthesised an
+ *     argv[0]; the fallback below still does, for a hypothetical
+ *     empty blob.)
  *   - this libc's execve() (rc_proc.c): a 0x01 marker, then argc strings
  *     the first of which is argv[0], then optionally a 0x02 marker and
  *     "KEY=VAL\0…" ended by an empty string. A real argv[0] + environ,
@@ -74,13 +78,22 @@ __attribute__((used, noreturn)) void __libc_start(int argc, char *blob)
 		_exit(main(n, libc_argv, environ));
 	}
 
-	libc_argv[0] = libc_argv0;
+	if (n == 0) {
+		/* No blob at all — hand main a synthetic argv[0] so argv[0]
+		 * is never NULL. */
+		libc_argv[0] = libc_argv0;
+		libc_argv[1] = 0;
+		_exit(main(1, libc_argv, environ));
+	}
+
+	/* Blob string 0 is argv[0] (the program path); the rest are the
+	 * real arguments. argc already counts string 0. */
 	for (int i = 0; i < n; i++) {
-		libc_argv[i + 1] = p;
+		libc_argv[i] = p;
 		while (*p) p++;
 		p++;
 	}
-	libc_argv[n + 1] = 0;
+	libc_argv[n] = 0;
 
-	_exit(main(n + 1, libc_argv, environ));
+	_exit(main(n, libc_argv, environ));
 }
