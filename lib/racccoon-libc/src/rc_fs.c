@@ -10,11 +10,6 @@
 extern long __rc_syscall3(long, long, long, long);
 extern long __rc_syscall5(long, long, long, long, long, long);
 
-static int rc_ns_resolve(const char *path, unsigned *prefix_len_out)
-{
-	return (int)__rc_syscall3((long)path, (long)prefix_len_out, 0, RC_SYS_NS_RESOLVE);
-}
-
 /* Union-aware path resolution — applies any `bind` rewrite (the /bin
  * union at login, e.g.) that rc_ns_resolve + a manual prefix strip
  * would silently drop. member 0 = the first/highest-priority binding.
@@ -80,6 +75,17 @@ static int resolve_stripped(const char *abspath, char *stripped)
 	return pid;
 }
 
+/* Same, but for creation — resolves to the union's create member (the
+ * `bind -c` one, or member 0 with no union, so identical there). So
+ * `tcc x.c -o /bin/x` / `go build -o /bin/x` land in /usr/$user/bin,
+ * not the root-owned system /bin. Matches user/user.c3's fs_write. */
+static int resolve_stripped_c(const char *abspath, char *stripped)
+{
+	int pid = rc_ns_translate(abspath, -1, stripped, 100);
+	if (pid < 0) { stripped[0] = 0; return -1; }
+	return pid;
+}
+
 long __rc_fs_read_at(const char *path, void *buf, long len, unsigned long off)
 {
 	char ap[128]; __rc_abspath(path, ap);
@@ -105,7 +111,7 @@ long __rc_fs_write_at(const char *path, const void *buf, long len, unsigned long
 {
 	char ap[128]; __rc_abspath(path, ap);
 	char req[RC_FS_MSG_MAX];
-	int pid = resolve_stripped(ap, req);
+	int pid = resolve_stripped_c(ap, req);
 	if (pid < 0) return -1;
 
 	if (len < 0) len = 0;
@@ -150,7 +156,7 @@ long __rc_fs_write(const char *path, const void *buf, long len)
 {
 	char ap[128]; __rc_abspath(path, ap);
 	char req[RC_FS_MSG_MAX];
-	int pid = resolve_stripped(ap, req);
+	int pid = resolve_stripped_c(ap, req);
 	if (pid < 0) return -1;
 
 	if (len < 0) len = 0;
@@ -219,11 +225,11 @@ int __rc_fs_list(const char *path, void *out, int max_entries)
 	return total;
 }
 
-static int simple_verb(const char *path, unsigned verb, unsigned aux_at_100)
+static int simple_verb(const char *path, unsigned verb, unsigned aux_at_100, int create)
 {
 	char ap[128]; __rc_abspath(path, ap);
 	char req[RC_FS_MSG_MAX];
-	int pid = resolve_stripped(ap, req);
+	int pid = create ? resolve_stripped_c(ap, req) : resolve_stripped(ap, req);
 	if (pid < 0) return -1;
 	*(unsigned *)(req + 100) = aux_at_100;
 	unsigned rv = 0;
@@ -232,20 +238,19 @@ static int simple_verb(const char *path, unsigned verb, unsigned aux_at_100)
 	return *(int *)req;
 }
 
-int __rc_fs_mkdir(const char *path)              { return simple_verb(path, RC_FS_MKDIR, 0); }
-int __rc_fs_delete(const char *path, int recur)  { return simple_verb(path, RC_FS_DELETE, (unsigned)recur); }
+int __rc_fs_mkdir(const char *path)              { return simple_verb(path, RC_FS_MKDIR, 0, 1); }
+int __rc_fs_delete(const char *path, int recur)  { return simple_verb(path, RC_FS_DELETE, (unsigned)recur, 0); }
 
 int __rc_fs_rename(const char *oldp, const char *newp)
 {
 	char apo[128]; __rc_abspath(oldp, apo);
 	char apn[128]; __rc_abspath(newp, apn);
-	unsigned po = 0, pn = 0;
-	int pido = rc_ns_resolve(apo, &po);
-	int pidn = rc_ns_resolve(apn, &pn);
+	char so[100], sn[100];
+	int pido = resolve_stripped(apo, so);      /* source: existing */
+	int pidn = resolve_stripped_c(apn, sn);    /* dest: create member */
 	if (pido < 0 || pidn < 0 || pido != pidn) return -1;
 
 	char req[RC_FS_MSG_MAX];
-	const char *so = apo + po, *sn = apn + pn;
 	int i = 0; while (so[i] && i < 99) { req[i] = so[i]; i++; } req[i] = 0;
 	int j = 0; while (sn[j] && j < 99) { req[100 + j] = sn[j]; j++; } req[100 + j] = 0;
 

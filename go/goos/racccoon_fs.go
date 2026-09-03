@@ -122,11 +122,11 @@ func abspath(p string) string {
 // union walk (member 1, 2, …) isn't done here yet: the one consumer
 // that would need it, os/exec against a $home/bin binary, is rare and
 // can wait.
-func resolve(ap string) (int64, string, bool) {
+func resolveMember(ap string, member int64) (int64, string, bool) {
 	var pb [256]byte
 	putPath(pb[:], ap, len(pb))
 	var out [256]byte
-	pid := nsTranslate(&pb[0], 0, &out[0], int64(len(out)))
+	pid := nsTranslate(&pb[0], member, &out[0], int64(len(out)))
 	if pid < 0 {
 		return 0, "", false
 	}
@@ -136,6 +136,13 @@ func resolve(ap string) (int64, string, bool) {
 	}
 	return pid, string(out[:i]), true
 }
+
+// resolve for reads/stat/delete — the first/highest-priority union
+// member. resolveCreate (member -1) for creation, so `go build -o
+// /bin/x` lands in the `bind -c`'d /usr/$user/bin, not the root-owned
+// system /bin (member == 0 with no union, so identical there).
+func resolve(ap string) (int64, string, bool)       { return resolveMember(ap, 0) }
+func resolveCreate(ap string) (int64, string, bool) { return resolveMember(ap, -1) }
 
 func fsdCall(pid, verb int64, buf []byte) (int32, bool) {
 	packed := (int64(fsMsgMax) << 16) | int64(fsMsgMax&0xFFFF)
@@ -199,7 +206,7 @@ func readAt(ap string, b []byte, off int64) (int, int) {
 }
 
 func writeAt(ap string, b []byte, off int64) (int, int) {
-	pid, stripped, ok := resolve(ap)
+	pid, stripped, ok := resolveCreate(ap)
 	if !ok {
 		return 0, eNOENT
 	}
@@ -230,7 +237,16 @@ func writeAt(ap string, b []byte, off int64) (int, int) {
 }
 
 func simpleVerb(ap string, verb int64, aux uint32) int {
-	pid, stripped, ok := resolve(ap)
+	// Mkdir creates -> the create member; Remove finds an existing entry
+	// -> the first member.
+	var pid int64
+	var stripped string
+	var ok bool
+	if verb == fsMkdir {
+		pid, stripped, ok = resolveCreate(ap)
+	} else {
+		pid, stripped, ok = resolve(ap)
+	}
 	if !ok {
 		return eNOENT
 	}
@@ -412,8 +428,8 @@ func (fsdBackend) Remove(path string, dir bool) int { return simpleVerb(abspath(
 
 func (fsdBackend) Rename(from, to string) int {
 	apo, apn := abspath(from), abspath(to)
-	pido, so, ok1 := resolve(apo)
-	pidn, sn, ok2 := resolve(apn)
+	pido, so, ok1 := resolve(apo)        // source: existing
+	pidn, sn, ok2 := resolveCreate(apn)  // dest: create member
 	if !ok1 || !ok2 || pido != pidn {
 		return eIO
 	}

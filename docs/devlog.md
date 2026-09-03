@@ -4,6 +4,36 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-03 — Plan 9 /bin, part 5: union-aware creates
+
+The `/bin` union routed *reads* to the right member (P3), but every fs
+client still resolved *creates* to member 0 — so `tcc x.c -o /bin/x`
+either failed (non-root, `/bin` is root-owned) or wrote into the system
+`/bin` (root). Now a create under `/bin` lands in the caller's own
+`/usr/$user/bin`.
+
+- `lib/racccoon-libc/src/rc_fs.c`: `resolve_stripped_c()` (member `-1` =
+  the union's create member) backs `__rc_fs_write` / `__rc_fs_write_at`
+  / `__rc_fs_mkdir` / rename-destination. `__rc_fs_rename` also moved
+  off the last `SYS_NS_RESOLVE` + manual-strip site (would have 404'd
+  a `/bin/*` rename like `stage6test` did). Reads / delete / rename
+  source stay on member 0.
+- `go/goos/racccoon_fs.go`: `resolveCreate()` for `writeAt`,
+  `Mkdir`, and rename-destination.
+- Member `-1` == member 0 when there's no union, so the non-union path
+  is byte-identical.
+
+The idiom is `-o /bin/<name>` (no toolchain patch, no racccoon-specific
+`-o` magic; a bare `-o hello` still writes `./hello`). `docs/bin-layout.md`
+updated.
+
+Verified QEMU: `tcc /hello.c -o /bin/hitcc` then `hitcc` (bare) runs;
+`cat … > /bin/uu.txt` lands in `/usr/root/bin`, `rm /bin/uu.txt`
+deletes it through the union. Regression green — `tcctest` `stage6test`
+`ctest` `runtest` `argvtest` `gostage3test` `gostage41test`.
+
+---
+
 ## 2026-09-03 — echod: NUL-terminate the P9_TREAD reply (argvtest fix)
 
 `argvtest` / `argvtest2` "flakiness" — root-caused and fixed. Not a

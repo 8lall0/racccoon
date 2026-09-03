@@ -57,15 +57,24 @@ can use. The mechanism in §5 already covers it.
 The seeded set — `cat ls echo … tcc go go-compile go-link wasm fsd …` —
 lives directly in `/bin`, owned by uid 0. Written only by the image
 build (`scripts/build.sh`) / provisioning (`scripts/populate_duo_bin.sh`).
-Nothing at runtime writes here; `fsd`'s ownership checks make an
-unprivileged `tcc -o /bin/x` fail, by design.
+Nothing at runtime writes here *directly* — but see §4/§5: a create
+under `/bin` is routed by the union to the caller's own bin dir.
 
 ### 4. User-built binaries: `/usr/$user/bin`
 
-`go build hello`, `tcc hello.c -o hello`, `go-link -o hello` — output
-with a bare `-o` name goes to **`/usr/$user/bin`** (Plan 9's
-`$home/bin`). `/usr/$user/bin` is seeded per user alongside the home
-directory. An absolute `-o /some/path` is still honoured verbatim.
+The idiom is **`-o /bin/<name>`**: `tcc hello.c -o /bin/hello`,
+`go build -o /bin/hello`, `go-link -o /bin/hello`. The `/bin` union's
+create member (§5) sends the new file to `/usr/$user/bin/hello`, so it
+runs as `hello` immediately — without `/bin` itself being writable, and
+without the toolchain needing any racccoon-specific `-o` magic (a bare
+`-o hello` still writes `./hello`, standard Unix). `/usr/$user/bin` is
+seeded per user alongside the home directory. An absolute `-o
+/some/other/path` is honoured verbatim.
+
+Every fs client resolves a create through the union: `user/user.c3`
+(`fs_write` etc.), `lib/racccoon-libc/src/rc_fs.c`, and
+`go/goos/racccoon_fs.go` all use `ns_translate(path, -1, …)` — member
+`-1` = "the create member" (`ns_translate_core`, `src/entry.c3`).
 
 ### 5. `/bin` is a union; `/usr/$user/bin` unions in at login
 
