@@ -107,6 +107,7 @@ const SYS_TIMEBASE      = 49; // board::TIMEBASE_HZ — the `time` CSR's tick ra
 const SYS_GETPID        = 50; // the caller's own pid — a c3 program gets its children's pids from rfork() but never its own; the C libc's getpid() needs it (temp-file names, etc.)
 const SYS_EXEC_MAX      = 51; // board::EXEC_MAX_IMAGE_SIZE — the shell reads this to size its own exec() receive buffer per-board instead of hardcoding a constant
 const SYS_NS_TRANSLATE  = 52; // a0 = path, a1 = union member index, a2 = out buf, a4 = out cap — writes the server-relative path for that member, returns the serving pid (-1 = no match); the union-aware successor to SYS_NS_RESOLVE + caller-side prefix strip
+const SYS_PROF          = 53; // a0 = out buf (>= 32 bytes: 4 LE u64 — ipc_calls, ipc_ticks, yields, switches), a1 = reset flag — cheap on-device profiling odometer (gobuildtest)
 
 // Per-process SYS_MAP ceiling: the bump pointer can't grow more than this
 // past USER_BASE. Board-specific (board::HEAP_MAX_BYTES): 16 MiB on the
@@ -2447,7 +2448,10 @@ fn void handle_syscall(Trap_frame* f) @noinline
 		case SYS_IPC_SEND:
 			sys_ipc_send(f);
 		case SYS_IPC_CALL:
+			ulong prof_ipc_t0 = read_reg("time");
 			sys_ipc_call(f);
+			g_prof_ipc_calls++;
+			g_prof_ipc_ticks += read_reg("time") - prof_ipc_t0;
 		case SYS_IPC_REPLY:
 			sys_ipc_reply(f);
 		case SYS_IPC_RECV:
@@ -2460,6 +2464,25 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			sys_ns_resolve(f);
 		case SYS_NS_TRANSLATE:
 			sys_ns_translate(f);
+		case SYS_PROF:
+			ulong* prof_out = (ulong*)(uptr)f.a0;
+			if (!user_range_valid(current_proc.page_table, (uptr)prof_out, 32, true))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			prof_out[0] = g_prof_ipc_calls;
+			prof_out[1] = g_prof_ipc_ticks;
+			prof_out[2] = g_prof_yields;
+			prof_out[3] = g_prof_switches;
+			if (f.a1 != 0)
+			{
+				g_prof_ipc_calls = 0;
+				g_prof_ipc_ticks = 0;
+				g_prof_yields = 0;
+				g_prof_switches = 0;
+			}
+			f.a0 = 0;
 		case SYS_DISKD_INFO:
 			// diskd-only, called once at its own startup — see
 			// setup_diskd_mappings in process.c3 for why these addresses

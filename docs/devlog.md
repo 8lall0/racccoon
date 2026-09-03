@@ -4,6 +4,45 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-03 — profiled `go build`: it's IPC-bound
+
+Added `SYS_PROF` (53) + `prof_read()` + a `gobuildtest prof:` line —
+four always-on odometers: `ipc_calls`, `ipc_ticks`, `yields`,
+`switches` (the low-frequency events; a per-syscall histogram needs its
+own temporary counter, it's 348M/run).
+
+`gobuildtest` (a 1-file module, prepopulated `/gocache`, QEMU `-m 2G`
+TCG):
+
+```
+wall     1332 s  (22 min)
+ipc_calls   1,566,046
+ipc_ticks   ≈2031 s-equiv   (152% of wall — summed across procs, the
+                             sys_ipc_call intervals overlap; read as
+                             "≥1 proc parked in IPC essentially always")
+yields = switches = 5,386,392
+fsd cache   1.55M hit / 3.30M miss  =  32% hit   (vs 68% on light runs)
+```
+
+**Verdict: IPC-bound, decisively — not compute.** 1.57M round trips,
+5.4M context switches. A separate one-off run with a `handle_syscall`
+counter showed **348M syscalls** — only 1.57M are IPC and 5.4M are
+yields, so ~340M is a spinner (netd's link poll, or the Go runtime's
+sysmon while its one goroutine is blocked in the `ipcCall` ecall) —
+worth a histogram, possibly the biggest single win.
+
+Next, in order: (1) syscall histogram — chase the 340M spinner;
+(2) bigger + set-associative fsd cache (512 KiB direct-mapped can't
+hold a `go build` working set); (3) #3 read-ahead; (4) #5 zero-copy /
+batched IPC rings — now justified, the round-trip *count* is the cost.
+Memory `racccoon_gobuild_profile`.
+
+Verified QEMU: runtest / argvtest / elftest / wasmtest / fscachestat /
+gostage3 / gostage41 / tcctest / stage6test all green with the
+counters in.
+
+---
+
 ## 2026-09-03 — Plan 9 /bin, part 5: union-aware creates
 
 The `/bin` union routed *reads* to the right member (P3), but every fs

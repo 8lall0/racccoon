@@ -1513,8 +1513,25 @@ fn void setup_netd_mappings(Process* proc)
 Process* current_proc; // Currently running process
 Process* idle_proc;    // Idle process
 
+// --- lightweight profiling counters (SYS_PROF, `prof` shell builtin) ---
+// Reset + read from userspace to attribute an on-device workload's wall
+// time between IPC, context switches, and everything else. Plain ulongs,
+// never reset by the kernel itself — a monotonically-rising odometer the
+// `prof` builtin snapshots around a workload (e.g. gobuildtest).
+// Kept to the low-frequency events (millions/run, negligible cost) — a
+// per-syscall histogram (348M/run for a `go build`) needs its own,
+// temporary instrumentation, not an always-on counter.
+ulong g_prof_ipc_calls = 0;  // SYS_IPC_CALL entries
+ulong g_prof_ipc_ticks = 0;  // `time` CSR ticks spent inside SYS_IPC_CALL — SUMMED across
+                              //   processes, so nested/overlapping intervals (sys_ipc_call
+                              //   yields) can push the total past wall-clock; read it as
+                              //   "fraction of time with >=1 proc parked in IPC", not a share.
+ulong g_prof_yields    = 0;  // yield() calls
+ulong g_prof_switches  = 0;  // real context switches (yield picked a different proc)
+
 fn void yield() @noinline
 {
+	g_prof_yields++;
 	Process* next = idle_proc;
 	for (int i = 0; i < PROCS_MAX; i++)
 	{
@@ -1553,5 +1570,6 @@ fn void yield() @noinline
 	fp_restore((uptr)&next.fp_area);
 	write_csr("sstatus", (read_reg("sstatus") & ~SSTATUS_FS_MASK) | SSTATUS_FS_CLEAN);
 
+	g_prof_switches++;
 	switch_context(&prev.sp, &next.sp, ((ulong)(uptr)next.page_table >> 12) | SATP_SV39, (uptr)&next.stack + STACK_SIZE);
 }

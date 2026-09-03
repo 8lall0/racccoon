@@ -63,7 +63,8 @@ const int SYS_STDIN_ISATTY  = 48; // 1 = console, 0 = pipe — see src/entry.c3'
 const int SYS_TIMEBASE      = 49; // the `time` CSR tick rate (Hz) — see src/entry.c3's case
 const int SYS_GETPID        = 50; // the caller's own pid — see src/entry.c3's case
 const int SYS_EXEC_MAX      = 51; // board::EXEC_MAX_IMAGE_SIZE — the largest image SYS_EXEC will install (varies by board: 1 MiB Duo, 4 MiB QEMU/JH7110) — see src/entry.c3's case
-const int SYS_NS_TRANSLATE  = 52; // union-aware path resolution — see src/entry.c3's case + ns_translate() below
+const int SYS_NS_TRANSLATE  = 52; // union-aware path resolution — see src/entry.c3's case
+const int SYS_PROF          = 53; // on-device profiling odometer — see src/entry.c3's case + ns_translate() below
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -1190,6 +1191,14 @@ fn ulong rdtime() @export("rdtime") {
 // seconds from now, on any board.
 fn ulong timebase_hz() @export("timebase_hz") {
     return (ulong)syscall(SYS_TIMEBASE, 0, 0, 0);
+}
+
+// Snapshot the kernel's profiling odometer into out4 (>= 4 ulongs:
+// ipc_calls, ipc_ticks, yields, switches). reset != 0 zeroes the
+// counters after reading — snapshot a workload with prof_read(x, 1)
+// before it and prof_read(x, 0) after. Returns 0/-1.
+fn int prof_read(ulong* out4, int reset) @export("prof_read") {
+    return syscall(SYS_PROF, (long)out4, (long)reset, 0);
 }
 
 // The largest image SYS_EXEC will install on this board

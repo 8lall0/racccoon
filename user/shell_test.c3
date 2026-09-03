@@ -2227,11 +2227,37 @@ fn void main() {
                 if (chdir("/gomod") != 0) { print("gobuildtest: chdir /gomod failed\n"); }
                 char*[4] gb_av4;
                 gb_av4[0] = "build"; gb_av4[1] = "-o"; gb_av4[2] = "/tmp/gbt"; gb_av4[3] = ".";
+
+                // Profile the build itself (docs: "profile go build").
+                ulong[4] gb_p0 @noinit; ulong[4] gb_p1 @noinit;
+                ulong gb_ch0 = 0; ulong gb_cm0 = 0;
+                fs_cache_stats(&gb_ch0, &gb_cm0);
+                prof_read(&gb_p0[0], 1);        // reset the odometer
+                ulong gb_wt0 = rdtime();
+
                 uint gb_g1 = 0;
                 int gb_c1 = rfork(RFPROC, &gb_g1);
                 if (gb_c1 == 0) { exec("/bin/go", exec_buf(), exec_buf_max(), 0, &gb_av4[0], 4); exitcode(127); }
                 int gb_rc1 = join(gb_c1, gb_g1);
+
+                ulong gb_wt1 = rdtime();
+                prof_read(&gb_p1[0], 0);
+                ulong gb_ch1 = 0; ulong gb_cm1 = 0;
+                fs_cache_stats(&gb_ch1, &gb_cm1);
                 chdir("/");
+
+                ulong gb_hz = timebase_hz();
+                ulong gb_wall = gb_wt1 - gb_wt0;
+                ulong gb_ipc_t = gb_p1[1] - gb_p0[1];
+                print("gobuildtest prof: wall=");
+                print_uint((uint)(gb_hz > 0 ? gb_wall / gb_hz : 0)); print("s ipc_calls=");
+                print_uint((uint)(gb_p1[0] - gb_p0[0])); print(" ipc_time=");
+                print_uint((uint)(gb_hz > 0 ? gb_ipc_t / gb_hz : 0)); print("s (");
+                print_uint((uint)(gb_wall > 0 ? (gb_ipc_t * 100) / gb_wall : 0)); print("% x-wall) yields=");
+                print_uint((uint)(gb_p1[2] - gb_p0[2])); print(" switches=");
+                print_uint((uint)(gb_p1[3] - gb_p0[3])); print(" cache=");
+                print_uint((uint)(gb_ch1 - gb_ch0)); print("h/");
+                print_uint((uint)(gb_cm1 - gb_cm0)); print("m\n");
 
                 if (gb_rc1 != 0) {
                     print("gobuildtest: FAILED (go build exit "); print_uint((uint)gb_rc1); print(")\n");
