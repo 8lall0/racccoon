@@ -101,37 +101,102 @@ bool g_diskd_multi_ok = true;
 const uint SECTOR_SIZE   = 512;
 
 // --- read cache -----------------------------------------------------
-// Direct-mapped sector cache below fs_read_sector/fs_write_sector.
-// Without it, every FS_READ walks the tree and every walk step is one
-// IPC + one single-sector virtio op to diskd — loading /bin/go (13.6
-// MiB) is ~26k round trips. The Go toolchain re-reads compile/link/asm
-// and re-walks $GOROOT's inode-table + directory blocks constantly, so
-// nearly all of that is a cache hit after the first pass.
+// A 4-way set-associative sector cache below fs_read_sector /
+// fs_read_sectors / fs_write_sector. Without it, every FS_READ walks the
+// tree and every walk step is one IPC + one single-sector virtio op to
+// diskd — loading /bin/go (13.6 MiB) is ~26k round trips, and each cache
+// MISS also makes diskd busy-poll SYS_IPC_POLL for the completion IRQ
+// (docs/devlog.md — the go-build syscall storm), so hit rate drives the
+// syscall count too, not just latency.
 //
-// The tags are a small static array; the 512-byte payloads live in a
-// lazily-backed SYS_MAP region (fs_cache_init) so the fsd .bin doesn't
-// carry 512 KiB of zeros and a cold slot costs no real RAM. Keyed on
-// the partition-relative sector (fsd only ever touches one partition;
-// fsd2 is a separate process with its own cache). Write-through:
-// diskd_rw stays the single enforcement point for the reserved-sector /
-// write-disabled checks, and a successful write refreshes the slot — so
-// the cache can never be staler than the disk (fsd is the sole writer,
-// diskd doesn't cache, a diskd respawn leaves disk contents unchanged).
-const uint FS_CACHE_ENTRIES = 1024;               // * 512 B = 512 KiB
-const uint FS_CACHE_EMPTY   = 0xFFFFFFFF;
+// The old cache was 512 KiB direct-mapped and dropped to a 32% hit rate
+// on a `go build` (working set — goroot stdlib source + gocache blobs —
+// far bigger, plus direct-mapped conflict thrash). Now 8 MiB, 4-way:
+//   FS_CACHE_SETS sets x FS_CACHE_WAYS ways x 512 B.
+// Tags, round-robin eviction pointers, and payloads all live in one
+// lazily-backed SYS_MAP region (fs_cache_init) — the fsd .bin carries
+// none of it and a cold slot costs no real RAM. Tag is `sector + 1`
+// (0 == empty, so a fresh zero page needs no init loop). Keyed on the
+// partition-relative sector (fsd2 is a separate process, own cache).
+// Write-through: diskd_rw stays the single reserved-sector /
+// write-disabled enforcement point; a successful write refreshes the
+// slot, so the cache can never be staler than the disk.
+const uint FS_CACHE_WAYS = 4;
+const uint FS_CACHE_SETS = 4096;                  // 4096 * 4 * 512 B = 8 MiB
+const uint FS_CACHE_SLOTS = FS_CACHE_SETS * FS_CACHE_WAYS;
 
-uint[FS_CACHE_ENTRIES] fs_cache_tag;              // relative sector, or FS_CACHE_EMPTY
-char* fs_cache_data;                              // FS_CACHE_ENTRIES * SECTOR_SIZE, or null
+uint* fs_cache_tag;    // FS_CACHE_SLOTS uints, sector+1 or 0
+char* fs_cache_rr;     // FS_CACHE_SETS bytes, next way to evict per set
+char* fs_cache_data;   // FS_CACHE_SLOTS * SECTOR_SIZE, or null on map failure
 ulong fs_cache_hits;
 ulong fs_cache_misses;
 
 fn void fs_cache_init()
 {
-	for (uint i = 0; i < FS_CACHE_ENTRIES; i++) fs_cache_tag[i] = FS_CACHE_EMPTY;
-	void* region = map_pages(FS_CACHE_ENTRIES * SECTOR_SIZE);
-	// SYS_MAP returns (uptr)-1 on failure (bad size / per-process
-	// ceiling). Anything else is a valid lazily-backed region.
-	fs_cache_data = (uptr)region == (uptr)0xFFFFFFFFFFFFFFFF ? null : (char*)region;
+	uint tag_bytes = FS_CACHE_SLOTS * 4;
+	uint rr_bytes  = (FS_CACHE_SETS + 3) & ~3u;    // keep the data 4-aligned
+	uint total = tag_bytes + rr_bytes + FS_CACHE_SLOTS * SECTOR_SIZE;
+	void* region = map_pages(total);
+	if ((uptr)region == (uptr)0xFFFFFFFFFFFFFFFF)
+	{
+		fs_cache_data = null;
+		return;
+	}
+	fs_cache_tag  = (uint*)region;
+	fs_cache_rr   = (char*)region + tag_bytes;
+	fs_cache_data = (char*)region + tag_bytes + rr_bytes;
+}
+
+// The set-associative slot index for `sector`, or -1 if `sector` isn't
+// cached. Does NOT count a hit — fs_cache_hit() does that. Used both to
+// serve reads and to decide where a run of uncached sectors ends.
+fn int fs_cache_slot_of(uint sector)
+{
+	if (fs_cache_data == null) return -1;
+	uint want = sector + 1;
+	uint base = (sector % FS_CACHE_SETS) * FS_CACHE_WAYS;
+	for (uint w = 0; w < FS_CACHE_WAYS; w++)
+	{
+		if (fs_cache_tag[base + w] == want) return (int)(base + w);
+	}
+	return -1;
+}
+
+fn char* fs_cache_slot_data(int slot)
+{
+	return &fs_cache_data[(uptr)(uint)slot * SECTOR_SIZE];
+}
+
+// Insert / refresh `sector` with `src` (512 B). Prefers an empty way,
+// else round-robins within the set.
+fn void fs_cache_put(uint sector, char* src)
+{
+	if (fs_cache_data == null) return;
+	uint set  = sector % FS_CACHE_SETS;
+	uint base = set * FS_CACHE_WAYS;
+	int  dst  = -1;
+	for (uint w = 0; w < FS_CACHE_WAYS; w++)
+	{
+		uint t = fs_cache_tag[base + w];
+		if (t == sector + 1 || t == 0) { dst = (int)(base + w); break; }
+	}
+	if (dst < 0)
+	{
+		uint way = ((uint)fs_cache_rr[set] & 0xFF) % FS_CACHE_WAYS;
+		fs_cache_rr[set] = (char)((way + 1) & 0xFF);
+		dst = (int)(base + way);
+	}
+	char* slot = &fs_cache_data[(uptr)(uint)dst * SECTOR_SIZE];
+	for (uint i = 0; i < SECTOR_SIZE; i++) slot[i] = src[i];
+	fs_cache_tag[(uint)dst] = sector + 1;
+}
+
+// Invalidate `sector` if present (a write that may or may not have
+// reached the platter — see fs_write_sector).
+fn void fs_cache_drop(uint sector)
+{
+	int slot = fs_cache_slot_of(sector);
+	if (slot >= 0) fs_cache_tag[(uint)slot] = 0;
 }
 
 // The storage driver's pid (diskd on QEMU, sdd on the Duo). fsd learns
@@ -516,23 +581,18 @@ fn bool diskd_rw(char* buf, uint sector, bool is_write)
 // backend — neither FAT32 nor ext2 touches fs_partition_start directly.
 fn bool fs_read_sector(uint sector, char* buf)
 {
-	if (fs_cache_data != null)
+	int slot = fs_cache_slot_of(sector);
+	if (slot >= 0)
 	{
-		uint idx = sector % FS_CACHE_ENTRIES;
-		char* slot = &fs_cache_data[(uptr)idx * SECTOR_SIZE];
-		if (fs_cache_tag[idx] == sector)
-		{
-			for (uint i = 0; i < SECTOR_SIZE; i++) buf[i] = slot[i];
-			fs_cache_hits++;
-			return true;
-		}
-		if (!diskd_rw(buf, fs_partition_start + sector, false)) return false;
-		for (uint i = 0; i < SECTOR_SIZE; i++) slot[i] = buf[i];
-		fs_cache_tag[idx] = sector;
-		fs_cache_misses++;
+		char* s = fs_cache_slot_data(slot);
+		for (uint i = 0; i < SECTOR_SIZE; i++) buf[i] = s[i];
+		fs_cache_hits++;
 		return true;
 	}
-	return diskd_rw(buf, fs_partition_start + sector, false);
+	if (!diskd_rw(buf, fs_partition_start + sector, false)) return false;
+	fs_cache_put(sector, buf);
+	fs_cache_misses++;
+	return true;
 }
 
 // Reads `count` (1..DISKD_MAX_SECTORS) consecutive sectors starting at
@@ -580,25 +640,21 @@ fn bool fs_read_sectors(uint start, uint count, char* buf)
 	{
 		uint sec = start + i;
 		// Serve a cache hit.
-		if (fs_cache_data != null)
+		int hslot = fs_cache_slot_of(sec);
+		if (hslot >= 0)
 		{
-			uint hidx = sec % FS_CACHE_ENTRIES;
-			if (fs_cache_tag[hidx] == sec)
-			{
-				char* hslot = &fs_cache_data[(uptr)hidx * SECTOR_SIZE];
-				for (uint k = 0; k < SECTOR_SIZE; k++) buf[i * SECTOR_SIZE + k] = hslot[k];
-				fs_cache_hits++;
-				i++;
-				continue;
-			}
+			char* hs = fs_cache_slot_data(hslot);
+			for (uint k = 0; k < SECTOR_SIZE; k++) buf[i * SECTOR_SIZE + k] = hs[k];
+			fs_cache_hits++;
+			i++;
+			continue;
 		}
 		// Gather the longest run of not-currently-cached sectors, capped
 		// at DISKD_MAX_SECTORS, and read it in one op.
 		uint run = 1;
 		while (i + run < count && run < DISKD_MAX_SECTORS)
 		{
-			uint nsec = start + i + run;
-			if (fs_cache_data != null && fs_cache_tag[nsec % FS_CACHE_ENTRIES] == nsec) break;
+			if (fs_cache_slot_of(start + i + run) >= 0) break;
 			run++;
 		}
 
@@ -619,16 +675,9 @@ fn bool fs_read_sectors(uint start, uint count, char* buf)
 			continue;
 		}
 		// Populate the cache from the batch.
-		if (fs_cache_data != null)
+		for (uint j = 0; j < run; j++)
 		{
-			for (uint j = 0; j < run; j++)
-			{
-				uint cs = sec + j;
-				uint cidx = cs % FS_CACHE_ENTRIES;
-				char* cslot = &fs_cache_data[(uptr)cidx * SECTOR_SIZE];
-				for (uint k = 0; k < SECTOR_SIZE; k++) cslot[k] = dst[j * SECTOR_SIZE + k];
-				fs_cache_tag[cidx] = cs;
-			}
+			fs_cache_put(sec + j, &dst[j * SECTOR_SIZE]);
 		}
 		fs_cache_misses += run;
 		i += run;
@@ -646,23 +695,17 @@ fn bool fs_read_sectors(uint start, uint count, char* buf)
 fn bool fs_write_sector(uint sector, char* buf)
 {
 	bool ok = diskd_rw(buf, fs_partition_start + sector, true);
-	if (fs_cache_data != null)
+	if (ok)
 	{
-		uint idx = sector % FS_CACHE_ENTRIES;
-		if (ok)
-		{
-			char* slot = &fs_cache_data[(uptr)idx * SECTOR_SIZE];
-			for (uint i = 0; i < SECTOR_SIZE; i++) slot[i] = buf[i];
-			fs_cache_tag[idx] = sector;
-		}
-		else if (fs_cache_tag[idx] == sector)
-		{
-			// A rejected write leaves the disk unchanged, but a write
-			// that reached the platter then lost its reply (driver died
-			// past the point of no return, retry didn't reconnect) would
-			// not — drop the slot so the next read goes to disk.
-			fs_cache_tag[idx] = FS_CACHE_EMPTY;
-		}
+		fs_cache_put(sector, buf);
+	}
+	else
+	{
+		// A rejected write leaves the disk unchanged, but a write that
+		// reached the platter then lost its reply (driver died past the
+		// point of no return, retry didn't reconnect) would not — drop
+		// the slot so the next read goes to disk.
+		fs_cache_drop(sector);
 	}
 	return ok;
 }

@@ -4,6 +4,35 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-03 — fsd cache: 4-way, 8 MiB (was 512 KiB direct-mapped)
+
+The old cache was 512 KiB / 1024-entry direct-mapped and fell to a 32%
+hit rate on a `go build` (working set — goroot stdlib source + gocache
+blobs — far bigger, plus direct-mapped conflict thrash). And every miss
+also makes diskd busy-poll `SYS_IPC_POLL` for the completion IRQ (the
+syscall storm), so hit rate drives the syscall count too.
+
+`user/fs/fsd.c3`: **4-way set-associative, 4096 sets × 4 ways × 512 B =
+8 MiB.** Tags (`sector + 1`, 0 = empty, so a fresh zero page needs no
+init loop), per-set round-robin eviction bytes, and payloads all live
+in one lazily-backed `SYS_MAP` region — the fsd `.bin` carries none of
+it, a cold slot costs no real RAM, `fsd2` is a separate process with
+its own. The five ad-hoc `sector % ENTRIES` sites collapse to
+`fs_cache_slot_of` / `fs_cache_put` / `fs_cache_drop`.
+
+Verified QEMU ext2 + dual: `bigwritetest` (400 KiB double-indirect
+write-through) `chmodtest` `p9fswritetest` `gostage3` `gostage35`
+`tcctest` `stage6test` `elftest` `wasmtest` `gostage41` `mounttest`
+`bigreadtest` `nstest` `runtest2` `argvtest2` — all pass.
+
+**`SYS_IPC_POLL` during a Go workload (`synhist go`): 57 k/s → 19 k/s**,
+a ~66% cut in the diskd completion-wait spin, from the same workload.
+The mixed test battery only reached 39% hit (each small test is mostly
+first-touch reads — not a re-read workload); the `go build` re-profile
+is next.
+
+---
+
 ## 2026-09-03 — the syscall storm is diskd's completion-wait spin
 
 `SYS_PROF_HIST` (54) — a 64-entry per-syscall-number histogram, one
