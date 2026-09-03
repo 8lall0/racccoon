@@ -25,11 +25,24 @@ write-through) `chmodtest` `p9fswritetest` `gostage3` `gostage35`
 `tcctest` `stage6test` `elftest` `wasmtest` `gostage41` `mounttest`
 `bigreadtest` `nstest` `runtest2` `argvtest2` — all pass.
 
-**`SYS_IPC_POLL` during a Go workload (`synhist go`): 57 k/s → 19 k/s**,
-a ~66% cut in the diskd completion-wait spin, from the same workload.
-The mixed test battery only reached 39% hit (each small test is mostly
-first-touch reads — not a re-read workload); the `go build` re-profile
-is next.
+**`SYS_IPC_POLL` during a Go workload (`synhist go`): 57 k/s → 19 k/s**
+— a ~66% cut in the diskd completion-wait spin for a small working set.
+
+**`go build` re-profile — modest, not the fix:**
+
+```
+              wall    ipc_calls  yields/switches  cache hit
+512K DM       1332s   1.57M      5.39M            32%
+4-way 8 MiB   1345s   1.47M      5.04M            38%
+```
+
++6 pt hit rate, −6% IPC calls, **wall time unchanged**. The toolchain
+binaries (`go` 13.6M, `compile` 23M, `link` 5.9M, `asm` 4.6M) are
+re-exec'd and re-read whole from fsd every build — ~50 MiB no sane
+cache holds — and the real cost is the IPC round-trip machinery
+(rendezvous + 5M context switches + copies), not read latency. The
+next levers: (1) exec keeps recently-loaded images resident, or `go`
+keeps its tools resident; (2) #5 zero-copy / batched IPC rings.
 
 ---
 
