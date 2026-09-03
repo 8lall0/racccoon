@@ -111,11 +111,23 @@ fn void main(String[] args) {
     // itself returned success. Boot-time (pid 2, no argv) and runtest's
     // own no-args exec() both get an empty args here, so the canned
     // reply stays exactly what it's always been for them.
-    char* canned = "hello from 9p-lite\n";
-    int canned_len = 21;
-    if (args.len > 0) {
-        canned = args[0].ptr;
-        canned_len = (int)args[0].len;
+    // The P9_TREAD reply, NUL-terminated in our own buffer: args[0]
+    // points into the exec blob and its slice length does NOT cover the
+    // trailing NUL, so replying `args[0].len` bytes leaves the caller's
+    // (often @noinit) receive buffer unterminated — a strcmp there then
+    // reads stack garbage (argvtest / argvtest2 failed exactly this way
+    // on the dual image, where the garbage was leftover /adm/users
+    // bytes). Copy + terminate + reply length+1.
+    char[64] canned @noinit;
+    int canned_len = 0;
+    {
+        char* src = "hello from 9p-lite\n";
+        int slen = 19;
+        if (args.len > 0) { src = args[0].ptr; slen = (int)args[0].len; }
+        if (slen > 62) slen = 62;
+        for (int i = 0; i < slen; i++) canned[i] = src[i];
+        canned[slen] = 0;
+        canned_len = slen + 1;
     }
 
     char[64] buf @noinit;
@@ -136,7 +148,7 @@ fn void main(String[] args) {
         }
 
         if (verb == P9_TREAD) {
-            ipc_reply(from, P9_TREAD, canned, canned_len, from_gen);
+            ipc_reply(from, P9_TREAD, &canned[0], canned_len, from_gen);
         } else if (verb == P9_TWALK) {
             // No real namespace yet (that's a later phase) — just prove
             // the path made it across by handing it straight back.

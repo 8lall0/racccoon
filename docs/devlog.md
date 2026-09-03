@@ -4,6 +4,33 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-03 — echod: NUL-terminate the P9_TREAD reply (argvtest fix)
+
+`argvtest` / `argvtest2` "flakiness" — root-caused and fixed. Not a
+race: **`echod`'s `P9_TREAD` reply wasn't NUL-terminated.** When exec'd
+with an argument, echod replied `args[0].ptr` / `args[0].len` — and
+`args[0]` is a slice into the exec blob whose length stops at the last
+character, not the trailing NUL. The caller (`argvtest`) receives that
+into a `char[64] @noinit` buffer and `strcmp`s it against the expected
+marker, so the compare runs straight off the end of the copied bytes
+into whatever was on the stack. On the ext2 image that was zeros — pass.
+On the dual image it was leftover `/adm/users` bytes ("glenda",
+"65534:none") — the `strcmp` saw `"argvtest2-marker" + "glenda…"` and
+failed. Deterministic, just stack-content-dependent.
+
+`user/sys/echod.c3`: the `P9_TREAD` handler now copies the string into
+its own buffer, NUL-terminates it, and replies `len + 1`. The canned
+no-arg reply ("hello from 9p-lite\n") goes through the same path — 19
+bytes + NUL, was a hand-counted 21.
+
+Verified QEMU ext2 + dual: `argvtest2` 4/4 (was 0/4 on dual),
+`argvtest` clean, and the whole echod-consumer battery — `p9test`
+`p9fstest` `nstest` `srvtest` `hungservertest` `ipcdeathtest`
+`p9mkdirtest` `runtest` `elftest` `pathtest` `threadtest` `mutextest`
+`racetest` `tcctest` `gostage41test`.
+
+---
+
 ## 2026-09-03 — libc: two regressions the exec/ns changes left behind
 
 Both landed features (`tcctest`, `stage6test`) were broken by changes
