@@ -4,6 +4,40 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-03 — IPC rings: design doc (lever #5)
+
+`docs/ipc-rings.md` — the design for zero-copy / batched IPC rings, the
+"proper" fix for the round-trip cost after the cache work moved the hit
+rate but not `go build` wall time.
+
+Two tiers: keep `SYS_IPC_CALL` (9P-lite) for the control plane (open,
+stat, walk, mkdir, mount, perms, clunk), add a per-connection
+shared-memory SQ/CQ + data-arena ring for the two hot data verbs
+(`FS_READ_AT` / `FS_WRITE_AT`). New kernel primitive: `SYS_RING_ATTACH`
+(map one physically-contiguous run RW into both peers, each side its own
+vaddr, all-offsets-no-pointers), `SYS_RING_KICK` (fence + wake peer,
+optional wait), `SYS_RING_WAIT` (park; for a driver, hand-drain the PLIC
+like `SYS_IPC_POLL` — once per batch, not per sector). Teardown in
+`cleanup_process`, dead-slot → re-handshake like `ipc_peer_gone`.
+
+Phased: **P1 = fsd↔diskd ring** (hottest edge, 2 C3 procs, no bindings,
+collapses the ~330 M `SYS_IPC_POLL` storm to one wait/batch and lets
+diskd keep virtqueue depth > 1). P2 = client↔fsd ring for read/write
+bulk (user.c3 + libc + Go clients). P3 = Go `chan` wrapper over the ring
+(the goroutine-concurrency payoff). P4 = true producer/consumer, zero
+switches — SMP-scheduler-gated, designed-for not built-for (cache-line
+separated indices, release/acquire fences from P1).
+
+Costs noted: crash-recovery re-attach, ring-dump debuggability,
+non-swappable pinned regions, per-SQ-entry validation on the server hot
+path, and the `sscratch` nested-trap constraint still stands (P1 makes
+diskd's poll rare, doesn't remove it).
+
+No code yet. Next: `ringbench` microbench (P0) to measure the real
+per-op delta, then P1.
+
+---
+
 ## 2026-09-03 — fsd cache: 4-way, 8 MiB (was 512 KiB direct-mapped)
 
 The old cache was 512 KiB / 1024-entry direct-mapped and fell to a 32%
