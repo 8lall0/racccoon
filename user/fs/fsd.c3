@@ -152,6 +152,16 @@ char* fs_cache_data;   // FS_CACHE_SLOTS * SECTOR_SIZE, or null on map failure
 ulong fs_cache_hits;
 ulong fs_cache_misses;
 
+// Round-trip accounting (docs/ipc-rings.md — figuring out where the
+// 1.47M SYS_IPC_CALLs in a `go build` actually go before batching them).
+// g_op_read/write/meta count client->fsd requests by kind; g_op_diskd
+// counts fsd->diskd ops (diskd_rw + diskd_read_multi). Exposed via the
+// widened FS_CACHE_STATS reply.
+ulong g_op_read;
+ulong g_op_write;
+ulong g_op_meta;
+ulong g_op_diskd;
+
 fn void fs_cache_init()
 {
 	uint tag_bytes = FS_CACHE_SLOTS * 4;
@@ -544,6 +554,8 @@ fn bool diskd_rw(char* buf, uint sector, bool is_write)
 		if (fs_sector_is_reserved(sector - fs_partition_start)) return false;
 	}
 
+	g_op_diskd++;
+
 	char* req = &g_disk_io_buf[0];
 	uint* sector_field = (uint*)req;
 	*sector_field = sector;
@@ -648,6 +660,7 @@ fn bool fs_read_sector(uint sector, char* buf)
 // verb (so the caller retries per-sector).
 fn bool diskd_read_multi(char* buf, uint abs_sector, uint count)
 {
+	g_op_diskd++;
 	char* req = &g_disk_io_buf[0];
 	uint* sector_field = (uint*)req;
 	uint* count_field  = (uint*)&req[4];
@@ -1407,11 +1420,20 @@ fn void main(String[] args)
 			ulong* stat_out = (ulong*)&buf;
 			stat_out[0] = fs_cache_hits;
 			stat_out[1] = fs_cache_misses;
-			ipc_reply(from, FS_CACHE_STATS, &buf, 16, from_gen);
+			stat_out[2] = g_op_read;
+			stat_out[3] = g_op_write;
+			stat_out[4] = g_op_meta;
+			stat_out[5] = g_op_diskd;
+			ipc_reply(from, FS_CACHE_STATS, &buf, 48, from_gen);
 			continue;
 		}
 
 		if (verb != FS_READ && verb != FS_READ_AT && verb != FS_WRITE && verb != FS_WRITE_AT && verb != FS_STAT && verb != FS_DELETE && verb != FS_LIST && verb != FS_MKDIR && verb != FS_RENAME && verb != FS_CHMOD && verb != FS_CHOWN) continue;
+
+		// Round-trip accounting (docs/ipc-rings.md step 3).
+		if (verb == FS_READ || verb == FS_READ_AT) { g_op_read++; }
+		else if (verb == FS_WRITE || verb == FS_WRITE_AT) { g_op_write++; }
+		else { g_op_meta++; }
 
 		int* result_len_field = (int*)&buf;
 

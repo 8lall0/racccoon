@@ -4,6 +4,51 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-03 — IPC rings P1: step 3 (read-ahead) tried and reverted; arc stopped
+
+`gobuildtest` gained a round-trip breakdown (`fsd reads/writes/meta/
+diskd_ops`, off a widened `FS_CACHE_STATS`) — **kept**, it's the useful
+finding here:
+
+```
+fsd -> diskd:   1,335,577 round trips   (91 % of the 1.47 M SYS_IPC_CALLs)
+client -> fsd:  reads 118k, writes 7.5k, meta 5.5k  =  131 k  (9 %)
+3.0 M cache misses / 1.34 M diskd ops  =  2.25 sectors per op
+```
+
+**Step 3 = read-ahead** (a 64-sector window per cache miss into a 64 KiB
+arena) — tried, measured, reverted:
+
+```
+              step 2      step 3
+wall          1366 s      1602 s   (+17 %, WORSE)
+ipc_calls     1.47 M      1.30 M   (−11 %)
+diskd_ops     1.34 M      1.17 M   (−13 %, modest)
+cache hits    1.85 M      4.82 M   (+2.6×)
+sectors read  ~3 M        ~47 M    (+15×, read amplification)
+```
+
+The window is the wrong shape: `go build`'s disk access is scattered
+small reads (ext2 metadata walks + interleaved multi-file compile), not
+long sequential runs. 15× the bandwidth for 13 % fewer round trips, and
+wall got worse. Reverted the read-ahead; `disk_arena` back to 32 KiB.
+
+**Arc stopped.** The real finding across steps 1→3: `ipc_calls` went
+*down* (1.47 M → 1.30 M) while wall went *up*. If wall were
+round-trip-bound, fewer round trips would mean less wall — it doesn't.
+**`go build` under QEMU TCG is not IPC-round-trip-bound.** The original
+"IPC-bound, decisively" verdict (docs/ipc-rings.md) was misled by the
+348 M syscall count, which turned out to be ~free — it's compute-bound
+(the Go compiler is slow under TCG), with IPC overlapping the compute.
+
+Kept: step 1 (`SYS_DRIVER_IRQ_WAIT`, −15× syscalls, wall-neutral),
+step 2 (fsd↔diskd shared arena, −copy traffic, wall-neutral) — both
+correct, both a real win on actual hardware / SMP where syscalls and
+copies aren't free, neither a `go build`-under-TCG win. Plus the
+`gobuildtest` round-trip breakdown instrumentation.
+
+---
+
 ## 2026-09-03 — IPC rings P1 step 2: fsd↔diskd shared arena
 
 `disk_arena` — one 32 KiB physically-contiguous run, identity-mapped by

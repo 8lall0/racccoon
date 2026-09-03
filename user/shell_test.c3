@@ -2342,8 +2342,9 @@ fn void main() {
                 // Profile the build itself (docs: "profile go build").
                 ulong[4] gb_p1 @noinit;
                 ulong[64] gb_hist @noinit;     // per-syscall counts — chasing the diskd poll storm
-                ulong gb_ch0 = 0; ulong gb_cm0 = 0;
-                fs_cache_stats(&gb_ch0, &gb_cm0);
+                ulong[6] gb_os0 @noinit; ulong[6] gb_os1 @noinit;
+                fs_opstats(&gb_os0[0]);
+                ulong gb_ch0 = gb_os0[0]; ulong gb_cm0 = gb_os0[1];
                 // SYS_PROF / SYS_PROF_HIST return the PRE-reset totals then
                 // zero — so after these reset calls the odometer is 0 and
                 // the single post-build read IS the delta. (Subtracting the
@@ -2361,8 +2362,8 @@ fn void main() {
                 ulong gb_wt1 = rdtime();
                 prof_read(&gb_p1[0], 0);
                 prof_hist(&gb_hist[0], 0);      // gb_hist now holds the build's per-syscall counts
-                ulong gb_ch1 = 0; ulong gb_cm1 = 0;
-                fs_cache_stats(&gb_ch1, &gb_cm1);
+                fs_opstats(&gb_os1[0]);
+                ulong gb_ch1 = gb_os1[0]; ulong gb_cm1 = gb_os1[1];
                 chdir("/");
 
                 ulong gb_sc_total = 0;
@@ -2384,6 +2385,11 @@ fn void main() {
                 print_uint((uint)(gb_sc_total / 1000)); print("k  sys10(ipc_poll)=");
                 print_uint((uint)(gb_hist[10] / 1000)); print("k  sys55(irq_wait)=");
                 print_uint((uint)(gb_hist[55] / 1000)); print("k\n");
+                print("gobuildtest prof: fsd reads=");
+                print_uint((uint)(gb_os1[2] - gb_os0[2])); print(" writes=");
+                print_uint((uint)(gb_os1[3] - gb_os0[3])); print(" meta=");
+                print_uint((uint)(gb_os1[4] - gb_os0[4])); print(" diskd_ops=");
+                print_uint((uint)(gb_os1[5] - gb_os0[5])); print("\n");
 
                 if (gb_rc1 != 0) {
                     print("gobuildtest: FAILED (go build exit "); print_uint((uint)gb_rc1); print(")\n");

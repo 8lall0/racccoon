@@ -1599,15 +1599,26 @@ fn int fs_write_at(char* filename, char* buf, int len, uint offset) @export("fs_
 // Resolves the fsd serving "/" (the primary/ext2 mount). Returns 0 on
 // success. Introspection only — see user/fs/fsd.c3's fs_cache_init.
 fn int fs_cache_stats(ulong* out_hits, ulong* out_misses) @export("fs_cache_stats") {
+    ulong[6] s @noinit;
+    if (fs_opstats(&s[0]) < 0) return -1;
+    if (out_hits != null) *out_hits = s[0];
+    if (out_misses != null) *out_misses = s[1];
+    return 0;
+}
+
+// The full FS_CACHE_STATS reply: out6 = [cache hits, cache misses,
+// client FS_READ*s, client FS_WRITE*s, client meta ops, fsd->diskd ops].
+// Round-trip accounting for the batched-submission work (docs/ipc-rings.md
+// step 3). Introspection only. Returns 0, or -1.
+fn int fs_opstats(ulong* out6) @export("fs_opstats") {
     int fsd_pid = ns_resolve("/", null);
     if (fsd_pid < 0) return -1;
-    char[16] req @noinit;
+    char[48] req @noinit;
     uint reply_verb = 0;
-    int from = p9_call(fsd_pid, FS_CACHE_STATS, &req, 16, &req, 16, &reply_verb);
+    int from = p9_call(fsd_pid, FS_CACHE_STATS, &req, 48, &req, 48, &reply_verb);
     if (from <= 0 || reply_verb != FS_CACHE_STATS) return -1;
     ulong* fields = (ulong*)&req;
-    if (out_hits != null) *out_hits = fields[0];
-    if (out_misses != null) *out_misses = fields[1];
+    for (int i = 0; i < 6; i++) out6[i] = fields[i];
     return 0;
 }
 

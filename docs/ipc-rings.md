@@ -166,17 +166,28 @@ single-message path needs.
   exec image instead of thousands of round trips), and **Phase 1's
   diskd poll storm** — not through shaving switches off one read.
 
-### Phase 1 — fsd ↔ diskd ring  ← in progress
+### Phase 1 — fsd ↔ diskd ring  ← STOPPED after step 3 (see devlog 2026-09-03)
 
-**Step 1 (done):** `SYS_DRIVER_IRQ_WAIT` — diskd's userspace completion
+**Outcome:** steps 1 and 2 landed and are kept — both correct, both
+wall-neutral on `go build` under QEMU TCG, both a real win on actual
+hardware / SMP. Step 3 (read-ahead) was a loss (read amplification,
++17 % wall) and was reverted. The arc is stopped because the premise
+broke: `ipc_calls` went *down* across steps 1→3 while wall went *up*, so
+`go build` under TCG is **not IPC-round-trip-bound** — it's
+compute-bound (the Go compiler under TCG), and the "IPC-bound" verdict
+below was an artifact of the cheap 348 M-syscall count. Phases 2–4 are
+not worth building for the same reason. If `go build` speed is revisited,
+profile the *compiler* first.
+
+**Step 1 (done, kept):** `SYS_DRIVER_IRQ_WAIT` — diskd's userspace completion
 poll-spin (`for(;;){ ipc_poll_type() }`, ~330 M `SYS_IPC_POLL`/build)
 moved into one kernel syscall whose internal `yield()`s aren't syscalls.
 The storm is gone (`sys10 = 0`, `sys55` at ~1/completion). All fs tests
 pass. Small on its own (~2 % wall — each poll was cheap), but removes a
 pathological pattern and is a prerequisite for the ring's own wait.
 
-**Step 2 (next):** a shared data *arena* between diskd and the primary
-fsd — the zero-copy half, without the full SQ/CQ machinery yet.
+**Step 2 (done, kept):** a shared data *arena* between diskd and the
+primary fsd — the zero-copy half, without the full SQ/CQ machinery.
 
 Deliberately minimal: keep the existing blocking-IPC control flow
 (`p9_call` / `ipc_recv` / generation checks / respawn retry) exactly as
