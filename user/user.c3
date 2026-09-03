@@ -64,7 +64,8 @@ const int SYS_TIMEBASE      = 49; // the `time` CSR tick rate (Hz) — see src/e
 const int SYS_GETPID        = 50; // the caller's own pid — see src/entry.c3's case
 const int SYS_EXEC_MAX      = 51; // board::EXEC_MAX_IMAGE_SIZE — the largest image SYS_EXEC will install (varies by board: 1 MiB Duo, 4 MiB QEMU/JH7110) — see src/entry.c3's case
 const int SYS_NS_TRANSLATE  = 52; // union-aware path resolution — see src/entry.c3's case
-const int SYS_PROF          = 53; // on-device profiling odometer — see src/entry.c3's case + ns_translate() below
+const int SYS_PROF          = 53; // on-device profiling odometer — see src/entry.c3's case
+const int SYS_PROF_HIST     = 54; // DIAGNOSTIC per-syscall histogram — see src/entry.c3's case + ns_translate() below
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -1199,6 +1200,12 @@ fn ulong timebase_hz() @export("timebase_hz") {
 // before it and prof_read(x, 0) after. Returns 0/-1.
 fn int prof_read(ulong* out4, int reset) @export("prof_read") {
     return syscall(SYS_PROF, (long)out4, (long)reset, 0);
+}
+
+// DIAGNOSTIC: snapshot the per-syscall-number histogram into out64
+// (64 ulongs, indexed by syscall number). reset != 0 zeroes it.
+fn int prof_hist(ulong* out64, int reset) @export("prof_hist") {
+    return syscall(SYS_PROF_HIST, (long)out64, (long)reset, 0);
 }
 
 // The largest image SYS_EXEC will install on this board

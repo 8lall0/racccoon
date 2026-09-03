@@ -4,6 +4,36 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-03 — the syscall storm is diskd's completion-wait spin
+
+`SYS_PROF_HIST` (54) — a 64-entry per-syscall-number histogram, one
+indexed `++` per ecall — plus a `synhist` shell builtin (`synhist` = a
+5 s window while the shell just yields; `synhist go` wraps a Go
+workload).
+
+- **Idle**: nothing but the shell's own `SYS_YIELD` loop. `netd` does
+  NOT spin-poll the link.
+- **During a Go workload** (`gostage2`): **`SYS_IPC_POLL` (10) at
+  ~57 k/s** — the whole storm.
+
+Root cause: **`diskd`'s completion-wait** (`user/block/diskd.c3`) —
+`for(;;){ ipc_poll_type(…); if (DISKD_IRQ_NOTIFY) break; }`, a tight
+busy-poll on `SYS_IPC_POLL` waiting for each virtio-blk completion IRQ.
+It can't just block (the comment there: enabling interrupts while
+parked mid-trap corrupts the frame via the fixed `sscratch` reset). So
+every fsd-cache-missed sector read spins through tens–hundreds of polls
+before the completion fires: 3.3M misses in the build × ~100 ≈ the
+340M syscalls.
+
+So **a bigger fsd cache attacks the syscall storm too**, not just read
+latency — that's next.
+
+Verified QEMU: `synhist` / `synhist go` / `gostage41test` / `gostage2`
+run; the counter is ~3–4% always-on at that syscall rate, kept for
+re-profiling after the cache change.
+
+---
+
 ## 2026-09-03 — profiled `go build`: it's IPC-bound
 
 Added `SYS_PROF` (53) + `prof_read()` + a `gobuildtest prof:` line —

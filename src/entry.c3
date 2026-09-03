@@ -108,6 +108,7 @@ const SYS_GETPID        = 50; // the caller's own pid — a c3 program gets its 
 const SYS_EXEC_MAX      = 51; // board::EXEC_MAX_IMAGE_SIZE — the shell reads this to size its own exec() receive buffer per-board instead of hardcoding a constant
 const SYS_NS_TRANSLATE  = 52; // a0 = path, a1 = union member index, a2 = out buf, a4 = out cap — writes the server-relative path for that member, returns the serving pid (-1 = no match); the union-aware successor to SYS_NS_RESOLVE + caller-side prefix strip
 const SYS_PROF          = 53; // a0 = out buf (>= 32 bytes: 4 LE u64 — ipc_calls, ipc_ticks, yields, switches), a1 = reset flag — cheap on-device profiling odometer (gobuildtest)
+const SYS_PROF_HIST     = 54; // DIAGNOSTIC (temporary): a0 = out buf (512 bytes = 64 LE u64, indexed by syscall number), a1 = reset flag — the `synhist` builtin, chasing the go-build syscall storm
 
 // Per-process SYS_MAP ceiling: the bump pointer can't grow more than this
 // past USER_BASE. Board-specific (board::HEAP_MAX_BYTES): 16 MiB on the
@@ -2377,6 +2378,7 @@ fn void sys_ns_mount_wait(Trap_frame* f) @noinline
 
 fn void handle_syscall(Trap_frame* f) @noinline
 {
+	g_prof_syscall_hist[f.a3 & 63]++; // DIAGNOSTIC — see g_prof_syscall_hist, SYS_PROF_HIST
 	switch (f.a3)
 	{
 		case SYS_PUTCHAR:
@@ -2481,6 +2483,19 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				g_prof_ipc_ticks = 0;
 				g_prof_yields = 0;
 				g_prof_switches = 0;
+			}
+			f.a0 = 0;
+		case SYS_PROF_HIST:
+			ulong* hist_out = (ulong*)(uptr)f.a0;
+			if (!user_range_valid(current_proc.page_table, (uptr)hist_out, 512, true))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			for (int hi = 0; hi < 64; hi++)
+			{
+				hist_out[hi] = g_prof_syscall_hist[hi];
+				if (f.a1 != 0) g_prof_syscall_hist[hi] = 0;
 			}
 			f.a0 = 0;
 		case SYS_DISKD_INFO:

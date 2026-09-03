@@ -1529,6 +1529,12 @@ ulong g_prof_ipc_ticks = 0;  // `time` CSR ticks spent inside SYS_IPC_CALL — S
 ulong g_prof_yields    = 0;  // yield() calls
 ulong g_prof_switches  = 0;  // real context switches (yield picked a different proc)
 
+// DIAGNOSTIC (temporary): per-syscall-number histogram, all processes.
+// One indexed increment per ecall — a few % overhead at 348M/run, kept
+// only long enough to attribute the `go build` syscall storm (memory
+// racccoon_gobuild_profile), then removed with SYS_PROF_HIST.
+ulong[64] g_prof_syscall_hist;
+
 fn void yield() @noinline
 {
 	g_prof_yields++;

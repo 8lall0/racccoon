@@ -872,6 +872,38 @@ fn void main() {
                 }
                 putchar('\n');
             }
+        } else if (strcmp(cmd, "synhist") == 0) {
+            // DIAGNOSTIC (temporary): per-syscall-number histogram over a
+            // ~5 s window while the shell just yields — catches a
+            // background spinner (netd link-poll, a server busy-wait).
+            // `synhist go` also wraps gostage2test to catch a Go-runtime
+            // spin. Chasing the go-build syscall storm.
+            ulong[64] sh_a @noinit; ulong[64] sh_b @noinit;
+            bool sh_go = (cmd_argc > 0 && strcmp(cmd_argv[0], "go") == 0);
+            prof_hist(&sh_a[0], 1);   // reset — the kernel histogram is now 0
+            ulong sh_hz = timebase_hz();
+            ulong sh_t0 = rdtime();
+            if (sh_go) {
+                char*[1] sh_av; sh_av[0] = "x";
+                uint sh_g = 0; int sh_c = rfork(RFPROC, &sh_g);
+                if (sh_c == 0) { exec("bin/go-gostage2", exec_buf(), exec_buf_max(), 0, &sh_av[0], 1); exitcode(127); }
+                join(sh_c, sh_g);
+            } else {
+                ulong sh_win = sh_hz * 5;
+                while (rdtime() - sh_t0 < sh_win) { yield(); }
+            }
+            ulong sh_wall = rdtime() - sh_t0;
+            prof_hist(&sh_b[0], 0);   // sh_b IS the window's counts (reset above)
+            print("synhist: window ");
+            print_uint((uint)(sh_hz > 0 ? sh_wall / sh_hz : 0)); print("s\n");
+            for (int sv = 0; sv < 64; sv++) {
+                ulong sd = sh_b[sv];
+                if (sd == 0) continue;
+                ulong rate = (sh_wall > 0 && sh_hz > 0) ? (sd * sh_hz) / sh_wall : 0;
+                print("  sys "); print_uint((uint)sv); print(": ");
+                print_uint((uint)(sd / 1000)); print("k  (");
+                print_uint((uint)(rate / 1000)); print("k/s)\n");
+            }
         } else if (strcmp(cmd, "hardentest") == 0) {
             // Regression guard for src/page.c3's user_range_valid() and
             // its call sites in src/entry.c3: proves a syscall given a
