@@ -223,8 +223,12 @@ fn int shell_glob_into(char* pat, char* names, int* nb, int nb_cap, char** words
         if (base[0] == 0) { return 0; }
     }
 
-    char[576] lb @noinit;           // FS_LIST_ENTRY_SIZE (36) * 16
-    int cnt = fs_list(&dir[0], &lb[0], 16);
+    // FS_LIST_ENTRY_SIZE (36) * N. fs_list() pages fsd internally, so N
+    // just caps how many matches one glob can yield — 16 was too few
+    // (`tcc /src/*.c` on a 19-file dir silently dropped 3). 64 * 36 =
+    // 2304 B on the stack, still modest.
+    char[36 * 64] lb @noinit;
+    int cnt = fs_list(&dir[0], &lb[0], 64);
     if (cnt < 0) { return 0; }
 
     int matched = 0;
