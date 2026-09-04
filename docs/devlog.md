@@ -4,6 +4,57 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-04 — the self-host chain runs in QEMU: tcc *on racccoon* compiles c3c output
+
+Two things: fix `scripts/build.sh` (broken), then close the biggest open
+gap in the self-hosting arc.
+
+**`build.sh` was dead** at `scripts/build_tcc.sh` — `tcc.h:46: fatal
+error: dlfcn.h: No such file or directory`. Cause: an earlier
+`./configure` run in `third_party/tinycc` (done for the host cross-tcc
+build) had left a `config.h` / `config.mak` in the tree; `#include
+"config.h"` from `tcc.h` picks up the *submodule* one before
+`lib/tcc/config.h` (via `-I`), and the configure-generated one has no
+`CONFIG_TCC_STATIC` → `<dlfcn.h>` pulled in under `-nostdinc`. Fix:
+`git -C third_party/tinycc clean -fdX` (the configure artifacts are all
+`.gitignore`d), keep the host `riscv64-tcc` binary as `build/riscv64-tcc`.
+Also: `build.sh`'s post-seed submodule revert only un-did `riscv64-link.c`;
+`lib/tcc/racccoon.patch` grew `riscv64-asm.c` hunks, so it now reverses
+the whole patch (`b870d5d`). `build.sh` runs end-to-end again.
+
+**Then: `tcc` running *on racccoon* compiles the c3c `--backend=c`
+output.** `scripts/build_tcc.sh` → `build/tcc/tcc.bin` (the on-device
+compiler, 651 KB) + `/src/tcc/` (self-host source subset), seeded onto
+`build/disk_ext2.img` by `seed_tcc.sh`. Seeded a few c3c-emitted kernel
+`.c` files next to it and, from the racccoon shell in QEMU (`-m 2G`):
+
+```
+root / # tcc -c /src/sbi.c -o /tmp/sbi.o          → 13097 B rv64 .o
+root / # tcc -c /src/compiler_rt.c -o /tmp/crt.o  → 130953 B rv64 .o   (235 KB source, the biggest module)
+root / # tcc -c /src/libc.c -o /tmp/libc.o        → 19924 B rv64 .o
+```
+
+Every one is a valid `ELF 64-bit LSB relocatable, UCB RISC-V,
+double-float ABI`, same object size as the host `riscv64-tcc` produces,
+and `compiler_rt.o`'s `.text` is **byte-identical** host vs on-device (the
+header bytes differ trivially — section ordering / `.comment`). So:
+
+```
+C3 ─c3c --backend=c─▶ .c ─[ tcc ON RACCCOON ]─▶ valid rv64 .o     ✓  in QEMU
+```
+
+The `%d`-family, i128-struct, freestanding-prelude, rv64-atomic-asm,
+`@naked`→file-scope-asm and asm-string-fixup codegen from the earlier
+tcc entry all survive being compiled by the racccoon-hosted tcc, not just
+the host one.
+
+**Left:** on-device *link* (tcc's integrated linker vs `kernel.ld`'s
+layout), all 19 modules + link in one racccoon session (RAM), and the
+actual JH7110 / Orange Pi RV board. c3c itself on-device is the other
+half.
+
+---
+
 ## 2026-09-04 — real Duo: `sdd` was left behind by the IPC-rings protocol change
 
 Flashed a fresh production kernel (LLVM backend, master `bb4ab18`) to a
