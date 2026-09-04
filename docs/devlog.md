@@ -4,6 +4,90 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-04 — bug 3 isolated: SYS_EXIT hangs after ~300+ fopen/fread cycles, nothing to do with c3c or tcc
+
+Continuation of the c3c-stdlib-seed session. Left off with c3c's
+`compare_fps()` hitting `UNREACHABLE` during real stdlib sema, followed
+by a silent 100%-CPU hang instead of a clean `error_exit`. Set out to
+find out whether that's a tcc-codegen bug or something else.
+
+**`compare_fps` itself is not the bug.** Disassembled `build/riscv64-tcc`'s
+codegen for a standalone repro matching the real `BinaryOp` enum values
+(18–23 for GT..EQ) and function shape exactly — the 6-way switch dispatch
+is bit-for-bit correct (`riscv64-unknown-elf-objdump` walkthrough:
+op=18→GT, 19→GE, 20→LT, 21→LE, 22→NE, 23→EQ, default→sentinel, all
+correct). So `compare_fps` really is being called with a bad `BinaryOp`
+from somewhere in real c3c code — a separate, unconfirmed bug — but that's
+not what makes the process hang.
+
+**The hang is not `longjmp` either.** Dropped `fprintf(stderr,...)`
+checkpoints (temporary, not committed) into c3c's `main_real()`/
+`cleanup()`/`exit_compiler()`. Every one fired in order:
+`exit_compiler` → `longjmp` → `setjmp` returns nonzero → `cleanup()`
+(`symtab_destroy` + `memory_release`, both complete) → `main_real`
+returns 1 → back through `__libc_start`'s `exit(1)`. c3c's own code
+runs to completion, cleanly, every time. Then: 99% CPU, forever, no
+further output — after c3c has already returned control to the libc
+runtime. So the hang is downstream of *libc's* `exit()`/`_exit()`, in
+the kernel's `SYS_EXIT` path (`sys_exit`/`proc_destroy`, `src/entry.c3`) —
+nothing to do with c3c or tcc at all.
+
+**Reproduced without c3c or tcc.** Wrote a battery of `test/c-src/*.c`
+racccoon-libc programs (built with the normal `riscv64-unknown-elf-gcc` +
+`crt0.o` toolchain, `lib/racccoon-libc/build.sh` auto-discovers them) to
+isolate the trigger:
+
+| test | what it does | result |
+|---|---|---|
+| `hogtest` | mmap+touch 150 MiB, exit | clean |
+| `spamtest` | 80,000 `printf` lines, exit | clean |
+| `openspam` | `fopen`+`fread`+`fclose` the *same* file 400x | clean |
+| `dirspam` | `opendir`/`readdir`/`closedir` on 40 distinct dirs, 10 passes (400 calls), no file reads | clean |
+| `flatfilespam` | `fopen`+`fread`+`fclose` 28 distinct files, one directory, no recursion | clean |
+| `recursespam` | recursive dir walk, `fopen`+`fclose` 337 distinct files, **no `fread`** | clean |
+| `fsspam` | recursive dir walk, `fopen`+`fread`+`fclose` 337 distinct files (the real `/c3/std` tree) | **hangs on exit** |
+| `iterfilespam` | same as `fsspam` but iterative (flat double loop, no C-level recursion) | **hangs on exit**, at 327 files |
+| `capfilespam` (`-DCAP=N`) | same iterative walk, stops after N files | **315: clean. 327: hangs.** Threshold is in (315, 327]. |
+
+So: not memory footprint, not console volume, not many opens of one
+file, not many `opendir()`s without reads, not <=~300 fopen+fread
+cycles, not recursion by itself (`recursespam` — same 337-file
+recursive walk, open+close only — is clean). It's specifically **actual
+file *reads* (`fread`, i.e. `FS_READ_AT` IPC round trips) at volume,
+somewhere between 315 and 327 of them in one process's lifetime**, that
+leaves something in a state where `SYS_EXIT` never returns control —
+every case above prints its own "done, exiting" line, then goes
+completely silent, pegged at ~99% CPU, matching bug 3's original
+signature exactly.
+
+**Not root-caused.** Candidates not yet checked: `proc_destroy`'s
+three-level page-table walk (`src/entry.c3`) doesn't look pathological
+by inspection (bounded by populated PTEs, and `hogtest` proves large
+*memory* footprints alone are fine) — the read-count correlation points
+somewhere else, maybe in `fsd`'s own per-request state (`user/fs/fsd.c3`)
+or the IPC layer, not necessarily in the exiting process's own teardown
+at all. Needs either a QEMU GDB stub (`-gdb tcp::1234 -S`, not the
+`mon:stdio`-merged setup this session used) to catch the guest mid-spin,
+or `fprintf(stderr,...)`-style checkpoints dropped directly into
+`sys_exit`/`proc_destroy`/`fsd`'s message loop — the same technique that
+worked for isolating this from c3c.
+
+**Files added (kept — they're a precise, minimal, reusable repro
+matrix, not throwaway):** `test/c-src/{hogtest,spamtest,openspam,
+dirspam,flatfilespam,recursespam,fsspam,iterfilespam,capfilespam}.c`.
+`capfilespam`'s threshold constant (`CAP`, default 150) needs
+`-DCAP=N` at build time to retest a specific N — not wired into
+`lib/racccoon-libc/build.sh`'s test-program loop, built by hand this
+session (see this entry's own shell history for the exact `gcc`/`ld.lld`
+invocation).
+
+**Next:** find the actual root cause, now that it's this well bounded —
+this blocks the c3c self-host arc (`c3c` can't parse the real stdlib
+without reading 315+ files) independent of anything c3c- or
+tcc-specific.
+
+---
+
 ## 2026-09-04 — c3c-on-device + the c3 stdlib: a 256 KiB stack, a missing hex-float parser, and a real tcc-codegen bug
 
 Step 1 of the c3c self-host arc's next phase: get on-device `c3c` to
