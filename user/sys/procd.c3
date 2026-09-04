@@ -81,7 +81,21 @@ fn void main() {
         uint from_gen = 0;
         int from = ipc_recv_type_gen(&buf, FS_MSG_MAX, &verb, &from_gen);
         if (from <= 0) continue;
-        if (verb != FS_READ && verb != FS_LIST && verb != FS_WRITE) continue;
+        if (verb != FS_READ && verb != FS_LIST && verb != FS_WRITE)
+        {
+            // Any other fs verb (FS_STAT, FS_DELETE, FS_MKDIR, FS_RENAME,
+            // the *_AT verbs, FS_CHMOD/CHOWN): /proc doesn't implement it,
+            // but we MUST still reply — a bare `continue` here left the
+            // caller's SYS_IPC_CALL blocked forever. That hung any
+            // stat()/access() of a /proc path: e.g. a ported tool
+            // (c3c's find_executable_path) walking /proc/self/exe.
+            // -1 in the result field is what every fs client reads as
+            // "nothing resolves there" / ENOENT.
+            int* rf = (int*)&buf;
+            *rf = -1;
+            ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
+            continue;
+        }
 
         char[100] path @noinit;
         mem::copy(&path, &buf, 100);

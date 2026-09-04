@@ -102,6 +102,17 @@ int fflush(FILE *f)
 	return flush_write(f);
 }
 
+/* Called by exit() (src/exit.c) after the atexit handlers. Without this
+ * a program that ends by returning from main() — or by calling exit() —
+ * loses whatever is still sitting in stdout's line buffer (a final
+ * write with no trailing '\n', or a fully-buffered stream). _exit()
+ * still skips it, by design. */
+void __libc_stdio_exit_flush(void)
+{
+	flush_write(&_stdout);
+	flush_write(&_stderr);
+}
+
 static int parse_mode(const char *mode, int *rd, int *wr, int *append, int *trunc)
 {
 	*rd = *wr = *append = *trunc = 0;

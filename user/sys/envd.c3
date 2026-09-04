@@ -181,7 +181,20 @@ fn void main() {
         uint from_gen = 0;
         int from = ipc_recv_type_gen(&buf, FS_MSG_MAX, &verb, &from_gen);
         if (from <= 0) continue;
-        if (verb != FS_READ && verb != FS_WRITE && verb != FS_LIST && verb != FS_DELETE) continue;
+        if (verb != FS_READ && verb != FS_WRITE && verb != FS_WRITE_AT && verb != FS_LIST && verb != FS_DELETE)
+        {
+            // Any other fs verb (FS_STAT above all, plus FS_MKDIR /
+            // FS_RENAME / FS_READ_AT / FS_CHMOD/CHOWN): /env doesn't
+            // implement it, but we MUST still reply or the caller's
+            // SYS_IPC_CALL blocks forever. A bare `continue` here hung
+            // stat()/access() of any /env path — hit by ported tools
+            // that scan the cwd (c3c's resolve_libraries stats every
+            // entry in "/"). -1 reads as "nothing resolves there".
+            int* rf = (int*)&buf;
+            *rf = -1;
+            ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
+            continue;
+        }
 
         env_maybe_inherit(from, from_gen);
 
@@ -235,6 +248,51 @@ fn void main() {
                 for (uint j = 0; j < write_len; j++) env_table[idx].value[j] = buf[104 + j];
                 env_table[idx].value[write_len] = 0;
                 *result_field = (int)write_len;
+            }
+            ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
+            continue;
+        }
+
+        if (verb == FS_WRITE_AT)
+        {
+            // Offset-aware write. Env values are tiny (ENV_VALUE_MAX),
+            // so this only really matters for offset 0 — that's the
+            // `echo x > /env/NAME` path (the shell's `>` redirect first
+            // does an FS_WRITE(len 0) to create, then streams the data
+            // with FS_WRITE_AT). offset 0 == overwrite; a later chunk
+            // past the value cap is clamped away, not an error.
+            uint w_len = *(uint*)&buf[100];
+            uint w_off = *(uint*)&buf[104];
+            int* wa_result = (int*)&buf;
+
+            int idx = -1;
+            if (path[0] != '.')
+            {
+                idx = env_find(from, from_gen, &path);
+                if (idx < 0 && w_off == 0) idx = env_find_free_or_reclaim();
+            }
+            if (idx < 0)
+            {
+                *wa_result = -1;
+            }
+            else
+            {
+                if (w_off == 0)
+                {
+                    env_table[idx].pid = from;
+                    env_table[idx].generation = from_gen;
+                    env_copy_name(&env_table[idx].name, &path);
+                }
+                uint wrote = 0;
+                for (uint j = 0; j < w_len && w_off + j < ENV_VALUE_MAX - 1; j++)
+                {
+                    env_table[idx].value[w_off + j] = buf[108 + j];
+                    wrote++;
+                }
+                if (w_off + wrote > 0) env_table[idx].value[w_off + wrote] = 0;
+                // Report the whole request as written even when the tail
+                // was clamped, so the shell's `>` pump doesn't error out.
+                *wa_result = (int)w_len;
             }
             ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
             continue;

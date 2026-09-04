@@ -25,6 +25,7 @@
 #include <racccoon/syscall.h>
 
 int main(int argc, char **argv, char **envp);
+__attribute__((noreturn)) void exit(int code);   /* src/exit.c — atexit + stdio flush */
 
 #ifndef LIBC_ARGV_MAX
 #define LIBC_ARGV_MAX 64
@@ -75,7 +76,7 @@ __attribute__((used, noreturn)) void __libc_start(int argc, char *blob)
 			libc_envp[e] = 0;
 		}
 
-		_exit(main(n, libc_argv, environ));
+		exit(main(n, libc_argv, environ));
 	}
 
 	if (n == 0) {
@@ -83,7 +84,7 @@ __attribute__((used, noreturn)) void __libc_start(int argc, char *blob)
 		 * is never NULL. */
 		libc_argv[0] = libc_argv0;
 		libc_argv[1] = 0;
-		_exit(main(1, libc_argv, environ));
+		exit(main(1, libc_argv, environ));
 	}
 
 	/* Blob string 0 is argv[0] (the program path); the rest are the
@@ -95,5 +96,5 @@ __attribute__((used, noreturn)) void __libc_start(int argc, char *blob)
 	}
 	libc_argv[n] = 0;
 
-	_exit(main(n, libc_argv, environ));
+	exit(main(n, libc_argv, environ));
 }

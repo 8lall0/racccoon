@@ -4,6 +4,82 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-04 — `c3c` itself runs on racccoon: `C3 → c3c(on device) → .c → tcc(on device) → .o`
+
+The other half of the self-host chain. Last session got *tcc* running on
+racccoon compiling c3c's C-backend output; this session gets **`c3c`
+itself** running on racccoon, so the whole `C3 → C → object` path happens
+on the device with no host compiler involved.
+
+`/bin/c3c` is the non-LLVM c3c (C backend) cross-built with
+`build/riscv64-tcc` against `racccoon-libc` — 85 of 92 `.c` compile (the 7
+that don't are all network / SDK / xz stubs already covered by
+`rc_c3c_stubs.c`), linked with the gcc-built `crt1.o` (tcc mis-emits a
+prologue for the `naked` `_start`) + `libtcc1.a`. `-DC3_SMALL_ARENAS=64`
+keeps the arena `mmap` reservations (5 × `START_VMEM_SIZE` + the two in
+`memory_init`) under racccoon's 512 MiB `SYS_MAP` ceiling.
+
+`c3c --version` / `--help` already worked. `c3c compile` did not — it
+**hung with no output** right after `-- INFO: Version`. Four separate
+bugs, peeled one at a time:
+
+1. **`stat("/proc/…")` hangs forever.** `c3c`'s `find_executable_path()`
+   does `realpath("/proc/self/exe")` → `stat`. racccoon's `/proc` is a
+   real synthetic-FS server (`user/sys/procd.c3`) — but its main loop was
+   `if (verb != FS_READ && verb != FS_LIST && verb != FS_WRITE) continue;`,
+   i.e. it *silently dropped* `FS_STAT` (and `FS_DELETE`, `FS_MKDIR`, the
+   `*_AT` verbs…). The client's `SYS_IPC_CALL` then blocks with no
+   reply, forever. `user/sys/envd.c3` (`/env`) had the identical bug.
+   Fix: both servers now reply `-1` ("nothing resolves there") to any
+   verb they don't implement instead of `continue`. A `stat()`/`access()`
+   of a `/proc` or `/env` path returns `ENOENT` cleanly now. While there,
+   gave `envd` a real `FS_WRITE_AT` handler (offset 0 = overwrite, tail
+   past `ENV_VALUE_MAX` clamped) so `echo x > /env/NAME` works — the
+   shell's `>` redirect streams the data with `FS_WRITE_AT`, which envd
+   used to drop (→ hang, then after this fix → a clean "write failed").
+2. **`c3c` aborts when it can't find its own path.** With `/proc/self/exe`
+   unresolvable, `get_executable_path_raw()` called `error_exit()`.
+   Patched the fork's `whereami.c` (`-DC3_NO_PROC_SELF_EXE`): on a
+   freestanding host it returns `""` and lets `find_lib_dir()` fall back
+   to `$C3C_LIB` / `--stdlib` (and with `--use-stdlib=no`, nothing at
+   all).
+3. **`c3c`'s error messages were invisible.** racccoon's `__libc_start`
+   did `_exit(main(...))` — no stdio flush — so anything still in
+   stdout's line buffer (and every fully-buffered stream) was lost on a
+   normal `return` from `main`. `stderr` is unbuffered so *some*
+   diagnostics got through, which is what made this so confusing.
+   `libc_start.c` now calls `exit()`, which runs the `atexit` handlers
+   and then `__libc_stdio_exit_flush()` (new, `src/stdio.c`). `_exit()`
+   still skips the flush, by design.
+4. **`Unable to detect the default target`.** Once the output was
+   visible, the actual error. c3c's `builder.c` picks `default_target`
+   from `#elif defined(__riscv64)` — a macro **tcc doesn't define** (it
+   sets `__riscv` + `__riscv_xlen == 64`, the standard spelling). Fell
+   through to `ARCH_OS_TARGET_DEFAULT` → the error. Fixed the guard to
+   also accept `__riscv && __riscv_xlen == N`, and — since tcc also
+   (falsely) predefines `__linux__` — pick `ELF_RISCV64` (what `c3c build
+   racccoon` uses) rather than `LINUX_RISCV64` when `C3_NO_PROC_SELF_EXE`
+   marks the freestanding host.
+
+**End state**, from the QEMU shell (`-m 2G`):
+
+```
+root / # c3c compile --backend=c --use-stdlib=no --no-entry /h1.c3
+C backend: emitted .c files (no link step yet).
+root / # tcc -c /h1.c -o /h1.o && echo CHAIN_OK
+CHAIN_OK
+```
+
+`/h1.c` is byte-identical to what the host `c3c` emits for the same
+input. Next: scale past a toy `add(2,3)` — compile a real kernel module
+on-device, then the whole kernel, then link it with the `--kernel-image`
+tcc flag from last session.
+
+**racccoon files changed:** `user/sys/procd.c3`, `user/sys/envd.c3`,
+`lib/racccoon-libc/src/{stdio,exit,libc_start}.c`.
+**c3c fork (`feat-racccoon-support`):** `src/utils/whereami.c`,
+`src/build/builder.c`.
+
 ## 2026-09-04 — the self-host chain runs in QEMU: tcc *on racccoon* compiles c3c output
 
 Two things: fix `scripts/build.sh` (broken), then close the biggest open
