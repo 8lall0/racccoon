@@ -37,6 +37,7 @@ double floor(double x);
 double trunc(double x);
 double fmod(double x, double y);
 double log10(double x);
+double round(double x);
 double nan(const char *tag);
 
 #endif

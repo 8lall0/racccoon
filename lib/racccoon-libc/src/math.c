@@ -59,6 +59,15 @@ double trunc(double x) { return (double)(long long)x; }
 double floor(double x) { double t = trunc(x); return (t > x) ? t - 1.0 : t; }
 double ceil(double x)  { double t = trunc(x); return (t < x) ? t + 1.0 : t; }
 double fmod(double x, double y) { if (y == 0.0) return __rc_nan(""); return x - trunc(x / y) * y; }
+/* round-half-away-from-zero, C99 round(). Needed by c3c's own
+ * diagnostics.c (round(log10(...))) — 2026-09-05, the 0.8.3-rebase. */
+double round(double x)
+{
+	double t = trunc(x);
+	double frac = x - t;
+	if (x >= 0.0) return frac >= 0.5 ? t + 1.0 : t;
+	return frac <= -0.5 ? t - 1.0 : t;
+}
 
 /* log10 via a crude series — c3c only needs it for diagnostics-ish
  * float formatting; precision isn't load-bearing. */

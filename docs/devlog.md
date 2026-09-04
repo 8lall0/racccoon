@@ -4,6 +4,74 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — c3c fork rebased onto v0.8.3 stable (was 0.8.4-pre)
+
+User caught it: `c3c --version` had been reporting `0.8.4 (Pre-release)`
+all along — the racccoon C-backend work sat on the fork's `master`,
+which tracks upstream c3lang/c3c's own dev branch, not a release tag.
+Not a deliberate choice, just which branch existed when the racccoon
+work started. Asked to rebase onto `v0.8.3` (the last stable tag —
+also what the system's pre-installed `/usr/bin/c3c` LLVM build already
+is, commit `1d155ee04`, confirming that pick).
+
+**Turned out simpler than it looked.** `git log --first-parent` from
+`v0.8.3` to the fork tip showed only ONE non-c-backend commit sits
+between them (`d53f16182`, "initial support for racccoon" — its parent
+*is* `v0.8.3` exactly) before a single merge commit
+(`b830f5359`, "Merge branch 'master' into feat-racccoon-support")
+pulled in ~61 unrelated upstream commits and bumped the version string
+to 0.8.4-pre. `git show` on that merge showed zero manual
+conflict-resolution content — a clean union, nothing racccoon-specific
+baked into it. So: skip the merge, cherry-pick the 35 first-parent
+c-backend commits from `d53f16182`'s child straight onto `v0.8.3`.
+
+34 of 35 applied clean (`c_codegen.c` is a file only the fork touches,
+so most hunks just match by context). One real conflict, in an early
+step's version of the function-pointer-typedef codegen
+(`c_codegen.c`) that a later commit rewrote anyway — took the later
+(correct) version. One textual-only conflict in `CMakeLists.txt`
+(v0.8.3's own `-Wall`/`-Werror` list differs from what upstream had by
+the time the racccoon fix was written) — kept v0.8.3's own base flags,
+dropped `-Werror` from the unconditional list same as the original fix
+intended.
+
+**One new build break surfaced**: `src/compiler/diagnostics.c` calls
+`round()`, unreached by any earlier racccoon build but real on v0.8.3.
+racccoon-libc had no `round()` at all. Added one (round-half-away-from-
+zero via `trunc`) to `lib/racccoon-libc/src/math.c` + `math.h`.
+
+**Verified the rebase changed nothing functionally**: native
+`--backend=c` output for `h1.c3` is byte-identical to the 0.8.4-based
+build's. The full kernel (`c3c build racccoon --backend=c --no-entry
+--safe=no` → 19 `.c` → rv64 gcc → `ld.lld`) builds and **boots to a
+working shell**, same as before. On-device: `c3c --version` correctly
+reports `0.8.3`; `h1.c3` compiles clean; the real-stdlib compile
+(`stdtest.c3` against a **freshly reseeded 0.8.3-matched** `/c3/std` —
+the previously-seeded tree was the 0.8.4 stdlib and hit an unrelated
+parse error on `excuse { }` syntax 0.8.3's parser doesn't have,
+`faultdef` being the 0.8.3 spelling) still hits the exact same
+`compare_fps()` `UNREACHABLE` at `number.c:51`, exiting cleanly with
+status 1 — **confirms that bug is not an 0.8.4-dev-only regression, it
+reproduces identically on stable 0.8.3.**
+
+**What this does *not* touch**: racccoon's normal kernel build
+(`scripts/build.sh`, LLVM backend) was never on 0.8.4 — it already used
+the system `/usr/bin/c3c`, which is 0.8.3. This rebase only affects the
+experimental non-LLVM C-backend self-hosting arc.
+
+**Branch bookkeeping** (fork repo, `/home/blallo/Workspace/c3c`, all
+local — not pushed, user pushes c3c): `feat-racccoon-support` now
+*is* the rebased, 0.8.3-based branch (tip `04866ba92`). The old
+0.8.4-based history is kept at `feat-racccoon-support-084-legacy` for
+reference. **Pushing this to origin will need `--force`** — it's a
+different commit graph, not a fast-forward of what's currently on
+`origin/feat-racccoon-support`.
+
+**Files changed (racccoon):** `lib/racccoon-libc/src/math.c`,
+`lib/racccoon-libc/include/math.h` (`round()`).
+
+---
+
 ## 2026-09-05 — retraction: "bug 3" was this session's own QEMU processes fighting each other, not a kernel bug
 
 Correcting the previous entry ("bug 3 isolated: SYS_EXIT hangs after
