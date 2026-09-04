@@ -528,9 +528,12 @@ STUB
   echo "==> Done: build/kernel.elf"
 
   # build_tcc.sh applied lib/tcc/racccoon.patch to the submodule in place
-  # (seed_tcc.sh needs the patched riscv64-link.c on the images). Revert
-  # it now that seeding is done, so `git status` stays clean.
+  # (seed_tcc.sh needs the patched riscv64-link.c / riscv64-asm.c on the
+  # images). Revert the whole patch now that seeding is done, so
+  # `git status` stays clean.
   if [ -e third_party/tinycc/.git ]; then
-    git -C third_party/tinycc checkout -- riscv64-link.c 2>/dev/null || true
+    git -C third_party/tinycc apply --reverse "$(pwd)/lib/tcc/racccoon.patch" 2>/dev/null \
+      || git -C third_party/tinycc checkout -- riscv64-link.c riscv64-asm.c 2>/dev/null \
+      || true
   fi
 )
