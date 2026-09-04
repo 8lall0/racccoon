@@ -11,3 +11,106 @@ index 48ae785c..46f86eb0 100644
  #define ELF_PAGE_SIZE 0x1000
  
  #define PCRELATIVE_DLLPLT 1
+diff --git a/riscv64-asm.c b/riscv64-asm.c
+index b35615fc..245fbc17 100644
+--- a/riscv64-asm.c
++++ b/riscv64-asm.c
+@@ -208,31 +208,25 @@ static void parse_operand(TCCState *s1, Operand *op)
+     if (!op->e.sym) {
+         if ((int) op->e.v >= -0x1000 && (int) op->e.v < 0x1000)
+             op->type = OP_IM12S;
+-    } else if (op->e.sym->type.t & (VT_EXTERN | VT_STATIC)) {
+-        /* see also: "RISC-V ABIs Specification" V1.0
+-
+-           section 5.2 recommends using a GOT for
+-           "possibly-undefined weak symbols"
++    } else {
++        /* A symbol operand (la/li/branch/jump target).  see also:
++           "RISC-V ABIs Specification" V1.0 sections 5.2 / 5.3.
+ 
+-           section 5.3: "Medium position independent code model"
+-           if this is a non-local symbol: use a GOT
+-           non-local: outside of a pc-relative +- 2 GiB range
+-        */
++           A possibly-undefined extern (weak) symbol goes through the GOT;
++           anything defined in this object -- static OR a plain global,
++           including a defined function -- is reached PC-relative.  (The
++           stock code rejected a defined non-static global with
++           "operand expected".) */
+ 
+         label.type.t = VT_VOID | VT_STATIC;
+ 
+-        /* use the medium PIC model: GOT, auipc, lw */
+-        if (op->e.sym->type.t & VT_STATIC)
+-            greloca(cur_text_section, op->e.sym, ind, R_RISCV_PCREL_HI20, 0);
+-        else
+-            greloca(cur_text_section, op->e.sym, ind, R_RISCV_GOT_HI20, 0);
++        /* -static kernel: no GOT, everything is reached PC-relative. */
++        greloca(cur_text_section, op->e.sym, ind, R_RISCV_PCREL_HI20, 0);
+         put_extern_sym(&label, cur_text_section, ind, 0);
+         greloca(cur_text_section, &label, ind+4, R_RISCV_PCREL_LO12_I, 0);
+ 
+         op->type = OP_IM12S;
+         op->e.v = 0;
+-    } else {
+-        expect("operand");
+     }
+ }
+ 
+@@ -246,13 +240,11 @@ static void parse_branch_offset_operand(TCCState *s1, Operand *op){
+     if (!op->e.sym) {
+         if ((int) op->e.v >= -0x1000 && (int) op->e.v < 0x1000)
+             op->type = OP_IM12S;
+-    } else if (op->e.sym->type.t & (VT_EXTERN | VT_STATIC)) {
+-        /* For extern/static symbols, always use far-branch expansion
+-           since linker relaxation (R_RISCV_RELAX) is not implemented. */
++    } else {
++        /* Any symbol (extern/static/defined global): far-branch expansion,
++           linker relaxation (R_RISCV_RELAX) is not implemented. */
+         op->type = OP_IM32;
+         op->e.v = 0;
+-    } else {
+-        expect("operand");
+     }
+ }
+ 
+@@ -266,12 +258,10 @@ static void parse_jump_offset_operand(TCCState *s1, Operand *op){
+     if (!op->e.sym) {
+         if ((int) op->e.v >= -0x1000 && (int) op->e.v < 0x1000)
+             op->type = OP_IM12S;
+-    } else if (op->e.sym->type.t & (VT_EXTERN | VT_STATIC)) {
++    } else {
+         greloca(cur_text_section, op->e.sym, ind, R_RISCV_JAL, 0);
+         op->type = OP_IM12S;
+         op->e.v = 0;
+-    } else {
+-        expect("operand");
+     }
+ }
+ 
+@@ -424,8 +414,9 @@ static void asm_unary_opcode(TCCState *s1, int token)
+         /* auipc ra, 0 */
+         greloca(cur_text_section, op.e.sym, ind, R_RISCV_CALL, 0);
+         asm_emit_opcode(3 | (5 << 2) | ENCODE_RD(1));
+-        /* jalr zero, 0(ra) */
+-        asm_emit_opcode(0x67 | (0 << 12) | ENCODE_RS1(1));
++        /* jalr ra, 0(ra)  -- link! (stock tcc emitted `jalr zero`, so a
++           called routine's `ret` jumped back to the auipc's scratch value) */
++        asm_emit_opcode(0x67 | (0 << 12) | ENCODE_RD(1) | ENCODE_RS1(1));
+         return;
+     case TOK_ASM_tail:
+         /* auipc x6, 0 */
+@@ -619,11 +610,8 @@ static void asm_binary_opcode(TCCState* s1, int token)
+     /* pseudoinstructions */
+     /* rd, sym */
+     case TOK_ASM_la:
+-        /* auipc rd, 0 */
+-        asm_emit_u(token, 3 | (5 << 2), ops, ops + 1);
+-        /* lw rd, rd, 0 */
+-        asm_emit_i(token, 3 | (2 << 12), ops, ops, ops + 1);
+-        return;
++        /* -static / -nostdlib: no GOT, so `la` is `lla` (auipc+addi, a
++           direct PC-relative address) rather than the GOT load `auipc+lw`. */
+     case TOK_ASM_lla:
+         /* auipc rd, 0 */
+         asm_emit_u(token, 3 | (5 << 2), ops, ops + 1);

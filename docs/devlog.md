@@ -4,6 +4,247 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-04 — real Duo: `sdd` was left behind by the IPC-rings protocol change
+
+Flashed a fresh production kernel (LLVM backend, master `bb4ab18`) to a
+Milk-V Duo SD card and it **hung after `sdd`/`ethd`/`usbd`/`gpiod` init,
+no shell** — no `fsd:` output at all. First-boot symptom looked like ethd
+("link down, stuck here") but ethd was fine (yielding poll loop); the real
+hang was `fsd` blocked forever on its first storage read.
+
+**Root cause.** The IPC-rings commits (`07de755` 8 KiB messages +
+multi-sector, `7a17270` shared payload arena, `3dac29c` SYS_DRIVER_IRQ_WAIT)
+reworked the `fsd ↔ storage-driver` wire protocol and updated `diskd.c3`
+(QEMU virtio-blk) + `fsd.c3` + `ext2.c3` — **but not `user/block/sdd.c3`**,
+the Duo's real SD driver, untouched since August. On the Duo:
+`setup_fsd_mappings` mapped the shared arena to `fsd` *unconditionally* and
+set `disk_arena_fsd_pid`, so `SYS_DISK_ARENA_INFO` succeeded → `fsd` set
+`g_arena_ok = true` → every read went out as `DISKD_READ_ARENA` (verb 213)
+→ `sdd`'s loop (`if (verb != DISKD_READ && verb != DISKD_WRITE) continue;`)
+**silently dropped it, never replied** → `fsd`'s `p9_call` blocked forever
+→ ext2 never mounted → shell blocked on `fsd`.
+
+**Fix** (2 files):
+- `src/process.c3` `setup_fsd_mappings` — only `map_disk_arena` when
+  `board::HAS_VIRTIO_BLOCK`. The arena is a virtio-blk optimization; `sdd`
+  has none (`setup_sdd_mappings` never maps one), so handing `fsd` an arena
+  on the Duo just makes it emit verbs `sdd` can't answer.
+- `user/block/sdd.c3` — `DISKD_MSG_MAX` 516 → 8192 (match diskd/fsd);
+  implement `DISKD_READ_MULTI` (loop `count` single-sector `sdd_block_rw`s
+  into `buf[4..]`); and **always reply** — an unknown verb now gets a
+  `DISKD_UNSUPPORTED` rejection instead of a silent `continue`, so `fsd`
+  can never hang on a verb `sdd` doesn't speak.
+
+Re-flashed just `fip.bin` (kernel only; ext2 `/bin` unchanged) via
+`udisksctl mount` — no root, no `reflash_duo.sh`. **Boots to `login: root`
+→ interactive shell**: `ls /bin` (30 commands), `ls /` (full tree),
+`whoami`. First real-hardware verification of the Plan 9 `/bin` union work
+(P1–P4) too — `/usr/root/bin/mywho` shows in `ls /bin` via `bind -ac` at
+login.
+
+QEMU regression clean (ext2 mount + `cat hello.txt`, arena path unchanged
+there since `HAS_VIRTIO_BLOCK` is true).
+
+SD-card provisioning for the record (all no-root): `scripts/build_duo.sh`
+→ `llvm-objcopy` → `scripts/make_loader2nd.py` → `fiptool.py genfip
+--OLD_FIP <a known-good fip> --LOADER_2ND <kernel>`; full-card image built
+with `sfdisk` on a plain file + `mtools` (FAT32/`fip.bin`) + `mke2fs -d`
+(ext2 `/bin`) `dd`'d into place at the right sector offsets (2048 / 2099200,
+matching `boards/duo/board.c3`). Scripts in the session scratchpad
+(`mk_duo_card.sh`).
+
+---
+
+## 2026-09-04 — c3c C backend: the kernel now compiles **with tcc** and boots
+
+Same session, next milestone on the self-hosting arc. The C backend's
+output (`c3c build racccoon --backend=c` → 19 `.c`) now assembles and
+links with **tinycc**, not just gcc — `build/kernel_tcc.elf` boots to an
+interactive shell in QEMU with the same behaviour as the gcc build (DHCP /
+ARP / ping, ext2 mount, `whoami` / `argvtest` / `stage6test`). This is the
+last piece before an on-device `c3c → tcc` bootstrap.
+
+Build loop: `c3c --backend=c` → 19 `.c` → `third_party/tinycc/riscv64-tcc
+-c -nostdinc -nostdlib` → `ld.lld … -T src/kernel.ld`. Host cross-tcc:
+`cd third_party/tinycc && ./configure --cpu=riscv64 --enable-cross &&
+make riscv64-tcc` (with `lib/tcc/racccoon.patch` applied).
+
+What it took, in the c3c fork (`f524f6c96`):
+
+- **128-bit ints → a two-limb struct.** tcc has no `__int128`. `i128`/
+  `u128` lower to `struct { u64 lo, hi; }` + prelude helpers (add/sub/mul,
+  a bit-serial udiv/umod/sdiv/smod, shifts, comparisons, int↔i128 /
+  f64↔i128). This is what `formatter_ntoa` / `compiler_rt`'s `__*ti3` run
+  on — so it also had to stay correct under gcc (it does; `%d` verified).
+- **Freestanding prelude** — no `#include <stdint.h>` (tcc `-nostdinc`
+  has none), explicit LP64 typedefs + `#define bool _Bool`.
+- **rv64 atomics** — tcc emits libcalls to the non-existent `__atomic_*_n`
+  builtins. `$$atomic_*` / `$$compare_exchange` now lower to A-extension
+  asm (`amo*` / `lr` / `sc`, with an `lr.w`/`sc.w` masked loop for 1/2-byte
+  RMW), emitted only into modules that use one.
+- **`@naked` asm functions → file-scope `__asm__`.** tcc has no `naked`
+  attribute and wrapped the reset vector / trap entry / context switch in
+  a prologue that trashed `sp` / the trap frame. A naked + asm-only body
+  is now a `.globl` label inside a file-scope `__asm__` block instead of a
+  C function.
+- **asm-string fixups** for tcc's weaker integrated assembler: fold
+  `8 * 30(sp)` → `240(sp)`; rewrite `sret` / `sfence.vma` / `fmv.d.x` /
+  `fscsr rs` to `.long <encoding>`; map supervisor CSR names
+  (`stvec`, `satp`, …) to numbers; `__builtin_trap` → `ebreak`.
+
+Plus a **two-line tinycc patch** (`lib/tcc/racccoon.patch`, alongside the
+existing `ELF_START_ADDR` one), all genuine tcc bugs for `-static`
+freestanding rv64:
+- `call sym` assembled `jalr **zero**` — a called routine's `ret` jumped
+  back to the `auipc` scratch value. Must link `ra`.
+- `la sym` did the GOT load (`auipc; lw`); under `-static` there is no
+  GOT, so it must be `lla` (`auipc; addi`).
+- symbol operands to a *defined non-static global* (every kernel function)
+  raised "operand expected" — now emitted PC-relative like any other.
+
+gcc build + boot unchanged; 13/13 synthetic tests still compile for rv64.
+
+**Next**: real Duo (`scripts/build_duo.sh` + flash), then run c3c itself
+on the JH7110 / Orange Pi RV and close the loop (`tcc` compiles the
+c3c-emitted kernel *on device*).
+
+Fork commit: `f524f6c96` on top of `874ddecc2`.
+
+---
+
+## 2026-09-04 — c3c C backend: the racccoon kernel compiles C3→C→gcc→rv64 and **boots to a shell**
+
+Continued the c3c self-hosting arc (fork `/home/blallo/Workspace/c3c`,
+branch `feat-racccoon-support`, all commits local, not pushed). The
+kernel — `c3c build racccoon --backend=c` → 19 `.c` (~40k lines) →
+`riscv64-unknown-elf-gcc -std=c11 -O0 -fno-common -mcmodel=medany
+-ffreestanding -nostdlib …` → `ld.lld` against the LLVM-built user
+`.bin.o` + `src/kernel.ld` — now **boots all the way to `root / #`**
+under a normal `scripts/launch64.sh`-shape QEMU (virtio-blk + virtio-net):
+
+```
+netd: DHCP: bound, ip=10.0.2.15 gateway=10.0.2.2
+netd: self-test: ARP resolve of gateway ok / ping to gateway ok
+netd: link up
+fsd: FAT32 mounted, partition_start=0 root_cluster=2
+root / #        <- interactive; `echo hello` works
+```
+
+IPC, process spawn, the cooperative scheduler, S-timer interrupts, and
+PLIC external-IRQ delivery are all functional. (`help`/`ps`/`ls` print
+nothing — trimmed test shell + no ext2 on the FAT disk, not a codegen
+bug.)
+
+This session was mostly finding and fixing C-backend codegen bugs by
+booting, tracing (`qemu -d in_asm,int`, QMP `xp`), and reading the
+emitted C. Two of them were pervasive and each unblocked a big chunk:
+
+- **`&&` / `||` didn't short-circuit.** The backend emitted C `a && b`
+  after eagerly evaluating *both* operands (statements, side effects,
+  guarded derefs and all). `p != null && p.field` dereferenced `p` even
+  when null. `service_pending_external_irq`'s IRQ-route null-check hit
+  this → netd never received RX interrupts → stuck in DHCP forever.
+  Fixed: `&&`/`||` now branch (eval LHS, only eval RHS when it matters).
+- **`!x` was silently dropped.** c3 sema folds `!ptr` / `!int` / `!(e)`
+  into an `EXPR_INT_TO_BOOL` node with its `.negate` flag flipped, not a
+  `UNARYOP_NOT`. `c_emit_cast_expr` ignored `.negate` and emitted
+  `(bool)x`. So `if (!proc) panic("no free process slots")` fired on a
+  perfectly good zeroed slot 0 — the whole boot died in `create_process`.
+
+Plus:
+- **`CONST_POINTER` was stubbed to `0`** — `(uint*)PLIC_CLAIM` (a
+  compile-time address) became a null MMIO pointer and `plic_claim`
+  page-faulted. Also wired `CONST_ENUM` (→ `inner_ordinal`) and
+  `CONST_TYPEID` (→ FNV-1a hash of the type name, so the formatter has
+  something to compare for `%s`/`%d`).
+- **typed / `any` variadic arguments were passed as `{0,0}`** — an empty
+  slice. Every `printf`/`printfn`-family call read its format args from
+  nothing and looped on garbage lengths. Now packs a real
+  stack `any[]` and passes `{ &arr[0], n }`.
+- **runtime initializer lists** (`{ .f = x }` and `{ a, b }`) were a
+  `memset(0)` stub — `Formatter.init` left its `out_fn` null.
+- **`&`/`any`-wrap of a non-lvalue** (a constant, `$$FILE`/`$$LINE`, a
+  call result) emitted `/* TODO LVALUE */ 0`; now spills to a temp and
+  points at it.
+- **boot section order**: `boot` must be the first byte of `.text.boot`
+  (QEMU/OpenSBI on `virt` enter S-mode at a fixed `0x80200000`, not the
+  ELF entry). The C backend was emitting `secondary_entry` first, so the
+  boot hart ran `secondary_entry` and died. `c_gen_module` now runs a
+  pre-pass that emits the `@export("boot")` function ahead of the rest of
+  its `.text.boot` section.
+
+Compile flags settled: `-fno-common` is required (zero-init globals were
+going to COMMON, placed past `__bss_end`, and never cleared by
+`kernel_main`'s `mem::set(&__bss, …)`). `-O1`/`-O2` still miscompile
+something — staying on `-O0`.
+
+Then finished off the remaining expression kinds — `EXPR_SLICE`
+(`a[x..y]` / `a[x:len]` / `^n` from-end), `EXPR_DEFAULT_ARG`,
+`EXPR_TRY` / `EXPR_CATCH` / `EXPR_TRY_UNWRAP_CHAIN` (fold the inner
+optional under a captured catch), `EXPR_BUILTIN_ACCESS`
+(`any.type` → the typeid), `EXPR_SLICE_ASSIGN` / `EXPR_SLICE_COPY`,
+`EXPR_MACRO_BODY_EXPANSION`, plus wrapping array-typed string constants
+in `{ .ptr = "…" }`. The kernel C now has **zero `/* TODO EXPR */`**
+(two `ACCESS on non-struct` lvalue edge cases remain).
+
+13/13 synthetic round-trip tests still pass; new ones this session:
+`neg` (`!` on ptr/int), `sc` (short-circuit null walk), `va` (typed
+variadic), `di` (designated + positional init), `bs` (bitstruct),
+`tern` (ternary), `sl` (slicing), `tc` (try/catch), `sa` (slice fill).
+
+### `io::printf` family — `%d`/`%s` now work
+
+Follow-up in the same session. `io::printfn("...%d...", n)` printed
+`%ERR` (any specifier) or mangled digits. Four interlocking codegen bugs,
+found by reading the emitted `std.io.c` + `objdump`-ing the linked ELF:
+
+- **File-scope `const` referenced as a null pointer.** `ASCII_LOOKUP[c]`
+  (and `XDIGITS`, …) — `VARDECL_CONST` with `backend_id == 0` — has real
+  storage from `c_emit_global`, but `c_emit_lvalue` / `c_print_var_ref`
+  only recognised `VARDECL_GLOBAL` / `is_static`, so the subscript base
+  came out `0`. Every format specifier page-faulted in
+  `printf_parse_format_field`'s `c.is_digit()` (reads `ASCII_LOOKUP[c]`).
+- **Labelled `break` broke out of the wrong construct.** `break FLAG_EVAL`
+  from inside a `switch` nested in the labelled loop jumped to the switch
+  exit, not the loop's. The formatter's `while FLAG_EVAL:` flag scanner
+  never terminated on a spec char, ran `i` off the end of the string →
+  `%ERR`. Now tracks enclosing breakables (for / switch / labelled if) by
+  `Ast*` and honours `contbreak_stmt.ast`.
+- **Anonymous sub-record fields all aliased slot 0.** `c_member_index`
+  returned the index of the containing anon struct/union and never
+  descended. `Formatter.flags` / `.width` / `.prec` all became `.m2`;
+  `Int128bits.low` / `.high` both became `.m0`. The latter silently broke
+  `__udivti3` / `__umodti3`, so `%d` of any value ≥ 10 was mangled
+  (`42` → `16842`). Now emits the full `.mN.mM` path.
+- **typeid identity didn't hold across modules.** Replaced the FNV
+  type-name hash with real weak `__c3_introspect__` records
+  (`{ kind, parentof, dtable, sizeof, inner, len }`), named by
+  `type_mangle_introspect_name_to_buffer` so `int`'s record from `kernel.c`
+  and from `std.io.c` collapse to one symbol. `EXPR_TYPEID_INFO` now reads
+  the real fields; `EXPR_MAKE_ANY` simplified to the "inner is already a
+  pointer" path (mirrors `llvm_emit_make_any`).
+
+Verified in QEMU: `io::printfn` `%d` (int + long, 0/1/7/42/…), `%s`, and
+multi-arg (`%d,%d`) all correct; the `SMP:` tally line now matches the
+LLVM-backend kernel byte-for-byte. Full boot regression clean (DHCP/ARP/
+ping, ext2 mount, `whoami`/`ls`/`echo`/`true`/`argvtest`/`stage6test`).
+13/13 synthetic tests still pass.
+
+Next: the real-Duo build (`scripts/build_duo.sh`), then swapping
+`gcc` → `tcc` for the on-device bootstrap.
+
+Fork commits (local, not pushed), on top of `7a50fbed8`
+(ternary/bitstruct/pointer-offset/static-init): `6c45cb71a` (boot
+order), `d3a63fdab` (varargs), `4b585f9f8` (init lists), `ff0638384`
+(`!` + any-rvalue + typeid hash), `4bfeb6a49` (`&&`/`||` +
+CONST_POINTER/ENUM + robust lvalue), `9703467ee` (slice + default arg),
+`031961693` (try/catch + builtin access), `c2124181d` (slice assign +
+macro body + array string consts), `8857ca545` (pointer `++`/`--`/`+=`
+scaling), `874ddecc2` (printf family: typeids + labelled break + anon
+members + const storage refs).
+
+---
+
 ## 2026-09-03 — IPC rings P1: step 3 (read-ahead) tried and reverted; arc stopped
 
 `gobuildtest` gained a round-trip breakdown (`fsd reads/writes/meta/
