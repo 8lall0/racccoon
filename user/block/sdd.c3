@@ -21,10 +21,18 @@ import std::nolibc::main_stub;
 // against either.
 
 // --- Shared with the kernel / fsd — kept in sync by hand, same wire
-// protocol as user/block/diskd.c3.
-const uint DISKD_READ    = 210;
-const uint DISKD_WRITE   = 211;
-const uint DISKD_MSG_MAX = 516;
+// protocol as user/block/diskd.c3. sdd implements the *inline* verbs
+// (DISKD_READ/WRITE/READ_MULTI); it has no shared payload arena (that's
+// setup_diskd_mappings, virtio-only), so fsd never sends it the _ARENA
+// verbs — src/process.c3's setup_fsd_mappings only maps the arena on
+// board::HAS_VIRTIO_BLOCK. Any other verb gets a rejection reply (never
+// a silent drop — a dropped verb would hang fsd's p9_call forever).
+const uint DISKD_READ        = 210;
+const uint DISKD_WRITE       = 211;
+const uint DISKD_READ_MULTI  = 212; // read `count` consecutive sectors, count at byte 4..7
+const uint DISKD_UNSUPPORTED = 209; // reply verb for an unknown request
+const uint DISKD_MAX_SECTORS = 15;  // must match user/block/diskd.c3 + fsd.c3
+const uint DISKD_MSG_MAX     = 8192; // must match user/block/diskd.c3 + fsd.c3 + src/process.c3 MSG_MAX
 
 fn void sdd_init()
 {
@@ -65,26 +73,61 @@ fn void main()
 		// Same stale note removed as diskd.c3's own — see its comment:
 		// every real sender today is a genuine process pid >= 1.
 		if (from == 0) continue;
-		if (verb != DISKD_READ && verb != DISKD_WRITE) continue;
 
+		bool is_read  = (verb == DISKD_READ);
 		bool is_write = (verb == DISKD_WRITE);
+		bool is_multi = (verb == DISKD_READ_MULTI);
+		if (!is_read && !is_write && !is_multi)
+		{
+			// Unknown verb (the _ARENA family, a future extension, junk).
+			// Reply — never drop — so fsd's p9_call returns and its
+			// reply_verb mismatch check triggers its fallback.
+			buf[0] = 1;
+			ipc_reply(from, DISKD_UNSUPPORTED, &buf, 4, from_gen);
+			continue;
+		}
+
 		uint* sector_ptr = (uint*)&buf;
 		uint sector = *sector_ptr;
+
+		uint count = 1;
+		if (is_multi)
+		{
+			uint* count_ptr = (uint*)&buf[4];
+			count = *count_ptr;
+			if (count < 1) count = 1;
+			if (count > DISKD_MAX_SECTORS) count = DISKD_MAX_SECTORS;
+		}
 
 		if (SDD_VERBOSE)
 		{
 			print("sdd: rw sector=");
 			print_hex32(sector);
+			if (is_multi) { print(" x"); print_hex32(count); }
 			print(is_write ? " write\n" : " read\n");
 		}
 
 		char status = 0;
-		if (!sdd_block_rw(&buf[4], sector, is_write))
+		if (is_multi)
+		{
+			// DISKD_READ_MULTI: `count` consecutive sectors into buf[4..],
+			// one sdd_block_rw() per sector (no scatter DMA on this IP).
+			for (uint i = 0; i < count; i++)
+			{
+				if (!sdd_block_rw(&buf[4 + i * SECTOR_SIZE], sector + i, false))
+				{
+					status = 1;
+					break;
+				}
+			}
+		}
+		else if (!sdd_block_rw(&buf[4], sector, is_write))
 		{
 			status = 1;
 		}
 
 		buf[0] = status;
-		ipc_reply(from, verb, &buf, DISKD_MSG_MAX, from_gen);
+		int reply_len = is_multi ? (int)(4 + count * SECTOR_SIZE) : (int)(4 + SECTOR_SIZE);
+		ipc_reply(from, verb, &buf, reply_len, from_gen);
 	}
 }

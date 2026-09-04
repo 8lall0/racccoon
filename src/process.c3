@@ -1325,7 +1325,13 @@ fn void setup_fsd_mappings(Process* proc, uint partition_start, bool is_secondar
 	// inline-IPC diskd verbs (it's the rarely-hot /mnt/fs2 partition, and
 	// a single shared arena with two producers would need locking). Maps
 	// every call, so a supervisor respawn re-establishes it for free.
-	if (!is_secondary)
+	//
+	// Only on a board with diskd (virtio-blk): sdd (Duo's real SD driver)
+	// has no arena of its own — setup_sdd_mappings doesn't map one — so
+	// handing fsd an arena there would just make it send DISKD_READ_ARENA
+	// verbs sdd can't answer, hanging the mount. sdd speaks the inline
+	// verbs only.
+	if (!is_secondary && board::HAS_VIRTIO_BLOCK)
 	{
 		map_disk_arena(proc);
 		disk_arena_fsd_pid = proc.pid;
