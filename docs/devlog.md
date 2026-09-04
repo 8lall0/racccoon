@@ -4,6 +4,90 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-04 — c3c-on-device + the c3 stdlib: a 256 KiB stack, a missing hex-float parser, and a real tcc-codegen bug
+
+Step 1 of the c3c self-host arc's next phase: get on-device `c3c` to
+parse the real c3 standard library (not just `--use-stdlib=no` toy
+programs). Seeded `lib/std` (337 `.c3`, 3.1 MB) onto the ext2 image at
+`/c3/std/` — c3c's own `find_lib_dir()` fallback search list happens to
+try a bare `/c3/` candidate, so it found it with **no `$C3C_LIB` needed**
+(setting `/env/C3C_LIB` via the shell's `>` redirect — now that envd
+handles `FS_WRITE_AT` — also works, confirmed separately).
+
+**Bug 1 — a 512 KiB local variable on a 256 KiB stack, with no fault
+ever reported.** `c3c compile` (even the already-working
+`--use-stdlib=no /h1.c3` case) hung/died silently right after printing
+`-- INFO: Version` under `-vvv`, no error text, no kernel fault message.
+Binary-searched it with `fprintf(stderr, "RCCKPT N\n"); fflush(stderr);`
+checkpoints dropped straight into `compiler_init()` (temporary, not
+committed) — stderr is unbuffered so this survives anything. Found:
+`GlobalContext new_context = { .in_panic_mode = false };` in
+`compiler_init()` declares `sizeof(GlobalContext) = 524736` bytes
+on the **stack** — it embeds `Decl *decl_stack[65536]` (512 KiB by
+itself). `lib/tcc/crt1.c`'s `_start` only `SYS_MAP`s a 256 KiB stack for
+tcc-linked binaries. The overflow silently trashed whatever SYS_MAP page
+came next instead of hitting an unmapped one — no fault, no crash, just
+the process going quiet forever. Fixed: `RC_CRT1_STACK` 256 KiB → 4 MiB
+(`lib/tcc/crt1.c`). Trivial against `board::HEAP_MAX_BYTES` (512 MiB
+QEMU) since `SYS_MAP` is demand-paged. With this fix, `-vvv` finally
+shows the *entire* expected `INFO`/`DEBUG` trace (executable path,
+library search, type creation, `Resolve libraries`, …) — this had never
+been seen before, because every prior `-vvv` run died in this exact spot.
+
+**Bug 2 — hex-float literals.** With the stack fixed, c3c got as far as
+parsing `lib/std/_nolibc/math_nolibc/__cosdf.c3`'s constants
+(`-0x1ffffffd0c5e81.0p-54`, C99 hex-float syntax) and reported "The
+float format is invalid" for every one, then hung again (same silent
+no-more-output, 100% CPU — a lexer-recovery loop on the malformed
+token, not investigated further since the real fix removes the trigger).
+Root cause: `lib/racccoon-libc/src/stdlib.c`'s `strtod()` is a
+hand-rolled decimal-only parser — no `0x`/`p` exponent support at all.
+c3c's number parser presumably round-trips through `strtod` to validate
+the literal. Added `strtod_hex()` (mantissa + fractional hex digits,
+mandatory `p`/`P` binary exponent, exponentiation by squaring so a large
+`|exp|` doesn't loop) ahead of the decimal path in `strtod()`; unit-tested
+standalone against glibc's values on the host (`0x1.999999999999ap-4` ==
+0.1, the exact stdlib constant, `0x1.8p3` == 12, …) before ever touching
+QEMU again.
+
+**With both fixed:** the on-device compile ran for real — all 337
+"Added file" lines in seconds, then deep into semantic analysis (tens
+of thousands of `-- DEBUG: Resolving identifier` lines) — until:
+
+**Bug 3 — NOT fixed, stopped here.** `compare_fps()`
+(`src/compiler/number.c:51`) hit its `default: UNREACHABLE` case — a
+`switch` over `BinaryOp` covering all 6 comparison ops that native c3c
+(compiling the exact same stdlib) never hits. The diagnostic message
+printed in full (format substitution worked), then the process went
+silent again at 99%+ CPU for 15+ minutes with zero further output —
+looks like `longjmp(on_error_jump, …)` (the path every `error_exit`
+takes) either doesn't unwind correctly from this call depth under tcc,
+or something downstream of it loops. Given this is now three
+`-vvv`-invisible silent hangs in one session, all upstream of the
+supposedly-reliable `error_exit`/`longjmp` path, there may be a common
+thread — worth checking whether `setjmp`/`longjmp` (`lib/racccoon-libc/src/setjmp.S`)
+holds up when the saved stack is *very* deep, separately from whatever
+is actually wrong in `compare_fps`. Not chased further this session —
+this is a real tcc-codegen-vs-c3c-internals bug, not a racccoon-libc gap,
+and deserves its own investigation.
+
+**End state:** `c3c` reliably parses and starts semantic analysis of the
+*real* c3 standard library on-device now (was categorically impossible
+before Bug 1). `h1.c3`/`stdtest.c3` (`--use-stdlib=no`) regression-clean;
+`stage3test`/`stage5test`/`ctest`/`exiter` (libc suite) all still pass
+with the new `strtod` and the bigger tcc stack.
+
+**Files changed:** `lib/tcc/crt1.c` (stack size),
+`lib/racccoon-libc/src/stdlib.c` (`strtod` hex-float). c3c fork: none
+committed (the `RCCKPT` checkpoints were diagnostic only, reverted).
+
+**Next:** chase Bug 3 — minimal repro of `compare_fps` under
+`build/riscv64-tcc` outside c3c entirely (a tiny switch over a 6-value
+enum, comparing float args), and check whether `longjmp` really unwinds
+correctly from deep recursion. Then re-attempt the full stdlib parse.
+
+---
+
 ## 2026-09-04 — `c3c` itself runs on racccoon: `C3 → c3c(on device) → .c → tcc(on device) → .o`
 
 The other half of the self-host chain. Last session got *tcc* running on

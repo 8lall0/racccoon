@@ -63,12 +63,75 @@ int       atoi(const char *s) { return (int)strtol(s, NULL, 10); }
 long      atol(const char *s) { return strtol(s, NULL, 10); }
 long long atoll(const char *s) { return strtoll(s, NULL, 10); }
 
+static int hexval(char c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+/* C99 hex float: 0x<hex digits>[.<hex digits>]p[+-]<decimal exponent>,
+ * binary exponent mandatory. Used by c3's own math_nolibc constants
+ * (e.g. "-0x1ffffffd0c5e81.0p-54") — c3c parses these when compiling
+ * the c3 stdlib on-device, so this isn't just spec completeness. */
+static double strtod_hex(const char *p, int *any, const char **endp)
+{
+	double val = 0.0;
+	while (hexval(*p) >= 0) { val = val * 16.0 + hexval(*p); p++; *any = 1; }
+	if (*p == '.') {
+		p++;
+		double scale = 1.0 / 16.0;
+		while (hexval(*p) >= 0) { val += hexval(*p) * scale; scale /= 16.0; p++; *any = 1; }
+	}
+	if (!*any) { *endp = p; return 0.0; }
+	if (*p == 'p' || *p == 'P') {
+		const char *save = p;
+		p++;
+		int eneg = 0;
+		if (*p == '+' || *p == '-') eneg = (*p++ == '-');
+		int exp = 0;
+		int have_exp = 0;
+		while (isdigit((unsigned char)*p)) { exp = exp * 10 + (*p++ - '0'); have_exp = 1; }
+		if (have_exp) {
+			if (eneg) exp = -exp;
+			/* val * 2^exp, exponentiating by squaring so huge |exp|
+			 * doesn't loop thousands of times. */
+			double scale = 1.0;
+			double base = exp < 0 ? 0.5 : 2.0;
+			unsigned n = (unsigned)(exp < 0 ? -exp : exp);
+			while (n) {
+				if (n & 1) scale *= base;
+				base *= base;
+				n >>= 1;
+			}
+			val *= scale;
+		} else {
+			p = save;   /* "p" with no digits after — not consumed */
+		}
+	}
+	*endp = p;
+	return val;
+}
+
 double strtod(const char *s, char **end)
 {
 	const char *p = s;
 	while (isspace((unsigned char)*p)) p++;
 	int neg = 0;
 	if (*p == '+' || *p == '-') neg = (*p++ == '-');
+
+	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+		int any = 0;
+		const char *hexend;
+		double hval = strtod_hex(p + 2, &any, &hexend);
+		if (any) {
+			if (end) *end = (char *)hexend;
+			return neg ? -hval : hval;
+		}
+		/* "0x" not followed by a valid hex float — fall through and
+		 * parse the leading "0" as a plain decimal below. */
+	}
 
 	double val = 0.0;
 	int any = 0;

@@ -9,7 +9,19 @@
  * kernel's a0 = argc, a1 = argv-blob preserved. */
 #include <racccoon/syscall.h>
 
-#define RC_CRT1_STACK (256 * 1024)
+/* 2026-09-04: was 256 KiB, too small for c3c (self-hosting on racccoon,
+ * QEMU only) — its GlobalContext has a `Decl *decl_stack[65536]` local
+ * (524 KiB by itself) declared on the stack in compiler_init(), which
+ * blew straight through 256 KiB with no fault ever reported (the
+ * overflow silently corrupted whatever SYS_MAP page came next, instead
+ * of hitting an unmapped one) — the process just died with no output,
+ * looking exactly like a hang until stderr checkpoints pinned it to
+ * that one local. 4 MiB leaves ~8x headroom over that single local
+ * plus real recursion depth (parser/sema). Trivial either way against
+ * board::HEAP_MAX_BYTES (512 MiB QEMU) since SYS_MAP is demand-paged —
+ * unused pages cost nothing. Duo's 16 MiB ceiling is the one board
+ * this matters for; nothing tcc-linked targets the Duo today. */
+#define RC_CRT1_STACK (4 * 1024 * 1024)
 
 void __libc_start(int argc, char *blob);
 
