@@ -20,6 +20,11 @@ struct __FILE {
 	size_t wlen;              /* write buffer: [0, wlen) pending */
 	long  pos;                /* logical file position (start of the read buffer / after last write) */
 	int   ungot;              /* -1 = none */
+	/* open_memstream(): when ms_bufp != NULL the stream writes into a
+	 * caller-owned growable heap buffer instead of a fd. */
+	char   **ms_bufp;
+	size_t  *ms_sizep;
+	size_t   ms_len, ms_cap;
 };
 
 static struct __FILE _stdin  = { 0, 1, 0, 0, 0, _IOLBF, 0, NULL, 0, 0, 0, 0, 0, -1 };
@@ -40,9 +45,34 @@ static int ensure_buf(FILE *f)
 	return 0;
 }
 
+/* Append `n` bytes to an open_memstream buffer, keeping it NUL-terminated
+ * and *ms_sizep in sync. */
+static int ms_append(FILE *f, const unsigned char *src, size_t n)
+{
+	if (f->ms_len + n + 1 > f->ms_cap) {
+		size_t nc = f->ms_cap ? f->ms_cap * 2 : 128;
+		while (nc < f->ms_len + n + 1) nc *= 2;
+		char *nb = realloc(*f->ms_bufp, nc);
+		if (!nb) { f->err = 1; errno = ENOMEM; return EOF; }
+		*f->ms_bufp = nb;
+		f->ms_cap = nc;
+	}
+	__builtin_memcpy(*f->ms_bufp + f->ms_len, src, n);
+	f->ms_len += n;
+	(*f->ms_bufp)[f->ms_len] = 0;
+	if (f->ms_sizep) *f->ms_sizep = f->ms_len;
+	return 0;
+}
+
 static int flush_write(FILE *f)
 {
 	if (f->wlen == 0) return 0;
+	if (f->ms_bufp) {
+		if (ms_append(f, f->buf, f->wlen) == EOF) return EOF;
+		f->pos += (long)f->wlen;
+		f->wlen = 0;
+		return 0;
+	}
 	size_t done = 0;
 	while (done < f->wlen) {
 		long w = write(f->fd, f->buf + done, f->wlen - done);
@@ -94,6 +124,28 @@ FILE *fdopen(int fd, const char *mode)
 	f->rmode = rd; f->wmode = wr;
 	f->bufmode = isatty(fd) ? _IOLBF : _IOFBF;
 	f->ungot = -1;
+	return f;
+}
+
+/* POSIX open_memstream: a write-only stream backed by a heap buffer the
+ * libc grows; *bufp / *sizep are updated on every fflush and on fclose,
+ * and *bufp stays NUL-terminated. The caller frees *bufp. */
+FILE *open_memstream(char **bufp, size_t *sizep)
+{
+	if (!bufp || !sizep) { errno = EINVAL; return NULL; }
+	FILE *f = calloc(1, sizeof *f);
+	if (!f) { errno = ENOMEM; return NULL; }
+	*bufp = malloc(1);
+	if (!*bufp) { free(f); errno = ENOMEM; return NULL; }
+	(*bufp)[0] = 0;
+	*sizep = 0;
+	f->fd = -1;
+	f->wmode = 1;
+	f->bufmode = _IOFBF;
+	f->ungot = -1;
+	f->ms_bufp = bufp;
+	f->ms_sizep = sizep;
+	f->ms_cap = 1;
 	return f;
 }
 

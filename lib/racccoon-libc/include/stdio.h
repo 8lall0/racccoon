@@ -31,6 +31,9 @@ extern FILE *stderr;
 
 FILE  *fopen(const char *path, const char *mode);
 FILE  *fdopen(int fd, const char *mode);
+FILE  *open_memstream(char **bufp, size_t *sizep);
+FILE  *popen(const char *cmd, const char *mode);
+int    pclose(FILE *f);
 FILE  *freopen(const char *path, const char *mode, FILE *f);
 int    fclose(FILE *f);
 int    fflush(FILE *f);
