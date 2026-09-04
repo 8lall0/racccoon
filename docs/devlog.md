@@ -4,6 +4,73 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — retraction: "bug 3" was this session's own QEMU processes fighting each other, not a kernel bug
+
+Correcting the previous entry ("bug 3 isolated: SYS_EXIT hangs after
+~300+ fopen/fread cycles"). It was wrong.
+
+Set out to attach a GDB stub (`-gdb tcp::1234`) to a "hung" instance to
+finally root-cause it — a bundled JetBrains gdb worked where the system
+`riscv64-unknown-elf-gdb` didn't (missing `libpython3.12`; CLion ships
+its own at `~/.local/share/JetBrains/Toolbox/apps/clion/bin/gdb/linux/
+x64/bin/gdb`, `set architecture riscv:rv64` before `target remote`).
+Repeated sampling of the "hung" guest always landed in
+`board.console_getchar`'s SBI ecall — looked like a smoking gun (an
+interrupt storm, or the shell's blocking-getchar loop wedged). **Then
+the control experiment that should have come first**: sampled a
+completely idle, freshly-booted shell (nothing run at all) the same
+way — identical PC/register signature. `console_getchar`'s ecall loop
+is what an idle racccoon shell looks like *at rest*, always — 99% host
+CPU included (QEMU TCG interpreting a tight ecall poll loop). Sampling
+it proved nothing.
+
+That forced the real question: was the "hang" actually permanent, or
+just slower than the fixed sleep windows in every one of the previous
+session's test scripts? Re-ran the *exact* scenarios previously
+recorded as "hangs forever, 15+ minutes, confirmed with GDB" —
+`iterfilespam` (327 files), `fsspam` (the original recursive-walk
+repro), and `c3c compile --backend=c --emit-stdlib=no /stdtest.c3`
+itself (still hits the real, separate `compare_fps` bug, but exits
+cleanly with status 1, no hang) — each in a freshly verified *clean*
+QEMU launch (`ps aux | grep qemu` empty first). **All three completed
+normally, no hang, first try.**
+
+Root cause of the illusion: this session ran *many* overlapping QEMU
+instances back to back — chasing this exact bug — and repeatedly found
+(and had to `kill -9`) leftover ones still running from earlier steps
+(logged at least four separate times: after the 64 MiB-stack diagnostic,
+after the `compare_fps` checkpoint build, after `fsspam`, after
+`iterfilespam`). Several TCG QEMU processes genuinely fighting for the
+same host cores can slow a guest down by an order of magnitude or more
+— easily enough to blow through a 60–90s sleep window, or even the
+30-minute one used for the very first `iterfilespam` run, if the
+contention was bad and self-reinforcing (new test launches kept adding
+load while an earlier one was still starved). Every "hang" observed
+was consistent with this, and none of the isolated re-runs reproduced
+it.
+
+**Correction to Milestone 16's bug 3**: there is no evidence of a
+racccoon kernel or fsd bug here. Retracted. The `test/c-src/*spam*.c`
+programs from the previous entry are kept — they're still a reasonable
+stress/regression battery for heavy `fread`/`opendir` volume, just not
+evidence of anything broken. **What actually still blocks the c3c
+stdlib compile is unrelated and much smaller**: `compare_fps()`
+(`src/compiler/number.c:51`, c3c fork) genuinely hits `UNREACHABLE` on
+real stdlib input that native c3c compiles fine — confirmed via
+disassembly that `build/riscv64-tcc`'s codegen for that switch is
+correct, so `op` is arriving bad from an actual (still unidentified)
+caller-side bug, not a tcc miscompile. That's the real next lever —
+tractable, not a phantom kernel deadlock.
+
+**Lesson for next time — apply this before believing any more "hang"
+results**: always `ps aux | grep qemu` and kill every stray instance
+*immediately before* launching a new timed test, not just when a
+launch visibly fails to acquire the image's write lock. A single test
+run's timeout budget is not evidence once other QEMU processes might
+have been sharing the host's cores during it.
+
+---
+
 ## 2026-09-04 — bug 3 isolated: SYS_EXIT hangs after ~300+ fopen/fread cycles, nothing to do with c3c or tcc
 
 Continuation of the c3c-stdlib-seed session. Left off with c3c's
