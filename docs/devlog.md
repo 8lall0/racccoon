@@ -98,6 +98,27 @@ C3 ─c3c --backend=c─▶ 19 .c ─[ tcc ON RACCCOON: compile + link ]─▶ k
 the full build), and c3c itself on-device (these `.c` files still come
 from host c3c).
 
+### c3c on-device — Phase 1 probe
+
+Started on the last gap: c3c (the non-LLVM build, `feat-racccoon-support`,
+~92 `.c` / `-DLLVM_AVAILABLE=0 -DTB_AVAILABLE=0`) running on racccoon.
+First step — compile it with the patched `riscv64-tcc` against
+`lib/racccoon-libc`. Almost everything failed on one thing: `limits.h`
+not found (the gcc `limits.h`'s `#include_next` chain dead-ends under
+`-nostdinc`). Added `limits.h` → **59/67 compiler-core files compiled**.
+The other 8 wanted small headers: `iso646.h`, `signal.h`, `wchar.h`,
+`glob.h`, `pthread.h`, and `EOVERFLOW`. Added those (+ `src/rc_pthread.c`
+— the single-core kernel has no threads; the stubs `abort()` on
+`pthread_create`, which c3c only calls when `build_threads > 1`, and
+`cpus()` returns 1 on racccoon so `taskqueue.c` always takes its serial
+path). **Now 74/75 compile** — the one holdout is `compiler_tests/
+benchmark.c` (test-only).
+
+So c3c's compiler core compiles for racccoon. **Left:** link (a `glob`
+impl, a `PLATFORM_RACCCOON` branch in c3c's `common.h`, the
+SDK/platform `.c` — `fetch_sdk/`, `mac_support.c`, … — stubbed), then run
+`c3c compile --backend=c hello.c3` on racccoon, then scale to the kernel.
+
 ---
 
 ## 2026-09-04 — real Duo: `sdd` was left behind by the IPC-rings protocol change
