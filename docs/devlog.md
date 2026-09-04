@@ -48,10 +48,55 @@ The `%d`-family, i128-struct, freestanding-prelude, rv64-atomic-asm,
 tcc entry all survive being compiled by the racccoon-hosted tcc, not just
 the host one.
 
-**Left:** on-device *link* (tcc's integrated linker vs `kernel.ld`'s
-layout), all 19 modules + link in one racccoon session (RAM), and the
-actual JH7110 / Orange Pi RV board. c3c itself on-device is the other
-half.
+### On-device link: a `--kernel-image` flag for tcc
+
+tcc's linker has effectively **no** linker-script support (`tcc_load_ldscript`
+only reads `INPUT`/`GROUP`), so it can't consume `src/kernel.ld`. Rather
+than write a `SECTIONS` parser (`ld_next` is unusable — it lexes `. = 0x…`
+as one blob), `lib/tcc/racccoon.patch` gains a
+**`-Wl,--kernel-image=<hex>`** option: tcc lays the output out like
+`kernel.ld` — `.text.boot` at exactly that address (ELF headers before it,
+unmapped), then `.text.trap` / `.text` / RO / RW / `.bss`, one PT_LOAD per
+RWX group; and defines `__kernel_base` / `__kernel_map_base` / `__bss` /
+`__bss_end` / `__stack_top` / `__free_ram` / `__free_ram_end` SHN_ABS
+(overriding the placeholder `.bss` globals `src/kernel.c3` declares so
+`&__bss` compiles). ~150 lines in `tccelf.c`, gated on the flag — zero
+effect on any other link.
+
+```
+tcc *.o *.bin.o -nostdlib -static -Wl,--kernel-image=0x80200000 -o kernel.elf
+```
+
+links a kernel that boots clean in QEMU — BSS clear, all servers, DHCP,
+`fsd: ext2 mounted`, `cat hello.txt`, `argvtest` — identical to the
+`ld.lld -T kernel.ld` build. No linker script, no `ld`.
+
+So the whole build is tcc now: `c3c --backend=c` → `.c` → `tcc` compile →
+`tcc --kernel-image` link → bootable kernel.
+
+### The racccoon-built racccoon boots (QEMU)
+
+Seeded the 19 c3c-emitted `.c` + the 11 user `.bin.o` blobs + `/bin/tcc`
+onto an ext2 image, and from the racccoon shell in QEMU (`-m 2G`), one
+command:
+
+```
+tcc /src/kc/*.c /src/ko/*.bin.o -nostdlib -static -Wl,--kernel-image=0x80200000 -o /tmp/k.elf
+```
+
+tcc compiled all 19 modules and linked → `k.elf`, a 2.1 MB
+`ELF 64-bit LSB executable, UCB RISC-V, statically linked`, entry
+`0x80200000`. Pulled it off the image and booted it: **BSS cleared, all
+servers, SMP, DHCP, `fsd: ext2 mounted`, `cat hello.txt` →
+"Hello from ext2!", `whoami` → root, `argvtest: ok`.**
+
+```
+C3 ─c3c --backend=c─▶ 19 .c ─[ tcc ON RACCCOON: compile + link ]─▶ kernel.elf ─▶ boots
+```
+
+**Left:** the actual JH7110 / Orange Pi RV board (Duo RAM too small for
+the full build), and c3c itself on-device (these `.c` files still come
+from host c3c).
 
 ---
 
