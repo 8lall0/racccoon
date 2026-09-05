@@ -111,6 +111,9 @@ const SYS_PROF          = 53; // a0 = out buf (>= 32 bytes: 4 LE u64 — ipc_cal
 const SYS_PROF_HIST     = 54; // DIAGNOSTIC (temporary): a0 = out buf (512 bytes = 64 LE u64, indexed by syscall number), a1 = reset flag — the `synhist` builtin, chasing the go-build syscall storm
 const SYS_DRIVER_IRQ_WAIT = 55; // interrupt-driven driver: block until this driver's pending device-completion notify (driver_irq_pending) is set, hand-draining the PLIC each pass — one syscall per completion in place of diskd's per-sector SYS_IPC_POLL spin (docs/ipc-rings.md P1). Returns 0, or -1 if not a routed driver.
 const SYS_DISK_ARENA_INFO = 56; // diskd + primary fsd only: a0 -> arena paddr, a1 -> arena size (u32). The fsd<->diskd shared payload region (docs/ipc-rings.md P1 step 2) — identity-mapped into both by setup_diskd_mappings / setup_fsd_mappings. Returns 0, or -1 for any other caller / before it's allocated.
+const SYS_KLOG_READ  = 57; // a0 = out buf, a1 = max bytes, a2 = ulong* cursor (bytes-consumed counter; 0 = from the oldest byte still in the ring). Copies newer kernel-console bytes out, advances *cursor, returns the count. The kernel log ring (sbi.c3) — /bin/dmesg.
+const SYS_PROC_STAT  = 58; // a0 = slot (1..PROCS_MAX), a1 = out buf (>= 52 bytes): [0..3] state LE, [4..7] uid LE, [8..11] generation LE, [12..15] resident pages LE, [16..19] real pid LE, [20..51] name (NUL-padded). Returns 0, or -1 for an unused slot. /bin/ps + /bin/top.
+const SYS_GETCHAR_NB = 59; // non-blocking console read: one keystroke from the USB-kbd queue or serial console, or -1 immediately if none waiting. Console only (returns -1 when stdin is a pipe). Lets a follow/redraw loop (`dmesg -f`, `top`) bail on a keypress — racccoon has no ^C.
 
 // Per-process SYS_MAP ceiling: the bump pointer can't grow more than this
 // past USER_BASE. Board-specific (board::HEAP_MAX_BYTES): 16 MiB on the
@@ -745,6 +748,10 @@ fn void sys_rfork(Trap_frame* f) @noinline
 			child.namespace[ns_i] = current_proc.namespace[ns_i];
 		}
 		for (int cw = 0; cw < 100; cw++) { child.cwd[cw] = current_proc.cwd[cw]; }
+		// Inherit the parent's name until the child exec()s its own image
+		// (sys_exec overwrites it from argv[0]); a plain rfork'd worker
+		// with no exec keeps showing the parent's name in `ps`/`top`.
+		for (int nm = 0; nm < 32; nm++) { child.name[nm] = current_proc.name[nm]; }
 
 		// Build the child's first-resume state: a copy of this
 		// trap's own Trap_frame (a0 zeroed — the child's return
@@ -917,6 +924,25 @@ fn void sys_exec(Trap_frame* f) @noinline
 		{
 			f.a0 = (ulong)(-1);
 			return;
+		}
+
+		// Snapshot argv[0] NOW, while the caller's buffer is still mapped:
+		// the page-table rewrite further down frees every old PAGE_U leaf
+		// (the buffer among them), so `exec_image` is unreadable by the
+		// time proc.name gets set at the end. The argv blob is the
+		// NUL-separated strings packed right after the image content.
+		char[48] exec_name_snap;
+		exec_name_snap[0] = 0;
+		if (exec_argc >= 1 && exec_argv_len > 0)
+		{
+			char* exec_a0 = (char*)(exec_image + exec_image_size);
+			int ens = 0;
+			while (ens < 47 && (uint)ens < exec_argv_len && exec_a0[ens] != 0)
+			{
+				exec_name_snap[ens] = exec_a0[ens];
+				ens++;
+			}
+			exec_name_snap[ens] = 0;
 		}
 
 		// Stage every new page FIRST, before touching anything
@@ -1319,6 +1345,14 @@ fn void sys_exec(Trap_frame* f) @noinline
 		// handle_trap()'s own just_execd check below tests
 		// "(long)f.a0 >= 0" rather than "== 0" to tell this success
 		// path apart from that failure one.
+		// Name this process after argv[0]'s basename, for `ps` / `top`
+		// (SYS_PROC_STAT) — from the snapshot taken before the remap, since
+		// the caller's argv buffer is unmapped by now.
+		if (exec_name_snap[0] != 0)
+		{
+			proc_set_name(current_proc, &exec_name_snap[0]);
+		}
+
 		f.a0 = (ulong)exec_argc;
 		f.a1 = (ulong)exec_argv_base;
 
@@ -2472,11 +2506,23 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// calls SYS_BOOT_QUIET) — their init chatter otherwise keeps
 			// landing on the console after the prompt is up. The shell
 			// and everything it exec()s (is_boot_server == false) print
-			// normally. A dmesg-style recall of the dropped lines is a
-			// later add (docs/roadmap.md).
+			// normally.
 			else if (!(g_boot_quiet && current_proc.is_boot_server))
 			{
-				board::console_putchar((int)f.a0);
+				// Boot-server chatter (fsd/sdd/usbd/ethd init lines) is
+				// worth keeping in the kernel log — tee it. A plain
+				// process's stdout is terminal output, not kernel log, so
+				// it takes the raw path: without that split, `dmesg`
+				// (which prints what it reads) re-feeds its own output
+				// into the ring and loops forever.
+				if (current_proc.is_boot_server)
+				{
+					board::console_putchar((int)f.a0);
+				}
+				else
+				{
+					sbi::console_emit((int)f.a0);
+				}
 			}
 		case SYS_BOOT_QUIET:
 			// The shell calls this once, after a short settle delay, to
@@ -2522,6 +2568,23 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			current_proc.in_blocking_wait = false;
 			blocking_depth--;
+		case SYS_GETCHAR_NB:
+			// One non-blocking poll of the same two sources SYS_GETCHAR
+			// drains (USB keyboard queue, then serial console) — never
+			// yields, never blocks, returns -1 the instant both are
+			// empty. Console only: a redirected stdin (pipe) gets -1, so
+			// a caller uses it strictly as "did the user press a key?"
+			// and never as a data path.
+			if (current_proc.stdin_pipe >= 0)
+			{
+				f.a0 = (ulong)(-1);
+			}
+			else
+			{
+				int nb = kbd_queue_pop();
+				if (nb < 0) { nb = board::console_getchar(); }
+				f.a0 = (ulong)nb;
+			}
 		case SYS_EXIT:
 			sys_exit(f);
 		case SYS_IPC_SEND:
@@ -2577,6 +2640,49 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				if (f.a1 != 0) g_prof_syscall_hist[hi] = 0;
 			}
 			f.a0 = 0;
+		case SYS_KLOG_READ:
+			{
+				char*  klog_out = (char*)(uptr)f.a0;
+				int    klog_max = (int)f.a1;
+				ulong* klog_cur = (ulong*)(uptr)f.a2;
+				if (klog_max < 0) { klog_max = 0; }
+				if (!user_range_valid(current_proc.page_table, (uptr)klog_out, (uint)klog_max, true)
+					|| !user_range_valid(current_proc.page_table, (uptr)klog_cur, 8, true))
+				{
+					f.a0 = (ulong)(-1);
+					break;
+				}
+				ulong cur = *klog_cur;
+				int got = sbi::klog_copy(klog_out, klog_max, &cur);
+				*klog_cur = cur;
+				f.a0 = (ulong)got;
+			}
+		case SYS_PROC_STAT:
+			{
+				int   ps_slot = (int)f.a0;
+				char* ps_out = (char*)(uptr)f.a1;
+				if (!user_range_valid(current_proc.page_table, (uptr)ps_out, 52, true))
+				{
+					f.a0 = (ulong)(-1);
+					break;
+				}
+				if (ps_slot < 1 || ps_slot > PROCS_MAX) { f.a0 = (ulong)(-1); break; }
+				Process* ps_p = &procs[ps_slot - 1];
+				if (ps_p.state == PROC_UNUSED || ps_p.state == PROC_RESERVED) { f.a0 = (ulong)(-1); break; }
+				uint* ps_u = (uint*)ps_out;
+				ps_u[0] = (uint)ps_p.state;
+				ps_u[1] = (uint)ps_p.uid;
+				ps_u[2] = ps_p.generation;
+				// resident pages: eagerly-mapped image span + demand-mapped
+				// heap below map_floor. Rough — the exact leaf count would
+				// need a page-table walk; heap_top - USER_BASE is the
+				// process's own high-water mark, close enough for `top`.
+				ps_u[3] = ps_p.heap_top > (uptr)USER_BASE
+					? (uint)((ps_p.heap_top - (uptr)USER_BASE) / PAGE_SIZE) : 0;
+				ps_u[4] = (uint)ps_p.pid; // real pid (0 for idle), not the slot index
+				for (int k = 0; k < 32; k++) { ps_out[20 + k] = ps_p.name[k]; }
+				f.a0 = 0;
+			}
 		case SYS_DISKD_INFO:
 			// diskd-only, called once at its own startup — see
 			// setup_diskd_mappings in process.c3 for why these addresses

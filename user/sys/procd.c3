@@ -1,7 +1,7 @@
 module user;
 
-import std::nolibc::main_stub;
-import std::nolibc::mem;
+import std::io;
+import std::core::mem;
 import std::nolibc::fmt;
 
 // /proc: a synthetic filesystem server (see docs/devlog.md) — speaks the
@@ -60,18 +60,6 @@ fn char* procd_skip_pid(char* path)
         i++;
     }
     return &path[i];
-}
-
-fn int procd_append_str(char* dst, int pos, char* src)
-{
-    int i = 0;
-    while (src[i] != 0)
-    {
-        dst[pos] = src[i];
-        pos++;
-        i++;
-    }
-    return pos;
 }
 
 fn void main() {
@@ -237,15 +225,15 @@ fn void main() {
         }
         else
         {
-            int pos = 4;
-            pos = procd_append_str(&buf, pos, "pid: ");
-            pos += fmt::format_uint(pid_val, &buf[pos]);
-            pos = procd_append_str(&buf, pos, "\nstate: ");
-            pos = procd_append_str(&buf, pos, state == 1 ? "RUNNABLE" : "BLOCKED");
-            pos = procd_append_str(&buf, pos, "\ngeneration: ");
-            pos += fmt::format_uint(gen, &buf[pos]);
-            pos = procd_append_str(&buf, pos, "\n");
-            *result_len_field = pos - 4;
+            // Real std::io formatting into the wire buffer past the
+            // 4-byte result-length header — io::bprintf writes into a
+            // caller-provided slice, no allocation, returns what it
+            // wrote. Replaces the old procd_append_str + fmt::format_uint
+            // hand-rolled chain.
+            char[]? status = io::bprintf(buf[4..], "pid: %d\nstate: %s\ngeneration: %d\n",
+                pid_val, state == 1 ? "RUNNABLE" : "BLOCKED", gen);
+            if (catch status) { *result_len_field = -1; }
+            else { *result_len_field = status.len; }
         }
         ipc_reply(from, verb, &buf, FS_MSG_MAX, from_gen);
     }

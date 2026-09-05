@@ -567,7 +567,33 @@ struct Process
 	// blocking_depth's own comment for the real bug this closes.
 	bool in_blocking_wait;
 
+	// Short human-readable name for `ps` / `top` (SYS_PROC_STAT, entry.c3).
+	// Set for kernel-spawned boot servers right after create_process()
+	// (kernel.c3 / supervisor_spawn), from argv[0]'s basename on every
+	// SYS_EXEC, and inherited by an rfork child until it exec()s. NUL-
+	// padded, may be "" for a process that never got one (idle).
+	char[32] name;
+
 	char[STACK_SIZE] stack; // Kernel stack
+}
+
+// Copy a NUL-terminated name into p.name (basename only — anything up to
+// and including the last '/' is dropped), truncated to fit with a NUL.
+fn void proc_set_name(Process* p, char* s)
+{
+	int start = 0;
+	for (int i = 0; s[i] != 0; i++)
+	{
+		if (s[i] == '/') { start = i + 1; }
+	}
+	int o = 0;
+	while (s[start] != 0 && o < 31)
+	{
+		p.name[o] = s[start];
+		o++;
+		start++;
+	}
+	for (int i = o; i < 32; i++) { p.name[i] = 0; }
 }
 
 // How many processes, system-wide, are currently inside one of the
@@ -1236,6 +1262,7 @@ fn Process* create_process(void* image, uint image_size)
 	// a gap — create_process is the supervisor's respawn path.
 	proc.driver_irq_pending = false;
 	proc.is_boot_server = false; // kernel.c3 / supervisor_spawn set it for servers
+	for (int ni = 0; ni < 32; ni++) { proc.name[ni] = 0; } // kernel.c3 / sys_exec fill it
 	proc.cwd[0] = 0; // root
 	proc.stdout_pipe = -1;
 	proc.stdin_pipe = -1;

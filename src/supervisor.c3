@@ -112,6 +112,7 @@ fn void supervisor_register(char* name, char* bin_start, char* bin_end,
 	int* pid_global, Process* proc)
 {
 	if (service_count >= SVC_MAX || proc == null) { return; }
+	proc_set_name(proc, name);
 	Service* s = &services[service_count];
 	service_count++;
 	s.name           = name;
@@ -171,6 +172,7 @@ fn void supervisor_spawn(Service* s)
 	Process* p = create_process((void*)s.bin_start, img_size);
 
 	p.is_boot_server = true;
+	proc_set_name(p, s.name);
 	switch (s.kind)
 	{
 		case SVC_KIND_FSD:   setup_fsd_mappings(p, s.fsd_partition, s.fsd_secondary);

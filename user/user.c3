@@ -68,6 +68,9 @@ const int SYS_PROF          = 53; // on-device profiling odometer — see src/en
 const int SYS_PROF_HIST     = 54; // DIAGNOSTIC per-syscall histogram — see src/entry.c3's case + ns_translate() below
 const int SYS_DRIVER_IRQ_WAIT = 55; // interrupt-driven driver completion-wait, in-kernel — see src/entry.c3's case + driver_irq_wait() below
 const int SYS_DISK_ARENA_INFO = 56; // diskd + primary fsd: base+size of the shared payload arena — see src/entry.c3's case + disk_arena_info() below
+const int SYS_KLOG_READ     = 57; // kernel console log ring — /bin/dmesg — see src/entry.c3's case + klog_read() below
+const int SYS_PROC_STAT     = 58; // per-process state/uid/gen/pages/pid/name — /bin/ps + /bin/top — see src/entry.c3's case + proc_stat() below
+const int SYS_GETCHAR_NB    = 59; // non-blocking console read: a keystroke, or -1 if none waiting — see src/entry.c3's case + getchar_nb() below
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -1247,6 +1250,28 @@ fn int prof_hist(ulong* out64, int reset) @export("prof_hist") {
     return syscall(SYS_PROF_HIST, (long)out64, (long)reset, 0);
 }
 
+// Copy kernel-console bytes newer than *cursor into out (up to max).
+// *cursor is a running "bytes consumed" counter — start at 0 to read
+// from the oldest byte still in the ring, then keep passing the same
+// cursor back for follow-on reads. Returns bytes copied (0 = nothing
+// new), or -1 on a bad pointer. The kernel log ring — /bin/dmesg.
+fn int klog_read(char* out, int max, ulong* cursor) @export("klog_read") {
+    return syscall(SYS_KLOG_READ, (long)out, (long)max, (long)cursor);
+}
+
+// Look up process-table slot `slot` (1..PROCS_MAX) and fill `out` (>= 52
+// bytes) with:
+//   [0..3]   state   (1 RUNNABLE, 2 BLOCKED)   LE u32
+//   [4..7]   uid                                LE u32
+//   [8..11]  generation                         LE u32
+//   [12..15] resident pages (image + heap HWM)  LE u32
+//   [16..19] real pid (0 for idle)              LE u32
+//   [20..51] name, NUL-padded
+// Returns 0, or -1 for an unused / out-of-range slot. /bin/ps + /bin/top.
+fn int proc_stat(int slot, char* out52) @export("proc_stat") {
+    return syscall(SYS_PROC_STAT, slot, (long)out52, 0);
+}
+
 // The largest image SYS_EXEC will install on this board
 // (board::EXEC_MAX_IMAGE_SIZE — 1 MiB on the Duo, 4 MiB on QEMU/JH7110).
 // A caller sizing its own exec() receive buffer (the shell) reads this
@@ -1261,6 +1286,15 @@ fn void putchar(char ch) @export("putchar") {
 
 fn int getchar() @export("getchar") {
     return syscall(SYS_GETCHAR, 0, 0, 0);
+}
+
+// Non-blocking: returns the next console keystroke, or -1 immediately if
+// nothing is waiting. Console only (a redirected/piped stdin always
+// returns -1). Lets a follow / redraw loop bail on a keypress — there's
+// no ^C on racccoon. Not a data path: bytes read this way are consumed
+// from the same queue getchar() drains.
+fn int getchar_nb() @export("getchar_nb") {
+    return syscall(SYS_GETCHAR_NB, 0, 0, 0);
 }
 
 // 1 if stdin is the console, 0 if the shell wired it to a pipe. The

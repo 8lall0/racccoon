@@ -4,6 +4,77 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — introspection: `dmesg` + `ps` + `top`, and a latent `.text.boot` landmine
+
+From the "ideas beyond the roadmap" list. Three tools that make racccoon
+observable from inside itself, plus a boot bug this work flushed out.
+
+**Kernel log ring → `/bin/dmesg`.** `src/kernel/sbi.c3`: `__putchar`
+(the single console chokepoint every `io::print` / libc / panic path
+already funnels through) tees every byte into a 32 KiB ring
+(`klog_buf`). New `SYS_KLOG_READ` (57): copy bytes newer than a
+caller-held cursor, advancing it — so `dmesg` streams and `dmesg -f`
+follows. Whole boot history fits (~1 KiB of it).
+
+*Real Duo caught the feedback loop the QEMU harness had masked:* a plain
+process's `SYS_PUTCHAR` also routed through `__putchar`, so `dmesg`'s own
+output re-entered the ring and it chased its own tail forever — the shell
+never got control back, and racccoon has no `^C`. Fix: split the console
+path. Kernel-originated output and boot-server chatter (fsd/sdd/usbd/ethd
+init lines — worth keeping) still tee; a plain process's stdout takes a
+new raw `sbi::console_emit` that doesn't. That also keeps the shell
+prompt and every `ls`/`echo` out of `dmesg` — which is correct, it's the
+*kernel* log. Plus `SYS_GETCHAR_NB` (59), a non-blocking console read, so
+`dmesg -f` and `top 0` bail on a keypress instead of wedging the shell.
+
+**`SYS_PROC_STAT` (58) → `/bin/ps` + `/bin/top`.** Per-slot state / uid /
+generation / resident-page HWM / real pid / name. The name is new:
+`Process` gained a `char[32] name`, set from `argv[0]`'s basename on
+every `SYS_EXEC` (snapshotted *before* the page-table remap frees the
+caller's argv buffer — the obvious late placement faults), inherited
+across `rfork` until the child execs, and set for kernel-spawned servers
+in `supervisor_register` / `supervisor_spawn` (so a respawn keeps the
+name). `ps` is one-shot; `top` redraws every ~2 s for N frames
+(default 30 — racccoon has no `^C`) with an `ESC[H ESC[J` clear.
+
+**All three on the real-stdlib path** (`build_user_program_stdio`), for
+`io::printfn` column formatting (`%5d %-3s %4d %6d %s`). ~182 KiB each.
+
+**`procd` moved to the stdlib path too.** Its `/proc/<pid>/status` text
+is now one `io::bprintf(buf[4..], "pid: %d\nstate: %s\n…")` into the
+wire buffer (no allocation) instead of the hand-rolled
+`procd_append_str` + `fmt::format_uint` chain. procd is pure-IPC,
+supervised, no DMA/MMIO — the one server where the trade (+~115 KiB
+image) buys something. The DMA/MMIO drivers (diskd/sdd/fsd/usbd/ethd/
+netd/gpiod) stay on `std::nolibc`: they marshal wire buffers, not
+console text, so there's nothing to gain.
+
+**Latent boot bug, fixed (`.text.boot.entry`).** Adding code to any
+`module kernel` file shifted c3c's function emission order and put
+`smp.c3`'s `secondary_entry` at `0x80200000` — OpenSBI's fixed payload
+entry — ahead of `boot()`. Result: dead on arrival, zero output, on
+plain master too. This is exactly the hazard the `smp-stage-c` branch's
+C1 commit predicted ("latent since the scaffold landed"). Brought just
+the minimal fix to master: `boot()` → `@section(".text.boot.entry")`,
+pinned first in both linker scripts. None of the Stage C tp/sscratch
+rework — that stays parked.
+
+Verified QEMU FAT32 + ext2 + `-smp 2`: `ps` / `top N` / `top 0` +
+keypress-quit / `dmesg` / `dmesg -f` + keypress-stop / `dmesg | wc -l` /
+`cat /proc/N/status` (procd on the new path), shell responsive after each,
+and a regression sweep — runtest, rforktest, killtest, fsdkilltest,
+hungservertest (echod respawns with its name intact), wasmtest,
+stdiotest, maptest, oomtest.
+
+Real Duo (Milk-V, production shell): first flash confirmed `ps` / `top 2`
+/ `dmesg | head` / `cat /proc/N/status` (names, procd-on-stdlib, boot
+clean) — and `dmesg -f` there is what surfaced the feedback loop.
+Reflashed with the console split + `SYS_GETCHAR_NB` and re-verified:
+plain `dmesg` returns to the prompt (shell responsive after), `dmesg -f`
++ keypress stops, `top 0` + keypress quits, `dmesg | head` still pipes.
+
+---
+
 ## 2026-09-05 — self-sufficiency: shell line editing + history, and `/bin/ed`
 
 Two pieces toward racccoon being a place you can actually *work* (from

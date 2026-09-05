@@ -245,11 +245,20 @@ build_user_program_stdio test $STDIO_COMMON user/bin/test.c3
 build_user_program_stdio expr $STDIO_COMMON user/bin/expr.c3
 build_user_program_stdio usbrw $STDIO_COMMON user/bin/usbrw.c3
 build_user_program_stdio gpio $STDIO_COMMON user/bin/gpio.c3
+# introspection — dmesg (kernel console log ring, SYS_KLOG_READ) and
+# ps / top (per-process view, SYS_PROC_STAT). Real stdlib for io::printfn's
+# column formatting.
+build_user_program_stdio dmesg $STDIO_COMMON user/bin/dmesg.c3
+build_user_program_stdio ps $STDIO_COMMON user/bin/ps.c3
+build_user_program_stdio top $STDIO_COMMON user/bin/top.c3
 build_user_program wasm user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/wasm.c3
 build_user_program diskd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/virtio.c3 user/block/diskd.c3
 build_user_program sdd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/block/sdhci.c3 user/block/sdd.c3
 build_user_program fsd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/fs/fsd.c3 user/fs/fat32.c3 user/fs/ext2.c3 user/fs/exfat.c3
-build_user_program procd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/sys/procd.c3
+# procd — real stdlib: its /proc/<pid>/status text is now formatted with
+# io::bprintf (into the wire buffer, no allocation). Pure-IPC, supervised,
+# no DMA/MMIO — the one server where the stdlib path is a clean win.
+build_user_program_stdio procd $STDIO_COMMON user/sys/procd.c3
 build_user_program envd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/sys/envd.c3
 build_user_program usbd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/usb/dwc2.c3 user/usb/xpad.c3 user/usb/kbd.c3 user/usb/msc.c3 user/usb/usbd.c3
 build_user_program ethd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/net/eth_proto.c3 user/net/dhcp.c3 user/net/dwmac.c3 user/net/ephy.c3 user/net/ethd.c3

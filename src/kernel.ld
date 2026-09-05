@@ -15,6 +15,15 @@ SECTIONS {
     __kernel_base = .;
 
     .text.boot : {
+        /* boot() MUST be the very first byte at 0x80200000 — that's where
+           OpenSBI's payload handoff jumps, regardless of ELF e_entry. It
+           shares .text.boot with smp.c3's secondary_entry, and the order
+           two functions land in one section is just c3c's emission order
+           (which shifted once and silently put secondary_entry first —
+           OpenSBI then jumped straight into it, secondary_main masked
+           interrupts and parked, dead-on-arrival with no output). Pin it
+           via its own subsection, listed first. See kernel.c3's boot(). */
+        KEEP(*(.text.boot.entry));
         KEEP(*(.text.boot));
     } :text
 

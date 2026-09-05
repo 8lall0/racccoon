@@ -58,7 +58,14 @@ extern char[] _binary_netd_bin_end @cname("_binary_netd_bin_end");
 extern char[] _binary_gpiod_bin_start @cname("_binary_gpiod_bin_start");
 extern char[] _binary_gpiod_bin_end @cname("_binary_gpiod_bin_end");
 
-fn void boot() @naked @export("boot") @section(".text.boot") @noinline @nostrip @used
+// @section(".text.boot.entry") — pinned first in .text.boot by both
+// linker scripts so OpenSBI's fixed 0x80200000 payload-entry jump always
+// lands here and never in smp.c3's secondary_entry (which shares
+// .text.boot). c3c merges every `module kernel` file into one object and
+// picks its own function emission order; it once put secondary_entry
+// first, and any unrelated edit to a kernel-module file can flip it
+// again — so the ordering is pinned here, not left to chance.
+fn void boot() @naked @export("boot") @section(".text.boot.entry") @noinline @nostrip @used
 {
 	// OpenSBI enters S-mode here with a0 = the boot hart's id, a1 = the
 	// DTB address. Stash a0 for src/smp.c3 before setting up the stack —
@@ -125,6 +132,7 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	idle_proc = create_process(null, 0);
 	io::print("3: Idle created\n");
 
+	proc_set_name(idle_proc, "idle");
 	idle_proc.pid = 0;
 	current_proc = idle_proc;
 
@@ -271,7 +279,8 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	// wait), and the round-robin scan already correctly alternates
 	// between any number of such processes — the same shape that
 	// already works fine for e.g. hotplugtest's own dangling-fid race.
-	create_process((void*)&_binary_shell_bin_start, (uint)((uptr)&_binary_shell_bin_end - (uptr)&_binary_shell_bin_start));
+	Process* shell_proc = create_process((void*)&_binary_shell_bin_start, (uint)((uptr)&_binary_shell_bin_end - (uptr)&_binary_shell_bin_start));
+	proc_set_name(shell_proc, "shell");
 	io::print("shell created\n");
 
 	// usbd (the USB host-controller driver, user/usbd.c3) — Duo only
@@ -362,7 +371,8 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 		}
 		if (!shell_running)
 		{
-			create_process((void*)&_binary_shell_bin_start, (uint)((uptr)&_binary_shell_bin_end - (uptr)&_binary_shell_bin_start));
+			Process* respawned_shell = create_process((void*)&_binary_shell_bin_start, (uint)((uptr)&_binary_shell_bin_end - (uptr)&_binary_shell_bin_start));
+			proc_set_name(respawned_shell, "shell");
 		}
 
 		yield();

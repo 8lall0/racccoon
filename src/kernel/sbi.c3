@@ -35,10 +35,53 @@ fn Sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4, long a
 	return output;
 }
 
-fn int __putchar(int ch)
+// Kernel log ring — every byte the kernel prints (io::print, the libc
+// puts/fwrite path, board::console_putchar, panic) funnels through
+// __putchar, so teeing here captures the whole console history for
+// `dmesg` (SYS_KLOG_READ, src/entry.c3). Lives in `module sbi` — a leaf
+// module the kernel imports — because sbi can't import `kernel` back.
+// Plain non-atomic append: single-hart today, and a torn byte in a
+// debug log is harmless (see spinlock.c3's console note).
+const int KLOG_SIZE = 32768;
+char[KLOG_SIZE] klog_buf;
+ulong klog_written = 0;          // total bytes ever, monotonic
+
+// Raw console write — one legacy-SBI putchar, NO klog tee. Used for a
+// plain userspace process's SYS_PUTCHAR (src/entry.c3): its stdout is
+// terminal output, not kernel log, and — critically — teeing it would
+// let `dmesg` (which prints what it reads) chase its own tail forever.
+// Kernel-originated output (io::print, libc, panic) and boot-server
+// chatter still go through __putchar below, which does tee.
+fn int console_emit(int ch)
 {
 	sbi_call((long)ch, 0, 0, 0, 0, 0, 0, 1);
 	return ch;
+}
+
+fn int __putchar(int ch)
+{
+	klog_buf[(uint)(klog_written % KLOG_SIZE)] = (char)ch;
+	klog_written++;
+	return console_emit(ch);
+}
+
+// Copy log bytes newer than *cursor into out (up to max). *cursor is a
+// running "bytes consumed" counter — 0 to read from the start (clamped
+// to the oldest byte still in the ring). Returns bytes copied; advances
+// *cursor.
+fn int klog_copy(char* out, int max, ulong* cursor)
+{
+	ulong oldest = klog_written > KLOG_SIZE ? klog_written - KLOG_SIZE : 0;
+	ulong from = *cursor < oldest ? oldest : *cursor;
+	int n = 0;
+	while (from < klog_written && n < max)
+	{
+		out[n] = klog_buf[(uint)(from % KLOG_SIZE)];
+		n++;
+		from++;
+	}
+	*cursor = from;
+	return n;
 }
 
 fn int __getchar()
