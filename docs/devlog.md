@@ -4,6 +4,19 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-06 — a complete manual (`docs/manual.md`)
+
+`docs/manual.md` — one file, everything: architecture + boot sequence,
+the process/memory model, the syscall ABI, a reference table for all
+57 live syscalls, the `user.c3` API grouped by area, IPC + 9P,
+namespaces, the filesystem interface (topology + `FS_*` wire protocol),
+a walk-through of writing a program on both build paths with the c3
+gotchas and the build-wiring steps, the shell, the servers + supervisor,
+board abstraction, build/run/flash, and a candid limitations list.
+README gets a Documentation section and freshened blurbs.
+
+---
+
 ## 2026-09-06 — tried services-log-to-ring-only, reverted (`c760529` → `d2c8c60`)
 
 Follow-on to `dmesg`: make boot/driver servers write to the kernel log
