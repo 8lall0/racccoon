@@ -46,12 +46,26 @@ subsection, listed first in both linker scripts.
 `rforktest`, `threadtest`, `oomtest`, `maptest`, `fsdkilltest` all
 green. No real hardware yet — Stage C isn't done.
 
-**Next: C2** — a giant `kernel_lock` taken at trap entry and dropped
-around `yield()`'s `switch_context`, making the whole kernel correct
-under SMP at zero kernel parallelism (user code on the two harts still
-runs truly parallel). Uncontended until C3 brings the secondaries into
-the scheduler. **C3** is the dangerous one (real concurrency,
-QEMU-TCG-only validation).
+**C2 DONE** (`e617d8a`) — the giant `kernel_lock`. A single `Spinlock`
+held by whichever hart runs kernel code past the trap-entry asm:
+`handle_trap()` is now a thin wrapper (acquire → `handle_trap_body(f)` →
+release) and `yield()` drops the lock around `switch_context` and
+retakes it on resume, so a hart parked in a blocking wait (every
+blocking syscall spins on `yield()`) doesn't lock the other hart out.
+`kernel_main`'s idle loop acquires it before its `for(;;)`. The whole
+existing kernel — IPC rendezvous, page tables, namespace, procd/envd,
+pipes, supervisor — is now correct under SMP with no per-structure
+locking, at zero *kernel* parallelism; user code on the two harts still
+runs genuinely parallel. Uncontended until C3. SIE invariant preserved
+(lock held with interrupts off, same as pre-SMP). Verified QEMU FAT32 +
+ext2 + `-smp 2`, same test set as C1, all green.
+
+**Next: C3** — the dangerous one. Secondary harts enter a real
+scheduler loop instead of `wfi`; per-hart `current_proc`; a
+"running-on-a-hart" marker so two harts can't pick the same process;
+per-hart timer. First real 2-hart execution. QEMU-TCG is weak for race
+detection and there's no SMP hardware, so it lands carefully and stays
+on the branch until it's proven.
 
 **Files:** `src/smp.c3`, `src/entry.c3` (`kernel_entry`), `src/process.c3`
 (`switch_context`), `src/kernel.c3`, `src/kernel.ld`,
