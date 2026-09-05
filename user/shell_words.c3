@@ -55,6 +55,43 @@ fn void shell_local_set(char* name, char* value)
     g_shell_vvals[s][k] = 0;
 }
 
+// Command substitution (§2.5 S5): `` `{cmd} `` (rc's form) or `` `cmd` ``
+// (traditional). in[i] is the char right after the opening backtick.
+// Copies the inner command into `inner` (cap incl. NUL) and returns the
+// number of bytes consumed from in[i] *including* the closing delimiter,
+// or 0 if it never closes.
+fn int sh_read_cmdsub(char* in, int i, char* inner, int cap)
+{
+    int n = 0;
+    if (in[i] == '{') {
+        int depth = 0;
+        int j = i;
+        for (; in[j] != 0; j++) {
+            if (in[j] == '{') { depth++; }
+            else if (in[j] == '}') {
+                depth--;
+                if (depth == 0) {
+                    int k0 = i + 1;
+                    while (k0 < j && n < cap - 1) { inner[n] = in[k0]; n++; k0++; }
+                    inner[n] = 0;
+                    return (j - i) + 1;        // through the `}`
+                }
+            }
+        }
+        return 0;
+    }
+    // `...` form
+    int j = i;
+    while (in[j] != 0 && in[j] != '`') {
+        if (in[j] == '\\' && in[j + 1] != 0) { j++; }
+        if (n < cap - 1) { inner[n] = in[j]; n++; }
+        j++;
+    }
+    if (in[j] != '`') { return 0; }
+    inner[n] = 0;
+    return (j - i) + 1;                        // through the closing backtick
+}
+
 // Read the variable name that follows a `$` (in[i] is the first char
 // after it) into name (>= 32 bytes). Returns the number of chars
 // consumed from in[i], or 0 if in[i] doesn't begin one. Handles the
@@ -185,6 +222,17 @@ fn void shell_expand(char* in, char* out, int cap)
                 continue;
             }
         }
+        if (in[i] == '`') {
+            char[256] inner @noinit;
+            int consumed = sh_read_cmdsub(in, i + 1, &inner[0], 256);
+            if (consumed > 0) {
+                i += 1 + consumed;
+                char[512] cap_out @noinit;
+                int cl = shell_capture(&inner[0], &cap_out[0], 512);
+                for (int k = 0; k < cl && o < cap - 1; k++) { out[o] = cap_out[k]; o++; }
+                continue;
+            }
+        }
         out[o] = in[i];
         o++;
         i++;
@@ -249,11 +297,18 @@ fn int shell_expand_q(char* in, char* out, char* qmask, int cap)
                 }
                 char[32] nm @noinit;
                 int consumed = in[i] == '$' ? sh_read_varname(in, i + 1, &nm[0]) : 0;
+                char[256] cin @noinit;
+                int csub = (consumed == 0 && in[i] == '`') ? sh_read_cmdsub(in, i + 1, &cin[0], 256) : 0;
                 if (consumed > 0) {
                     i += 1 + consumed;
                     char[256] val @noinit;
                     int vl = shell_var_value(&nm[0], &val[0], 256);
                     for (int k = 0; k < vl && o < cap - 1; k++) { out[o] = val[k]; qmask[o] = 1; o++; }
+                } else if (csub > 0) {
+                    i += 1 + csub;
+                    char[512] cv @noinit;
+                    int cl = shell_capture(&cin[0], &cv[0], 512);
+                    for (int k = 0; k < cl && o < cap - 1; k++) { out[o] = cv[k]; qmask[o] = 1; o++; }
                 } else {
                     if (o < cap - 1) { out[o] = in[i]; qmask[o] = 1; o++; }
                     i++;
@@ -269,6 +324,17 @@ fn int shell_expand_q(char* in, char* out, char* qmask, int cap)
                 char[256] val @noinit;
                 int vl = shell_var_value(&nm[0], &val[0], 256);
                 for (int k = 0; k < vl && o < cap - 1; k++) { out[o] = val[k]; qmask[o] = 0; o++; }
+                continue;
+            }
+        }
+        if (c == '`') {
+            char[256] cin @noinit;
+            int csub = sh_read_cmdsub(in, i + 1, &cin[0], 256);
+            if (csub > 0) {
+                i += 1 + csub;
+                char[512] cv @noinit;
+                int cl = shell_capture(&cin[0], &cv[0], 512);
+                for (int k = 0; k < cl && o < cap - 1; k++) { out[o] = cv[k]; qmask[o] = 0; o++; }
                 continue;
             }
         }

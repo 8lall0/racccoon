@@ -1,6 +1,7 @@
 #!/bin/rc
-# S2/S3 script fixture (docs/roadmap.md §2.5). Command substitution
-# (`{...}`), for and while land in S4/S5.
+# Shell control-flow fixture (docs/roadmap.md §2.5): positional params,
+# shell-locals, if/else, for, while, break/continue, command
+# substitution (`{...}` / `...`).
 echo greet: hello, $# args, first=$1
 name=world
 echo greet: name is $name
@@ -9,12 +10,18 @@ if (test $# -ge 1) {
 } else {
     echo greet: no arg1
 }
-if (test $# -ge 1) {
-    if (test -f $1) {
-        echo greet: $1 is a file
-    } else {
-        echo greet: $1 is not a file
-    }
+for (w in alpha beta gamma) {
+    echo greet: word $w
+}
+i=0
+while (test $i -lt 3) {
+    echo greet: iter $i
+    i=`expr $i + 1`
+}
+for (n in 1 2 3 4 5) {
+    if (test $n -eq 3) break
+    if (test $n -eq 1) continue
+    echo greet: n=$n
 }
 count=3
 if (test $count -gt 2) echo greet: count over two

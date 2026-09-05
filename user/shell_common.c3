@@ -153,7 +153,7 @@ fn bool shell_text_balanced(char* s)
         char c = s[i];
         if (q != 0) { if (c == q) { q = 0; } continue; }
         if (c == '\\' && s[i + 1] != 0) { i++; continue; }
-        if (c == '\'' || c == '"') { q = c; continue; }
+        if (c == '\'' || c == '"' || c == '`') { q = c; continue; }
         if (c == '(') { paren++; }
         else if (c == ')') { if (paren > 0) { paren--; } }
         else if (c == '{') { brace++; }
@@ -598,6 +598,14 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
                 return true;
             }
             exit();
+        } else if (strcmp(cmd, "break") == 0) {
+            if (g_shell_loop_depth > 0) { g_shell_loop_break = true; }
+            else { print("break: not in a loop\n"); g_shell_status = 1; }
+            return true;
+        } else if (strcmp(cmd, "continue") == 0) {
+            if (g_shell_loop_depth > 0) { g_shell_loop_continue = true; }
+            else { print("continue: not in a loop\n"); g_shell_status = 1; }
+            return true;
         } else if (strcmp(cmd, ".") == 0 || strcmp(cmd, "source") == 0) {
             if (cmd_argc < 1) {
                 print("usage: . <script> [args...]\n");
@@ -836,6 +844,57 @@ fn int shell_spawn(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out, int 
                 exitcode(127);
             }
             return sh_r;
+}
+
+// Command substitution (§2.5 S5): run `inner` (a single command — no
+// pipes) with stdout to a pipe, drain it, and write the captured output
+// into `out` (cap includes the NUL) with trailing newlines trimmed and
+// any internal newline turned into a space (rc field-splits the result;
+// the caller's tokeniser then does the split for an unquoted result).
+// Returns the captured length. Both `. builtins` and /bin binaries work
+// as the command; shell-state builtins (`cd` etc.) don't (they run in
+// the forked child).
+fn int shell_capture(char* inner, char* out, int cap)
+{
+    out[0] = 0;
+
+    char[256] cx @noinit;
+    shell_expand(inner, &cx[0], 256);
+    char*[16] argv @noinit;
+    int argc = 0;
+    int ti = 0;
+    while (cx[ti] != 0 && argc < 16) {
+        while (cx[ti] == ' ' || cx[ti] == '\t') { ti++; }
+        if (cx[ti] == 0) { break; }
+        argv[argc] = &cx[ti];
+        argc++;
+        while (cx[ti] != 0 && cx[ti] != ' ' && cx[ti] != '\t') { ti++; }
+        if (cx[ti] != 0) { cx[ti] = 0; ti++; }
+    }
+    if (argc == 0) { return 0; }
+
+    int pp = pipe_new();
+    if (pp < 0) { print("shell: out of pipes\n"); return 0; }
+    pipe_hold(pp, 0, 1);                      // shell drains the read end
+
+    uint gen = 0;
+    int pid = shell_spawn(argv[0], &argv[1], argc - 1, &gen, pp, -1);
+    if (pid <= 0) { pipe_hold(pp, 0, -1); return 0; }
+
+    int n = 0;
+    for (;;) {
+        if (n >= cap - 1) { break; }
+        int r = pipe_read(pp, &out[n], cap - 1 - n);
+        if (r <= 0) { break; }
+        n += r;
+    }
+    join(pid, gen);
+    pipe_hold(pp, 0, -1);
+
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r')) { n--; }
+    for (int k = 0; k < n; k++) { if (out[k] == '\n' || out[k] == '\r') { out[k] = ' '; } }
+    out[n] = 0;
+    return n;
 }
 
 // Builtins that are safe to run as a pipeline stage: they only produce
@@ -1290,9 +1349,12 @@ fn int shell_exec_line(char* line)
 // end byte rather than copied out — no big per-recursion stack buffer.
 // ====================================================================
 
-// break/continue for S4's loops — the block loop checks these.
+// break/continue for S4's loops — the block loop checks these; the
+// `break` / `continue` builtins set them only when g_shell_loop_depth
+// says we're actually inside a `for` / `while`.
 bool g_shell_loop_break    = false;
 bool g_shell_loop_continue = false;
+int  g_shell_loop_depth    = 0;
 
 fn int sh_strlen(char* s)
 {
@@ -1334,7 +1396,7 @@ fn int sh_plain_end(char* s, int start)
     for (int i = start; s[i] != 0; i++) {
         char c = s[i];
         if (q != 0) { if (c == q) { q = 0; } continue; }
-        if (c == '\'' || c == '"') { q = c; continue; }
+        if (c == '\'' || c == '"' || c == '`') { q = c; continue; }
         if (c == '\\' && s[i + 1] != 0) { i++; continue; }
         if (c == '\n' || c == ';') { return i; }
     }
@@ -1413,23 +1475,29 @@ fn int sh_run_body(char* s, int at, bool run, int* after)
 // `if`, a trailing `else` + body); a plain statement ends at sh_plain_end.
 fn int sh_stmt_end(char* s, int start)
 {
-    if (sh_kw_head(&s[start], "if")) {
-        int i = start + 2;
-        i = sh_skip_ws(s, i);
-        if (s[i] != '(') { return sh_plain_end(s, start); }
-        int past_cond = sh_span_group(s, i);
-        if (past_cond < 0) { return sh_plain_end(s, start); }
-        i = sh_skip_ws(s, past_cond);
-        int after = 0;
-        sh_run_body(s, i, false, &after);
+    int kwlen = 0;
+    bool has_else = false;
+    if (sh_kw_head(&s[start], "if"))         { kwlen = 2; has_else = true; }
+    else if (sh_kw_head(&s[start], "for"))   { kwlen = 3; }
+    else if (sh_kw_head(&s[start], "while")) { kwlen = 5; }
+
+    if (kwlen == 0) { return sh_plain_end(s, start); }
+
+    int i = sh_skip_ws(s, start + kwlen);
+    if (s[i] != '(') { return sh_plain_end(s, start); }
+    int past_cond = sh_span_group(s, i);
+    if (past_cond < 0) { return sh_plain_end(s, start); }
+    i = sh_skip_ws(s, past_cond);
+    int after = 0;
+    sh_run_body(s, i, false, &after);
+    if (has_else) {
         int j = sh_skip_ws(s, after);
         if (sh_kw_head(&s[j], "else")) {
             j = sh_skip_ws(s, j + 4);
             sh_run_body(s, j, false, &after);
         }
-        return after;
     }
-    return sh_plain_end(s, start);
+    return after;
 }
 
 fn int shell_do_if(char* s)
@@ -1462,6 +1530,114 @@ fn int shell_do_if(char* s)
     return st;
 }
 
+// `for (VAR in WORD...) BODY` — WORD list is `$var`-expanded then split
+// on whitespace, and any word with an unquoted `*` / `?` is globbed
+// (rc's `for (f in *.c3)` idiom). VAR is set as a shell-local each pass.
+fn int shell_do_for(char* s)
+{
+    int i = sh_skip_ws(s, 3);                 // past "for"
+    if (s[i] != '(') { print("rc: for: expected `(`\n"); g_shell_status = 2; return 2; }
+    int past = sh_span_group(s, i);
+    if (past < 0) { print("rc: for: unbalanced `( )`\n"); g_shell_status = 2; return 2; }
+
+    // Inside the parens: VAR in WORD...
+    int p = sh_skip_ws(s, i + 1);
+    char[SH_VNAME_MAX] loopvar @noinit;
+    int vn = 0;
+    while (sh_name_char(s[p]) && vn < SH_VNAME_MAX - 1) { loopvar[vn] = s[p]; vn++; p++; }
+    loopvar[vn] = 0;
+    p = sh_skip_ws(s, p);
+    if (vn == 0 || !(s[p] == 'i' && s[p + 1] == 'n' && (s[p + 2] == ' ' || s[p + 2] == '\t'))) {
+        print("rc: for: expected `for (VAR in WORDS)`\n");
+        g_shell_status = 2;
+        return 2;
+    }
+    p += 2;                                   // past "in"
+
+    // WORD text is s[p .. past-1); expand $vars, then split.
+    int wtext_end = past - 1;                  // the ')'
+    char saveP = s[wtext_end];
+    s[wtext_end] = 0;
+    char[512] wexp @noinit;
+    shell_expand(&s[p], &wexp[0], 512);
+    s[wtext_end] = saveP;
+
+    int body_at = sh_skip_ws(s, past);
+
+    g_shell_loop_depth++;
+    int st = 0;
+    int wi = 0;
+    for (;;) {
+        while (wexp[wi] == ' ' || wexp[wi] == '\t') { wi++; }
+        if (wexp[wi] == 0) { break; }
+        int ws0 = wi;
+        while (wexp[wi] != 0 && wexp[wi] != ' ' && wexp[wi] != '\t') { wi++; }
+        char sc = wexp[wi];
+        wexp[wi] = 0;
+        char* word = &wexp[ws0];
+
+        // glob this word (rc: a pattern that matches nothing stays literal)?
+        bool has_meta = false;
+        for (int g = 0; word[g] != 0; g++) { if (word[g] == '*' || word[g] == '?') { has_meta = true; break; } }
+        char[512] gnames @noinit;
+        int gnb = 0;
+        char*[16] gwords @noinit;
+        int gsw = 0;
+        int gn = has_meta ? shell_glob_into(word, &gnames[0], &gnb, 512, &gwords[0], &gsw, 16) : 0;
+
+        int matches = gn > 0 ? gn : 1;
+        for (int m = 0; m < matches; m++) {
+            char* iter = gn > 0 ? gwords[m] : word;
+            shell_local_set(&loopvar[0], iter);
+            int after = 0;
+            st = sh_run_body(s, body_at, true, &after);
+            if (g_shell_loop_continue) { g_shell_loop_continue = false; continue; }
+            if (g_shell_loop_break || g_shell_script_stop) { break; }
+        }
+        wexp[wi] = sc;
+        if (g_shell_loop_break || g_shell_script_stop) { break; }
+    }
+    g_shell_loop_depth--;
+    g_shell_loop_break = false;
+    g_shell_status = st;
+    return st;
+}
+
+const int SH_WHILE_CAP = 1000000;   // runaway guard
+
+fn int shell_do_while(char* s)
+{
+    int i = sh_skip_ws(s, 5);                 // past "while"
+    if (s[i] != '(') { print("rc: while: expected `(`\n"); g_shell_status = 2; return 2; }
+    int past = sh_span_group(s, i);
+    if (past < 0) { print("rc: while: unbalanced `( )`\n"); g_shell_status = 2; return 2; }
+    int cond_close = past - 1;
+    int body_at = sh_skip_ws(s, past);
+
+    g_shell_loop_depth++;
+    int st = 0;
+    int iters = 0;
+    for (;;) {
+        if (iters >= SH_WHILE_CAP) { print("rc: while: iteration cap hit\n"); break; }
+        iters++;
+
+        char save = s[cond_close];
+        s[cond_close] = 0;
+        int cstatus = shell_exec_line(&s[i + 1]);
+        s[cond_close] = save;
+        if (cstatus != 0) { break; }
+
+        int after = 0;
+        st = sh_run_body(s, body_at, true, &after);
+        if (g_shell_loop_continue) { g_shell_loop_continue = false; continue; }
+        if (g_shell_loop_break || g_shell_script_stop) { break; }
+    }
+    g_shell_loop_depth--;
+    g_shell_loop_break = false;
+    g_shell_status = st;
+    return st;
+}
+
 // One statement, already isolated (NUL-terminated) and ws-trimmed at the
 // front by the caller.
 fn int shell_exec_stmt(char* s)
@@ -1469,11 +1645,8 @@ fn int shell_exec_stmt(char* s)
     int i = sh_skip_ws(s, 0);
     if (s[i] == 0 || s[i] == '#') { return g_shell_status; }   // blank / comment
     if (sh_kw_head(&s[i], "if"))    { return shell_do_if(&s[i]); }
-    if (sh_kw_head(&s[i], "for") || sh_kw_head(&s[i], "while")) {
-        print("rc: for/while not implemented yet (S4)\n");
-        g_shell_status = 2;
-        return 2;
-    }
+    if (sh_kw_head(&s[i], "for"))   { return shell_do_for(&s[i]); }
+    if (sh_kw_head(&s[i], "while")) { return shell_do_while(&s[i]); }
     if (sh_is_assign(&s[i]))        { return sh_do_assign(&s[i]); }
     return shell_exec_line(&s[i]);
 }
