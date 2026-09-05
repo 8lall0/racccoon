@@ -260,9 +260,9 @@ not bourne. Interleaved with §1/§2 rather than a phase of its own.
   continuation reader (production shell); the test shell does
   single-line control flow + `. script` for multi-line. Real-Duo
   verified over the debug UART.
-- Known gap: `"$x"` with `x` empty produces no argv word (`test -n
-  "$x"` misfires) — pre-existing tokeniser limitation, workaround
-  `test $# -ge 1` / `test x$x = x`.
+- `"$x"` empty-word gap fixed (`677d2bd`) — `SH_QMARK` anchor byte;
+  `test -n "$x"` works, `NAME=value` is quote-aware. Still unsupported:
+  `${name}` brace form, quote-respecting split in `for (v in …)`.
 
 **Still to do:**
 - proper functions (`fn name { }`), `switch` / `case` — not needed yet.

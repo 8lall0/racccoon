@@ -50,10 +50,15 @@ multi-statement `while` body on one line at the prompt; no wasmtest /
 killtest / rforktest / oomtest / maptest regression. Fixture
 `disk/greet.rc` + `disk-ext2/greet.rc` on the images.
 
-**Known gap** (pre-existing, not this work): `"$x"` where `x` is
-empty/unset produces no argv word rather than an empty one, so
-`test -n "$x"` misfires. Workaround `test $# -ge 1` / `test x$x = x`. A
-real fix needs empty-quoted-word tracking through the tokeniser.
+**Follow-up (`677d2bd`)** — fixed the `"$x"` gap: `shell_expand_q` emits
+a `SH_QMARK` (0x01) anchor byte at every quote-open, the tokeniser
+strips them out of each finished token, and a token that was only
+anchors becomes `""` (a real argv word). `test -n "$x"` /
+`if (test -n "$missing") { … }` now work. Same pass made `NAME=value`
+quote-aware (`x="a b"` no longer leaks the quotes — routes through
+shell_expand_q instead of the quote-blind shell_expand). Still
+unsupported: `${name}` brace form, quote-respecting word split in
+`for (v in …)`.
 
 **S6 (2026-09-05)** — reflashed the Duo (`reflash_duo.sh`, production
 `shell.c3`) + `populate_duo_bin.sh` for the new `/bin/{test,[,expr}`,
