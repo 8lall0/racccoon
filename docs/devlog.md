@@ -4,6 +4,30 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-06 — tried services-log-to-ring-only, reverted (`c760529` → `d2c8c60`)
+
+Follow-on to `dmesg`: make boot/driver servers write to the kernel log
+ring only, so a clean boot is just the kernel's own progress lines +
+`login:` and `dmesg` recalls the rest. Passed the full QEMU regression
+sweep — **hung the real Duo at boot**: no login prompt, stuck after
+`svc: respawned sdd`.
+
+The console klog-only split was fine. The break was dropping
+`shell_boot_settle` (the ~6 s wait before the first prompt): without it
+the shell calls `fs_read("/adm/users")` while sdd is still mid
+CMD0/CMD8/ACMD41, fsd's request piles up in sdd's inbox, the supervisor
+watchdog kills sdd, and the respawn gets hammered the same way. The
+settle was masking a real bug — **`fs_read` (→ `SYS_IPC_CALL`) blocks
+instead of returning -1 against a server that isn't in its `ipc_recv`
+loop yet**, so `shell_login`'s own 10 s deadline never gets a turn.
+
+Reverted whole. `dmesg` / `ps` / `top` / the console-tee split
+(`d5cd27b`) are untouched and stay on the board. Redo is on the
+desiderata list (keep the settle; separately, fix the blocking
+`fs_read`).
+
+---
+
 ## 2026-09-05 — introspection: `dmesg` + `ps` + `top`, and a latent `.text.boot` landmine
 
 From the "ideas beyond the roadmap" list. Three tools that make racccoon
