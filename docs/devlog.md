@@ -30,11 +30,19 @@ at a lone `.`), `d`, `j`, `m`, `s/old/new/[g]` (literal), `r`, `w`, `=`,
 `q` (fails once when dirty) / `Q`. CR or LF ends a line (serial
 terminals send CR). Seeded on all four images + populate_duo_bin.sh.
 
+**Six `/bin` text tools (`acba185`).** `grep [-vinc]`, `wc [-lwc]`,
+`sort [-rnu]`, `find [dir] [-name GLOB] [-type f|d]`, `cmp`, `tr`
+(with `a-z` ranges). Small nolibc programs, ~80 KiB each (sort ~145),
+literal matching (no regexp, like `ed`). The shell's pipes / globbing /
+control flow feed them.
+
 Verified QEMU FAT32 + ext2: raw-serial `^A`/`^E`/Home + mid-line
 arrow-insert + `^W`/`^U` + up-arrow recall (2 deep, mid-typing
 replace); `ed` create/`a`/`i`/`c`/`d`/`j`/`m`/`s`/`/search/`/`=`, `w`
-then `cat` shows edits persisted, dirty-quit warning. No wasmtest /
-killtest / chmodtest / pipeline regression.
+then `cat` shows edits persisted, dirty-quit warning; `ls | grep -i
+WASM | wc -l` (3-stage), `ls | sort -r | head`, `echo HELLO | tr A-Z
+a-z`, `find /bin -name "c*" -type f`, `grep -n ext2 file`, `cmp file
+file`. No wasmtest / killtest / chmodtest / pipeline regression.
 
 ---
 
