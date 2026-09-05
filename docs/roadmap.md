@@ -797,13 +797,21 @@ IPC rendezvous, `procs[]`). Staged:
   allocator lock held by a syscall path). Console output (`sbi::__putchar`)
   deliberately left unlocked — cosmetic interleaving only, and a naive
   lock deadlocks `panic()`; a panic-aware lock-break is a Stage C item.
-- **Stage C — not started.** Bring up hart 1 as a *scheduling* hart:
-  per-hart `current_proc` / idle proc / trap stack / `sscratch` (needs
-  a real `this_hartid()` — a tp reserved for S-mode or an
-  sscratch-indirect per-hart block, which touches the trap entry asm);
-  a scheduler lock around `yield()` + `switch_context`; per-hart timer
-  interrupts. QEMU `-smp 2`, first point the kernel runs code on two
-  harts.
+- **Stage C — in progress (branch `smp-stage-c`).**
+  - **C1 DONE** (`b6b036b`) — per-hart identity: `sscratch` → a tiny
+    per-hart `HartScratch`, `tp` = that block while in kernel C code,
+    `kernel_entry` / `switch_context` reworked, `this_hartid()` reads
+    `tp`. Behaviourally identical on one hart. (Also fixed a latent
+    boot-order bug: `boot()` now pinned first in `.text.boot`.)
+  - **C2 — next.** A giant `kernel_lock` at trap entry, dropped around
+    `yield()`'s `switch_context` and thus across every blocking wait.
+    Whole kernel correct under SMP, zero kernel parallelism; user code
+    on both harts runs parallel. Uncontended until C3.
+  - **C3 — the dangerous one.** Secondary harts enter the scheduler
+    loop instead of `wfi`; per-hart `current_proc` + a "running on a
+    hart" marker so two harts can't pick the same process; per-hart
+    timer. QEMU `-smp 2` — first real 2-hart run. TCG is weak for race
+    detection and there's no SMP hardware, so this lands carefully.
 - **Stage D — not started.** IPC rendezvous locking + TLB shootdown
   IPIs (`sbi_send_ipi`) — required for userspace correctness once >1
   hart runs user code. Audit every `state == PROC_UNUSED` site to also

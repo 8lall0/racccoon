@@ -4,6 +4,61 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — SMP scheduler, Stage C1: per-hart identity + trap-path rework
+
+Branch `smp-stage-c`, commit `b6b036b`. First of the C sub-stages (see
+docs/roadmap.md §8). Stage C is where the kernel's founding invariant —
+"kernel code is never preempted, so no locks" — finally has to go,
+because two harts run kernel code at once. C1 lays the per-hart
+plumbing; it changes nothing observable on one hart.
+
+**The mechanism (mirrors xv6).** `sscratch` now permanently holds
+`&hart_scratch[thishart]` — a tiny per-hart `HartScratch { kstack; tmp;
+hartid }` — instead of a bare kernel-stack pointer.
+- `kernel_entry` swaps `sscratch` with `tp` on trap entry, so kernel C
+  code runs with `tp` = the per-hart block. `tp` is ABI-reserved (the
+  compiler never allocates it), so it survives every call and every
+  `switch_context` untouched — and since a context switch doesn't move
+  a process between harts, `tp` correctly *follows the hart*. The user
+  sp is parked in `HartScratch.tmp` for the few instructions until it
+  reaches its frame slot; the frame itself is built on
+  `HartScratch.kstack`.
+- `switch_context` writes the resumed process's kernel-stack top into
+  `HartScratch.kstack` (`sd a3, 0(tp)`) instead of `csrw sscratch, a3`.
+- `this_hartid()` reads `tp`.
+
+On one scheduling hart this is the old behaviour exactly, one
+indirection later — `kernel_entry` reads the same anchor back.
+
+**Boot-order bug, fixed in passing.** The first build hung dead with no
+output. `boot()` (kernel.c3) and `secondary_entry` (smp.c3) both live in
+`.text.boot`, and their order in the merged object is just c3c's
+emission order — which this change perturbed, putting `secondary_entry`
+first. OpenSBI's payload handoff is a fixed jump to `0x80200000`
+regardless of ELF `e_entry`, so it jumped straight into
+`secondary_entry` → `secondary_main` → `wfi`. Latent since the SMP
+scaffold landed (2026-09-02); the ordering had just happened to favour
+`boot`. Fixed properly: `boot()` gets its own `.text.boot.entry`
+subsection, listed first in both linker scripts.
+
+**Verified (QEMU only, one scheduling hart):** FAT32 + ext2 + `-smp 2`
+— `wasmtest` 14/14, `stdiotest`, fs round trips, `killtest`,
+`rforktest`, `threadtest`, `oomtest`, `maptest`, `fsdkilltest` all
+green. No real hardware yet — Stage C isn't done.
+
+**Next: C2** — a giant `kernel_lock` taken at trap entry and dropped
+around `yield()`'s `switch_context`, making the whole kernel correct
+under SMP at zero kernel parallelism (user code on the two harts still
+runs truly parallel). Uncontended until C3 brings the secondaries into
+the scheduler. **C3** is the dangerous one (real concurrency,
+QEMU-TCG-only validation).
+
+**Files:** `src/smp.c3`, `src/entry.c3` (`kernel_entry`), `src/process.c3`
+(`switch_context`), `src/kernel.c3`, `src/kernel.ld`,
+`boards/duo/kernel.ld`.
+
+---
+
 ## 2026-09-05 — SMP scheduler, Stages A + B: per-hart control block + the first kernel spinlocks
 
 Roadmap §8. The kernel had a hart-bringup scaffold (`src/smp.c3`,
