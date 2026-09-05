@@ -7,9 +7,8 @@ Running log of work sessions with Claude Code. Newest entry on top.
 ## 2026-09-05 — Shell scripts + control flow (§2.5's last big item)
 
 `#!` scripts + `if` / `for` / `while` — the roadmap called this "the big
-structural one". Staged S1–S5, each committed and QEMU-verified (FAT32 +
-ext2); real-Duo verification (the production shell's multi-line prompt)
-is S6, pending a reflash.
+structural one". Staged S1–S6, each committed; QEMU-verified (FAT32 +
+ext2) and **real-Milk-V-Duo-verified over the debug UART** (S6).
 
 - **S1** (`752d791`) — `/bin/test` + `[`, `/bin/expr`. `test`:
   `-e/-f/-d/-s PATH`, `-z/-n STR`, `S1 =/!= S2`, `N -eq/-ne/-lt/-le/-gt/
@@ -56,9 +55,19 @@ empty/unset produces no argv word rather than an empty one, so
 `test -n "$x"` misfires. Workaround `test $# -ge 1` / `test x$x = x`. A
 real fix needs empty-quoted-word tracking through the tokeniser.
 
-**S6 pending**: reflash the Duo (production `shell.c3`, which is the
-one with the multi-line `> ` continuation prompt — untested since the
-test shell keeps its single-line reader) and run the same script sweep.
+**S6 (2026-09-05)** — reflashed the Duo (`reflash_duo.sh`, production
+`shell.c3`) + `populate_duo_bin.sh` for the new `/bin/{test,[,expr}`,
+then drove the debug UART directly (`screen -X readreg`/`paste` into the
+user's session, `log on` to capture). All green on real hardware:
+`x=5; echo $x`; `if (test -f /adm/users) { … } else { … }`;
+`for (w in one two three)`; `n=`whoami``; a **multi-line** `while`
+counter (`i=`expr $i + 1``) with the `> ` continuation prompt engaging
+(the production-shell-only path); a **multi-line** `for` + `break` +
+`continue` + nested `if` (→ `k=1`, `k=3`); `. /usr/root/t.rc`; a
+`#!/bin/rc` script run by name (`./hi.rc alpha beta` →
+`dollar1=alpha count=2`, the `for` loop, `if (test $# -ge 1)`). `break`
+at top level correctly reports "not in a loop". `&&` / `;` / `|`
+sequencing unregressed.
 
 **Files**: `user/bin/test.c3` + `user/bin/expr.c3` (new),
 `user/shell_words.c3`, `user/shell_common.c3`, `user/shell.c3`,
