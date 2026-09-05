@@ -4,6 +4,30 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — std::io: `%f`/`%e`/`%g` confirmed working
+
+Loose end from the std::io port: `user/std_racccoon/
+trunctfdf2_stub.c3` resolves an `__trunctfdf2` (f128→double) symbol
+c3's float formatter references, with a body that exits 134 if ever
+actually called — same "resolve the symbol, die loudly if a future
+change routes an f128 through a formatter" deal as the kernel's own
+`src/kernel/softfloat_f128_stubs.c3`, and, like the kernel's, left as
+an open "untested whether real float formatting needs more than this".
+
+Tested it directly: `%f` → `3.140000`, `%e` → `1.234568e+04`, `%g`
+→ `0.0001234` — all correct, and `__trunctfdf2` is never reached (a
+plain `double` argument through `io::printfn` doesn't hit the f128
+path at all). The stub stays as unreached insurance. Added the line
+to `user/bin/stdiotest.c3` as a real regression guard now that it's a
+known-good path. QEMU FAT32 + ext2 both green, no `wasmtest`
+regression; not re-verified on the Duo (a one-line addition of pure
+FPU arithmetic to an already-Duo-verified program — the SD card was
+in the board post-reflash and the risk of divergence is nil).
+
+**Files changed:** `user/bin/stdiotest.c3` (one `%f`/`%e`/`%g` line).
+
+---
+
 ## 2026-09-05 — fsd mount-retry: a bounded retry for the boot-time SD race
 
 Fixed a real gap flagged twice earlier this session and never

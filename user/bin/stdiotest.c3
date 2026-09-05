@@ -40,4 +40,11 @@ fn void main()
     foreach (int n : nums) { total += n; }
     io::printfn("stdiotest: list sum(1..5 squared)=%d (len=%d)", total, nums.len());
     nums.free();
+
+    // %f/%e/%g: confirmed working (2026-09-05, docs/devlog.md) — none
+    // of them actually reach user/std_racccoon/trunctfdf2_stub.c3's
+    // f128->double stub (an f128 conversion was the only theoretical
+    // risk, per that file's own comment); kept as a real regression
+    // guard now that it's a known-good path, not just an open question.
+    io::printfn("stdiotest: pi~=%f e~=%e tiny~=%g", 3.14, 12345.6789, 0.0001234);
 }
