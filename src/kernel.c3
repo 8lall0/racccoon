@@ -345,6 +345,15 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 	// today does nothing but wfi and a real scheduler isn't wired in.
 	smp_start_secondaries();
 
+	// SMP Stage C2: the idle loop is kernel code — hold the giant lock
+	// (spinlock.c3) for it, exactly like handle_trap does. yield() drops
+	// and retakes it around each switch_context, so a runnable process
+	// gets the kernel while idle is parked. (C3 note: once secondaries
+	// schedule, an all-blocked system busy-spins yield() here holding the
+	// lock — idle will need a wfi / lock-drop then. Fine in C2: only the
+	// boot hart runs kernel code.)
+	kernel_lock.acquire();
+
 	// Single call site for create_process(shell) below (a *respawn*
 	// only now — the initial spawn is explicit above), used once idle
 	// notices nothing else is runnable (e.g. the shell itself exiting).

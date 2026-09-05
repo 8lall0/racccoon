@@ -1685,5 +1685,17 @@ fn void yield() @noinline
 	write_csr("sstatus", (read_reg("sstatus") & ~SSTATUS_FS_MASK) | SSTATUS_FS_CLEAN);
 
 	g_prof_switches++;
+	// SMP Stage C2: drop the giant kernel lock across the actual stack
+	// swap and retake it when THIS context is later resumed. Every yield()
+	// caller holds kernel_lock (handle_trap wrapper, or kernel_main's idle
+	// loop) — the blocking-syscall loops spin here, so this is what lets
+	// the other hart into the kernel while one is parked in a wait. A
+	// context launched fresh (user_entry / fork_entry) never returns here,
+	// so its re-acquire is skipped — correct, it's leaving for user mode;
+	// it retakes the lock via handle_trap on its next trap. The `if (next
+	// == current_proc) return` path above returns still holding the lock,
+	// which is what the caller expects.
+	kernel_lock.release();
 	switch_context(&prev.sp, &next.sp, ((ulong)(uptr)next.page_table >> 12) | SATP_SV39, (uptr)&next.stack + STACK_SIZE);
+	kernel_lock.acquire();
 }

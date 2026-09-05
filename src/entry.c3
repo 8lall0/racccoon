@@ -3329,7 +3329,21 @@ fn bool try_lazy_fault(ulong scause, ulong stval) @noinline
 	return true;
 }
 
+// SMP Stage C2: kernel_entry's `call handle_trap` lands here. Take the
+// giant kernel lock for the whole of trap handling, drop it after. The
+// body has a single exit (no early returns), but keeping the lock in a
+// thin wrapper — not inside handle_trap_body — makes that impossible to
+// get wrong later. yield() (reached from the blocking-syscall loops
+// inside the body) drops and retakes kernel_lock around its own
+// switch_context, so a hart parked in a wait doesn't hold the kernel.
 fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
+{
+	kernel_lock.acquire();
+	handle_trap_body(f);
+	kernel_lock.release();
+}
+
+fn void handle_trap_body(Trap_frame* f) @noinline @nostrip
 {
 	ulong scause  = read_reg("scause");
 	ulong stval   = read_reg("stval");
