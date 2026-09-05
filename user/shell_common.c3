@@ -1549,9 +1549,10 @@ fn int shell_do_if(char* s)
     return st;
 }
 
-// `for (VAR in WORD...) BODY` — WORD list is `$var`-expanded then split
-// on whitespace, and any word with an unquoted `*` / `?` is globbed
-// (rc's `for (f in *.c3)` idiom). VAR is set as a shell-local each pass.
+// `for (VAR in WORD...) BODY` — the WORD list is quote-aware
+// `$var`-expanded then split on *unquoted* whitespace (`for (w in "a b"
+// c)` is two items), and any word with an unquoted `*` / `?` is globbed
+// (rc's `for (f in *.c3)`). VAR is set as a shell-local each pass.
 fn int shell_do_for(char* s)
 {
     int i = sh_skip_ws(s, 3);                 // past "for"
@@ -1573,13 +1574,16 @@ fn int shell_do_for(char* s)
     }
     p += 2;                                   // past "in"
 
-    // WORD text is s[p .. past-1); expand $vars, then split.
+    // WORD text is s[p .. past-1); quote-aware expand, then split on
+    // unquoted spaces (SH_QMARK anchors keep an empty `""` word alive).
     int wtext_end = past - 1;                  // the ')'
     char saveP = s[wtext_end];
     s[wtext_end] = 0;
     char[512] wexp @noinit;
-    shell_expand(&s[p], &wexp[0], 512);
+    char[512] wqm  @noinit;
+    int wl = shell_expand_q(&s[p], &wexp[0], &wqm[0], 512);
     s[wtext_end] = saveP;
+    if (wl < 0) { print("rc: for: unterminated quote\n"); g_shell_status = 2; return 2; }
 
     int body_at = sh_skip_ws(s, past);
 
@@ -1587,17 +1591,23 @@ fn int shell_do_for(char* s)
     int st = 0;
     int wi = 0;
     for (;;) {
-        while (wexp[wi] == ' ' || wexp[wi] == '\t') { wi++; }
+        while (wexp[wi] == ' ' && wqm[wi] == 0) { wi++; }
         if (wexp[wi] == 0) { break; }
-        int ws0 = wi;
-        while (wexp[wi] != 0 && wexp[wi] != ' ' && wexp[wi] != '\t') { wi++; }
-        char sc = wexp[wi];
-        wexp[wi] = 0;
-        char* word = &wexp[ws0];
 
-        // glob this word (rc: a pattern that matches nothing stays literal)?
+        // one word -> wbuf, SH_QMARK stripped, tracking an unquoted metachar
+        char[256] wbuf @noinit;
+        int wb = 0;
         bool has_meta = false;
-        for (int g = 0; word[g] != 0; g++) { if (word[g] == '*' || word[g] == '?') { has_meta = true; break; } }
+        while (wexp[wi] != 0 && !(wexp[wi] == ' ' && wqm[wi] == 0)) {
+            if (wexp[wi] != SH_QMARK) {
+                if (wb < 255) { wbuf[wb] = wexp[wi]; wb++; }
+                if (wqm[wi] == 0 && (wexp[wi] == '*' || wexp[wi] == '?')) { has_meta = true; }
+            }
+            wi++;
+        }
+        wbuf[wb] = 0;
+        char* word = &wbuf[0];
+
         char[512] gnames @noinit;
         int gnb = 0;
         char*[16] gwords @noinit;
@@ -1613,7 +1623,6 @@ fn int shell_do_for(char* s)
             if (g_shell_loop_continue) { g_shell_loop_continue = false; continue; }
             if (g_shell_loop_break || g_shell_script_stop) { break; }
         }
-        wexp[wi] = sc;
         if (g_shell_loop_break || g_shell_script_stop) { break; }
     }
     g_shell_loop_depth--;

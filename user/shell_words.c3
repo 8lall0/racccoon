@@ -109,6 +109,16 @@ fn int sh_read_cmdsub(char* in, int i, char* inner, int cap)
 fn int sh_read_varname(char* in, int i, char* name)
 {
     char c = in[i];
+    // ${name} / ${1} / ${#} — braces just delimit; the name inside is
+    // handled by shell_var_value the same as the bare form.
+    if (c == '{') {
+        int j = i + 1;
+        int n = 0;
+        while (in[j] != 0 && in[j] != '}' && n < 31) { name[n] = in[j]; n++; j++; }
+        if (in[j] != '}' || n == 0) { return 0; }   // unterminated / empty -> literal `${`
+        name[n] = 0;
+        return (j - i) + 1;                          // consumed through the `}`
+    }
     if (c == '#' || c == '*' || (c >= '1' && c <= '9')) {
         name[0] = c; name[1] = 0;
         return 1;
