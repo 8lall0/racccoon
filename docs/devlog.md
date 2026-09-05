@@ -4,6 +4,40 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — self-sufficiency: shell line editing + history, and `/bin/ed`
+
+Two pieces toward racccoon being a place you can actually *work* (from
+the "ideas beyond the roadmap" list — the roadmap's core is shipped).
+
+**Shell line editing + history (`c64af8a`).** `shell_readline_p(buf,
+cap, prompt, history)` replaces the dumb read loop in both shells.
+Cursor editing: Left/Right, Home/End (`^A`/`^E` and `ESC[H`/`ESC[F` /
+`ESC[1~`/`ESC[4~`), Del, mid-line Backspace, `^K` / `^U` / `^W` / `^D`,
+insert-anywhere with a `\r` + prompt + line + `ESC[K` + `\b`-to-cursor
+redraw. `^A`/`^E` are eaten by QEMU's `-serial mon:stdio` and by
+screen's escape prefix — Home/End keys and arrows still work there;
+`scripts/launch64_serialraw.sh` (`-serial stdio`, no monitor mux) is for
+testing the raw path. History: a 24-entry ring, up/down recall, dedups
+the immediately-preceding entry; on for the first line of a block and
+the dev shell, off for `> ` continuations and the login prompt.
+`shell_prompt()` now stashes what it printed in `g_prompt_str` for the
+redraw.
+
+**`/bin/ed` (`78e9b4b`).** The classic line editor, ~380 lines, nolibc,
+fixed buffer (300 x 160, `ed` is 184 KiB). Addressing (`N` `.` `$`
+`.+N` ranges `/literal/` `?literal?`), `p`/`n`, `a`/`i`/`c` (input ends
+at a lone `.`), `d`, `j`, `m`, `s/old/new/[g]` (literal), `r`, `w`, `=`,
+`q` (fails once when dirty) / `Q`. CR or LF ends a line (serial
+terminals send CR). Seeded on all four images + populate_duo_bin.sh.
+
+Verified QEMU FAT32 + ext2: raw-serial `^A`/`^E`/Home + mid-line
+arrow-insert + `^W`/`^U` + up-arrow recall (2 deep, mid-typing
+replace); `ed` create/`a`/`i`/`c`/`d`/`j`/`m`/`s`/`/search/`/`=`, `w`
+then `cat` shows edits persisted, dirty-quit warning. No wasmtest /
+killtest / chmodtest / pipeline regression.
+
+---
+
 ## 2026-09-05 — `fs_abspath` normalises `.` / `..` / `//`; `for`-list brace expansion
 
 Follow-on shell polish (`e614c5f`) that turned out to fix a real
