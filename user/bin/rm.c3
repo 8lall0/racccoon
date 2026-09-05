@@ -1,6 +1,6 @@
 module user;
 
-import std::nolibc::main_stub;
+import std::io;
 
 // Real, argv-taking replacement for shell.c3's own former deletetest/
 // deletetest2/rmdirtest/rmdirtest2/rmdirnonempty/rmdirnonempty2/rmrtest
@@ -17,13 +17,13 @@ fn void main(String[] args) {
         target = args[1].ptr;
         result = fs_delete_recursive(target);
     } else {
-        print("usage: rm <path> | rm -r <path>\n");
+        io::print("usage: rm <path> | rm -r <path>\n");
         return;
     }
 
     if (result < 0) {
-        print("rm: ");
-        print(target);
-        print(": failed\n");
+        io::print("rm: ");
+        io::print((ZString)target);
+        io::print(": failed\n");
     }
 }

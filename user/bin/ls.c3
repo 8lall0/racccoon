@@ -1,6 +1,6 @@
 module user;
 
-import std::nolibc::main_stub;
+import std::io;
 
 // Real, argv-taking replacement for shell.c3's own former ls/lssub
 // (hardcoded to "" and "subdir" respectively) — one optional path
@@ -14,17 +14,17 @@ fn void main(String[] args) {
     char[36 * 256] listbuf @noinit; // FS_LIST_ENTRY_SIZE * 256 entries — fs_list pages fsd for us
     int count = fs_list(path, &listbuf, 256);
     if (count < 0) {
-        print("ls: ");
-        print(path);
-        print(": not found\n");
+        io::print("ls: ");
+        io::print((ZString)path);
+        io::print(": not found\n");
         return;
     }
     for (int li = 0; li < count; li++) {
         char* rec = &listbuf[li * 36];
-        print(rec);
+        io::print((ZString)rec);
         if (rec[32] != 0) {
-            print("/");
+            io::print("/");
         }
-        print("\n");
+        io::print("\n");
     }
 }

@@ -4,6 +4,91 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — std::io on racccoon, part 3: 13 /bin utilities ported
+
+The user asked to port every user program to the real stdlib "if
+possible" — scoped down (their call, after being shown the real
+per-binary cost) to the small `/bin` utilities only: `cat`, `ls`,
+`echo`, `head`, `whoami`, `write`, `rm`, `mkdir`, `mv`, `chmod`,
+`chown`, `usbrw`, `gpio`. NOT ported: `wasm.c3` (already sizeable on
+top of a real interpreter), the shell (most complex/tested file in
+the project, no formatting/collection need), every system server
+(`diskd`/`sdd`/`fsd`/`procd`/`envd`/`usbd`/`ethd`/`netd`/`gpiod` —
+reliability-critical, no benefit), and `true`/`false` (zero I/O, no
+benefit). Each swaps its own hand-rolled `print()`/`putchar()` for
+`io::print`/`io::putchar`/`io::printfn`, and where it was a genuine
+simplification, hand-rolled parsing for real stdlib calls
+(`String.to_int()`/`to_uint(8)` instead of digit-by-digit loops;
+`usbrw.c3`'s old hand-rolled `print_int` is just gone, `%d` does it).
+
+**First real prerequisite — checked, not assumed**: every one of
+these needs `user.c3` for racccoon's own syscalls (`fs_read`, `exec`,
+...), not just `std::io`. `user.c3` exports its own `putchar`, which
+looked like it would collide at the linker level with `libc.c3`'s
+POSIX one (both claim the bare name "putchar"). Tested directly: it
+doesn't, because none of these programs actually call `user.c3`'s own
+`print()`/`putchar()`/`getchar()` family (they use `io::print`/
+`io::putchar` instead, calling `user::fs_read`/`exec`/etc. for
+everything racccoon-specific) — an unreferenced function just gets
+dropped by the linker, collision or not. Proven across all 13,
+including the two (`usbrw.c3`/`gpio.c3`) that reach fairly deep into
+`user.c3` (`ns_mount_wait`, `p9_call_path`).
+
+**Two real bugs found running these for real — `stdiotest` (part 2)
+had masked both**:
+
+1. **`rt_entry.c3`'s entry point only supported `fn void main()`** (no
+   args) — `real_main` was declared with zero parameters. Every
+   ported utility here declares `fn void main(String[] args)`, and
+   the real stdlib's synthetic wrapper for that shape
+   (`std::core::main_stub`'s `@main_args`) expects a genuine C-style
+   `(int argc, char** argv)` — an actual array of `char*` pointers,
+   nothing like racccoon's own NUL-separated exec blob. Calling
+   `real_main()` with no arguments left whatever garbage was in `a0`/
+   `a1` to be read as argc/argv by the generated wrapper — an
+   immediate null-pointer fault the instant any of these tried to
+   read `args`. Fixed: `_start` now preserves the real `a0`/`a1`
+   SYS_EXEC set (untouched by its own `la sp`/`la tp`), `_rt_run`
+   takes them as real parameters and converts racccoon's blob into a
+   genuine `char*[]` (same convention `std::nolibc::main_stub.c3`'s
+   own `@main_args` already established: peel off blob string 0, the
+   program's own path, so `args[0..]` is only the real arguments) —
+   then calls `real_main(argc, argv)` with the correct
+   `(int, char**) -> int` signature. Harmless for `fn void main()`
+   (stdiotest) too — `@main_no_args`'s generated wrapper ignores its
+   own argc/argv entirely, so passing real ones through changes
+   nothing there.
+2. **`io::print`/`io::printfn`'s `%s` don't correctly handle a plain
+   `char*`.** Passing one (from `args[i].ptr`, `&local_buf[0]`, etc.)
+   printed the pointer's own hex value instead of its string content —
+   `fprint`'s type dispatch only matches an explicit `ZString`
+   (`$case ZString: ...`), and a bare `char*` doesn't fall into that
+   case even though it's the exact same bit pattern; `whoami`
+   surfaced it first (prints its own uid→name lookup with no args at
+   all, unaffected by bug #1, and still printed a raw address).
+   Fixed: every such call site now casts explicitly — `io::print
+   ((ZString)ptr)` / `io::printfn("%s", ..., (ZString)ptr, ...)`.
+
+**Verified**: QEMU, both `disk.img` (FAT32) and `disk_ext2.img`
+(ext2) — the full exercise (`mkdir`/`write`/`cat`/`ls`/`mv`/`chmod`/
+`chown`/`rm -r`, `echo`, `whoami`, `head`, plus `gpio`/`usbrw`'s
+"not available" path on QEMU's no-GPIO/no-USB-host build) came back
+clean both times, `chmod`/`chown` correctly failing on FAT32 (no
+`i_mode`) and succeeding on ext2, no regression to `wasmtest`'s
+14-fixture sweep or `stdiotest`. Real Milk-V Duo: same full exercise
+clean, plus `gpio C24 read/write` printing the pin name correctly
+after the `%s` fix (confirmed live — `usbrw`'s own fix is the same
+class of change, not independently hardware-tested, no MSC device on
+hand this session).
+
+**Files changed:** `user/bin/{cat,ls,echo,head,whoami,write,rm,mkdir,
+mv,chmod,chown,usbrw,gpio}.c3` (the port itself), `user/std_racccoon/
+rt_entry.c3` (real argc/argv), `scripts/build_user.sh` (`STDIO_COMMON`
++ 13 `build_user_program_stdio` calls replacing the old
+`build_user_program` ones).
+
+---
+
 ## 2026-09-05 — std::io on racccoon, part 2: real allocation (DString, collections)
 
 The user asked to actually use more of the c3 stdlib, not just

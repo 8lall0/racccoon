@@ -1,6 +1,6 @@
 module user;
 
-import std::nolibc::main_stub;
+import std::io;
 
 // Interactive command-line access to gpiod (user/gpio/gpiod.c3) — its
 // own allowlisted GPIO pins, from the shell, rather than only the
@@ -24,8 +24,11 @@ const uint GPIO_IPC_MSG_MAX = 8;
 
 const ulong GPIOD_MOUNT_WAIT_ATTEMPTS = 20;
 
-// str_eq/print_int aren't available to an ordinary command binary —
-// small local copies, same convention usbrw.c3 already established.
+// str_eq isn't available to an ordinary command binary — a small
+// local copy, same convention usbrw.c3 already established.
+// parse_uint's own former hand-rolled copy is gone —
+// String.to_int()/String[1..].to_int() (std::core::string) does that
+// now.
 fn bool str_eq(char* a, char* b)
 {
     int i = 0;
@@ -37,21 +40,6 @@ fn bool str_eq(char* a, char* b)
     return a[i] == b[i];
 }
 
-// Minimal decimal parser — no atoi exists anywhere in this project yet
-// (usbrw.c3's own copy). Returns -1 on any non-digit character or an
-// empty string.
-fn int parse_uint(char* s)
-{
-    if (s[0] == 0) { return -1; }
-    int v = 0;
-    for (int i = 0; s[i] != 0; i++)
-    {
-        if (s[i] < '0' || s[i] > '9') { return -1; }
-        v = v * 10 + (int)(s[i] - '0');
-    }
-    return v;
-}
-
 // out_value may be null (dir/write don't need anything back). Returns
 // false if gpiod is unreachable, the request itself failed, or the
 // pin isn't one gpiod's own allowlist recognizes.
@@ -59,7 +47,7 @@ fn bool gpio_call(uint verb, char bank_letter, int bit, char arg, char* out_valu
 {
     if (ns_mount_wait("/srv/gpiod/", "gpiod", GPIOD_MOUNT_WAIT_ATTEMPTS) < 0)
     {
-        print("gpio: gpiod not available (no GPIO controller on this board?)\n");
+        io::print("gpio: gpiod not available (no GPIO controller on this board?)\n");
         return false;
     }
 
@@ -72,13 +60,13 @@ fn bool gpio_call(uint verb, char bank_letter, int bit, char arg, char* out_valu
     int from = p9_call_path("/srv/gpiod/", verb, &req[0], (int)GPIO_IPC_MSG_MAX, &req[0], (int)GPIO_IPC_MSG_MAX, &reply_verb);
     if (from <= 0 || reply_verb != verb)
     {
-        print("gpio: request failed (no reply from gpiod)\n");
+        io::print("gpio: request failed (no reply from gpiod)\n");
         return false;
     }
 
     if (req[0] != 0)
     {
-        print("gpio: not one of gpiod's own allowlisted pins\n");
+        io::print("gpio: not one of gpiod's own allowlisted pins\n");
         return false;
     }
 
@@ -88,9 +76,9 @@ fn bool gpio_call(uint verb, char bank_letter, int bit, char arg, char* out_valu
 
 fn void usage()
 {
-    print("usage: gpio <bank><bit> dir <in|out>   (e.g. gpio A28 dir out)\n");
-    print("       gpio <bank><bit> write <0|1>\n");
-    print("       gpio <bank><bit> read\n");
+    io::print("usage: gpio <bank><bit> dir <in|out>   (e.g. gpio A28 dir out)\n");
+    io::print("       gpio <bank><bit> write <0|1>\n");
+    io::print("       gpio <bank><bit> read\n");
 }
 
 fn void main(String[] args)
@@ -99,12 +87,12 @@ fn void main(String[] args)
 
     char* pin = args[0].ptr;
     char bank_letter = pin[0];
-    int bit = parse_uint(&pin[1]);
+    int? bit_r = args[0][1..].to_int();
+    if (catch bit_r) { io::printfn("gpio: \"%s\" isn't a valid <bank><bit> (e.g. A28, C24)", (ZString)pin); return; }
+    int bit = bit_r;
     if (bit < 0 || bit > 31)
     {
-        print("gpio: \"");
-        print(pin);
-        print("\" isn't a valid <bank><bit> (e.g. A28, C24)\n");
+        io::printfn("gpio: \"%s\" isn't a valid <bank><bit> (e.g. A28, C24)", (ZString)pin);
         return;
     }
 
@@ -114,28 +102,24 @@ fn void main(String[] args)
         if (args.len != 3 || (!str_eq(args[2].ptr, "in") && !str_eq(args[2].ptr, "out"))) { usage(); return; }
         bool out = str_eq(args[2].ptr, "out");
         if (!gpio_call(GPIO_IPC_SET_DIR, bank_letter, bit, out ? (char)1 : (char)0, null)) { return; }
-        print("gpio: ");
-        print(pin);
-        print(out ? " set to output\n" : " set to input\n");
+        io::printfn("gpio: %s%s", (ZString)pin, out ? " set to output" : " set to input");
     }
     else if (str_eq(subcmd, "write"))
     {
         if (args.len != 3) { usage(); return; }
-        int val = parse_uint(args[2].ptr);
+        int? val_r = args[2].to_int();
+        if (catch val_r) { usage(); return; }
+        int val = val_r;
         if (val != 0 && val != 1) { usage(); return; }
         if (!gpio_call(GPIO_IPC_WRITE, bank_letter, bit, (char)val, null)) { return; }
-        print("gpio: ");
-        print(pin);
-        print(val == 1 ? " -> 1\n" : " -> 0\n");
+        io::printfn("gpio: %s -> %d", (ZString)pin, val);
     }
     else if (str_eq(subcmd, "read"))
     {
         if (args.len != 2) { usage(); return; }
         char value = 0;
         if (!gpio_call(GPIO_IPC_READ, bank_letter, bit, (char)0, &value)) { return; }
-        print("gpio: ");
-        print(pin);
-        print(value != 0 ? " = 1\n" : " = 0\n");
+        io::printfn("gpio: %s = %d", (ZString)pin, value != 0 ? 1 : 0);
     }
     else
     {

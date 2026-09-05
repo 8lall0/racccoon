@@ -1,12 +1,12 @@
 module user;
 
-import std::nolibc::main_stub;
+import std::io;
 
 // Prints the current user's name (uid → name via /adm/users, falling
 // back to the decimal uid). See docs/roadmap.md §2.
 fn void main() {
     char[32] name @noinit;
     user_name_by_uid(getuid(), &name[0], 32);
-    print(&name[0]);
-    print("\n");
+    io::print((ZString)&name[0]);
+    io::print("\n");
 }

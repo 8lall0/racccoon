@@ -1,6 +1,6 @@
 module user;
 
-import std::nolibc::main_stub;
+import std::io;
 
 // Print the first N lines of stdin (default 10), then stop reading — a
 // filter for the middle or end of a pipeline (`ls | head -n 3`). No
@@ -9,15 +9,11 @@ import std::nolibc::main_stub;
 fn void main(String[] args) {
     int limit = 10;
     if (args.len == 2 && args[0].len == 2 && args[0][0] == '-' && args[0][1] == 'n') {
-        int v = 0;
-        String s = args[1];
-        for (usz i = 0; i < s.len; i++) {
-            if (s[i] < '0' || s[i] > '9') { print("head: bad line count\n"); return; }
-            v = v * 10 + (s[i] - '0');
-        }
+        int? v = args[1].to_int();
+        if (catch v) { io::print("head: bad line count\n"); return; }
         limit = v;
     } else if (args.len != 0) {
-        print("usage: head [-n count]\n");
+        io::print("usage: head [-n count]\n");
         return;
     }
 
@@ -25,7 +21,7 @@ fn void main(String[] args) {
     // EOF, so the read loop below would just wait for the user to
     // hand-type `limit` newline-terminated lines. Print usage instead.
     if (stdin_is_console() != 0) {
-        print("usage: head [-n count]   (reads stdin — use it in a pipeline)\n");
+        io::print("usage: head [-n count]   (reads stdin — use it in a pipeline)\n");
         return;
     }
 
@@ -33,7 +29,7 @@ fn void main(String[] args) {
     while (lines < limit) {
         int c = getchar();
         if (c < 0) { return; }
-        putchar((char)c);
+        io::putchar((char)c);
         if (c == '\n') { lines++; }
     }
 }

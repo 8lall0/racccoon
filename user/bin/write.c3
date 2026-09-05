@@ -1,6 +1,6 @@
 module user;
 
-import std::nolibc::main_stub;
+import std::io;
 
 // Real, argv-taking replacement for shell.c3's own former writefile/
 // newfile/newfile2/newsubfile/newsubfile2 (all hardcoded path+content
@@ -17,7 +17,7 @@ import std::nolibc::main_stub;
 fn void main(String[] args) {
     bool append = args.len == 3 && args[0].len == 2 && args[0][0] == '-' && args[0][1] == 'a';
     if (args.len != 2 && !append) {
-        print("usage: write [-a] <path> <text>\n");
+        io::print("usage: write [-a] <path> <text>\n");
         return;
     }
 
@@ -28,8 +28,8 @@ fn void main(String[] args) {
         ? fs_write_at(path, text.ptr, (int)text.len, FS_OFFSET_APPEND)
         : fs_write(path, text.ptr, (int)text.len);
     if (written < 0) {
-        print("write: ");
-        print(path);
-        print(": failed\n");
+        io::print("write: ");
+        io::print((ZString)path);
+        io::print(": failed\n");
     }
 }

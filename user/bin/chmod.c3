@@ -1,6 +1,6 @@
 module user;
 
-import std::nolibc::main_stub;
+import std::io;
 
 // chmod <octal-mode> <path> — replaces the permission bits (i_mode's low
 // 12) of an ext2 file or directory, keeping the format nibble. Octal
@@ -9,21 +9,16 @@ import std::nolibc::main_stub;
 // Owner-or-root — see docs/roadmap.md §2.
 fn void main(String[] args) {
     if (args.len != 2) {
-        print("usage: chmod <octal-mode> <path>\n");
+        io::print("usage: chmod <octal-mode> <path>\n");
         return;
     }
 
-    char* m = args[0].ptr;
-    if (m[0] == 0) { print("chmod: bad mode\n"); return; }
-    uint mode = 0;
-    for (int i = 0; m[i] != 0; i++) {
-        if (m[i] < '0' || m[i] > '7') { print("chmod: mode must be octal\n"); return; }
-        mode = mode * 8 + (uint)(m[i] - '0');
-    }
+    uint? mode = args[0].to_uint(8);
+    if (catch mode) { io::print("chmod: mode must be octal\n"); return; }
 
     if (fs_chmod(args[1].ptr, mode) < 0) {
-        print("chmod: ");
-        print(args[1].ptr);
-        print(": failed\n");
+        io::print("chmod: ");
+        io::print((ZString)args[1].ptr);
+        io::print(": failed\n");
     }
 }

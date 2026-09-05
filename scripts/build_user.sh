@@ -128,12 +128,19 @@ STUB
 #   - reuses lib/racccoon-libc/racccoon-libc.ld (ENTRY(_start), same
 #     USER_BASE layout as user/user.ld) rather than user/user.ld.
 #
-# Deliberately NOT user/user.c3 — its own exported `putchar` would
-# collide with libc.c3's POSIX one (see user/std_racccoon/rcsys.c3's
-# comment). A real program wanting both racccoon's own syscalls and
-# std::io just calls user::fs_read/exec/etc directly alongside it;
-# nothing here stops that, there's just no single combined helper for
-# it yet.
+# user/user.c3 CAN be one of the sources — its own exported `putchar`
+# looked like it would collide with libc.c3's POSIX one (both claim
+# the bare linker name "putchar"), but empirically it doesn't: a
+# program that never actually calls user.c3's print()/putchar()/
+# getchar() family (using io::print/io::putchar for output instead,
+# "std::io on racccoon" style, while still calling user::fs_read/exec/
+# etc. for everything racccoon-specific) never keeps that function
+# reachable, and the linker just drops it — proven across cat/ls/echo/
+# head/whoami/write/rm/mkdir/mv/chmod/chown/usbrw/gpio (2026-09-05),
+# including the ones that reach fairly deep into user.c3 (usbrw.c3/
+# gpio.c3's ns_mount_wait/p9_call_path). -D RACCCOON activates
+# RACCCOON_STD_DIR's own @feat(RACCCOON) gate, same as
+# build_user_program needs it for — user.c3 itself imports those files.
 build_user_program_stdio() {
   local name="$1"
   shift
@@ -146,6 +153,7 @@ build_user_program_stdio() {
     --safe=no \
     --link-libc=no \
     --custom-libc=yes \
+    -D RACCCOON \
     --target elf-riscv64 \
     --riscv-cpu=rvimac \
     --riscv-abi=double \
@@ -190,21 +198,38 @@ STUB
 build_user_program shell user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/shell_words.c3 user/shell_jobs.c3 user/shell_common.c3 user/shell.c3
 build_user_program shell_test user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/shell_words.c3 user/shell_jobs.c3 user/shell_common.c3 user/shell_test.c3
 build_user_program echod user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/sys/echod.c3
-build_user_program cat user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/cat.c3
-build_user_program ls user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/ls.c3
-build_user_program echo user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/echo.c3
+# true/false do zero I/O (just exitcode(0)/(1)) — no benefit from the
+# real stdlib's ~180 KiB, kept on the lightweight std::nolibc path.
 build_user_program true user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/true.c3
 build_user_program false user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/false.c3
-build_user_program head user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/head.c3
-build_user_program whoami user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/whoami.c3
-build_user_program write user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/write.c3
-build_user_program rm user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/rm.c3
-build_user_program mkdir user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/mkdir.c3
-build_user_program mv user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/mv.c3
-build_user_program chmod user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/chmod.c3
-build_user_program chown user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/chown.c3
-build_user_program usbrw user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/usbrw.c3
-build_user_program gpio user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/gpio.c3
+
+# The small /bin utilities, ported to the real stdlib (io::print/
+# io::printfn instead of user.c3's own print()/putchar(), String.to_int/
+# to_uint instead of hand-rolled digit parsing where that's a real
+# simplification) — "std::io on racccoon", docs/devlog.md 2026-09-05.
+# Not ported: wasm.c3 (already close to its own size budget on top of
+# a real interpreter), shell/shell_test (the most complex, most tested
+# file in the project — high risk, no formatting/collection need), and
+# every system server (diskd/sdd/fsd/procd/envd/usbd/ethd/netd/gpiod —
+# reliability-critical, no benefit, stay on std::nolibc).
+STDIO_COMMON="src/std/core/mem.c3 src/std/core/nolibc_allocator.c3 src/std/core/nolibc_vmem.c3 \
+  src/std/io/io.c3 src/std/io/os/os.c3 \
+  user/std_racccoon/rcsys.c3 user/std_racccoon/libc.c3 user/std_racccoon/io_native.c3 \
+  user/std_racccoon/trunctfdf2_stub.c3 user/std_racccoon/heap.c3 user/std_racccoon/rt_entry.c3 \
+  user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3"
+build_user_program_stdio cat $STDIO_COMMON user/bin/cat.c3
+build_user_program_stdio ls $STDIO_COMMON user/bin/ls.c3
+build_user_program_stdio echo $STDIO_COMMON user/bin/echo.c3
+build_user_program_stdio head $STDIO_COMMON user/bin/head.c3
+build_user_program_stdio whoami $STDIO_COMMON user/bin/whoami.c3
+build_user_program_stdio write $STDIO_COMMON user/bin/write.c3
+build_user_program_stdio rm $STDIO_COMMON user/bin/rm.c3
+build_user_program_stdio mkdir $STDIO_COMMON user/bin/mkdir.c3
+build_user_program_stdio mv $STDIO_COMMON user/bin/mv.c3
+build_user_program_stdio chmod $STDIO_COMMON user/bin/chmod.c3
+build_user_program_stdio chown $STDIO_COMMON user/bin/chown.c3
+build_user_program_stdio usbrw $STDIO_COMMON user/bin/usbrw.c3
+build_user_program_stdio gpio $STDIO_COMMON user/bin/gpio.c3
 build_user_program wasm user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/wasm.c3
 build_user_program diskd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/virtio.c3 user/block/diskd.c3
 build_user_program sdd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/block/sdhci.c3 user/block/sdd.c3
