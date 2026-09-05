@@ -151,10 +151,9 @@ fn void mutex_thread_body(void* arg) {
 }
 
 fn void main() {
-    // QEMU timebase is 10 MHz — ~3 s covers the (fast) virtio boot
-    // chatter; automated test runs wait much longer than this before
-    // sending anything anyway.
-    shell_boot_settle(30000000);
+    // No boot-settle wait: boot/driver servers log to the kernel ring,
+    // not the console (SYS_PUTCHAR / `is_boot_server`) — `dmesg` shows
+    // their trace, `loud` echoes it live.
     shell_bind_user_bin();   // union /usr/root/bin onto /bin (docs/bin-layout.md)
     for (;;) {
         shell_prompt();

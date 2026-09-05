@@ -90,7 +90,7 @@ const SYS_DRIVER_IRQ_ARM = 32; // interrupt-driven driver: re-enable this driver
 const SYS_SDD_INFO      = 33; // sdd-only: returns its SDMA staging buffer's physical address — see its case below
 const SYS_IPC_CALL      = 34; // one-shot RPC: deliver a request to a server and block for its reply, all in the kernel — the reply can't be pre-empted by a stray sender, and the whole thing aborts with -1 if the server dies at any point (see its case below); user-space p9_call is now just this
 const SYS_GETUID        = 35; // the caller's own uid — see its case below
-const SYS_BOOT_QUIET    = 36; // shell-only, called once after boot settles: silences boot servers' console output — see SYS_PUTCHAR
+const SYS_BOOT_QUIET    = 36; // a0=1 also echoes boot/driver-server stdout to the console (the `loud` builtin, HW bring-up); a0=0 = default, kernel-log-only. Server output is always in the log — read it with dmesg. See SYS_PUTCHAR
 const SYS_CHDIR         = 37; // set the caller's cwd (a0 = absolute, normalised path, <100 bytes) — the shell's `cd`
 const SYS_GETCWD        = 38; // copy the caller's cwd out (a0 = buf, a1 = cap) — `pwd`, the prompt, the fs_* wrappers
 const SYS_PIPE          = 39; // allocate an anonymous pipe, returns its id or -1 — src/pipe.c3
@@ -122,10 +122,13 @@ const SYS_GETCHAR_NB = 59; // non-blocking console read: one keystroke from the 
 // process can map its heap arena (docs/go-port-plan.md).
 const uptr HEAP_MAX_BYTES = board::HEAP_MAX_BYTES;
 
-// Flipped by SYS_BOOT_QUIET (the shell, once, after a settle delay).
-// While true, SYS_PUTCHAR from a process with is_boot_server set is
-// dropped — keeps late server init chatter off the prompt.
-bool g_boot_quiet = false;
+// A boot/driver server's stdout (SYS_PUTCHAR) always goes into the kernel
+// log ring; it also echoes to the console only while this is true. Off by
+// default — a clean boot shows just the kernel's own progress lines and
+// `login:`, and server init chatter (fsd mount, DHCP lease, USB
+// enumeration, ...) is one `dmesg` away. SYS_BOOT_QUIET's `loud` path
+// turns it on for watching a respawned driver live during HW bring-up.
+bool g_boot_server_console = false;
 
 // Cap on the image SYS_EXEC will install — board-specific
 // (board::EXEC_MAX_IMAGE_SIZE). racccoon's own binaries (build/user/*.bin)
@@ -2502,36 +2505,30 @@ fn void handle_syscall(Trap_frame* f) @noinline
 					yield();
 				}
 			}
-			// Boot servers go silent once the shell has settled (it
-			// calls SYS_BOOT_QUIET) — their init chatter otherwise keeps
-			// landing on the console after the prompt is up. The shell
-			// and everything it exec()s (is_boot_server == false) print
-			// normally.
-			else if (!(g_boot_quiet && current_proc.is_boot_server))
+			else if (current_proc.is_boot_server)
 			{
-				// Boot-server chatter (fsd/sdd/usbd/ethd init lines) is
-				// worth keeping in the kernel log — tee it. A plain
-				// process's stdout is terminal output, not kernel log, so
-				// it takes the raw path: without that split, `dmesg`
-				// (which prints what it reads) re-feeds its own output
-				// into the ring and loops forever.
-				if (current_proc.is_boot_server)
-				{
-					board::console_putchar((int)f.a0);
-				}
-				else
-				{
-					sbi::console_emit((int)f.a0);
-				}
+				// Boot/driver server: always captured in the kernel log
+				// (read it with `dmesg`), on the console only when `loud`
+				// asked for it. Keeps a clean boot — and, unlike the old
+				// "drop it after SYS_BOOT_QUIET" behaviour, a respawned
+				// driver's init chatter is no longer lost.
+				sbi::klog_put((int)f.a0);
+				if (g_boot_server_console) { sbi::console_emit((int)f.a0); }
+			}
+			else
+			{
+				// A plain process's stdout: terminal output, not kernel
+				// log — console only, no tee. Teeing it would let `dmesg`
+				// (which prints what it reads) chase its own tail forever.
+				sbi::console_emit((int)f.a0);
 			}
 		case SYS_BOOT_QUIET:
-			// The shell calls this once, after a short settle delay, to
-			// stop boot-server console output landing on the console
-			// after the prompt is up. a0 == 1 turns it back ON — a
-			// diagnostic escape hatch (the dev shell's `loud` builtin)
-			// for watching a *respawned* boot server's own init chatter,
-			// which is otherwise silenced exactly like the original's.
-			g_boot_quiet = f.a0 != 1;
+			// a0 == 1: also echo boot/driver-server stdout to the console
+			// (`loud` — the dev shell's builtin, for watching a respawned
+			// driver enumerate during HW bring-up). a0 == 0: back to the
+			// default, kernel-log-only (read it with `dmesg`). Server output
+			// is captured in the log either way; this only gates the echo.
+			g_boot_server_console = f.a0 == 1;
 			f.a0 = 0;
 		case SYS_GETCHAR:
 			current_proc.in_blocking_wait = true;

@@ -46,12 +46,23 @@ const int KLOG_SIZE = 32768;
 char[KLOG_SIZE] klog_buf;
 ulong klog_written = 0;          // total bytes ever, monotonic
 
-// Raw console write — one legacy-SBI putchar, NO klog tee. Used for a
-// plain userspace process's SYS_PUTCHAR (src/entry.c3): its stdout is
-// terminal output, not kernel log, and — critically — teeing it would
-// let `dmesg` (which prints what it reads) chase its own tail forever.
-// Kernel-originated output (io::print, libc, panic) and boot-server
-// chatter still go through __putchar below, which does tee.
+// The two halves of console output, split so src/entry.c3's SYS_PUTCHAR
+// can pick per source:
+//   - klog_put:     append to the ring, no console I/O.
+//   - console_emit: one legacy-SBI putchar, no ring tee.
+//   - __putchar:    both — for kernel-originated output (io::print, the
+//                   libc puts/fwrite path, panic).
+// A plain userspace process's stdout takes console_emit only (it's
+// terminal output, not kernel log — and teeing it would let `dmesg`,
+// which prints what it reads, chase its own tail forever). A boot/driver
+// server's stdout takes klog_put always + console_emit only when `loud`
+// is set (SYS_BOOT_QUIET); `dmesg` is the normal way to read it.
+fn void klog_put(int ch)
+{
+	klog_buf[(uint)(klog_written % KLOG_SIZE)] = (char)ch;
+	klog_written++;
+}
+
 fn int console_emit(int ch)
 {
 	sbi_call((long)ch, 0, 0, 0, 0, 0, 0, 1);
@@ -60,8 +71,7 @@ fn int console_emit(int ch)
 
 fn int __putchar(int ch)
 {
-	klog_buf[(uint)(klog_written % KLOG_SIZE)] = (char)ch;
-	klog_written++;
+	klog_put(ch);
 	return console_emit(ch);
 }
 

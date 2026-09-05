@@ -10,10 +10,10 @@ import std::nolibc::main_stub;
 // what scripts/build.sh embeds for QEMU. See docs/devlog.md for why
 // this split exists (shell.c3 used to carry both).
 fn void main() {
-    // Duo timebase is 25 MHz — ~6 s, long enough to cover sdd/usb/ethd
-    // bring-up (this shell is only ever built for the Duo; QEMU gets
-    // shell_test.c3).
-    shell_boot_settle(150000000);
+    // No boot-settle wait any more: boot/driver servers log to the
+    // kernel ring, not the console (see SYS_PUTCHAR / `is_boot_server`),
+    // so there's no chatter to land on the prompt and nothing to wait
+    // out. `dmesg` shows their init trace; `loud` echoes it live.
 
     // The console comes up needing a login — `login: <name>`, matched
     // against /adm/users, then setuid + cd $home. `root` is always

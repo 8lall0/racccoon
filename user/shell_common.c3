@@ -243,18 +243,6 @@ fn void shell_bind_user_bin()
     ns_bind_flags("/bin/", &hb[0], 1 | 4);   // member 1: /usr/$user/bin, -a + -c (creates land here)
 }
 
-// Wait out the boot servers' init chatter, then tell the kernel to drop
-// their console output (SYS_BOOT_QUIET). settle_ticks is a raw rdtime()
-// delta — the caller picks it for its board's timebase (there's no
-// board-agnostic "seconds" in user mode yet). Called once, before the
-// first prompt.
-fn void shell_boot_settle(ulong settle_ticks)
-{
-    ulong start = rdtime();
-    while (rdtime() - start < settle_ticks) { yield(); }
-    boot_quiet();
-}
-
 // The prompt — "<user> <cwd># " for root, "... % " otherwise (Plan 9's
 // `%`). Both shells call this instead of a bare "> ".
 // The last prompt string shell_prompt() printed — shell_readline needs
