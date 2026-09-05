@@ -56,9 +56,14 @@ strips them out of each finished token, and a token that was only
 anchors becomes `""` (a real argv word). `test -n "$x"` /
 `if (test -n "$missing") { … }` now work. Same pass made `NAME=value`
 quote-aware (`x="a b"` no longer leaks the quotes — routes through
-shell_expand_q instead of the quote-blind shell_expand). Still
-unsupported: `${name}` brace form, quote-respecting word split in
-`for (v in …)`.
+shell_expand_q instead of the quote-blind shell_expand).
+
+**Then (`8f5d903`)** — `${name}` / `${1}` / `${#}` brace form
+(sh_read_varname handles the `{}` delimiter), and `for (VAR in WORD...)`
+splits quote-aware: `for (w in "a b" c)` iterates two items, `for (w in
+"" x)` keeps the empty one. Each word goes into a scratch buffer then
+globs as before. (FAT32 `*.wasm` still misses — 8.3 short names are
+upper-case, `glob_match` is case-sensitive; pre-existing.)
 
 **S6 (2026-09-05)** — reflashed the Duo (`reflash_duo.sh`, production
 `shell.c3`) + `populate_duo_bin.sh` for the new `/bin/{test,[,expr}`,

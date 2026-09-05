@@ -260,9 +260,10 @@ not bourne. Interleaved with §1/§2 rather than a phase of its own.
   continuation reader (production shell); the test shell does
   single-line control flow + `. script` for multi-line. Real-Duo
   verified over the debug UART.
-- `"$x"` empty-word gap fixed (`677d2bd`) — `SH_QMARK` anchor byte;
-  `test -n "$x"` works, `NAME=value` is quote-aware. Still unsupported:
-  `${name}` brace form, quote-respecting split in `for (v in …)`.
+- `"$x"` empty-word gap fixed (`677d2bd`, `SH_QMARK` anchor);
+  `NAME=value` quote-aware; `${name}` brace form + quote-respecting
+  `for (v in …)` split (`8f5d903`). Remaining rough edges: FAT32
+  case-insensitive glob; `for`-list has no brace expansion.
 
 **Still to do:**
 - proper functions (`fn name { }`), `switch` / `case` — not needed yet.
