@@ -958,6 +958,32 @@ fn int pipe_hold(int id, int as_writer, int delta) @export("pipe_hold") { return
 // shell_resolve_path — needed because e.g. FAT32's fsd won't resolve a
 // literal `.` path component the way ext2 happens to (`ls .`, `echo
 // *.wasm` whose glob dir is `.`).
+// Collapse `.` / `..` / `//` in `raw` into `out` (>= 100 bytes). `rooted`
+// = emit an absolute `/…` path (a `..` past the root stays at root);
+// false keeps a bare first component slash-free (fs_abspath's root-cwd
+// case, so the namespace catch-all still matches it). `""` out = root.
+// Shared by fs_abspath here and the shell's shell_resolve_path.
+fn void path_collapse(char* raw, char* out, bool rooted) {
+    int o = 0;
+    int i = 0;
+    while (raw[i] != 0) {
+        while (raw[i] == '/') { i++; }
+        if (raw[i] == 0) { break; }
+        int s = i;
+        while (raw[i] != 0 && raw[i] != '/') { i++; }
+        int seglen = i - s;
+        if (seglen == 1 && raw[s] == '.') { continue; }
+        if (seglen == 2 && raw[s] == '.' && raw[s + 1] == '.') {
+            while (o > 0 && out[o - 1] != '/') { o--; }
+            if (o > 0) { o--; }
+            continue;
+        }
+        if ((rooted || o > 0) && o < 99) { out[o] = '/'; o++; }
+        for (int k = s; k < i && o < 99; k++) { out[o] = raw[k]; o++; }
+    }
+    out[o] = 0;
+}
+
 fn void fs_abspath(char* rel, char* out) @export("fs_abspath") {
     // Un-normalised form first: absolute rel as-is, else cwd + "/" + rel.
     char[128] raw @noinit;
@@ -978,30 +1004,7 @@ fn void fs_abspath(char* rel, char* out) @export("fs_abspath") {
         }
     }
     raw[r] = 0;
-
-    // Collapse `.` / `..` / `//`. A bare relative name from the root cwd
-    // keeps its no-leading-slash form (`hello.txt`) — the namespace
-    // catch-all mount matches it; anything rooted comes out `/...`. `""`
-    // (root, or `.` from the root cwd) resolves the same as the mount's
-    // own empty prefix.
-    int o = 0;
-    int i = 0;
-    while (raw[i] != 0) {
-        while (raw[i] == '/') { i++; }
-        if (raw[i] == 0) { break; }
-        int s = i;
-        while (raw[i] != 0 && raw[i] != '/') { i++; }
-        int seglen = i - s;
-        if (seglen == 1 && raw[s] == '.') { continue; }
-        if (seglen == 2 && raw[s] == '.' && raw[s + 1] == '.') {
-            while (o > 0 && out[o - 1] != '/') { o--; }
-            if (o > 0) { o--; }
-            continue;
-        }
-        if ((absolute || o > 0) && o < 99) { out[o] = '/'; o++; }
-        for (int k = s; k < i && o < 99; k++) { out[o] = raw[k]; o++; }
-    }
-    out[o] = 0;
+    path_collapse(&raw[0], out, absolute);
 }
 
 // --- /adm/users, the user database (docs/filesystem-layout.md, §2) ---

@@ -283,25 +283,8 @@ fn void shell_resolve_path(char* arg, char* out)
         for (int i = 0; arg[i] != 0 && r < 99; i++) { raw[r] = arg[i]; r++; }
     }
     raw[r] = 0;
-
-    int o = 0;
-    int i = 0;
-    while (raw[i] != 0) {
-        while (raw[i] == '/') i++;
-        if (raw[i] == 0) break;
-        int s = i;
-        while (raw[i] != 0 && raw[i] != '/') i++;
-        int seglen = i - s;
-        if (seglen == 1 && raw[s] == '.') { continue; }
-        if (seglen == 2 && raw[s] == '.' && raw[s + 1] == '.') {
-            while (o > 0 && out[o - 1] != '/') o--;
-            if (o > 0) o--;
-            continue;
-        }
-        if (o < 99) { out[o] = '/'; o++; }
-        for (int k = s; k < i && o < 99; k++) { out[o] = raw[k]; o++; }
-    }
-    out[o] = 0;
+    // Always an absolute result here (this feeds `cd`'s stored cwd).
+    path_collapse(&raw[0], out, true);
 }
 
 // Read one console line into buf (cap includes the NUL). Both Backspace
