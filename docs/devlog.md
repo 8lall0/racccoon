@@ -60,12 +60,15 @@ runs genuinely parallel. Uncontended until C3. SIE invariant preserved
 (lock held with interrupts off, same as pre-SMP). Verified QEMU FAT32 +
 ext2 + `-smp 2`, same test set as C1, all green.
 
-**Next: C3** — the dangerous one. Secondary harts enter a real
-scheduler loop instead of `wfi`; per-hart `current_proc`; a
-"running-on-a-hart" marker so two harts can't pick the same process;
-per-hart timer. First real 2-hart execution. QEMU-TCG is weak for race
-detection and there's no SMP hardware, so it lands carefully and stays
-on the branch until it's proven.
+**C3 parked** — at the user's call, pending the JH7110 / Orange Pi RV
+board (4 cores). C3 is the first real 2-hart run, and QEMU-TCG
+serialises harts too heavily to trust for race detection; the Duo is
+single-core and can't validate it either. So C1+C2 sit on branch
+`smp-stage-c` and master stays at the A+B state (real-Duo-verified)
+until there's multi-core hardware to prove C3 against. C3's shape when
+resumed: secondaries into the scheduler loop; per-hart `current_proc`;
+a "running-on-a-hart" marker so two harts can't pick the same process;
+per-hart timer; `yield()`'s FP `sstatus` bridge → direct asm.
 
 **Files:** `src/smp.c3`, `src/entry.c3` (`kernel_entry`), `src/process.c3`
 (`switch_context`), `src/kernel.c3`, `src/kernel.ld`,

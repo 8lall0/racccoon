@@ -807,11 +807,17 @@ IPC rendezvous, `procs[]`). Staged:
     `yield()`'s `switch_context` and thus across every blocking wait.
     Whole kernel correct under SMP, zero kernel parallelism; user code
     on both harts runs parallel. Uncontended until C3.
-  - **C3 — the dangerous one.** Secondary harts enter the scheduler
-    loop instead of `wfi`; per-hart `current_proc` + a "running on a
-    hart" marker so two harts can't pick the same process; per-hart
-    timer. QEMU `-smp 2` — first real 2-hart run. TCG is weak for race
-    detection and there's no SMP hardware, so this lands carefully.
+  - **C3 — PARKED pending the JH7110 / Orange Pi RV board**
+    (docs/opi-rv-plan.md, [[racccoon_opi_rv_port]]). Secondary harts
+    enter the scheduler loop instead of `wfi`; per-hart `current_proc` +
+    a "running on a hart" marker so two harts can't pick the same
+    process; per-hart timer; `yield()`'s FP-save `sstatus` bridge (a
+    shared global today) becomes direct asm. This is the first real
+    2-hart run, and QEMU-TCG serialises harts too heavily to trust for
+    race detection — so it waits for real multi-core hardware to
+    validate against. The Duo is single-core (`SMP_MAX_HARTS = 1`) and
+    can't. Branch `smp-stage-c` holds C1+C2 until then; master stays at
+    the A+B state (real-Duo-verified).
 - **Stage D — not started.** IPC rendezvous locking + TLB shootdown
   IPIs (`sbi_send_ipi`) — required for userspace correctness once >1
   hart runs user code. Audit every `state == PROC_UNUSED` site to also
