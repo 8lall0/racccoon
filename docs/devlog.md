@@ -4,6 +4,106 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — chasing compare_fps: pinned down, not root-caused
+
+Went after the `compare_fps()` `UNREACHABLE` bug directly (c3c fork,
+`src/compiler/number.c:51`). All instrumentation below was temporary
+(`fprintf(stderr,...)` / a couple of global tracking variables dropped
+into `number.c`, `sema_expr.c`, `sema_stmts.c`) and has been reverted —
+none of it is committed.
+
+**Exact trigger, nailed down precisely:**
+`/home/blallo/Workspace/c3c/lib/std/core/builtin.c3:478:11` —
+```
+@require $probability >= 0 && $probability <= 1.0
+```
+the contract on the `@unlikely(#value, $probability = 1.0)` builtin
+macro. The crashing comparison is `$probability >= 0` with
+`$probability` at its default (`left=1.0`, `right=0.0` — matches
+`BINARYOP_GE`), called from `sema_expr_analyse_comp` (`sema_expr.c`
+~9522), the very same call site working correctly for the other 1678
+comparisons that come before it in the same compile — this is
+specifically the **1679th** invocation of that exact code path
+(counted with a global counter) that gets a garbage `BinaryOp`. Every
+earlier and (would-be) later call succeeds.
+
+**Ruled out, each with direct evidence, no plausible cause left
+unexplored on the "isolated repro" front:**
+1. **tcc miscompiling the `compare_fps` switch itself** —
+   disassembled `build/riscv64-tcc`'s output for a byte-for-byte
+   replica of the function + the real `BinaryOp` enum values (18-23
+   for GT..EQ): dispatch is correct for every case.
+2. **`longjmp`/`error_exit` not unwinding** — `fprintf` checkpoints in
+   `main_real`/`cleanup`/`exit_compiler` showed every step completing
+   normally; c3c's own code always runs to completion and returns
+   status 1 cleanly (this is also what unwound the "bug 3" SYS_EXIT
+   retraction, previous entry).
+3. **`ExprBinary`'s `BinaryOp operator : 8` bitfield, packed next to
+   `bool grouped : 1`, corrupting under tcc** — built a byte-for-byte
+   replica of `Expr_`'s real prefix (`type`/`loc`/`expr_kind:8`/
+   `resolve_status:4`) + union + `ExprBinary`, wrote all 24 real
+   `BinaryOp` comparison values through it, read them back before and
+   after writing the adjacent `grouped` bit. Zero mismatches — on a
+   **native x86 tcc** built fresh from the `third_party/tinycc`
+   submodule for this specific test, AND on real `build/riscv64-tcc`
+   run on racccoon in QEMU.
+4. **Struct-size/alignment mismatch between tcc and gcc for the real,
+   full `Expr_` union** (~50 variant members) — compiled a probe
+   against the actual `compiler_internal.h` with both compilers:
+   `sizeof(Expr) = 48, alignof(Expr) = 8` on both gcc and native tcc.
+   Identical.
+5. **Double/argument-passing ABI for `compare_fps(Real, Real,
+   BinaryOp)`** (2 doubles + 1 enum) — same disassembly from point 1
+   confirms `fa0`/`fa1`/`a0` register usage matches the standard RV64
+   calling convention exactly.
+6. **A demand-paged `SYS_MAP` page coming back non-zeroed** (would
+   explain "reads garbage from what should be a fresh Expr node") —
+   read both fault paths that back a lazy heap page
+   (`user_range_valid`'s syscall-argument pass, `try_lazy_fault`'s
+   general exception path, both `src/entry.c3`): both go through
+   `try_alloc_pages` → `alloc_scan`, which unconditionally
+   `mem::set(paddr, 0, ...)`s every physical page before handing it
+   out, reused or not. No path that skips this was found.
+7. **A flaky/unstable read of the bitfield right at the crash site
+   itself** (as opposed to it already holding bad data) — read
+   `expr->binary_expr.operator` twice in a row immediately before the
+   crashing call; both reads were identical every single time
+   (including on the crashing #1679th call) — whatever's wrong, the
+   memory holds a stable, wrong value by the time this code touches
+   it, not something racing under it.
+
+**Where that leaves it:** the corruption happens *before* this call
+site, on a per-instantiation basis (`@unlikely`'s `@require` is
+re-checked fresh at every one of its many call sites across the real
+stdlib, each getting its own `Expr` node from the arena — call #1679
+is the one with bad data, not the macro definition itself). Everything
+that can be checked via disassembly, isolated repros, and blind
+`fprintf` instrumentation says the arena, the struct layout, the
+calling convention, and the argument-passing are all fine in isolation
+— which means whatever corrupts call #1679's `Expr` node is a *result*
+of something happening elsewhere in the compile between calls #1 and
+#1679, not a fixed, always-broken code shape. That kind of bug needs
+an actual debugger attached to the failing process at the moment of
+failure (breakpoint at `compare_fps`'s `default:` case, then inspect
+what wrote to that `Expr`'s memory, or watch the specific address) —
+blind instrumentation has reached the limit of what it can tell us.
+Racccoon's userspace has no debug/ptrace support to attach to a live
+process the way the earlier kernel-level GDB stub could (that one
+attaches to the *guest CPU*, not a specific process's memory
+semantically) — this would need either a purpose-built approach (a
+watchpoint-style check inside c3c's own allocator, asserting the
+memory is still zero/consistent right up until each Expr is
+"activated" as a binary-expr) or real hardware/debugger support this
+racccoon userspace doesn't have yet.
+
+**Not blocking anything else in the arc.** The compile still exits
+cleanly with status 1 when this fires (no hang, confirmed repeatedly
+this session and the previous one) — it just means the *real* c3
+stdlib can't be fully parsed on-device yet. Toy programs
+(`--use-stdlib=no`) and the whole `.c → tcc` chain are unaffected.
+
+---
+
 ## 2026-09-05 — c3c fork rebased onto v0.8.3 stable (was 0.8.4-pre)
 
 User caught it: `c3c --version` had been reporting `0.8.4 (Pre-release)`
