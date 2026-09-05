@@ -264,6 +264,41 @@ code = [
 fixtures["tableinit.wasm"] = module(t, imp, fn, exp, code, table=table, elems=elems)
 
 
+# --- tablegrowfill.wasm : table.size/grow/fill -> "118" ----------------
+# table starts at min=2 (both slots null). table.size() -> 2 (s0).
+# table.grow(val=funcB, delta=2) grows 2->4, fills slots[2,3]=funcB,
+# returns old size 2 (g1); s0+g1=4. table.fill(d=0, val=funcC, n=2)
+# fills slots[0,1]=funcC. call_indirect through slots 0..3:
+# funcC(33)+funcC(33)+funcB(22)+funcB(22)=110; +4 (s0+g1) = 114; a
+# second table.size() (now 4, proving grow actually took) -> 118.
+t = [functype([], []), functype([I32], []), functype([], [I32])]
+imp = [import_func("racccoon", "print_i32", 1)]     # funcidx 0
+fn  = [2, 2, 2, 0]                                  # funcidx 1:A 2:B 3:C 4:_start
+exp = [export_func("_start", 4)]
+table = b"\x70\x00" + uleb(2)                       # funcref, min 2
+TABLE_GROW = b"\xfc" + uleb(15) + uleb(0)           # reserved tableidx
+TABLE_SIZE = b"\xfc" + uleb(16) + uleb(0)
+TABLE_FILL = b"\xfc" + uleb(17) + uleb(0)
+code = [
+    body([], i32c(11)),   # funcA (unused here, kept for numbering symmetry with tableinit.wasm)
+    body([], i32c(22)),   # funcB
+    body([], i32c(33)),   # funcC
+    body([], (
+        TABLE_SIZE +                              # s0 = 2
+        i32c(2) + i32c(2) + TABLE_GROW + I32_ADD + # val=funcB(2), delta=2 -> g1=2; s0+g1=4
+        i32c(0) + i32c(3) + i32c(2) + TABLE_FILL + # d=0, val=funcC(3), n=2
+        i32c(0) + CALL_IND(2) +
+        i32c(1) + CALL_IND(2) + I32_ADD +
+        i32c(2) + CALL_IND(2) + I32_ADD +
+        i32c(3) + CALL_IND(2) + I32_ADD +
+        I32_ADD +                                  # + running (s0+g1)
+        TABLE_SIZE + I32_ADD +                     # + table.size() now 4
+        call(0)
+    )),
+]
+fixtures["tablegrowfill.wasm"] = module(t, imp, fn, exp, code, table=table)
+
+
 # --- fac.wasm : recursion + if/else -> fac(5) = "120" -----------------
 # type 0: () -> ()        _start
 # type 1: (i32) -> ()     racccoon.print_i32

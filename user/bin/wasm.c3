@@ -22,8 +22,9 @@ import std::nolibc::mem;
 // reinterpret/promote/demote. Hardware FP (§3): the operators lower to
 // fadd.d etc. directly; sqrt and the roundings use small @naked asm.
 //
-// Bulk-memory follow-up: memory.copy/fill, memory.init/data.drop, and
-// table.init/elem.drop/table.copy for passive data/element segments.
+// Bulk-memory follow-up: memory.copy/fill, memory.init/data.drop,
+// table.init/elem.drop/table.copy for passive data/element segments,
+// and table.grow/size/fill.
 //
 // Next: milestone 3 — real compiled programs (raise limits, decide
 // AssemblyScript / `env` import compat).
@@ -177,13 +178,19 @@ const uint FC_I64_TRUNC_SAT_F64_S = 6; const uint FC_I64_TRUNC_SAT_F64_U = 7;
 // "easy" half — bounds-checked memmove/memset, no passive segments)
 // plus memory.init/data.drop and table.init/elem.drop/table.copy for
 // passive data/element segments (SEC_DATA/SEC_ELEM mode 1, and mode 2/3
-// where practical — see decode_data/decode_elem). table.grow/size/fill
-// (reference-types proposal, not needed for passive segments) still
-// unimplemented.
+// where practical — see decode_data/decode_elem), plus table.grow/
+// size/fill (reference-types proposal): the table itself is always
+// allocated at its full TABLE_MAX capacity (see g_table in wasm_alloc),
+// so "grow" just raises g_table_len; a funcref value on our stack is
+// just the same untyped i32 funcidx table.init/copy already move
+// around — this interpreter does no full type-checking, so nothing
+// beyond what's already here (no ref.func/ref.null) is needed to
+// exercise them.
 const uint FC_MEMORY_INIT = 8;  const uint FC_DATA_DROP  = 9;
 const uint FC_MEMORY_COPY = 10; const uint FC_MEMORY_FILL = 11;
 const uint FC_TABLE_INIT  = 12; const uint FC_ELEM_DROP  = 13;
-const uint FC_TABLE_COPY  = 14;
+const uint FC_TABLE_COPY  = 14; const uint FC_TABLE_GROW = 15;
+const uint FC_TABLE_SIZE  = 16; const uint FC_TABLE_FILL = 17;
 
 const int WPAGE = 65536;             // wasm linear-memory page size
 const int MEM_HARD_CAP_PAGES = 240;  // ~15 MiB — under HEAP_MAX_BYTES with room for the other allocs
@@ -846,7 +853,8 @@ fn char next_instr(Cur* c)
         // byte skip) reads them correctly regardless.
         if (sub == FC_MEMORY_INIT || sub == FC_MEMORY_COPY
          || sub == FC_TABLE_INIT || sub == FC_TABLE_COPY) { read_u32(c); read_u32(c); }
-        else if (sub == FC_MEMORY_FILL || sub == FC_DATA_DROP || sub == FC_ELEM_DROP) { read_u32(c); }
+        else if (sub == FC_MEMORY_FILL || sub == FC_DATA_DROP || sub == FC_ELEM_DROP
+              || sub == FC_TABLE_GROW || sub == FC_TABLE_SIZE || sub == FC_TABLE_FILL) { read_u32(c); }
     }
     // everything else: no immediates
     return op;
@@ -1690,6 +1698,40 @@ fn void interp()
                         {
                             for (uint i = tcn; i > 0; i--) { g_table[tcd + i - 1] = g_table[tcs + i - 1]; }
                         }
+                    // table.grow: stack [val, delta]; pushes the OLD
+                    // size, or -1 if it would exceed TABLE_MAX (the
+                    // table's real allocated capacity — see g_table's
+                    // wasm_alloc). New slots get `val` (a raw funcidx,
+                    // -1 = null — same untyped representation
+                    // table.init/copy already use).
+                    case FC_TABLE_GROW:
+                        imm_u32(fr);                 // reserved tableidx (always 0)
+                        int gdelta = (int)vpop();
+                        int gval = (int)vpop();
+                        int gold = g_table_len;
+                        if (gdelta < 0) { vpush((long)(int)-1); }
+                        else
+                        {
+                            long gwant = (long)gold + (long)gdelta;
+                            if (gwant > TABLE_MAX) { vpush((long)(int)-1); }
+                            else
+                            {
+                                for (int i = gold; i < (int)gwant; i++) { g_table[i] = gval; }
+                                g_table_len = (int)gwant;
+                                vpush((long)gold);
+                            }
+                        }
+                    case FC_TABLE_SIZE:
+                        imm_u32(fr);                 // reserved tableidx (always 0)
+                        vpush((long)g_table_len);
+                    // table.fill: stack [d, val, n].
+                    case FC_TABLE_FILL:
+                        imm_u32(fr);                 // reserved tableidx (always 0)
+                        uint tfn = (uint)vpop();
+                        int tfval = (int)vpop();
+                        uint tfd = (uint)vpop();
+                        if ((long)tfd + (long)tfn > (long)g_table_len) { die("table.fill: out of bounds"); }
+                        for (uint i = 0; i < tfn; i++) { g_table[tfd + i] = tfval; }
                     default: die("unimplemented 0xfc subop");
                 }
 

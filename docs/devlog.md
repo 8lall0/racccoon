@@ -4,6 +4,59 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — WASM `table.grow`/`table.size`/`table.fill`
+
+Rounded out the `table.*` bulk-memory/reference-types family after the
+previous entry's `table.init`/`elem.drop`/`table.copy`. `g_table` was
+already allocated at its full `TABLE_MAX` (4096-slot) capacity
+regardless of the module's declared size, so "grow" is just raising
+`g_table_len` in place — no reallocation needed. `table.grow` pushes
+the OLD size (or `-1` if the requested growth would exceed
+`TABLE_MAX`); `table.size` just pushes `g_table_len`; `table.fill`
+bounds-checks then writes a raw funcidx across a slot range. None of
+these needed `ref.func`/`ref.null` (still unimplemented) — this
+interpreter does no full type-checking, so the same untyped i32
+funcidx that `table.init`/`table.copy` already move around doubles as
+the "funcref value" `table.grow`/`table.fill` take.
+
+New fixture `tablegrowfill.wasm` (`test/mkwasm.py`): starts a 2-slot
+table, `table.size()`→2, `table.grow(val=funcB, delta=2)`→2 (old
+size) and leaves slots 2-3 = funcB, `table.fill(d=0, val=funcC, n=2)`
+sets slots 0-1 = funcC, then `call_indirect` through all four slots
+plus both size results sums to `118`. `wasmtest` sweep: 13 → 14
+fixtures.
+
+**Verified in QEMU**: full sweep green on both `disk.img` (FAT32) and
+`disk_ext2.img` (ext2, the real Duo's topology).
+
+**Verified on real Milk-V Duo — and the hardware-flake pattern from
+the previous entry repeated.** `bulkmem.wasm`/`datainit.wasm`/
+`tableinit.wasm` all ran clean first try; `tablegrowfill.wasm` (the
+one genuinely new fixture) then hung the console indefinitely on its
+very first real-hardware execution — no echo of the command line
+itself, and even an unrelated `echo hello` sent afterward produced
+nothing, meaning the console was fully wedged, not just that one
+command stuck. Needed a power-cycle (no `^C` in this shell) to
+recover, exactly like the previous entry's `datainit.wasm` hang. On
+the clean reboot, `tablegrowfill.wasm` then ran correctly **6/6** in a
+row, plus a full four-fixture re-sweep clean. Tallying both sessions:
+11 total real-hardware runs across the two newest fixtures, with only
+each one's *very first* attempt ever hanging and zero repeats since.
+Flagged this pattern to the user directly rather than silently
+re-applying the "probably environmental" conclusion a second time —
+still not chasing it further per their call, but it's now happened
+twice in a row specifically on a brand-new fixture's first real-HW
+execution, which is at least worth someone's attention if it happens
+a third time (worth checking whether `exec()`'s ELF load path does an
+icache flush/fence.i after copying a freshly host-written binary's
+code pages into memory neither of us has confirmed either way).
+
+**Files changed:** `user/bin/wasm.c3` (3 new opcodes), `test/mkwasm.py`
+(`tablegrowfill.wasm` fixture), `user/shell_test.c3` (`wasmtest` sweep,
+13 → 14).
+
+---
+
 ## 2026-09-05 — WASM passive segments: `memory.init`/`data.drop` + `table.init`/`elem.drop`/`table.copy`
 
 Picked up where the previous entry's bulk-memory work left off: the

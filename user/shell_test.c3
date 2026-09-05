@@ -2160,7 +2160,7 @@ fn void main() {
             // _start computes 2+3 and calls racccoon.print_i32 -> the
             // console shows "5"; _start has no result so it exits 0.
             int wt_ok = 0;
-            char*[13] wt_fx;
+            char*[14] wt_fx;
             wt_fx[0] = "add.wasm";     // -> "5"    (call + host import)
             wt_fx[1] = "mem.wasm";     // -> "142"  (linear memory + grow)
             wt_fx[2] = "loop.wasm";    // -> "55"   (block/loop/br/br_if)
@@ -2174,7 +2174,8 @@ fn void main() {
             wt_fx[10] = "bulkmem.wasm"; // -> "367" (overlapping memory.copy + memory.fill, §4 bulk-memory)
             wt_fx[11] = "datainit.wasm"; // -> "156" (passive data seg: memory.init + data.drop)
             wt_fx[12] = "tableinit.wasm"; // -> "99" (passive elem seg: table.init + elem.drop + table.copy)
-            for (int wf = 0; wf < 13; wf++) {
+            wt_fx[13] = "tablegrowfill.wasm"; // -> "118" (table.size + table.grow + table.fill)
+            for (int wf = 0; wf < 14; wf++) {
                 char* wt_arg = wt_fx[wf];
                 char*[3] wt_av;
                 wt_av[0] = wt_arg; wt_av[1] = "a"; wt_av[2] = "b";
