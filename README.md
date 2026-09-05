@@ -52,10 +52,30 @@ Sv39 paging, one hart. The second C906 core on the Duo (no MMU) is not a target.
   with a hand-rolled ARP / ICMP-echo / DHCP client.
 - **GPIO** (Duo) — the on-board LED, via a user-space `gpiod`.
 - A tiny shell with the usual builtins plus `/bin` binaries loaded through
-  `exec`.
+  `exec`, `rc`-style control flow (`if` / `for` / `while`, command
+  substitution, shell-local variables), line editing and history.
+- **Introspection** — a kernel log ring (`dmesg`), a live process view
+  (`ps`, `top`), `/proc/<pid>/status`.
+- **`/bin`** — `ls cat echo head grep wc sort find cmp tr ed mkdir rm mv
+  chmod chown test expr whoami write dmesg ps top wasm` and more, most
+  built against the real C3 standard library (`std::io`, allocation).
 
 Everything except the kernel core (traps, scheduling, paging, IPC) runs as an
 ordinary user process.
+
+## Documentation
+
+- **[docs/manual.md](docs/manual.md)** — the complete reference:
+  architecture, the process/memory model, the full syscall ABI and
+  reference, the userspace API, IPC and the 9P protocol, namespaces, the
+  filesystem interface, **how to write and build a program**, the shell,
+  the servers, board abstraction, and the known limitations.
+- **[docs/roadmap.md](docs/roadmap.md)** — what's planned, done, and
+  explicitly not being done.
+- **[docs/devlog.md](docs/devlog.md)** — a running log of every work
+  session, newest on top. The real record of what was done and why.
+- Narrower notes: `docs/filesystem-layout.md`, `docs/bin-layout.md`,
+  `docs/ipc-rings.md`, `docs/usb-*.md`, `docs/go-port-plan.md`.
 
 ## Building & running
 
@@ -87,19 +107,25 @@ link address on RV64.
 
 ```
 src/          kernel — traps & syscalls (entry.c3), scheduling & processes
-              (process.c3), paging (page.c3), allocator, console/SBI
-boards/       per-board constants & PLIC setup (qemu/, duo/)
+              (process.c3), paging (page.c3), allocator, supervisor, console/SBI
+boards/       the only platform seam — per-board constants & PLIC setup (qemu/, duo/)
 user/         everything that runs in user mode:
-  user.c3       the shared user runtime (syscall wrappers, print, mmio, ...)
+  user.c3       the shared runtime, linked into every program (syscall
+                wrappers, exec/rfork, ipc/p9/ns/fs helpers, print, mmio)
+  std_racccoon/ shims for the real-C3-stdlib build path (heap over SYS_MAP, ...)
+  shell*.c3     the production shell + the dev/test shell + shared parts
   fs/           fsd + the FAT32 / ext2 / exFAT backends
   usb/          usbd + dwc2, hub, HID (kbd/xpad), MSC
   net/          netd (virtio) / ethd (dwmac) + eth_proto + dhcp
   block/        diskd (virtio) / sdd (SDHCI)
   sys/          procd, envd, echod
-  bin/          standalone /bin programs (ls, cat, ...)
-scripts/      build & launch & flash
-docs/         devlog.md — a running log of every work session
+  bin/          standalone /bin programs (ls, cat, dmesg, ps, ...)
+scripts/      build_user.sh (every program's build line), build.sh, launch*, reflash_duo.sh
+docs/         manual.md (the reference), roadmap.md, devlog.md
 ```
+
+See **[docs/manual.md](docs/manual.md)** for the syscall reference, the
+userspace API, and a walk-through of writing and wiring in a new program.
 
 ## Status
 
