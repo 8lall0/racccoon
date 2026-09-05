@@ -25,6 +25,44 @@ SECTIONS {
         *(.data .data.* .sdata .sdata.*)
     }
 
+    /* Module-level static initializers (c3's own — the real stdlib's
+       "std::io on racccoon" path is the first thing here to need any;
+       plain C programs from lib/racccoon-libc/build.sh don't emit
+       this). Empirically: c3's runtime type-introspection data (the
+       per-type "dtable" a `(Allocator)`-style interface call looks up
+       its method through — "No method 'acquire' could be found on
+       target" otherwise) gets built by functions placed here, not by
+       anything that just runs at load time — user/std_racccoon/
+       rt_entry.c3's _start has to walk this array and call each one
+       before `main`, same as any real crt0 would. */
+    .init_array : ALIGN(8) {
+        __init_array_start = .;
+        *(.init_array .init_array.*)
+        __init_array_end = .;
+    }
+
+    /* Thread-local storage (c3's `tlocal` — std::core::mem::allocators::
+       thread_allocator is the one that surfaced this, "std::io on
+       racccoon"). No real per-thread anything here (one execution
+       context per process) — .tdata/.tbss just need SOME real,
+       adjacent memory and a symbol marking its start, so
+       user/std_racccoon/rt_entry.c3's _start can point tp straight at
+       it (`la tp, __tls_start`), matching the TCB-less convention
+       LLVM's static riscv64 codegen assumes for tp-relative access
+       here (empirically: a tlocal var's own load offset is exactly
+       its distance from .tdata's start, no header). Harmless for the
+       plain C programs (lib/racccoon-libc/build.sh) that also link
+       against this script and never declare a _Thread_local — these
+       sections are just empty for them. */
+    .tdata : ALIGN(8) {
+        __tls_start = .;
+        *(.tdata .tdata.*)
+    }
+
+    .tbss : ALIGN(8) {
+        *(.tbss .tbss.*)
+    }
+
     .bss : ALIGN(8) {
         *(.bss .bss.* .sbss .sbss.* COMMON)
 

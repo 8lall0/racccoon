@@ -220,5 +220,5 @@ build_user_program_stdio stdiotest \
   src/std/core/mem.c3 src/std/core/nolibc_allocator.c3 src/std/core/nolibc_vmem.c3 \
   src/std/io/io.c3 src/std/io/os/os.c3 \
   user/std_racccoon/rcsys.c3 user/std_racccoon/libc.c3 user/std_racccoon/io_native.c3 \
-  user/std_racccoon/trunctfdf2_stub.c3 user/std_racccoon/rt_entry.c3 \
+  user/std_racccoon/trunctfdf2_stub.c3 user/std_racccoon/heap.c3 user/std_racccoon/rt_entry.c3 \
   user/bin/stdiotest.c3

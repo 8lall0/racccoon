@@ -4,6 +4,75 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — std::io on racccoon, part 2: real allocation (DString, collections)
+
+The user asked to actually use more of the c3 stdlib, not just
+`io::printn`. Wiring in a real allocator (`user/std_racccoon/heap.c3`
+— `std::core::mem::allocators::SimpleHeapAllocator` over a `SYS_MAP`-
+backed `MemoryAllocFn`, same idea as WASM's own `wasm_allocator` in
+the real stdlib) surfaced three genuine, previously-invisible gaps —
+nothing in racccoon userspace had ever needed any of them before,
+because `std::nolibc` code never touches this machinery:
+
+1. **`tp` (thread pointer) leaked kernel state into every process.**
+   `std::core::mem::allocators::thread_allocator` is `tlocal`, and a
+   `tlocal` access on riscv64 is `tp`-relative. Neither `SYS_EXEC`
+   (`src/entry.c3`) nor `create_process`'s `user_entry()`
+   (`src/process.c3`) ever set `tp` — exactly the same class of gap
+   the two functions' own existing comments already flagged for `a0`/
+   `a1` ("would otherwise still hold whatever the kernel's own
+   boot-time code last left in the physical registers"), just for a
+   register nothing had ever read before. `stdiotest` inherited a
+   real kernel-boot-time address (`~0x80046000`) through `tp`, and
+   `thread_allocator`'s `tp`-relative read faulted through it — a
+   real, if previously dormant, kernel bug. Fixed both call sites to
+   zero `tp`, same reasoning as the existing `a0`/`a1` zeroing.
+2. **No TLS setup at all.** Zeroing `tp` alone just moves the fault
+   (reads through address `0x18` instead of a kernel address) — a
+   `tlocal` variable on this target needs `tp` to point at wherever
+   the linker actually placed `.tdata`/`.tbss` (empirically: no TCB
+   header, `tp` = the section's own start address exactly). Added an
+   explicit `.tdata`/`.tbss` section pair + `__tls_start` symbol to
+   `lib/racccoon-libc/racccoon-libc.ld` (harmless for the plain C
+   programs sharing that script — empty sections for them), and
+   `user/std_racccoon/rt_entry.c3`'s `_start` now does `la tp,
+   __tls_start` right alongside its existing `la sp, __stack_top`.
+3. **`.init_array` was never walked.** Past the TLS fix, `DString`/
+   `List` (anything actually calling `.acquire()` through the
+   `Allocator` interface) panicked at runtime: `"No method 'acquire'
+   could be found on target"`. c3's per-type runtime introspection
+   data (the "dtable" a dynamic interface call looks up its method
+   through) gets built by module-level static-initializer functions —
+   ordinary C crt0 territory, but racccoon's never needed one before.
+   Added an explicit `.init_array` section + `__init_array_start`/
+   `__init_array_end` symbols to the same linker script; `_rt_run`
+   (rt_entry.c3) now walks and calls every entry before `main` — the
+   same thing any real crt0 does, just previously unnecessary here.
+
+With all three fixed, `stdiotest` now also builds a `DString` via
+`.appendf()` and a `List(<int>)` via `push`/`foreach`, both backed by
+the real heap, both correct. `alias IntList = List {int};` — the
+actual generic-instantiation syntax (`def X = List(<int>)` doesn't
+exist; c3's own README example uses `alias`+`{}`).
+
+**Verified**: QEMU FAT32 + ext2, `stdiotest` (3 plain-format lines +
+DString + List) and the 14-fixture `wasmtest` sweep both green. Real
+Milk-V Duo: 4/4 clean runs, correct output, no regression on a
+bulk-memory wasm re-check.
+
+**Files changed:** `src/entry.c3` + `src/process.c3` (the `tp`-zeroing
+fix — kernel-level, benefits any future tlocal-using userspace code,
+not just this), `lib/racccoon-libc/racccoon-libc.ld` (`.tdata`/`.tbss`/
+`.init_array` + their symbols), `user/std_racccoon/rt_entry.c3` (walks
+init_array, sets `tp`), `user/std_racccoon/heap.c3` (new — the
+`SimpleHeapAllocator` wiring), `user/std_racccoon/rcsys.c3` (added
+`rc_syscall_long`, `SYS_MAP` wrapper — the earlier `int`-returning
+`rc_syscall` would have truncated a real heap-block pointer above
+4 GiB), `user/bin/stdiotest.c3` (DString + List demo),
+`scripts/build_user.sh` (`heap.c3` added to the `stdiotest` build).
+
+---
+
 ## 2026-09-05 — std::io on racccoon: a real, working /bin program
 
 Answered a question that came up mid-session ("why can't /bin programs

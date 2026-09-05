@@ -1306,6 +1306,19 @@ fn void sys_exec(Trap_frame* f) @noinline
 		// path apart from that failure one.
 		f.a0 = (ulong)exec_argc;
 		f.a1 = (ulong)exec_argv_base;
+
+		// tp is otherwise left exactly as it was in the CALLING image's
+		// trapframe — exec() doesn't touch it at all, so a fresh image
+		// silently inherits whatever the previous program (or, further
+		// back, create_process's own user_entry(), which never sets tp
+		// either) last put there. Invisible as long as nothing reads tp;
+		// surfaced for real once std::io's tlocal thread_allocator
+		// (user/std_racccoon/, "std::io on racccoon") became the first
+		// userspace code to actually use it — tp held a leftover
+		// kernel-boot-time address, and thread_allocator's tp-relative
+		// TLS access faulted reading through it. Same reasoning as a0/a1
+		// above, just for a register nothing needed zeroed until now.
+		f.tp = 0;
 }
 
 // True while this process is blocked in ipc_send/ipc_reply toward a

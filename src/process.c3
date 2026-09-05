@@ -988,6 +988,12 @@ fn void user_entry() @naked @noinline @noreturn
 	// procd, envd, shell) reliably see an empty args (String[] of
 	// length 0, via std::nolibc::main_stub's @main_args) instead of
 	// reading that leftover garbage as if it meant something.
+	//
+	// tp zeroed for the same reason, added later: std::io's tlocal
+	// thread_allocator (user/std_racccoon/, "std::io on racccoon") was
+	// the first userspace code to ever read tp, and it faulted through
+	// a leftover kernel-boot-time value nothing had zeroed before —
+	// harmless as long as nothing used tp, same as a0/a1 above.
 	asm(`
         li t0, 0x1000000
         csrw sepc, t0
@@ -995,6 +1001,7 @@ fn void user_entry() @naked @noinline @noreturn
         csrw sstatus, t1
         li a0, 0
         li a1, 0
+        li tp, 0
         sret
     `);
 }

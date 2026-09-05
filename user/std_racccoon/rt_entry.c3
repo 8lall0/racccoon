@@ -1,5 +1,6 @@
 module rt_entry @feat(CUSTOM_LIBC);
-import rcsys;
+import rcsys, rcsys_heap;
+import std::core::mem;
 
 // Entry point for a /bin program built WITH the real c3 stdlib
 // (std::io, std::core::mem, ...) instead of std::nolibc — see
@@ -24,14 +25,52 @@ import rcsys;
 // real argc/argv parse (SYS_EXEC's blob, same convention main_stub.c3
 // already decodes) would be the natural next step if a std::io program
 // ever needs its own arguments.
-fn void _rt_after_main() @export("_rt_after_main")
+extern fn void real_main() @cname("main");
+
+// racccoon-libc.ld's own comment explains what these are and why they
+// have to be walked by hand: c3's module-level static initializers
+// (dtable/type-introspection registration among them — without this,
+// any `(Allocator)`-style interface call panics "No method '...' could
+// be found on target" the first time it's actually invoked, not at
+// compile time).
+extern char __init_array_start;
+extern char __init_array_end;
+alias InitFn = fn void();
+
+// `_start` itself has to be raw asm (no C3 code runs before `sp`/`tp`
+// are set), but everything after that needs real C3, not more asm. So
+// `_start` only sets `sp`/`tp` and jumps into this — the first real C3
+// code in the process — which runs the init_array, wires up heap.c3's
+// allocator (mem::@scoped — thread_allocator is @private to the real
+// stdlib's own allocators module, only reachable through its own
+// public helpers), runs `main` with it scoped in for the whole call,
+// then exits cleanly.
+fn void _rt_run() @export("_rt_run")
 {
+    InitFn* p = (InitFn*)&__init_array_start;
+    InitFn* end = (InitFn*)&__init_array_end;
+    while (p < end) { (*p)(); p++; }
+
+    rcsys_heap::heap_init();
+    mem::@scoped(&rcsys_heap::heap)
+    {
+        real_main();
+    };
     rcsys::rc_exit(0);
 }
 
+// `tp` (thread pointer) has to be set here too, before anything can
+// touch a tlocal variable (thread_allocator, reached inside
+// _rt_run's mem::@scoped) — see racccoon-libc.ld's own comment on
+// __tls_start for why tp = __tls_start exactly, no header offset.
+// The kernel zeroes tp for a fresh process/exec (src/entry.c3's
+// sys_exec, src/process.c3's user_entry — same fix, same day this
+// was found) so a leftover value can't leak in, but only THIS
+// program's own crt0 knows where ITS OWN .tdata/.tbss actually
+// landed, so only it can point tp at the right place.
 fn void _start() @section(".text.start") @naked @noinline @nostrip @export("_start")
 {
     asm(`la sp, __stack_top
-    call main
-    call _rt_after_main`);
+    la tp, __tls_start
+    call _rt_run`);
 }
