@@ -107,6 +107,86 @@ STUB
   echo "==> Done: build/user/$name.bin.o"
 }
 
+# Builds one user-mode program against the REAL c3 stdlib (std::io,
+# std::core::mem, ...) instead of std::nolibc — see docs/devlog.md
+# ("std::io on racccoon"). Same output shape as build_user_program
+# (build/user/<name>.bin.o), three real differences:
+#   - --use-stdlib isn't forced off, and --custom-libc=yes activates
+#     the @feat(CUSTOM_LIBC) hooks user/std_racccoon/ (libc.c3,
+#     io_native.c3, rcsys.c3, trunctfdf2_stub.c3 — the userspace
+#     counterparts of src/libc/libc.c3 + src/std/io/io_native.c3 the
+#     KERNEL already uses for the exact same reason) and three files
+#     reused verbatim from the kernel's own override set
+#     (src/std/core/mem.c3, nolibc_allocator.c3, nolibc_vmem.c3) plus
+#     std::io's own os.c3/io.c3 overrides (src/std/io/...) satisfy.
+#   - entry point is user/std_racccoon/rt_entry.c3's hand-written
+#     `_start` (ENTRY(_start), not std::nolibc::main_stub's `start`) —
+#     c3c's own synthetic-main generator still produces the real,
+#     exported `main` for a plain `fn void main()` here (that's stock
+#     compiler behavior, not something RACCCOON_STD_DIR provides); what's
+#     missing on a target with no OS is only the thing that calls it.
+#   - reuses lib/racccoon-libc/racccoon-libc.ld (ENTRY(_start), same
+#     USER_BASE layout as user/user.ld) rather than user/user.ld.
+#
+# Deliberately NOT user/user.c3 — its own exported `putchar` would
+# collide with libc.c3's POSIX one (see user/std_racccoon/rcsys.c3's
+# comment). A real program wanting both racccoon's own syscalls and
+# std::io just calls user::fs_read/exec/etc directly alongside it;
+# nothing here stops that, there's just no single combined helper for
+# it yet.
+build_user_program_stdio() {
+  local name="$1"
+  shift
+  local sources=("$@")
+
+  mkdir -p "build/user/$name/obj"
+
+  echo "==> Compiling $name (real stdlib)..."
+  c3c compile-only \
+    --safe=no \
+    --link-libc=no \
+    --custom-libc=yes \
+    --target elf-riscv64 \
+    --riscv-cpu=rvimac \
+    --riscv-abi=double \
+    --output-dir "build/user/$name/obj" \
+    "${sources[@]}"
+
+  local obj_dir="build/user/$name/obj/obj/elf-riscv64"
+
+  echo "==> Linking $name.elf..."
+  $LLVM_LLD \
+    "$obj_dir"/*.o \
+    -T lib/racccoon-libc/racccoon-libc.ld \
+    -Map="build/user/$name.map" \
+    -o "build/user/$name.elf"
+
+  echo "==> Converting ELF -> raw binary..."
+  $LLVM_OBJCOPY \
+    --set-section-flags .bss=alloc,contents \
+    -O binary \
+    "build/user/$name.elf" \
+    "build/user/$name.bin"
+
+  echo "==> Embedding binary as linkable object..."
+  (
+    cd build/user
+    cat > "$name.bin.s" <<STUB
+	.section .rodata._binary_${name}_bin, "a"
+	.balign 8
+	.globl _binary_${name}_bin_start
+_binary_${name}_bin_start:
+	.incbin "${name}.bin"
+	.globl _binary_${name}_bin_end
+_binary_${name}_bin_end:
+STUB
+    $LLVM_MC --triple=riscv64 --mattr=+m,+a,+c,+f,+d --target-abi=lp64d \
+      --filetype=obj -o "$name.bin.o" "$name.bin.s"
+  )
+
+  echo "==> Done: build/user/$name.bin.o"
+}
+
 build_user_program shell user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/shell_words.c3 user/shell_jobs.c3 user/shell_common.c3 user/shell.c3
 build_user_program shell_test user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/shell_words.c3 user/shell_jobs.c3 user/shell_common.c3 user/shell_test.c3
 build_user_program echod user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/sys/echod.c3
@@ -135,3 +215,10 @@ build_user_program usbd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_D
 build_user_program ethd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/net/eth_proto.c3 user/net/dhcp.c3 user/net/dwmac.c3 user/net/ephy.c3 user/net/ethd.c3
 build_user_program netd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/virtio.c3 user/net/eth_proto.c3 user/net/dhcp.c3 user/net/netd.c3
 build_user_program gpiod user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/gpio/gpiod.c3
+
+build_user_program_stdio stdiotest \
+  src/std/core/mem.c3 src/std/core/nolibc_allocator.c3 src/std/core/nolibc_vmem.c3 \
+  src/std/io/io.c3 src/std/io/os/os.c3 \
+  user/std_racccoon/rcsys.c3 user/std_racccoon/libc.c3 user/std_racccoon/io_native.c3 \
+  user/std_racccoon/trunctfdf2_stub.c3 user/std_racccoon/rt_entry.c3 \
+  user/bin/stdiotest.c3

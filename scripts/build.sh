@@ -174,7 +174,7 @@ ext2_seed_tree() {
   # bin/{cat,ls,write,rm,mkdir,mv} — the real, argv-taking utilities
   # shell.c3's own /bin/ fallback branch execs (see docs/devlog.md),
   # replacing what used to be hardcoded shell builtins.
-  for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do
+  for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm stdiotest; do
     mcopy -i build/disk.img "build/user/$u.bin" "::bin/$u"
   done
   for w in build/wasm/*.wasm; do mcopy -i build/disk.img "$w" "::$(basename "$w")"; done
@@ -308,7 +308,7 @@ GOEOF
     debugfs -w -R "write build/go/toolchain/importcfg.link lib/go/importcfg.link" build/disk_ext2.img > /dev/null
     debugfs -w -R "write build/go/toolchain/hello.go hello.go" build/disk_ext2.img > /dev/null
   fi
-  for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do
+  for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm stdiotest; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_ext2.img > /dev/null
   done
   # A binary in /usr/root/bin, NOT /bin — bindirtest execs it by bare
@@ -388,7 +388,7 @@ GOEOF
     case "$(basename "$g")" in compile.elf|link.elf|go.elf|gostage*.elf) continue ;; esac
     [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_dual_root_part.img > /dev/null
   done
-  for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do
+  for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm stdiotest; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_root_part.img > /dev/null
   done
   for w in build/wasm/*.wasm; do debugfs -w -R "write $w $(basename "$w")" build/disk_dual_root_part.img > /dev/null; done
@@ -416,7 +416,7 @@ GOEOF
     case "$(basename "$g")" in compile.elf|link.elf|go.elf|gostage*.elf) continue ;; esac
     [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_dual_ext2_part.img > /dev/null
   done
-  for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm; do
+  for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm stdiotest; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_ext2_part.img > /dev/null
   done
   for w in build/wasm/*.wasm; do debugfs -w -R "write $w $(basename "$w")" build/disk_dual_ext2_part.img > /dev/null; done

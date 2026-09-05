@@ -4,6 +4,97 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — std::io on racccoon: a real, working /bin program
+
+Answered a question that came up mid-session ("why can't /bin programs
+`import std::io`?") by actually getting it to work, not just
+explaining why it doesn't by default.
+
+**Why not by default**: `user/project.json` builds every `/bin`
+program with `--use-stdlib=no --link-libc=no`, so `std::nolibc` (a
+self-contained subset needing nothing external) is all that's ever
+been reachable — `std::io`'s real implementation is a thin wrapper
+over `std::libc`'s `extern fn fopen/malloc/fwrite/...` declarations,
+symbols only a real C library provides, and none is linked in.
+
+**How it actually works, once you look**: the KERNEL already does
+exactly this (`src/std/io/io_native.c3`, `src/libc/libc.c3`,
+`src/std/core/{mem,nolibc_allocator,nolibc_vmem}.c3`, `src/std/io/
+{io,os/os}.c3` — all gated `@feat(CUSTOM_LIBC)`, the hook c3c's
+`--custom-libc=yes` activates). `std::io::os`'s no-libc file layer
+calls through `@weak` function-pointer globals
+(`native_fwrite_fn`/`native_fputc_fn`/...) that a project supplies;
+`os.c3`'s bottom half wires them to `io_native.c3`'s own
+`my_fwrite`/`my_fputc`, which for the kernel just call `sbi::__putchar`.
+The kernel's own boot-time `io::printfn("...%d...%x...")` calls
+(`src/entry.c3`'s fault handler, `src/smp.c3`) are real proof this
+whole chain — including `%d`/`%x` numeric formatting — already works
+on this target; it isn't a stub.
+
+**Ported to userspace** (`user/std_racccoon/`, new): `libc.c3` and
+`io_native.c3` are the kernel's own files with `sbi::__putchar` swapped
+for a private `SYS_PUTCHAR` syscall wrapper (`rcsys.c3` — deliberately
+NOT `user::putchar`, which would collide at link time with libc.c3's
+own POSIX-named `putchar`). `mem.c3`/`nolibc_allocator.c3`/
+`nolibc_vmem.c3`/`io.c3`/`os.c3` are reused verbatim by path
+(`src/std/core/...`, `src/std/io/...`) — no copies, no drift risk.
+`rt_entry.c3` supplies `_start` by hand (`@section(".text.start")`,
+same reasoning as `user/user.c3`'s own `start()`), since c3c's own
+synthetic-`main`-for-`fn void main()` machinery still runs on this
+build path (that's stock compiler behavior) but nothing calls it on a
+target with no OS — set `sp`, `call main`, exit cleanly if it returns.
+One `__trunctfdf2` stub (`trunctfdf2_stub.c3`), same reasoning as
+`src/kernel/softfloat_f128_stubs.c3`: std::io's float formatter has an
+f128->double truncation in a path `%s`/`%d`/`%x`/`%v` never reach, but
+the *symbol* still needs to resolve.
+
+New helper `build_user_program_stdio` (`scripts/build_user.sh`) builds
+this way: real stdlib + `--custom-libc=yes`, links against
+`lib/racccoon-libc/racccoon-libc.ld` (`ENTRY(_start)`) instead of
+`user/user.ld`. Genuinely opt-in, not a blanket migration — every
+other `/bin` program keeps its existing `std::nolibc` build, the
+`build_user_program` helper untouched. New demo program `user/bin/
+stdiotest.c3`: `io::printn` + `io::printfn("%d ... %x", ...)`. Seeded
+onto every disk image next to the rest of `/bin`; `stdiotest` (shell
+builtin, `shell_test.c3`) runs it and checks a clean exit, same
+rfork/exec/join shape as `wasmtest`.
+
+**The real cost, measured, not guessed**: ~165 KiB image
+(`llvm-size`'s real text+data+bss, not raw `.elf`-on-disk which
+includes throwaway debug/symbol tables) for a program that prints
+three lines — comfortably under `EXEC_MAX_IMAGE_SIZE` (256 KiB), but
+a couple hundred bytes' worth of hand-rolled `print()` would do the
+same job at a fraction of the size. Worth it only when a program
+genuinely wants `%`-style formatting; not a reason to migrate anything
+else.
+
+**One real bug this hit, worth remembering**: the first `stdiotest`
+build crashed instantly (`scause=15` store fault, `sepc` = 2 bytes
+into `USER_BASE`) — `_start` wasn't placed in `.text.start` (no
+`@section` attribute on it), so the linker's `KEEP(*(.text.start))`
+never caught it and something else (`compiler_rt.__mulddi3`, as it
+happened) ended up at the fixed load address instead, executing with
+`sp` never set. Since these are flat binaries loaded at a hardcoded
+address (not real ELF loading — the kernel ignores `e_entry`
+entirely), whatever physically lands at the front of the image *is*
+the entry point; `@section(".text.start")` is not optional here.
+Fixed, then verified clean.
+
+**Verified**: QEMU, both `disk.img` (FAT32) and `disk_ext2.img` (ext2)
+— `stdiotest: ok`, no regressions to `wasmtest`'s 14-fixture sweep.
+Real Milk-V Duo — 4/4 clean runs, correct `%d`/`%x` output. (One
+detour: the file didn't survive an SD-card swap-and-reboot the first
+time around — a card-handling hiccup, not a racccoon bug — recopied
+and it was fine on retry.)
+
+**Files added**: `user/std_racccoon/{rcsys,libc,io_native,
+trunctfdf2_stub,rt_entry}.c3`, `user/bin/stdiotest.c3`. **Changed**:
+`scripts/build_user.sh` (`build_user_program_stdio` + the `stdiotest`
+build line), `scripts/build.sh` (`stdiotest` added to all four
+disk-image seed loops), `user/shell_test.c3` (`stdiotest` builtin).
+
+---
+
 ## 2026-09-05 — WASM `table.grow`/`table.size`/`table.fill`
 
 Rounded out the `table.*` bulk-memory/reference-types family after the

@@ -2193,6 +2193,25 @@ fn void main() {
                 if (wt_code != 0) { wt_ok = -1; }
             }
             print(wt_ok == 0 ? "wasmtest: ok\n" : "wasmtest: FAILED\n");
+        } else if (strcmp(cmd, "stdiotest") == 0) {
+            // /bin/stdiotest (docs/devlog.md, "std::io on racccoon") —
+            // a program built against the REAL c3 stdlib (std::io)
+            // instead of std::nolibc, proving io::printn/printfn work
+            // end to end (user/std_racccoon/, scripts/build_user.sh's
+            // build_user_program_stdio). Its own output goes straight
+            // to the console (printfn's %d/%x); this just proves it
+            // runs to a clean exit, same rfork/exec/join(code) shape
+            // as wasmtest.
+            uint st_gen = 0;
+            int st_c = rfork(RFPROC, &st_gen);
+            if (st_c == 0) {
+                char*[1] st_av;
+                st_av[0] = "bin/stdiotest";
+                exec("bin/stdiotest", exec_buf(), exec_buf_max(), 0, &st_av[0], 1);
+                exitcode(127);
+            }
+            int st_code = join(st_c, st_gen);
+            print(st_code == 0 ? "stdiotest: ok\n" : "stdiotest: FAILED\n");
         } else if (strcmp(cmd, "gotest") == 0 || strcmp(cmd, "gostage2test") == 0 || strcmp(cmd, "gostage3test") == 0 || strcmp(cmd, "gostage35test") == 0 || strcmp(cmd, "gostage41test") == 0 || strcmp(cmd, "gostage42test") == 0) {
             // Go on racccoon (docs/go-port-plan.md). /bin/go-* are
             // GOOS=racccoon static riscv64 binaries built by
