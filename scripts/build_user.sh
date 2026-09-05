@@ -206,6 +206,12 @@ build_user_program false user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_
 # line buffer, no need for the ~180 KiB stdlib path). Lets racccoon edit
 # a file without host tools.
 build_user_program ed user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/ed.c3
+# text tools — grep / wc / sort / find / cmp / tr. Small nolibc programs
+# (hand-rolled parsing, literal match — no regexp, matching ed); the
+# shell's pipes / globbing / control flow feed them.
+for t in grep wc sort find cmp tr; do
+  build_user_program "$t" user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 "user/bin/$t.c3"
+done
 
 # The small /bin utilities, ported to the real stdlib (io::print/
 # io::printfn instead of user.c3's own print()/putchar(), String.to_int/

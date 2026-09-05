@@ -42,7 +42,7 @@ fi
 # image's own bin/ — kept in sync by hand, same convention this
 # project already uses for the small protocol constants duplicated
 # across diskd.c3/fsd.c3.
-BINARIES="echod cat ls echo true false ed head whoami write rm mkdir mv chmod chown test expr usbrw fsd gpio wasm"
+BINARIES="echod cat ls echo true false ed grep wc sort find cmp tr head whoami write rm mkdir mv chmod chown test expr usbrw fsd gpio wasm"
 
 for b in $BINARIES; do
   if [ ! -f "build/user/$b.bin" ]; then
