@@ -4,6 +4,104 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — SMP scheduler, Stages A + B: per-hart control block + the first kernel spinlocks
+
+Roadmap §8. The kernel had a hart-bringup scaffold (`src/smp.c3`,
+2026-09-02) that starts secondary harts and parks them in `wfi` — but
+no scheduler, and the whole kernel assumes "kernel code is never
+preempted on the one hart there is": one run queue, and not a single
+lock anywhere (page allocator, `procs[]`, the kbd queue, IPC
+rendezvous). This session lays the first two of five stages toward a
+real scheduler. Neither stage changes behaviour — there is still
+exactly one scheduling hart — but the pieces a second scheduling hart
+needs are now in place and correct.
+
+**Stage A — per-hart control block (`src/smp.c3`).**
+- `struct Hart { uint hartid; bool scheduling; }` + `Hart[SMP_MAX_HARTS]
+  harts`. Stage C grows this to hold the per-hart `current_proc`, idle
+  proc, trap-stack top (the `sscratch` anchor), and an IPI mailbox.
+- `fn uint this_hartid()` — the "which hart am I" accessor every Stage B
+  lock / irq nest indexes by. RISC-V S-mode has no hartid CSR, so for
+  now (only the boot hart runs kernel code) it is a constant
+  `(uint)boot_hartid`. Stage C swaps in a real per-hart source (a `tp`
+  reserved for S-mode, or an `sscratch`-indirect per-hart block) — that
+  touches the trap-entry asm and belongs with the second-hart bringup,
+  and it is a single call site, not a scattered refactor.
+- `smp_init_boot_hart()` from `kernel_main`, right after BSS clear and
+  before anything that takes a lock.
+
+`current_proc` / `idle_proc` stay plain globals — 280 references, zero
+benefit until Stage C actually runs a second scheduler loop; that
+conversion is Stage C's, done as a rename-to-accessor at that point.
+
+**Stage B — `Spinlock` + the first guarded structures (`src/spinlock.c3`).**
+- `amoswap.w.aq` / `.rl` test-and-set over a `uint` word (the kernel is
+  built with the A extension — `--riscv-cpu=rvimac`, `llc -mattr=+a`),
+  `@naked` a0/a1-by-ABI, same shape as `switch_context` /
+  `flush_tlb_page`. These deliberately do NOT bridge through the
+  `read_reg_tmp` / `write_csr_tmp` globals — those aren't reentrant and
+  race the moment a second hart exists.
+- `irq_push_off()` / `irq_pop_off()` — xv6's nested interrupt-disable,
+  per-hart (`g_irq_nest[this_hartid()]`). `Spinlock.acquire` clears
+  `sstatus.SIE` for the critical section; the outermost `release`
+  restores it, and only if it had been set.
+- **Page allocator** (`alloc_lock`, `src/allocation.c3`): guards
+  `try_alloc_pages` / `free_pages` / `free_page_count` — the leaf
+  mutators, so `alloc_pages()` never double-locks. The allocator is the
+  one shared structure a bringing-up secondary hart could plausibly
+  touch. `irq_push_off` here ALSO closes a pre-existing *single-hart*
+  hole: a timer tick inside a syscall's `alloc_pages` runs
+  `supervisor_tick` → `create_process` → `alloc_pages` and would
+  re-enter the (non-recursive) lock on the same hart.
+- **`procs[]` slot table** (`proc_table_lock`, `src/process.c3`): a new
+  `PROC_RESERVED` state. `create_process` / `sys_rfork` claim a free
+  slot atomically as `PROC_RESERVED` under the lock, then release it and
+  do the heavy init unlocked; `state` flips to `PROC_RUNNABLE` only at
+  the very end, once `page_table` / `sp` / `fp_area` are all valid. This
+  also fixes a latent single-hart bug: `create_process` used to set
+  `PROC_RUNNABLE` *before* `sp` / `page_table`, so a timer tick landing
+  in that window could have `yield()` pick a process with a null page
+  table. `proc_by_pid` and `supervisor.c3`'s namespace-reseat now treat
+  `PROC_RESERVED` like `PROC_UNUSED`. `free_process` releases the slot
+  under the same lock. Lock order is always `proc_table_lock` →
+  `alloc_lock`, never the reverse (the claim releases before any alloc).
+- **Keyboard queue** (`kbd_lock`, `src/kbd.c3`): producer
+  (`SYS_KBD_PUSH` from usbd) and consumer (`SYS_GETCHAR`) are separate
+  syscall paths; the head/tail update is now atomic w.r.t. the other
+  side.
+
+Not guarded in Stage B: console output (`sbi::__putchar`). Interleaved
+console writes are cosmetic, never corruption, and a naive console lock
+deadlocks `panic()` (which prints while something else may hold it) —
+that needs a panic-aware lock-break, a Stage C item.
+
+**Verified — QEMU, all green, no regressions:**
+- FAT32 (`launch64.sh`): boot clean, `wasmtest` 14/14, `stdiotest`
+  (incl. DString / List / `%f`/`%e`/`%g`), `mkdir`/`write`/`cat`.
+- ext2 (`launch64_ext2.sh`): same sweep + `chmod`, plus `rforktest`,
+  `threadtest`, `maptest`, `oomtest` (allocator exhaustion → process
+  killed, no panic, RAM recovered), `fsdkilltest` (`svc: respawned
+  fsd` — supervisor respawn through `create_process`) — all pass.
+- `-smp 2` (new `launch64_smp2.sh`): `SMP: 2 hart(s) online of 2` —
+  hart 1 comes up via SBI HSM and parks; boot hart runs everything
+  under the new locks. `wasmtest` / `stdiotest` / fs ops clean.
+- dual-fs (`launch64_dual.sh`): both fsd instances mount and list;
+  `killtest` PASS (process teardown + slot reuse under
+  `proc_table_lock`).
+
+**Not verified on real Milk-V Duo** — the Duo is `SMP_MAX_HARTS = 1`
+(no-MMU 2nd core), so `smp_start_secondaries` is a no-op there and
+`this_hartid()` is 0; the Stage B locks still run on every allocation /
+process create / keystroke. Awaiting a Duo reflash + boot sweep before
+commit.
+
+**Files:** `src/spinlock.c3` (new), `src/smp.c3`, `src/kernel.c3`,
+`src/allocation.c3`, `src/process.c3`, `src/entry.c3`, `src/kbd.c3`,
+`src/supervisor.c3`, `docs/roadmap.md` (§8 restaged),
+`scripts/launch64_smp2.sh` (new).
+
+---
+
 ## 2026-09-05 — `sandbox` shell builtin: §2's last open item
 
 `sandbox <cmd> [args...]` (`user/shell_common.c3`'s

@@ -78,6 +78,13 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 
 	io::print("1: BSS cleared\n");
 
+	// SMP Stage A: publish which hart booted us before anything that
+	// takes a Stage B lock (create_process -> proc_table_lock, alloc_lock)
+	// runs — those index per-hart state by this_hartid(), which reads
+	// boot_hartid. smp_start_secondaries() (called much later) re-runs the
+	// same assignment harmlessly.
+	smp_init_boot_hart();
+
 	self_test_pte_roundtrip();
 
 	write_reg("stvec", "kernel_entry");

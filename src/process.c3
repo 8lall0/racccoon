@@ -24,6 +24,18 @@ const PROCS_MAX     = 16; // Maximum number of processes
 const PROC_UNUSED   = 0; // Unused process control structure
 const PROC_RUNNABLE = 1; // Runnable process
 const PROC_BLOCKED  = 2; // Waiting on SYS_IPC_RECV for a message to arrive
+// SMP scheduler, Stage B (spinlock.c3, docs/roadmap.md §8): a slot that
+// create_process / sys_rfork has claimed under proc_table_lock but not
+// yet finished initialising. NOT runnable (yield() skips it, so the
+// scheduler can't pick a process with a null page_table / garbage sp),
+// but NOT free either (a second claimant, or a mid-init timer tick, must
+// see it as taken). The claim and the eventual flip to PROC_RUNNABLE
+// bracket the whole of create_process; only the claim itself holds the
+// lock. Stage C audit note: every `state == PROC_UNUSED` site outside
+// the timer tick (free_process's waiter sweeps, the IPC paths) also needs
+// to treat PROC_RESERVED as "not a valid peer" once those paths can run
+// on another hart concurrently with create_process; today they can't.
+const PROC_RESERVED = 3;
 
 // Every process's IPC inbox (Process.msg_data). Sized for the largest
 // thing anyone speaks over IPC, not per-conversation. 8 KiB: raised from
@@ -646,7 +658,9 @@ fn Process* proc_by_pid(int pid)
 {
 	if (pid < 1 || pid > PROCS_MAX) return null;
 	Process* p = &procs[pid - 1];
-	if (p.pid != pid || p.state == PROC_UNUSED) return null;
+	// PROC_RESERVED (SMP Stage B): claimed by create_process/sys_rfork but
+	// not yet initialised — not a valid lookup target, same as UNUSED.
+	if (p.pid != pid || p.state == PROC_UNUSED || p.state == PROC_RESERVED) return null;
 	return p;
 }
 
@@ -1080,6 +1094,14 @@ fn void fork_entry() @naked @noinline @noreturn
 
 Process[PROCS_MAX] procs; // All process control structures.
 
+// SMP scheduler, Stage B (spinlock.c3): serialises free-slot claiming in
+// create_process / sys_rfork and the PROC_UNUSED store in free_process,
+// so two harts can't hand out the same procs[] slot. Held only for the
+// scan-and-claim, never across the heavy init that follows (which takes
+// alloc_lock — lock order is always proc_table_lock -> alloc_lock, never
+// the reverse).
+Spinlock proc_table_lock;
+
 // Mount.server_generation's own value at namespace-population time — see
 // that field's comment. 0 for a pid that doesn't currently exist (0
 // itself, or a slot that's PROC_UNUSED), matching server_pid's existing
@@ -1094,17 +1116,24 @@ fn uint mount_generation(int pid)
 
 fn Process* create_process(void* image, uint image_size)
 {
-	// Find an unused process control structure.
+	// Find an unused process control structure and claim it atomically
+	// (PROC_RESERVED) so a concurrent create_process / sys_rfork — or a
+	// timer tick that runs supervisor_tick mid-init — sees the slot as
+	// taken. proc.state flips to PROC_RUNNABLE only at the very end, once
+	// page_table / sp / fp_area are all valid.
 	Process* proc = null;
 	int i;
+	proc_table_lock.acquire();
 	for (i = 0; i < PROCS_MAX; i++)
 	{
 		if (procs[i].state == PROC_UNUSED)
 		{
 			proc = &procs[i];
+			proc.state = PROC_RESERVED;
 			break;
 		}
 	}
+	proc_table_lock.release();
 
 	if (!proc)
 	{
@@ -1157,10 +1186,12 @@ fn Process* create_process(void* image, uint image_size)
 		map_page(page_table, (uptr)USER_BASE + (uptr)off, page, PAGE_U | PAGE_R | PAGE_W | PAGE_X);
 	}
 
-	// Initialize fields.
+	// Initialize fields. proc.state stays PROC_RESERVED until the end of
+	// this function (see the free-slot claim above) — the scheduler must
+	// not be able to pick this process before sp / page_table / fp_area
+	// are all set.
 	proc.pid = i + 1;
 	proc.generation++;
-	proc.state = PROC_RUNNABLE;
 	proc.sp = (uptr)sp;
 	proc.page_table = page_table;
 	// SYS_MAP bump pointer starts one page past the mapped image (which
@@ -1288,6 +1319,12 @@ fn Process* create_process(void* image, uint image_size)
 
 	proc.fs_partition_start = 0; // meaningful only once setup_fsd_mappings() sets it
 	proc.is_secondary_fs = false; // same — meaningful only once setup_fsd_mappings() sets it
+
+	// Fully initialised now — publish it to the scheduler. Everything the
+	// switch path reads (sp, page_table, fp_area) is set above, so a timer
+	// tick / another hart picking this up here is safe. Plain aligned
+	// store; the acquire in yield()'s own scan pairs with it.
+	proc.state = PROC_RUNNABLE;
 
 	return proc;
 }

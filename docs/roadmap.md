@@ -778,15 +778,42 @@ each into `secondary_main`, which announces itself and parks in `wfi`.
 QEMU `-smp N` discovered at runtime; Duo forced to 1 (no-MMU 2nd core).
 No behaviour change — the secondaries do nothing yet.
 
-**Real SMP — not started, large.** The kernel currently relies on
-"kernel code is never preempted" (one run queue, no locks anywhere —
-allocator, `fsd` IPC rendezvous, `procs[]`). A real scheduler needs:
-per-hart `current_proc` / kernel stack / `sscratch`; a lock (or
-lock-free discipline) around the run queue, the page allocator, and IPC
-rendezvous; IPIs (SBI `sbi_send_ipi`) for cross-hart reschedule; and a
-decision on whether GOMAXPROCS > 1 / parallel builds are worth it
-before the userspace is bigger. Likely lands on the JH7110 (4 cores),
-not QEMU.
+**Real SMP — in progress, large.** The kernel relied on "kernel code is
+never preempted" (one run queue, no locks anywhere — allocator, `fsd`
+IPC rendezvous, `procs[]`). Staged:
+
+- **Stage A DONE** (2026-09-05 devlog) — `src/smp.c3`: `struct Hart` +
+  `harts[]` array, `this_hartid()` accessor (a constant while only the
+  boot hart schedules), `smp_init_boot_hart()` from `kernel_main`. No
+  behaviour change; QEMU (FAT32/ext2/`-smp 2`) green.
+- **Stage B DONE** (2026-09-05 devlog) — `src/spinlock.c3`: `amoswap.w`
+  spinlock + per-hart `irq_push_off`/`pop_off` nest. Guards the page
+  allocator (`alloc_lock`), the procs[] slot table (`proc_table_lock` +
+  a new `PROC_RESERVED` claim state), and the keyboard queue
+  (`kbd_lock`). Uncontended today (one scheduling hart); the guarded
+  structures are correct for when a second hart runs kernel code.
+  `irq_push_off` also closed a real single-hart hole (timer tick →
+  `supervisor_tick` → `create_process` → `alloc_pages` re-entering an
+  allocator lock held by a syscall path). Console output (`sbi::__putchar`)
+  deliberately left unlocked — cosmetic interleaving only, and a naive
+  lock deadlocks `panic()`; a panic-aware lock-break is a Stage C item.
+- **Stage C — not started.** Bring up hart 1 as a *scheduling* hart:
+  per-hart `current_proc` / idle proc / trap stack / `sscratch` (needs
+  a real `this_hartid()` — a tp reserved for S-mode or an
+  sscratch-indirect per-hart block, which touches the trap entry asm);
+  a scheduler lock around `yield()` + `switch_context`; per-hart timer
+  interrupts. QEMU `-smp 2`, first point the kernel runs code on two
+  harts.
+- **Stage D — not started.** IPC rendezvous locking + TLB shootdown
+  IPIs (`sbi_send_ipi`) — required for userspace correctness once >1
+  hart runs user code. Audit every `state == PROC_UNUSED` site to also
+  reject `PROC_RESERVED`, and the `free_page_count()` check-then-act in
+  `sys_rfork`.
+- **Stage E — not started.** Scale to N harts; decide whether
+  GOMAXPROCS > 1 / parallel builds justify the complexity.
+
+Likely lands for real on the JH7110 (4 cores), not the Duo (no-MMU 2nd
+core, `SMP_MAX_HARTS = 1`).
 
 ---
 

@@ -540,8 +540,15 @@ fn void proc_destroy(Process* target, int exit_code) @noinline
 		free_pages((uptr)t2, 1);
 	}
 
+	// SMP Stage B: release the slot under proc_table_lock so it
+	// establishes a happens-before with the scan-and-claim in
+	// create_process / sys_rfork (a plain word store on one hart, an
+	// ordering point once a second hart can be scanning). Taken after all
+	// the free_pages() above — never the reverse order.
+	proc_table_lock.acquire();
 	target.state = PROC_UNUSED;
 	target.pid = 0;
+	proc_table_lock.release();
 }
 
 // Extracted from handle_syscall's SYS_KILL case (2026-08-28 probe of
@@ -613,16 +620,23 @@ fn void sys_rfork(Trap_frame* f) @noinline
 			return;
 		}
 
+		// SMP Stage B: claim the slot atomically as PROC_RESERVED (see
+		// process.c3's PROC_RESERVED / proc_table_lock). Any early return
+		// below (the OOM bail) must hand it back with PROC_UNUSED; the
+		// state only flips to PROC_RUNNABLE once the child is fully built.
 		Process* child = null;
 		int child_i;
+		proc_table_lock.acquire();
 		for (child_i = 0; child_i < PROCS_MAX; child_i++)
 		{
 			if (procs[child_i].state == PROC_UNUSED)
 			{
 				child = &procs[child_i];
+				child.state = PROC_RESERVED;
 				break;
 			}
 		}
+		proc_table_lock.release();
 		if (!child)
 		{
 			f.a0 = (ulong)(-1);
@@ -679,6 +693,7 @@ fn void sys_rfork(Trap_frame* f) @noinline
 			}
 			if (free_page_count() < rf_leaves + rf_leaves / 256 + 40)
 			{
+				child.state = PROC_UNUSED; // hand the reserved slot back
 				f.a0 = (ulong)(-1);
 				return;
 			}

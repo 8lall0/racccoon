@@ -139,7 +139,10 @@ fn void reseat_namespace_mounts(int old_pid, int new_pid, uint new_generation)
 	if (old_pid == 0) { return; }
 	for (int i = 0; i < PROCS_MAX; i++)
 	{
-		if (procs[i].state == PROC_UNUSED) { continue; }
+		// PROC_RESERVED (SMP Stage B): a slot create_process is still
+		// initialising — its namespace is the previous occupant's and is
+		// about to be overwritten wholesale, so nothing to reseat.
+		if (procs[i].state == PROC_UNUSED || procs[i].state == PROC_RESERVED) { continue; }
 		for (int m = 0; m < NS_MOUNTS_MAX; m++)
 		{
 			if (procs[i].namespace[m].server_pid == old_pid)

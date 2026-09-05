@@ -36,6 +36,50 @@ ulong boot_hartid;
 // cross-hart mutation of a shared word, so no atomics needed.
 bool[SMP_MAX_HARTS] hart_online;
 
+// --- SMP scheduler, Stage A: per-hart control block --------------------
+// (docs/roadmap.md §8, docs/devlog.md). The kernel's scheduler state is
+// still single-hart — current_proc / idle_proc (process.c3) are plain
+// globals, and yield() has one run queue. This struct is where Stage C
+// moves the per-hart pieces: `current_proc`, an idle Process*, this
+// hart's dedicated trap stack top (the sscratch anchor for traps taken
+// before its first switch_context), and an IPI mailbox for cross-hart
+// reschedule / TLB shootdown. Stage A only lays down the array and the
+// "which hart am I" accessor so the Stage B locks (spinlock.c3) can be
+// per-hart from the start.
+struct Hart
+{
+	uint hartid;
+	bool scheduling; // Stage C: does this hart run the scheduler loop?
+}
+
+Hart[SMP_MAX_HARTS] harts;
+
+// Which hart is executing this code. Stage A/B: only the boot hart ever
+// runs kernel code (secondaries park in wfi with interrupts masked), so
+// this is a constant. Stage C replaces it with a real per-hart source —
+// RISC-V S-mode has no hartid CSR, so the options are a tp reserved for
+// S-mode use or an sscratch-indirect per-hart block; that choice touches
+// the trap entry asm and belongs with the second-hart bring-up, not here.
+// Every Stage B lock / irq nest indexes by this, so getting it wrong
+// later is a compile-time-visible single call site, not a scattered
+// refactor.
+fn uint this_hartid() @inline
+{
+	return (uint)boot_hartid;
+}
+
+// Called from kernel_main before smp_start_secondaries, once boot_hartid
+// is known, to mark the boot hart as the (currently sole) scheduling hart.
+fn void smp_init_boot_hart() @noinline
+{
+	boot_hartid = boot_hartid_raw;
+	if (boot_hartid < SMP_MAX_HARTS)
+	{
+		harts[(uint)boot_hartid].hartid = (uint)boot_hartid;
+		harts[(uint)boot_hartid].scheduling = true;
+	}
+}
+
 // One boot stack per potential secondary. .bss, so zero-filled; 16 KiB
 // each is plenty for the wfi-park path (it never nests deep). Indexed
 // by hartid. @align(16) — the RISC-V ABI wants a 16-byte-aligned sp.

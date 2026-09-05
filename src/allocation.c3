@@ -33,6 +33,17 @@ const TOTAL_PAGES   = RAM_SIZE / PAGE_SIZE;
 // (the Duo — see ram_page_count) just leaves the tail words unused.
 uint[TOTAL_PAGES / BITS_PER_WORD] bitmap;
 
+// SMP scheduler, Stage B (spinlock.c3, docs/roadmap.md §8): the page
+// allocator is the one shared structure a bringing-up secondary hart
+// could plausibly touch, and the RMW on `bitmap` / `alloc_rover` is not
+// atomic. Guards try_alloc_pages / free_pages / free_page_count — the
+// leaf mutators — so alloc_pages() (which only calls try_alloc_pages)
+// never double-locks. Spinlock.acquire disables S-mode interrupts, which
+// ALSO fixes a pre-existing single-hart hole: a timer tick inside a
+// syscall's alloc_pages runs supervisor_tick -> create_process ->
+// alloc_pages and would re-enter this on the same hart.
+Spinlock alloc_lock;
+
 // The actual number of allocatable pages: the real distance between the
 // linker's __free_ram and __free_ram_end, in pages, capped at
 // TOTAL_PAGES (the bitmap's size). QEMU's src/kernel.ld reserves
@@ -71,12 +82,14 @@ fn void clear_bit(uint page_idx)
 // valid between the check and the allocs.
 fn uint free_page_count()
 {
+	alloc_lock.acquire();
 	uint free = 0;
 	uint limit = ram_page_count();
 	for (uint i = 0; i < limit; i++)
 	{
 		if (!bit_is_set(i)) free++;
 	}
+	alloc_lock.release();
 	return free;
 }
 
@@ -140,6 +153,7 @@ fn uptr alloc_scan(uint lo, uint hi, uint n)
 
 fn uptr try_alloc_pages(uint n)
 {
+	alloc_lock.acquire();
 	uint limit = ram_page_count();
 	if (alloc_rover >= limit) alloc_rover = 0;
 
@@ -150,6 +164,7 @@ fn uptr try_alloc_pages(uint n)
 	{
 		paddr = alloc_scan(0, alloc_rover, n);
 	}
+	alloc_lock.release();
 	return paddr;
 }
 
@@ -186,6 +201,7 @@ fn void free_pages(uptr paddr, uint n)
 	// allocator's pool, so there's genuinely nothing to free.
 	if (paddr < (uptr)&__free_ram || paddr >= (uptr)&__free_ram_end) return;
 
+	alloc_lock.acquire();
 	uint start_idx = (uint)((paddr - (uptr)&__free_ram) / PAGE_SIZE);
 	for (uint j = start_idx; j < start_idx + n; j++)
 	{
@@ -195,4 +211,5 @@ fn void free_pages(uptr paddr, uint n)
 	// scan runs off the end again (a Go process exiting frees its whole
 	// arena — the next one should land right back in it).
 	if (start_idx < alloc_rover) alloc_rover = start_idx;
+	alloc_lock.release();
 }
