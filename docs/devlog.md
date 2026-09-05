@@ -4,6 +4,34 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-06 — services log to the kernel ring, not the console (`c760529`)
+
+Follow-on to `dmesg`: now that the log ring exists, the boot/driver
+servers don't need to print to the console at all. `is_boot_server`
+processes' `SYS_PUTCHAR` output goes to the ring only; `dmesg` shows the
+full trace. A clean boot is the kernel's own ~13 progress lines and
+`login:` — no DHCP-lease / FAT32-mount / USB-enumeration wall.
+
+`src/kernel/sbi.c3` splits the console primitive: `klog_put` (ring only),
+`console_emit` (SBI putchar only), `__putchar` (both — kernel
+`io::print` / libc / panic). `SYS_PUTCHAR` picks per source. `SYS_BOOT_QUIET`
+flips to a `loud`-on toggle (a0=1 echoes server output to the console for
+watching a respawned driver during HW bring-up; a0=0 default) — log
+capture is unconditional. A respawned driver's chatter is no longer lost
+(the old behaviour dropped it after `SYS_BOOT_QUIET`).
+
+Also drops the shell's boot-settle wait (`shell_boot_settle`, ~6 s on the
+Duo / ~3 s on QEMU before the first prompt) — nothing to wait out now.
+
+Verified QEMU FAT32 + ext2: clean boot, `dmesg` has the full server
+trace, `loud` re-enables the echo, regression sweep green (runtest,
+rfork, kill, wasm, stdio, map, oom, hungserver — the echod
+supervisor-respawn). `fsdkilltest` hangs under QEMU-TCG (virtio-blk too
+slow for fsd respawn+remount inside its retry window — a real-Duo test,
+same on the parent commit).
+
+---
+
 ## 2026-09-05 — introspection: `dmesg` + `ps` + `top`, and a latent `.text.boot` landmine
 
 From the "ideas beyond the roadmap" list. Three tools that make racccoon
