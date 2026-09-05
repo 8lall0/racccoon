@@ -797,13 +797,17 @@ IPC rendezvous, `procs[]`). Staged:
   allocator lock held by a syscall path). Console output (`sbi::__putchar`)
   deliberately left unlocked — cosmetic interleaving only, and a naive
   lock deadlocks `panic()`; a panic-aware lock-break is a Stage C item.
-- **Stage C — not started.** Bring up hart 1 as a *scheduling* hart:
-  per-hart `current_proc` / idle proc / trap stack / `sscratch` (needs
-  a real `this_hartid()` — a tp reserved for S-mode or an
-  sscratch-indirect per-hart block, which touches the trap entry asm);
-  a scheduler lock around `yield()` + `switch_context`; per-hart timer
-  interrupts. QEMU `-smp 2`, first point the kernel runs code on two
-  harts.
+- **Stage C — on branch `smp-stage-c`, C3 parked pending the 4-core
+  board.** C1 (per-hart identity: `sscratch` → a per-hart `HartScratch`,
+  `tp` = that block in kernel mode, `kernel_entry` / `switch_context`
+  reworked) and C2 (a giant `kernel_lock` at trap entry, dropped around
+  `yield()`) are done and QEMU-verified on the branch — both
+  behaviourally transparent on one scheduling hart. **C3** — secondaries
+  into the scheduler loop, per-hart `current_proc`, a running-on-a-hart
+  marker, per-hart timer — is the first real 2-hart run and needs
+  multi-core hardware to validate (QEMU-TCG serialises harts too heavily
+  for race detection; the Duo is single-core). Master stays at A+B
+  (real-Duo-verified) until then.
 - **Stage D — not started.** IPC rendezvous locking + TLB shootdown
   IPIs (`sbi_send_ipi`) — required for userspace correctness once >1
   hart runs user code. Audit every `state == PROC_UNUSED` site to also

@@ -4,6 +4,47 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — SMP scheduler, Stage C (C1 + C2) on branch `smp-stage-c`, C3 parked
+
+Roadmap §8. After Stages A + B (below, on master, Duo-verified), Stage C
+was carried on a branch — this is where the kernel's "never preempted,
+so no locks" invariant has to go, since two harts run kernel code at
+once. C1 and C2 are done there and QEMU-verified; both are
+behaviourally transparent on one scheduling hart, so the risk is
+contained.
+
+- **C1** (`b6b036b`) — per-hart identity, xv6-style. `sscratch`
+  permanently holds `&hart_scratch[thishart]` (a tiny `HartScratch`);
+  `kernel_entry` swaps it with `tp` on entry so kernel C code runs with
+  `tp` = the per-hart block (ABI-reserved, so it survives calls and
+  `switch_context` and follows the hart). `switch_context` writes the
+  resumed process's kstack top into `HartScratch.kstack`.
+  `this_hartid()` reads `tp`. Also fixed a **latent boot bug** it
+  surfaced: `boot()` and `secondary_entry` share `.text.boot` and c3c's
+  emission order had flipped them, so OpenSBI's fixed `0x80200000`
+  handoff was jumping into `secondary_entry` → `wfi`. `boot()` is now
+  pinned first via a `.text.boot.entry` subsection in both linker
+  scripts.
+- **C2** (`e617d8a`) — a giant `kernel_lock`. `handle_trap` is a thin
+  wrapper (acquire → `handle_trap_body` → release); `yield()` drops the
+  lock around `switch_context` so a hart in a blocking wait doesn't lock
+  the other out. The whole existing kernel is now correct under SMP with
+  no per-structure locking, at zero *kernel* parallelism — user code on
+  the two harts still runs genuinely parallel.
+
+**C3 parked at the user's call, pending the JH7110 / Orange Pi RV board
+(4 cores).** C3 (secondaries into the scheduler loop, per-hart
+`current_proc`, a running-on-a-hart marker, per-hart timer) is the first
+real 2-hart execution, and QEMU-TCG serialises harts too heavily to
+trust for race detection; the Duo is single-core. So C1+C2 sit on
+`smp-stage-c` and master stays at A+B until there's multi-core hardware.
+
+Verified (branch, QEMU, one scheduling hart): FAT32 + ext2 + `-smp 2` —
+`wasmtest`, `stdiotest`, fs round trips, `killtest`, `rforktest`,
+`threadtest`, `oomtest`, `maptest`, `fsdkilltest` all green.
+
+---
+
 ## 2026-09-05 — SMP scheduler, Stages A + B: per-hart control block + the first kernel spinlocks
 
 Roadmap §8. The kernel had a hart-bringup scaffold (`src/smp.c3`,
