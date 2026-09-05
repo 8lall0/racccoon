@@ -42,7 +42,7 @@ fi
 # image's own bin/ — kept in sync by hand, same convention this
 # project already uses for the small protocol constants duplicated
 # across diskd.c3/fsd.c3.
-BINARIES="echod cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm"
+BINARIES="echod cat ls echo true false head whoami write rm mkdir mv chmod chown test expr usbrw fsd gpio wasm"
 
 for b in $BINARIES; do
   if [ ! -f "build/user/$b.bin" ]; then
@@ -70,6 +70,8 @@ for b in $BINARIES; do
   echo "==> Copying build/user/$b.bin -> $MNT/bin/$b..."
   cp "build/user/$b.bin" "$MNT/bin/$b"
 done
+# /bin/[ is the same binary as /bin/test (it drops a trailing `]`).
+cp "build/user/test.bin" "$MNT/bin/["
 # echod.elf too, matching the QEMU images — exercises SYS_EXEC's own
 # real-ELF loader (see scripts/build.sh's own comment), not just the
 # flat-binary format every other command above uses.

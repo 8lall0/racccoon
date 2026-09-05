@@ -228,6 +228,11 @@ build_user_program_stdio mkdir $STDIO_COMMON user/bin/mkdir.c3
 build_user_program_stdio mv $STDIO_COMMON user/bin/mv.c3
 build_user_program_stdio chmod $STDIO_COMMON user/bin/chmod.c3
 build_user_program_stdio chown $STDIO_COMMON user/bin/chown.c3
+# test/[ and expr — the primitives the shell's if/for/while build on
+# (docs/roadmap.md §2.5). One test.bin is seeded as both /bin/test and
+# /bin/[ by scripts/build.sh / populate_duo_bin.sh.
+build_user_program_stdio test $STDIO_COMMON user/bin/test.c3
+build_user_program_stdio expr $STDIO_COMMON user/bin/expr.c3
 build_user_program_stdio usbrw $STDIO_COMMON user/bin/usbrw.c3
 build_user_program_stdio gpio $STDIO_COMMON user/bin/gpio.c3
 build_user_program wasm user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/wasm.c3

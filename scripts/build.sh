@@ -174,9 +174,10 @@ ext2_seed_tree() {
   # bin/{cat,ls,write,rm,mkdir,mv} — the real, argv-taking utilities
   # shell.c3's own /bin/ fallback branch execs (see docs/devlog.md),
   # replacing what used to be hardcoded shell builtins.
-  for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm stdiotest; do
+  for u in cat ls echo true false head whoami write rm mkdir mv chmod chown test expr usbrw fsd gpio wasm stdiotest; do
     mcopy -i build/disk.img "build/user/$u.bin" "::bin/$u"
   done
+  mcopy -i build/disk.img build/user/test.bin "::bin/["   # /bin/[ is /bin/test
   for w in build/wasm/*.wasm; do mcopy -i build/disk.img "$w" "::$(basename "$w")"; done
   # C test programs (roadmap §7), if the C libc build produced any.
   for c in build/libc/*.bin; do [ -e "$c" ] && mcopy -i build/disk.img "$c" "::bin/$(basename "$c" .bin)"; done
@@ -308,9 +309,10 @@ GOEOF
     debugfs -w -R "write build/go/toolchain/importcfg.link lib/go/importcfg.link" build/disk_ext2.img > /dev/null
     debugfs -w -R "write build/go/toolchain/hello.go hello.go" build/disk_ext2.img > /dev/null
   fi
-  for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm stdiotest; do
+  for u in cat ls echo true false head whoami write rm mkdir mv chmod chown test expr usbrw fsd gpio wasm stdiotest; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_ext2.img > /dev/null
   done
+  debugfs -w -R "write build/user/test.bin bin/[" build/disk_ext2.img > /dev/null   # /bin/[ is /bin/test
   # A binary in /usr/root/bin, NOT /bin — bindirtest execs it by bare
   # name to prove the `bind -ac /usr/root/bin /bin` union at login
   # (docs/bin-layout.md). Byte-exact (debugfs write), unlike a runtime
@@ -388,9 +390,10 @@ GOEOF
     case "$(basename "$g")" in compile.elf|link.elf|go.elf|gostage*.elf) continue ;; esac
     [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_dual_root_part.img > /dev/null
   done
-  for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm stdiotest; do
+  for u in cat ls echo true false head whoami write rm mkdir mv chmod chown test expr usbrw fsd gpio wasm stdiotest; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_root_part.img > /dev/null
   done
+  debugfs -w -R "write build/user/test.bin bin/[" build/disk_dual_root_part.img > /dev/null   # /bin/[ is /bin/test
   for w in build/wasm/*.wasm; do debugfs -w -R "write $w $(basename "$w")" build/disk_dual_root_part.img > /dev/null; done
   for c in build/libc/*.bin; do [ -e "$c" ] && debugfs -w -R "write $c bin/$(basename "$c" .bin)" build/disk_dual_root_part.img > /dev/null; done
   dd if=build/disk_dual_root_part.img of=build/disk_dual.img bs=512 seek=0 conv=notrunc status=none
@@ -416,9 +419,10 @@ GOEOF
     case "$(basename "$g")" in compile.elf|link.elf|go.elf|gostage*.elf) continue ;; esac
     [ -e "$g" ] && debugfs -w -R "write $g bin/go-$(basename "$g" .elf)" build/disk_dual_ext2_part.img > /dev/null
   done
-  for u in cat ls echo true false head whoami write rm mkdir mv chmod chown usbrw fsd gpio wasm stdiotest; do
+  for u in cat ls echo true false head whoami write rm mkdir mv chmod chown test expr usbrw fsd gpio wasm stdiotest; do
     debugfs -w -R "write build/user/$u.bin bin/$u" build/disk_dual_ext2_part.img > /dev/null
   done
+  debugfs -w -R "write build/user/test.bin bin/[" build/disk_dual_ext2_part.img > /dev/null   # /bin/[ is /bin/test
   for w in build/wasm/*.wasm; do debugfs -w -R "write $w $(basename "$w")" build/disk_dual_ext2_part.img > /dev/null; done
   for c in build/libc/*.bin; do [ -e "$c" ] && debugfs -w -R "write $c bin/$(basename "$c" .bin)" build/disk_dual_ext2_part.img > /dev/null; done
   # bigfile.bin — same double-indirect-block fixture as the single-mount
