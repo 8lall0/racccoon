@@ -4,6 +4,54 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — WASM bulk-memory: `memory.copy` (overlap-safe) + `memory.fill`
+
+Parked the c3c self-host arc (previous entries) and picked up
+roadmap §4's next unblocked item: bulk-memory ops for `/bin/wasm`.
+
+`memory.copy` and `memory.fill` (the `0xfc 0x0a`/`0xfc 0x0b` prefixed
+opcodes), the two the earlier wasm-status note called "easy". Left
+`memory.init`/`data.drop`/the `table.*` bulk ops for later — those need
+`SEC_DATA`/`SEC_ELEM` to track *passive* segments (mode 1/2), which the
+loader only handles as active (mode 0) today.
+
+Two things worth flagging for whoever touches this next:
+- The load-time block-sidetable scan (`next_instr`) only skipped the
+  `0xfc` subopcode's own LEB128 byte, not any following immediates —
+  fine for the saturating-truncation subset (no immediates beyond the
+  subop), but `memory.copy`/`memory.fill` each carry 1-2 reserved
+  memidx bytes after it. Missing this would have silently desynced the
+  scanner for any function containing either op. Fixed alongside.
+- **`memory.copy` must be `memmove`-safe, not `memcpy`-safe** —
+  `std::nolibc::mem::copy()`'s own doc comment says "dst/src ranges
+  must not overlap", but a wasm program is free to call `memory.copy`
+  with overlapping ranges (its own spec requires the *as-if-through-a-
+  temp-buffer* semantics either way). Hand-rolled the direction switch
+  (forward copy when `dst <= src`, backward when `dst > src`) rather
+  than reaching for the stdlib helper.
+
+**Verified the overlap-safety specifically, not just "did it run"**:
+new fixture `bulkmem.wasm` (`test/mkwasm.py`) preloads `mem[0..9] =
+1..10` via a data segment, then `memory.copy(dst=5, src=0, n=10)` —
+deliberately overlapping (`dst > src`, ranges `[0,10)`/`[5,15)`
+intersect) — the exact shape that corrupts under a naive forward-only
+copy. Then `memory.fill(dst=15, val=99, n=3)`. Sums all 18 resulting
+bytes and prints it; a correct memmove gives `367`
+(`(1+2+3+4+5)+(1+..+10)+99*3`), anything else means the overlap broke.
+Added to the `wasmtest` sweep (now 11 fixtures) in
+`user/shell_test.c3`.
+
+**Verified both QEMU and real hardware**: `wasm bulkmem.wasm` → `367`
+in QEMU (full `wasmtest` sweep green, all 11), and the identical
+result on a real Milk-V Duo (SD card's `/bin/wasm` + fixture updated
+directly via `udisksctl`, tested live over its serial console).
+
+**Files changed:** `user/bin/wasm.c3` (the two opcodes + the scanner
+fix), `test/mkwasm.py` (`bulkmem.wasm` fixture), `user/shell_test.c3`
+(`wasmtest` sweep, 10 → 11 fixtures).
+
+---
+
 ## 2026-09-05 — chasing compare_fps: pinned down, not root-caused
 
 Went after the `compare_fps()` `UNREACHABLE` bug directly (c3c fork,

@@ -158,6 +158,38 @@ code = [body([], start_body)]
 fixtures["mem.wasm"] = module(t, imp, fn, exp, code, mem=mem, data=data)
 
 
+# --- bulkmem.wasm : memory.copy (overlapping) + memory.fill -> "367" --
+# (roadmap §4 bulk-memory follow-up.) Data seg preloads mem[0..9] =
+# 1..10. memory.copy(dst=5, src=0, n=10) deliberately overlaps
+# (dst > src, ranges [0,10) and [5,15) intersect) -- the whole point is
+# to catch a naive forward-only memcpy corrupting the tail of the
+# source before it's read; a correct memmove leaves mem[0..4] untouched
+# (1,2,3,4,5) and mem[5..14] = the ORIGINAL mem[0..9] (1..10), not
+# whatever a forward copy would have clobbered it into. Then
+# memory.fill(dst=15, val=99, n=3) sets mem[15..17]. Sum of bytes
+# mem[0..17] as unsigned: (1+2+3+4+5) + (1+..+10) + 99*3 = 15+55+297 = 367.
+t = [functype([], []), functype([I32], [])]
+imp = [import_func("racccoon", "print_i32", 1)]          # funcidx 0
+fn  = [0]                                                 # funcidx 1: _start
+exp = [export_func("_start", 1)]
+mem = b"\x00" + uleb(1)                                  # limits: flag 0, min 1 page
+I32_LOAD8_U = lambda off: b"\x2d\x00" + uleb(off)
+MEMORY_COPY = b"\xfc" + uleb(10) + uleb(0) + uleb(0)     # dst memidx, src memidx (reserved)
+MEMORY_FILL = b"\xfc" + uleb(11) + uleb(0)                # memidx (reserved)
+data = [uleb(0) + i32c(0) + END + uleb(10) + bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])]
+loads = [i32c(0) + I32_LOAD8_U(k) for k in range(18)]
+sum_body = loads[0]
+for l in loads[1:]:
+    sum_body += l + I32_ADD
+start_body = (
+    i32c(5) + i32c(0) + i32c(10) + MEMORY_COPY +
+    i32c(15) + i32c(99) + i32c(3) + MEMORY_FILL +
+    sum_body + call(0)
+)
+code = [body([], start_body)]
+fixtures["bulkmem.wasm"] = module(t, imp, fn, exp, code, mem=mem, data=data)
+
+
 # --- fac.wasm : recursion + if/else -> fac(5) = "120" -----------------
 # type 0: () -> ()        _start
 # type 1: (i32) -> ()     racccoon.print_i32

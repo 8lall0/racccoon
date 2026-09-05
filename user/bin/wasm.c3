@@ -170,6 +170,13 @@ const uint FC_I32_TRUNC_SAT_F32_S = 0; const uint FC_I32_TRUNC_SAT_F32_U = 1;
 const uint FC_I32_TRUNC_SAT_F64_S = 2; const uint FC_I32_TRUNC_SAT_F64_U = 3;
 const uint FC_I64_TRUNC_SAT_F32_S = 4; const uint FC_I64_TRUNC_SAT_F32_U = 5;
 const uint FC_I64_TRUNC_SAT_F64_S = 6; const uint FC_I64_TRUNC_SAT_F64_U = 7;
+// bulk-memory (roadmap §4 follow-up): memory.copy/memory.fill only —
+// the "easy" half (bounds-checked memmove/memset, no passive segments).
+// memory.init/data.drop need SEC_DATA to track passive segments (mode
+// 1/2), which decode_data (active-only today) doesn't; table.*
+// likewise needs SEC_ELEM passive-segment tracking. Left for later.
+const uint FC_MEMORY_INIT = 8;  const uint FC_DATA_DROP  = 9;
+const uint FC_MEMORY_COPY = 10; const uint FC_MEMORY_FILL = 11;
 
 const int WPAGE = 65536;             // wasm linear-memory page size
 const int MEM_HARD_CAP_PAGES = 240;  // ~15 MiB — under HEAP_MAX_BYTES with room for the other allocs
@@ -734,7 +741,15 @@ fn char next_instr(Cur* c)
     else if (op == OP_I32_CONST || op == OP_I64_CONST) { read_i64(c); }
     else if (op == OP_F32_CONST) { skip(c, 4); }
     else if (op == OP_F64_CONST) { skip(c, 8); }
-    else if ((uint)op == 0xfc) { read_u32(c); }   // misc prefix — subop only for now
+    else if ((uint)op == 0xfc)
+    {
+        uint sub = read_u32(c);
+        // memory.copy: 2 reserved memidx bytes; memory.fill: 1. Both
+        // LEB128-encoded (always 0x00 in the MVP single-memory case),
+        // so read_u32 (not a raw byte skip) reads them correctly.
+        if (sub == FC_MEMORY_COPY) { read_u32(c); read_u32(c); }
+        else if (sub == FC_MEMORY_FILL) { read_u32(c); }
+    }
     // everything else: no immediates
     return op;
 }
@@ -1495,6 +1510,34 @@ fn void interp()
                     case FC_I64_TRUNC_SAT_F32_U: vpush(f_trunc_sat_i64((double)vpop_f32(), false));
                     case FC_I64_TRUNC_SAT_F64_S: vpush(f_trunc_sat_i64(vpop_f64(), true));
                     case FC_I64_TRUNC_SAT_F64_U: vpush(f_trunc_sat_i64(vpop_f64(), false));
+                    // memory.copy: stack (bottom->top) is [d, s, n]; pop
+                    // order is n, s, d. Overlap-safe (memmove, not
+                    // memcpy) — std::nolibc::mem::copy() explicitly
+                    // doesn't guarantee that, and wasm programs are
+                    // free to pass overlapping ranges.
+                    case FC_MEMORY_COPY:
+                        imm_u32(fr); imm_u32(fr);   // reserved dst/src memidx (always 0)
+                        uint cn = (uint)vpop();
+                        uint cs = (uint)vpop();
+                        uint cd = (uint)vpop();
+                        char* cdst = mem_ptr(cd, cn);
+                        char* csrc = mem_ptr(cs, cn);
+                        if (cd <= cs)
+                        {
+                            for (uint i = 0; i < cn; i++) { cdst[i] = csrc[i]; }
+                        }
+                        else
+                        {
+                            for (uint i = cn; i > 0; i--) { cdst[i - 1] = csrc[i - 1]; }
+                        }
+                    // memory.fill: stack is [d, val, n]; pop order n, val, d.
+                    case FC_MEMORY_FILL:
+                        imm_u32(fr);                // reserved memidx (always 0)
+                        uint fn_ = (uint)vpop();
+                        char fval = (char)(uint)vpop();
+                        uint fd = (uint)vpop();
+                        char* fdst = mem_ptr(fd, fn_);
+                        for (uint i = 0; i < fn_; i++) { fdst[i] = fval; }
                     default: die("unimplemented 0xfc subop");
                 }
 
