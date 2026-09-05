@@ -47,7 +47,7 @@ const int SYS_DRIVER_IRQ_ARM = 32; // usbd/sdd: re-enable this driver's PLIC sou
 const int SYS_SDD_INFO      = 33; // sdd-only: returns its SDMA staging buffer's physical address — same shape as SYS_USBD_INFO
 const int SYS_IPC_CALL      = 34; // one-shot RPC: deliver a request and block for the reply, all in the kernel — reply can't be pre-empted by a stray sender, aborts -1 if the server dies at any point — see src/entry.c3's case
 const int SYS_GETUID        = 35; // the caller's own uid — see src/entry.c3's case
-const int SYS_BOOT_QUIET    = 36; // a0=1: also echo boot/driver-server stdout to the console (`loud`); a0=0: default, kernel-log-only. Log capture is unconditional — see src/entry.c3's case
+const int SYS_BOOT_QUIET    = 36; // shell-only: silences boot-server console output once boot settles — see src/entry.c3's case
 const int SYS_CHDIR         = 37; // set the caller's cwd (absolute, normalised) — see src/entry.c3's case
 const int SYS_GETCWD        = 38; // copy the caller's cwd out — see src/entry.c3's case
 const int SYS_PIPE          = 39;
@@ -924,15 +924,15 @@ fn int getuid() @export("getuid") {
     return syscall(SYS_GETUID, 0, 0, 0);
 }
 
-// Boot/driver-server stdout goes to the kernel log ring by default (read
-// it with `dmesg`), not the console. boot_loud() also echoes it to the
-// console — the dev shell's `loud` builtin, for watching a respawned
-// driver enumerate during HW bring-up; boot_quiet() undoes that. Neither
-// affects the log capture.
+// Shell-only: silences the boot servers' console chatter (fsd/sdd/usbd/
+// ethd/... init logs that otherwise keep landing after the prompt).
+// Called once, after a settle delay — see shell_boot_settle().
 fn void boot_quiet() @export("boot_quiet") {
     syscall(SYS_BOOT_QUIET, 0, 0, 0);
 }
 
+// Diagnostic: re-enable boot-server console output (the dev shell's
+// `loud` builtin) — to watch a respawned server's own init chatter.
 fn void boot_loud() @export("boot_loud") {
     syscall(SYS_BOOT_QUIET, 1, 0, 0);
 }

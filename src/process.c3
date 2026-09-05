@@ -538,11 +538,10 @@ struct Process
 
 	// True for every kernel-spawned boot server (fsd, sdd/diskd, usbd,
 	// ethd, netd, gpiod, procd, envd, echod) — set right after
-	// create_process() in kernel.c3 / supervisor_spawn(). Their
-	// SYS_PUTCHAR output goes to the kernel log ring only (read it with
-	// `dmesg`), not the console, unless `loud` is set (SYS_BOOT_QUIET) —
-	// so a clean boot isn't buried in driver init chatter. The shell and
-	// its exec()'d children leave this false and print to the console.
+	// create_process() in kernel.c3 / supervisor_spawn(). Once the shell
+	// calls SYS_BOOT_QUIET, SYS_PUTCHAR from these is dropped so their
+	// late init logs stop landing on the prompt. The shell and its
+	// exec()'d children leave this false and print normally.
 	bool is_boot_server;
 
 	// fsd-only, same "set by setup_fsd_mappings, handed back via a
