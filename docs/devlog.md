@@ -4,6 +4,61 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — fsd mount-retry: a bounded retry for the boot-time SD race
+
+Fixed a real gap flagged twice earlier this session and never
+addressed: `fsd` mounts exactly once at boot; if `sdd` (the Duo's SD
+driver) hasn't gotten a working card up yet at that exact instant,
+`ext2_probe`/`exfat_probe`/`fat32_probe` all legitimately read "not a
+filesystem" and `fs_type` stays `FS_TYPE_NONE` for the rest of that
+boot — the board comes up with no root fs at all. Seen live earlier
+this session: `sdd: ACMD41 gave up` → `fsd: no recognized filesystem
+found` → (next timer tick) `svc: respawned sdd` → `sdd: card ready`,
+too late for `fsd`, which never tries again.
+
+Fix: `user/fs/fsd.c3`'s `main()` now retries the whole `fs_mount()`
+probe (bounded, 6 attempts, ~400ms real elapsed time between each via
+`rdtime()`/`timebase_hz()` — not a plain `yield()` spin, since nothing
+else may be ready to run this early in boot, so that could spin
+through many iterations without any real time passing at all) if the
+first attempt found nothing. `fs_partition_info()` re-reads the
+current storage pid on every call, so a retry after `sdd`'s own
+respawn (new pid, same slot) picks it up for free — same idiom
+`diskd_rw()`'s existing IPC-failure retry already uses for the
+already-mounted case, just applied to the *first* mount attempt too.
+
+**Real regression caught before it shipped**: the first version
+applied this retry unconditionally, including to the *secondary*
+fsd2 instance (`/mnt/fs2`) — whose "no recognized filesystem" is
+routinely a normal, *permanent* outcome (a single-partition board or
+image, `fs_mount()`'s own long-standing "Deliberately NOT panic()"
+comment already explains why), not a transient race. Retrying that
+added ~2s of pure boot delay to *every* single-partition QEMU boot
+for zero possible benefit — caught by actually running it, not by
+inspection. Fixed: `fs_mount()` now exposes `is_secondary` via a new
+`g_fsd_is_secondary` global; the retry loop only fires for the
+primary instance.
+
+**Verified**: QEMU, all three disk-image shapes — `disk.img` (single
+FAT32, primary mounts clean first try, fsd2 fails once with no
+retry), `disk_ext2.img` (single ext2, same), `disk_dual.img` (both
+partitions real, both mount clean first try, `/mnt/fs2/` reachable) —
+no `wasmtest`/`stdiotest` regressions, no added delay in the common
+case. Real Milk-V Duo: **required a full kernel reflash**
+(`scripts/reflash_duo.sh`) since `fsd` is compiled into `kernel.elf`
+itself, not a separate `/bin` file — a genuinely more invasive step
+than this session's usual SD-card file-copy verification, confirmed
+before doing it. Booted clean (`fsd: ext2 mounted` on the first try,
+no regression), `stdiotest`/`wasm`/`ls` all working normally on the
+production shell this reflash carries. Honest limitation: this is a
+rare, hardware-timing-dependent race — the reflash confirms no
+regression, but couldn't force the original race to recur and
+directly prove the fix resolves it.
+
+**Files changed:** `user/fs/fsd.c3` (the retry loop, `g_fsd_is_secondary`).
+
+---
+
 ## 2026-09-05 — std::io on racccoon, part 3: 13 /bin utilities ported
 
 The user asked to port every user program to the real stdlib "if

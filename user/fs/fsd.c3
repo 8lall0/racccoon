@@ -255,6 +255,16 @@ fn void fs_cache_drop(uint sector)
 int  g_diskd_pid   = 0;
 bool g_fsd_dynamic = false;
 
+// Set by fs_mount() (static mount only) — main()'s own boot-time mount
+// retry loop needs to know this BEFORE deciding whether a failed probe
+// is worth retrying: the secondary instance (fsd2, /mnt/fs2) legitimately
+// has nothing to mount on a single-partition board/image, a normal,
+// permanent outcome (see fs_mount()'s own "Deliberately NOT panic()"
+// comment) — retrying THAT would just tax every such boot for no
+// possible benefit. The primary/root fsd failing is the real, rare,
+// worth-retrying case this was added for (docs/devlog.md).
+bool g_fsd_is_secondary = false;
+
 // board::FS_PARTITION_START_SECTOR, learned via syscall — board is a
 // kernel-only module (see user/sdd.c3's own header comment for why),
 // this is fsd's only way to learn this board-specific fact. Set once by
@@ -818,6 +828,7 @@ fn void fs_mount(bool dynamic_mode, char* dynamic_self_name)
 		{
 			panic("fsd: ", "failed to get partition info");
 		}
+		g_fsd_is_secondary = is_secondary;
 		// Boot fsd/fsd2 target whichever pid the kernel spawned the
 		// block driver at — no longer a hardcoded 3. (The dynamic USB
 		// instance resolves its own backend by name instead — see
@@ -1112,7 +1123,54 @@ fn void main(String[] args)
 	}
 	else
 	{
-		fs_mount(false, null);
+		// Retry the whole probe if the first attempt found nothing —
+		// board::HAS_SDD boots race sdd's own bring-up (ACMD41 card
+		// enumeration, itself internally retried ~200x) against this
+		// process's very first fs_mount() call; if sdd hasn't gotten a
+		// working card up yet, ext2_probe/exfat_probe/fat32_probe all
+		// legitimately read "not a filesystem" and fs_mount() leaves
+		// fs_type at FS_TYPE_NONE for good — found live on a real Duo:
+		// "sdd: ACMD41 gave up" -> "fsd: no recognized filesystem
+		// found" -> (next timer tick) "svc: respawned sdd" -> "sdd:
+		// card ready", the board left with no root fs for the rest of
+		// that boot (see docs/devlog.md). fs_partition_info() re-reads
+		// the current storage pid each call, so a retry after a
+		// respawn (new pid, same slot) picks it up for free — same
+		// "ask the kernel, don't assume the old pid" idiom diskd_rw's
+		// own IPC-failure retry already uses just above.
+		//
+		// Only for the PRIMARY instance — retrying is only ever worth
+		// it while the alternative is "no root fs at all". fsd2 (the
+		// secondary instance, g_fsd_is_secondary) failing is routinely
+		// a normal, PERMANENT outcome (a single-partition board/image
+		// — fs_mount()'s own "Deliberately NOT panic()" comment), not
+		// a transient race; retrying that would tax every such boot
+		// for zero possible benefit. First caught exactly this way in
+		// this session: an early version retried fsd2 too and added
+		// ~2s of pure boot delay on every ordinary QEMU boot.
+		//
+		// Bounded attempts, not a wall-clock timeout (this file's own
+		// established idiom, see ns_mount_wait callers project-wide):
+		// each attempt already costs real time (the probe's own disk
+		// reads), and the wait between attempts is real elapsed time
+		// (rdtime()-paced, not a plain yield() spin — nothing else may
+		// be ready to run this early in boot, so a bare yield() loop
+		// could spin through many iterations without any real time
+		// passing at all) generous enough for one supervisor tick
+		// (~1/s) plus a fresh sdd's own bring-up to land.
+		const int FS_MOUNT_RETRY_ATTEMPTS = 6;
+		const ulong FS_MOUNT_RETRY_WAIT_MS = 400;
+		for (int attempt = 0; attempt < FS_MOUNT_RETRY_ATTEMPTS; attempt++)
+		{
+			fs_mount(false, null);
+			if (fs_type != FS_TYPE_NONE) { break; }
+			if (g_fsd_is_secondary) { break; }
+			if (attempt + 1 >= FS_MOUNT_RETRY_ATTEMPTS) { break; }
+			print("fsd: retrying mount...\n");
+			ulong hz = timebase_hz();
+			ulong deadline = rdtime() + (hz > 0 ? (hz * FS_MOUNT_RETRY_WAIT_MS) / 1000 : 0);
+			while (rdtime() < deadline) { yield(); }
+		}
 	}
 
 	// One-shot probe: does the storage backend speak DISKD_READ_MULTI?
