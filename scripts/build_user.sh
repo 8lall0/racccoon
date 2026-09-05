@@ -202,6 +202,10 @@ build_user_program echod user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_
 # real stdlib's ~180 KiB, kept on the lightweight std::nolibc path.
 build_user_program true user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/true.c3
 build_user_program false user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/false.c3
+# ed — the classic line editor (nolibc: hand-rolled parsing, big fixed
+# line buffer, no need for the ~180 KiB stdlib path). Lets racccoon edit
+# a file without host tools.
+build_user_program ed user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/ed.c3
 
 # The small /bin utilities, ported to the real stdlib (io::print/
 # io::printfn instead of user.c3's own print()/putchar(), String.to_int/
