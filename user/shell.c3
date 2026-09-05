@@ -27,13 +27,15 @@ fn void main() {
     for (;;) {
         shell_prompt();
 
-        char[128] cmdline @noinit;
-        if (shell_readline(&cmdline[0], 128) < 0) { continue; }
-
-        // `;` / `&&` / `||` sequencing, then per-pipeline `$var`
-        // expansion + tokenising + `|` / `<` / `>` / `>>` + globbing;
-        // a plain line is still just shell_dispatch_common || the /bin
-        // fallback (see shell_exec_line, user/shell_common.c3).
-        shell_exec_line(&cmdline[0]);
+        // A block (one line, or several if it has an open `(` / `{` —
+        // `if (…) { … }` spread over lines gets a `> ` continuation
+        // prompt). shell_exec_block splits it into statements: `if` /
+        // `for` / `while` and `NAME=value` are handled in
+        // shell_common.c3, everything else flows through shell_exec_line
+        // (`;` / `&&` / `||`, `$var`, `|`, `<` / `>`, globbing) exactly
+        // as before.
+        char[2048] block @noinit;
+        if (shell_read_block(&block[0], 2048) < 0) { continue; }
+        shell_exec_block(&block[0]);
     }
 }

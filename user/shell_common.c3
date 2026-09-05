@@ -126,27 +126,60 @@ fn int shell_run_script(char* path, char** argv, int argc)
     g_shell_script_depth++;
     g_shell_script_stop = false;
 
-    int status = 0;
-    int line_start = 0;
-    for (int p = 0; ; p++) {
-        char c = buf[p];
-        if (c != '\n' && c != 0) { continue; }
-        buf[p] = 0;
-        char* line = &buf[line_start];
-        int s = 0;
-        while (line[s] == ' ' || line[s] == '\t') { s++; }
-        if (line[s] != 0 && line[s] != '#') {
-            status = shell_exec_line(line);
-        }
-        if (g_shell_script_stop || c == 0) { break; }
-        line_start = p + 1;
-    }
+    // Whole-buffer execution — shell_exec_block splits statements on
+    // top-level `\n` / `;` and runs `if` / `for` / `while` constructs
+    // (which may span lines) as units. The `#!` line and `#` comments
+    // are skipped by shell_exec_stmt.
+    int status = shell_exec_block(&buf[0]);
 
     g_shell_script_depth--;
     g_shell_pargs = saved_pargs;
     g_shell_pargc = saved_pargc;
     g_shell_script_stop = saved_stop;
     return status;
+}
+
+// True once every `'`/`"` is closed and `(`/`{` depth is back to 0 —
+// i.e. `s` is a complete block, not a half-typed `if (...) {` (§2.5 S3
+// multi-line prompt). Escapes are honoured; `{a,b}` brace expansion in
+// a plain command counts toward depth too, but a plain command has no
+// newline so the reader still returns it after one line.
+fn bool shell_text_balanced(char* s)
+{
+    char q = 0;
+    int paren = 0;
+    int brace = 0;
+    for (int i = 0; s[i] != 0; i++) {
+        char c = s[i];
+        if (q != 0) { if (c == q) { q = 0; } continue; }
+        if (c == '\\' && s[i + 1] != 0) { i++; continue; }
+        if (c == '\'' || c == '"') { q = c; continue; }
+        if (c == '(') { paren++; }
+        else if (c == ')') { if (paren > 0) { paren--; } }
+        else if (c == '{') { brace++; }
+        else if (c == '}') { if (brace > 0) { brace--; } }
+    }
+    return q == 0 && paren == 0 && brace == 0;
+}
+
+// Read a possibly-multi-line block: keep pulling lines (a `> `
+// continuation prompt after the first) until the accumulated text is
+// balanced. Returns its length, or -1 on overrun / read error.
+fn int shell_read_block(char* buf, int cap)
+{
+    int len = 0;
+    buf[0] = 0;
+    for (;;) {
+        char[256] line @noinit;
+        int n = shell_readline(&line[0], 256);
+        if (n < 0) { return -1; }
+        if (len + n + 2 > cap) { print("shell: block too long\n"); return -1; }
+        for (int k = 0; k < n; k++) { buf[len] = line[k]; len++; }
+        buf[len] = '\n'; len++;
+        buf[len] = 0;
+        if (shell_text_balanced(&buf[0])) { return len; }
+        print("> ");
+    }
 }
 
 // The exec target the shell would use for `cmd` — mirrors shell_spawn:
@@ -1237,6 +1270,237 @@ fn int shell_exec_line(char* line)
         seg_start = p;
     }
 
+    g_shell_status = status;
+    return status;
+}
+
+// ====================================================================
+// Control flow (§2.5 S3+): `if (COND) BODY [else BODY]`, plus
+// `NAME=value` shell-local assignment. `for` / `while` land in S4.
+//
+// shell_exec_block() is the new top layer: it splits a block of shell
+// text — which may span newlines / `;` and contain `{ }` groups — into
+// statements and runs each. A plain statement goes to shell_exec_line()
+// (the `;`/`&&`/`||` + pipeline machinery, unchanged). A control
+// construct is handled here. The interactive prompt (shell.c3) and
+// shell_run_script() both call shell_exec_block now.
+//
+// Everything parses in place: the caller's buffer is writable (readline
+// / script buffer), so a statement is run by temporarily NUL-ing its
+// end byte rather than copied out — no big per-recursion stack buffer.
+// ====================================================================
+
+// break/continue for S4's loops — the block loop checks these.
+bool g_shell_loop_break    = false;
+bool g_shell_loop_continue = false;
+
+fn int sh_strlen(char* s)
+{
+    int i = 0;
+    while (s[i] != 0) { i++; }
+    return i;
+}
+
+fn int sh_skip_ws(char* s, int i)
+{
+    while (s[i] == ' ' || s[i] == '\t' || s[i] == '\n') { i++; }
+    return i;
+}
+
+// s[i] is `(` or `{`. Index just past the matching close (quote- and
+// backslash-aware), or -1 if it never closes.
+fn int sh_span_group(char* s, int i)
+{
+    char open = s[i];
+    char close = open == '(' ? ')' : '}';
+    int depth = 0;
+    char q = 0;
+    for (; s[i] != 0; i++) {
+        char c = s[i];
+        if (q != 0) { if (c == q) { q = 0; } continue; }
+        if (c == '\'' || c == '"') { q = c; continue; }
+        if (c == '\\' && s[i + 1] != 0) { i++; continue; }
+        if (c == open) { depth++; }
+        else if (c == close) { depth--; if (depth == 0) { return i + 1; } }
+    }
+    return -1;
+}
+
+// End of a plain statement: the first top-level (not quoted, not
+// escaped) `\n` or `;`, or the NUL.
+fn int sh_plain_end(char* s, int start)
+{
+    char q = 0;
+    for (int i = start; s[i] != 0; i++) {
+        char c = s[i];
+        if (q != 0) { if (c == q) { q = 0; } continue; }
+        if (c == '\'' || c == '"') { q = c; continue; }
+        if (c == '\\' && s[i + 1] != 0) { i++; continue; }
+        if (c == '\n' || c == ';') { return i; }
+    }
+    return sh_strlen(s);
+}
+
+// Is `s` (starting at a non-ws char) the keyword `kw` used as a
+// statement head — i.e. followed by whitespace, `(`, or end?
+fn bool sh_kw_head(char* s, char* kw)
+{
+    int i = 0;
+    while (kw[i] != 0) { if (s[i] != kw[i]) { return false; } i++; }
+    char after = s[i];
+    return after == 0 || after == ' ' || after == '\t' || after == '\n' || after == '(';
+}
+
+// `NAME=...` as a whole one-word statement (no space before `=`, name is
+// [A-Za-z_][A-Za-z0-9_]*). `x = 5` (spaces) is a command, not this.
+fn bool sh_is_assign(char* s)
+{
+    if (!sh_name_start(s[0])) { return false; }
+    int i = 1;
+    while (sh_name_char(s[i])) { i++; }
+    return s[i] == '=';
+}
+
+fn int sh_do_assign(char* s)
+{
+    char[SH_VNAME_MAX] name @noinit;
+    int n = 0;
+    while (sh_name_char(s[n]) && n < SH_VNAME_MAX - 1) { name[n] = s[n]; n++; }
+    name[n] = 0;
+    // s[n] == '='
+    char[SH_VVAL_MAX] val @noinit;
+    shell_expand(&s[n + 1], &val[0], SH_VVAL_MAX);
+    shell_local_set(&name[0], &val[0]);
+    g_shell_status = 0;
+    return 0;
+}
+
+// Run the body starting at s[at] (already ws-skipped): a `{ ... }` group
+// (its inner text is run as a block) or a single bare statement. `*after`
+// is set to the index just past the body. `run` = actually execute
+// (false = just skip past it — for the not-taken branch of an `if`).
+fn int sh_run_body(char* s, int at, bool run, int* after)
+{
+    if (s[at] == '{') {
+        int past = sh_span_group(s, at);
+        if (past < 0) {
+            print("rc: unbalanced { }\n");
+            *after = sh_strlen(s);
+            g_shell_status = 2;
+            return 2;
+        }
+        *after = past;
+        if (!run) { return g_shell_status; }
+        char save = s[past - 1];      // the '}'
+        s[past - 1] = 0;
+        int st = shell_exec_block(&s[at + 1]);
+        s[past - 1] = save;
+        return st;
+    }
+    // bare statement
+    int end = sh_stmt_end(s, at);
+    *after = end;
+    if (!run) { return g_shell_status; }
+    char save = s[end];
+    s[end] = 0;
+    int st = shell_exec_stmt(&s[at]);
+    s[end] = save;
+    return st;
+}
+
+// End index of one statement beginning at s[start] (ws already at
+// start). A control construct swallows its `( )` and body (and, for
+// `if`, a trailing `else` + body); a plain statement ends at sh_plain_end.
+fn int sh_stmt_end(char* s, int start)
+{
+    if (sh_kw_head(&s[start], "if")) {
+        int i = start + 2;
+        i = sh_skip_ws(s, i);
+        if (s[i] != '(') { return sh_plain_end(s, start); }
+        int past_cond = sh_span_group(s, i);
+        if (past_cond < 0) { return sh_plain_end(s, start); }
+        i = sh_skip_ws(s, past_cond);
+        int after = 0;
+        sh_run_body(s, i, false, &after);
+        int j = sh_skip_ws(s, after);
+        if (sh_kw_head(&s[j], "else")) {
+            j = sh_skip_ws(s, j + 4);
+            sh_run_body(s, j, false, &after);
+        }
+        return after;
+    }
+    return sh_plain_end(s, start);
+}
+
+fn int shell_do_if(char* s)
+{
+    int i = sh_skip_ws(s, 2);              // past "if"
+    if (s[i] != '(') { print("rc: if: expected `(`\n"); g_shell_status = 2; return 2; }
+    int past_cond = sh_span_group(s, i);
+    if (past_cond < 0) { print("rc: if: unbalanced `( )`\n"); g_shell_status = 2; return 2; }
+
+    int cond_close = past_cond - 1;        // the ')'
+    char save = s[cond_close];
+    s[cond_close] = 0;
+    int cstatus = shell_exec_line(&s[i + 1]);
+    s[cond_close] = save;
+
+    int body_at = sh_skip_ws(s, past_cond);
+    int after = 0;
+    int st = sh_run_body(s, body_at, cstatus == 0, &after);
+
+    int j = sh_skip_ws(s, after);
+    if (sh_kw_head(&s[j], "else")) {
+        j = sh_skip_ws(s, j + 4);
+        st = sh_run_body(s, j, cstatus != 0, &after);
+    } else if (cstatus == 0) {
+        // no else, condition true -> `st` already holds the body status
+    } else {
+        st = 0;                            // `if` with a false cond, no else -> success
+    }
+    g_shell_status = st;
+    return st;
+}
+
+// One statement, already isolated (NUL-terminated) and ws-trimmed at the
+// front by the caller.
+fn int shell_exec_stmt(char* s)
+{
+    int i = sh_skip_ws(s, 0);
+    if (s[i] == 0 || s[i] == '#') { return g_shell_status; }   // blank / comment
+    if (sh_kw_head(&s[i], "if"))    { return shell_do_if(&s[i]); }
+    if (sh_kw_head(&s[i], "for") || sh_kw_head(&s[i], "while")) {
+        print("rc: for/while not implemented yet (S4)\n");
+        g_shell_status = 2;
+        return 2;
+    }
+    if (sh_is_assign(&s[i]))        { return sh_do_assign(&s[i]); }
+    return shell_exec_line(&s[i]);
+}
+
+// Split `text` (writable) into statements at top-level `\n` / `;` and
+// run each. `if` etc. are kept whole (their braced bodies contain the
+// separators). Returns the last statement's status.
+fn int shell_exec_block(char* text)
+{
+    int i = 0;
+    int status = g_shell_status;
+    while (text[i] != 0) {
+        while (text[i] == '\n' || text[i] == ';' || text[i] == ' ' || text[i] == '\t') { i++; }
+        if (text[i] == 0) { break; }
+        int start = i;
+        int end = sh_stmt_end(text, start);
+
+        char save = text[end];
+        text[end] = 0;
+        status = shell_exec_stmt(&text[start]);
+        text[end] = save;
+
+        if (g_shell_script_stop || g_shell_loop_break || g_shell_loop_continue) { break; }
+
+        i = end;
+        if (text[i] == '\n' || text[i] == ';') { i++; }
+    }
     g_shell_status = status;
     return status;
 }

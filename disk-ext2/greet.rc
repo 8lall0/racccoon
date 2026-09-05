@@ -1,9 +1,21 @@
 #!/bin/rc
-# S2 script fixture (docs/roadmap.md §2.5) — no control flow yet, just
-# line-by-line execution + positional params + comments.
-echo greet: hello from a script
-echo greet: got $# args
-echo greet: first=$1 second=$2
-echo greet: all=[$*]
-test -n $1 && echo greet: arg1 is non-empty
-expr $# + 1
+# S2/S3 script fixture (docs/roadmap.md §2.5). Command substitution
+# (`{...}`), for and while land in S4/S5.
+echo greet: hello, $# args, first=$1
+name=world
+echo greet: name is $name
+if (test $# -ge 1) {
+    echo greet: arg1 = $1
+} else {
+    echo greet: no arg1
+}
+if (test $# -ge 1) {
+    if (test -f $1) {
+        echo greet: $1 is a file
+    } else {
+        echo greet: $1 is not a file
+    }
+}
+count=3
+if (test $count -gt 2) echo greet: count over two
+echo greet: bye

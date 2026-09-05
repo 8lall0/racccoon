@@ -18,6 +18,43 @@ const int SH_PARG_LEN = 128;
 char[SH_PARG_LEN][SH_PARG_MAX] g_shell_pargs;
 int g_shell_pargc = 0;
 
+// Shell-local variables (§2.5 S3): `NAME=value` sets one, `$NAME` reads
+// it. Checked ahead of /env/<name> in shell_var_value, so a script can
+// keep a loop counter without an envd round-trip per iteration. A small
+// fixed table — scripts that need more are past what this shell is for.
+const int SH_VAR_MAX  = 24;
+const int SH_VNAME_MAX = 32;
+const int SH_VVAL_MAX  = 192;
+char[SH_VNAME_MAX][SH_VAR_MAX] g_shell_vnames;
+char[SH_VVAL_MAX][SH_VAR_MAX]  g_shell_vvals;
+int g_shell_nvars = 0;
+
+// -1 if `name` isn't a set shell-local.
+fn int shell_local_slot(char* name)
+{
+    for (int i = 0; i < g_shell_nvars; i++) {
+        if (strcmp(&g_shell_vnames[i][0], name) == 0) { return i; }
+    }
+    return -1;
+}
+
+// Set (or replace) a shell-local. Silently ignored past SH_VAR_MAX.
+fn void shell_local_set(char* name, char* value)
+{
+    int s = shell_local_slot(name);
+    if (s < 0) {
+        if (g_shell_nvars >= SH_VAR_MAX) { return; }
+        s = g_shell_nvars;
+        g_shell_nvars++;
+        int k = 0;
+        while (name[k] != 0 && k < SH_VNAME_MAX - 1) { g_shell_vnames[s][k] = name[k]; k++; }
+        g_shell_vnames[s][k] = 0;
+    }
+    int k = 0;
+    while (value[k] != 0 && k < SH_VVAL_MAX - 1) { g_shell_vvals[s][k] = value[k]; k++; }
+    g_shell_vvals[s][k] = 0;
+}
+
 // Read the variable name that follows a `$` (in[i] is the first char
 // after it) into name (>= 32 bytes). Returns the number of chars
 // consumed from in[i], or 0 if in[i] doesn't begin one. Handles the
@@ -108,6 +145,15 @@ fn int shell_var_value(char* name, char* out, int cap)
         out[k] = 0;
         return k;
     }
+    // Shell-local (set by `NAME=value`, §2.5 S3) — ahead of /env.
+    int ls = shell_local_slot(name);
+    if (ls >= 0) {
+        int k = 0;
+        while (g_shell_vvals[ls][k] != 0 && k < cap - 1) { out[k] = g_shell_vvals[ls][k]; k++; }
+        out[k] = 0;
+        return k;
+    }
+
     char[80] path @noinit;
     char* ep = "/env/";
     int p = 0;

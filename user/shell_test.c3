@@ -3111,11 +3111,14 @@ fn void main() {
             }
         } else {
             // Not a dev/test builtin: hand the raw line to the real
-            // executor — `;` / `&&` / `||` sequencing, then per-pipeline
-            // `$var` expansion + `|` / `<` / `>` / `>>`, else just
-            // shell_dispatch_common || the /bin fallback (see
-            // shell_exec_line, user/shell_common.c3).
-            shell_exec_line(&cmdline[0]);
+            // executor. shell_exec_block splits statements and runs
+            // `if` / `for` / `while` / `NAME=value` (shell_common.c3);
+            // everything else falls through to shell_exec_line (`;` /
+            // `&&` / `||`, `$var`, `|`, `<` / `>`, globbing). The dev
+            // shell reads one 128-byte line at a time, so a *multi-line*
+            // `if (...) { ... }` needs `. script` — single-line
+            // `if (test -f x) { echo y }` works here directly.
+            shell_exec_block(&cmdline[0]);
         }
     }
 }
