@@ -4,6 +4,31 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — `fs_abspath` normalises `.` / `..` / `//`; `for`-list brace expansion
+
+Follow-on shell polish (`e614c5f`) that turned out to fix a real
+filesystem gap:
+
+- **`fs_abspath()` now collapses `.` / `..` / `//`** (mirrors the
+  shell's own `shell_resolve_path`, `user.c3`). Before, a relative path
+  with a `.` or `..` component from a non-root cwd simply didn't
+  resolve — `cat ../x`, `cd sub; cat ./x`, `ls .` all failed. It also
+  explains the "FAT32 globbing is broken" symptom: `shell_glob_into`
+  lists `.` for a slash-less pattern, and FAT32's fsd (unlike ext2's,
+  which handled a literal `.` component by luck) rejected it, so
+  `echo *.wasm` / `for (f in *.wasm)` came back literal in the FAT32
+  root. A bare name from the root cwd still comes out slash-free (the
+  namespace catch-all matches it); anything rooted is `/…`.
+- **`for (VAR in WORD...)` brace-expands each word** before globbing:
+  `for (i in {1,2,3})`, `for (n in {a,b}{1,2})`, `for (x in pre{a,b}post)`.
+
+Verified QEMU FAT32 + ext2: `ls .`, `echo *.wasm` / `add.*` (FAT32
+globs now), `cd BIN; cat ../HELLO.TXT`, `cd sub; cat ./x`, `for` over
+`{1,2,3}` / `{a,b}{1,2}` / `pre{a,b}post` / `*.wasm`; greet.rc;
+wasmtest, chmodtest, fspermtest all pass.
+
+---
+
 ## 2026-09-05 — Shell scripts + control flow (§2.5's last big item)
 
 `#!` scripts + `if` / `for` / `while` — the roadmap called this "the big

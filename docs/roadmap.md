@@ -262,8 +262,9 @@ not bourne. Interleaved with §1/§2 rather than a phase of its own.
   verified over the debug UART.
 - `"$x"` empty-word gap fixed (`677d2bd`, `SH_QMARK` anchor);
   `NAME=value` quote-aware; `${name}` brace form + quote-respecting
-  `for (v in …)` split (`8f5d903`). Remaining rough edges: FAT32
-  case-insensitive glob; `for`-list has no brace expansion.
+  `for (v in …)` split (`8f5d903`); `for`-list brace expansion +
+  `fs_abspath` now collapses `.`/`..`/`//` — so `cat ../x`, `ls .`,
+  and FAT32 globbing all work (`e614c5f`).
 
 **Still to do:**
 - proper functions (`fn name { }`), `switch` / `case` — not needed yet.
