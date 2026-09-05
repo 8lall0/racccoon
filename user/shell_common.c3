@@ -169,9 +169,11 @@ fn int shell_read_block(char* buf, int cap)
 {
     int len = 0;
     buf[0] = 0;
+    bool first = true;
     for (;;) {
         char[256] line @noinit;
-        int n = shell_readline(&line[0], 256);
+        int n = shell_readline_p(&line[0], 256, first ? &g_prompt_str[0] : "> ", first);
+        first = false;
         if (n < 0) { return -1; }
         if (len + n + 2 > cap) { print("shell: block too long\n"); return -1; }
         for (int k = 0; k < n; k++) { buf[len] = line[k]; len++; }
@@ -255,16 +257,27 @@ fn void shell_boot_settle(ulong settle_ticks)
 
 // The prompt — "<user> <cwd># " for root, "... % " otherwise (Plan 9's
 // `%`). Both shells call this instead of a bare "> ".
+// The last prompt string shell_prompt() printed — shell_readline needs
+// it to redraw the line on a cursor edit / history recall.
+char[128] g_prompt_str @noinit;
+
 fn void shell_prompt()
 {
     shell_jobs_reap();   // report any background job that finished since last time
     if (g_shell_uid < 0) { shell_refresh_user(); }
-    print(&g_shell_user[0]);
-    putchar(' ');
+
+    int p = 0;
+    for (int k = 0; g_shell_user[k] != 0 && p < 126; k++) { g_prompt_str[p] = g_shell_user[k]; p++; }
+    if (p < 126) { g_prompt_str[p] = ' '; p++; }
     char[100] cw @noinit;
     int n = getcwd(&cw[0], 100);
-    print(n > 0 ? &cw[0] : "/");
-    print(g_shell_uid == 0 ? " # " : " % ");
+    char* c = n > 0 ? &cw[0] : "/";
+    for (int k = 0; c[k] != 0 && p < 126; k++) { g_prompt_str[p] = c[k]; p++; }
+    char* tail = g_shell_uid == 0 ? " # " : " % ";
+    for (int k = 0; tail[k] != 0 && p < 127; k++) { g_prompt_str[p] = tail[k]; p++; }
+    g_prompt_str[p] = 0;
+
+    print(&g_prompt_str[0]);
 }
 
 // Resolve `arg` against the cwd (or take it absolute), collapse "." /
@@ -287,45 +300,164 @@ fn void shell_resolve_path(char* arg, char* out)
     path_collapse(&raw[0], out, true);
 }
 
-// Read one console line into buf (cap includes the NUL). Both Backspace
-// bytes (0x7F / 0x08) erase with a "\b \b"; every other byte is echoed;
-// CR ends the line (a newline is printed). Returns the line length, or
-// -1 if it overran cap-1 (caller discards and reprompts). Shared by
-// shell.c3's command loop and shell_login() below — shell_test.c3 keeps
-// its own inline copy (it has extra dev-only line handling).
-fn int shell_readline(char* buf, int cap)
+// --- command history --------------------------------------------------
+const int SH_HIST_N   = 24;
+const int SH_HIST_MAX  = 200;
+char[SH_HIST_MAX][SH_HIST_N] g_hist;
+int g_hist_count = 0;              // total ever added (index into ring = % SH_HIST_N)
+int g_hist_view  = 0;             // 0 = current line; k>0 = k entries back
+
+fn void sh_hist_add(char* line)
 {
-    int i = 0;
+    if (line[0] == 0) { return; }
+    // skip if identical to the most recent entry
+    if (g_hist_count > 0) {
+        char* last = &g_hist[(g_hist_count - 1) % SH_HIST_N][0];
+        if (strcmp(last, line) == 0) { return; }
+    }
+    char* slot = &g_hist[g_hist_count % SH_HIST_N][0];
+    int k = 0;
+    while (line[k] != 0 && k < SH_HIST_MAX - 1) { slot[k] = line[k]; k++; }
+    slot[k] = 0;
+    g_hist_count++;
+}
+
+// nth entry back (1 = most recent), or null.
+fn char* sh_hist_get(int back)
+{
+    if (back < 1 || back > g_hist_count || back > SH_HIST_N) { return null; }
+    return &g_hist[(g_hist_count - back) % SH_HIST_N][0];
+}
+
+// --- line editing ----------------------------------------------------
+// Redraw: \r, prompt, the line, ESC[K (clear tail), then \b back to the
+// cursor column. Works on any ANSI-ish serial terminal (screen, minicom).
+fn void sh_redraw(char* prompt, char* buf, int len, int cur)
+{
+    putchar('\r');
+    print(prompt);
+    for (int k = 0; k < len; k++) { putchar(buf[k]); }
+    print("\x1b[K");
+    for (int k = 0; k < len - cur; k++) { putchar('\b'); }
+}
+
+// Read one line into buf (cap incl. NUL) with cursor editing (arrows,
+// ^A/^E/^K/^U/^W, Home/End/Del) and — when `history` — up/down recall.
+// `prompt` is the visible prompt, needed for redraws. CR or LF ends the
+// line. Returns the length, or -1 on overflow.
+fn int shell_readline_p(char* buf, int cap, char* prompt, bool history)
+{
+    int len = 0;
+    int cur = 0;
+    buf[0] = 0;
+    g_hist_view = 0;
+
     for (;;) {
-        char ch = (char)getchar();
-        if (ch == 127 || ch == 8) {
-            if (i > 0) { i--; print("\b \b"); }
+        int ci = getchar();
+        if (ci < 0) { continue; }
+        char ch = (char)ci;
+
+        // ESC sequence: ESC [ <final>, or ESC [ <digits> ~
+        if (ch == 0x1b) {
+            int b1 = getchar();
+            if (b1 != '[' && b1 != 'O') { continue; }
+            int b2 = getchar();
+            int code = b2;
+            if (b2 >= '0' && b2 <= '9') {
+                // e.g. "3~" = Del, "1~" = Home, "4~" = End
+                int b3 = getchar();
+                if (b3 != '~') { continue; }
+                if (b2 == '3') {                       // Del
+                    if (cur < len) {
+                        for (int k = cur; k < len - 1; k++) { buf[k] = buf[k + 1]; }
+                        len--; buf[len] = 0;
+                        sh_redraw(prompt, buf, len, cur);
+                    }
+                } else if (b2 == '1' || b2 == '7') {   // Home
+                    cur = 0; sh_redraw(prompt, buf, len, cur);
+                } else if (b2 == '4' || b2 == '8') {   // End
+                    cur = len; sh_redraw(prompt, buf, len, cur);
+                }
+                continue;
+            }
+            if (code == 'D') { if (cur > 0) { cur--; putchar('\b'); } continue; }   // Left
+            if (code == 'C') { if (cur < len) { putchar(buf[cur]); cur++; } continue; } // Right
+            if (code == 'H') { cur = 0; sh_redraw(prompt, buf, len, cur); continue; }
+            if (code == 'F') { cur = len; sh_redraw(prompt, buf, len, cur); continue; }
+            if ((code == 'A' || code == 'B') && history) {
+                int want = code == 'A' ? g_hist_view + 1 : g_hist_view - 1;
+                if (want < 0) { want = 0; }
+                char* h = want == 0 ? null : sh_hist_get(want);
+                if (want != 0 && h == null) { continue; }   // no more history
+                g_hist_view = want;
+                len = 0;
+                if (h != null) { while (h[len] != 0 && len < cap - 1) { buf[len] = h[len]; len++; } }
+                buf[len] = 0;
+                cur = len;
+                sh_redraw(prompt, buf, len, cur);
+            }
             continue;
         }
-        // A stray NUL (a UART framing error / line break shows up as one)
-        // or a bare LF at the start of a line (the trailing half of a
-        // CRLF the previous line's CR already consumed, or a double-tap)
-        // must not become a one-character phantom command — swallow it,
-        // no echo, no store.
-        if (ch == 0 || (ch == '\n' && i == 0)) {
-            continue;
-        }
-        putchar(ch);
-        if (i == cap - 1) {
-            print("\ncommand line too long\n");
-            return -1;
-        }
-        // CR or LF ends the line — accept either so a CRLF terminal works
-        // (its CR ends the command; the following LF then reads back here
-        // as an empty line, which shell_exec_line treats as a no-op).
+
+        if (ch == 0) { continue; }                       // UART framing noise
+        if (ch == '\n' && len == 0 && cur == 0) { continue; } // stray LF of a CRLF
+
         if (ch == '\r' || ch == '\n') {
             print("\n");
-            buf[i] = 0;
-            return i;
+            buf[len] = 0;
+            if (history) { sh_hist_add(buf); }
+            return len;
         }
-        buf[i] = ch;
-        i++;
+
+        if (ch == 127 || ch == 8) {                       // Backspace
+            if (cur > 0) {
+                for (int k = cur - 1; k < len - 1; k++) { buf[k] = buf[k + 1]; }
+                len--; cur--; buf[len] = 0;
+                sh_redraw(prompt, buf, len, cur);
+            }
+            continue;
+        }
+        if (ch == 1)  { cur = 0;   sh_redraw(prompt, buf, len, cur); continue; }   // ^A
+        if (ch == 5)  { cur = len; sh_redraw(prompt, buf, len, cur); continue; }   // ^E
+        if (ch == 11) { len = cur; buf[len] = 0; sh_redraw(prompt, buf, len, cur); continue; } // ^K
+        if (ch == 21) { len = 0; cur = 0; buf[0] = 0; sh_redraw(prompt, buf, len, cur); continue; } // ^U
+        if (ch == 23) {                                  // ^W — erase word before cursor
+            int e = cur;
+            while (cur > 0 && buf[cur - 1] == ' ') { cur--; }
+            while (cur > 0 && buf[cur - 1] != ' ') { cur--; }
+            for (int k = cur; k < len - (e - cur); k++) { buf[k] = buf[k + (e - cur)]; }
+            len -= (e - cur); buf[len] = 0;
+            sh_redraw(prompt, buf, len, cur);
+            continue;
+        }
+        if (ch == 4) {                                   // ^D — delete under cursor
+            if (cur < len) {
+                for (int k = cur; k < len - 1; k++) { buf[k] = buf[k + 1]; }
+                len--; buf[len] = 0;
+                sh_redraw(prompt, buf, len, cur);
+            }
+            continue;
+        }
+        if (ch == 12) { sh_redraw(prompt, buf, len, cur); continue; }   // ^L (no clear-screen — just redraw)
+
+        if (ch < 0x20) { continue; }                      // other control chars
+
+        if (len >= cap - 1) { print("\ncommand line too long\n"); return -1; }
+        // insert at cur
+        for (int k = len; k > cur; k--) { buf[k] = buf[k - 1]; }
+        buf[cur] = ch;
+        len++; cur++;
+        buf[len] = 0;
+        if (cur == len) { putchar(ch); }                 // fast path: append
+        else { sh_redraw(prompt, buf, len, cur); }
     }
+}
+
+// Back-compat wrapper: no prompt-redraw context, no history (login name,
+// and any caller that hasn't been updated).
+fn int shell_readline(char* buf, int cap)
+{
+    return shell_readline_p(buf, cap, "", false);
 }
 
 // Absolutise `in` against the cwd and write it into `out` (>=
@@ -401,7 +533,7 @@ fn void shell_login()
     for (;;) {
         print("login: ");
         char[64] nm @noinit;
-        int n = shell_readline(&nm[0], 64);
+        int n = shell_readline_p(&nm[0], 64, "login: ", false);
         if (n <= 0) { continue; }
         if (shell_login_once(&nm[0])) { return; }
     }

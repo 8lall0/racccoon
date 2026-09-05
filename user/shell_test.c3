@@ -159,52 +159,10 @@ fn void main() {
     for (;;) {
         shell_prompt();
 
+        // Cursor editing + history — shell_common.c3's shared reader
+        // (arrows, ^A/^E/^K/^U/^W, Home/End/Del, up-arrow recall).
         char[128] cmdline @noinit;
-        int i = 0;
-        bool too_long = false;
-        for (;;) {
-            char ch = (char)getchar();
-            // 0x7F (DEL) and 0x08 (BS) — different terminal
-            // emulators/serial console tools send different bytes for
-            // Backspace, no way to know which in advance, so both are
-            // handled. Checked before the echo/full-buffer logic below
-            // (not gated behind i == 127) so a user can also backspace
-            // their way back from a genuinely full line instead of it
-            // being unconditionally abandoned — falls out of the
-            // ordering, not extra logic. The raw byte is never echoed
-            // via putchar() — "\b \b" (cursor back, blank, cursor back
-            // again) is what actually erases the character on-screen.
-            if (ch == 127 || ch == 8) {
-                if (i > 0) {
-                    i--;
-                    print("\b \b");
-                }
-                continue;
-            }
-            // A stray NUL (UART framing error) or a bare LF at the start
-            // of a line (the trailing half of a CRLF the CR already
-            // consumed, or a double-tap) must not become a one-character
-            // phantom command — swallow it silently. Same fix as
-            // shell_common.c3's shell_readline (production shell).
-            if (ch == 0 || (ch == '\n' && i == 0)) {
-                continue;
-            }
-            putchar(ch);
-            if (i == 127) {
-                print("\ncommand line too long\n");
-                too_long = true;
-                break;
-            }
-            if (ch == '\r' || ch == '\n') {
-                print("\n");
-                cmdline[i] = 0;
-                break;
-            }
-            cmdline[i] = ch;
-            i++;
-        }
-
-        if (too_long) continue;
+        if (shell_readline_p(&cmdline[0], 128, &g_prompt_str[0], true) < 0) { continue; }
 
         // $var expansion, then tokenize the result in place.
         char[512] expanded @noinit;
