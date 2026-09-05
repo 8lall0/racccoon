@@ -1,0 +1,9 @@
+#!/bin/rc
+# S2 script fixture (docs/roadmap.md §2.5) — no control flow yet, just
+# line-by-line execution + positional params + comments.
+echo greet: hello from a script
+echo greet: got $# args
+echo greet: first=$1 second=$2
+echo greet: all=[$*]
+test -n $1 && echo greet: arg1 is non-empty
+expr $# + 1

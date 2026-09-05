@@ -9,6 +9,34 @@ module user;
 fn bool sh_name_start(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
 fn bool sh_name_char(char c)  { return sh_name_start(c) || (c >= '0' && c <= '9'); }
 
+// Positional parameters for `. script a b c` / `#!` scripts (§2.5 S2).
+// $1..$9, $#, $* — set by shell_run_script (shell_common.c3), saved and
+// restored around a nested source so `. inner` doesn't clobber the
+// outer script's args.
+const int SH_PARG_MAX = 9;
+const int SH_PARG_LEN = 128;
+char[SH_PARG_LEN][SH_PARG_MAX] g_shell_pargs;
+int g_shell_pargc = 0;
+
+// Read the variable name that follows a `$` (in[i] is the first char
+// after it) into name (>= 32 bytes). Returns the number of chars
+// consumed from in[i], or 0 if in[i] doesn't begin one. Handles the
+// special one-char names `#` / `*` / `1`..`9` as well as ordinary
+// [A-Za-z_][A-Za-z0-9_]* identifiers.
+fn int sh_read_varname(char* in, int i, char* name)
+{
+    char c = in[i];
+    if (c == '#' || c == '*' || (c >= '1' && c <= '9')) {
+        name[0] = c; name[1] = 0;
+        return 1;
+    }
+    if (!sh_name_start(c)) { return 0; }
+    int n = 0;
+    while (sh_name_char(in[i + n]) && n < 31) { name[n] = in[i + n]; n++; }
+    name[n] = 0;
+    return n;
+}
+
 // Value of $<name>, into out (cap includes the NUL). "user"/"cwd"
 // (alias "PWD")/"home" are synthesised from the shell's own state;
 // everything else reads /env/<name> (empty if unset — Plan 9 rc
@@ -41,6 +69,37 @@ fn int shell_var_value(char* name, char* out, int cap)
         out[k] = 0;
         return k;
     }
+    // Positional parameters. $# = count, $* = all joined by one space,
+    // $1..$9 = one arg ("" past the end, rc's unset-is-empty rule).
+    if (name[0] == '#' && name[1] == 0) {
+        int v = g_shell_pargc;
+        char[12] digs @noinit;
+        int d = 0;
+        digs[d] = (char)('0' + v % 10); d++; v /= 10;
+        while (v > 0) { digs[d] = (char)('0' + v % 10); d++; v /= 10; }
+        int k = 0;
+        while (d > 0 && k < cap - 1) { d--; out[k] = digs[d]; k++; }
+        out[k] = 0;
+        return k;
+    }
+    if (name[0] == '*' && name[1] == 0) {
+        int k = 0;
+        for (int a = 0; a < g_shell_pargc; a++) {
+            if (a > 0 && k < cap - 1) { out[k] = ' '; k++; }
+            for (int j = 0; g_shell_pargs[a][j] != 0 && k < cap - 1; j++) { out[k] = g_shell_pargs[a][j]; k++; }
+        }
+        out[k] = 0;
+        return k;
+    }
+    if (name[0] >= '1' && name[0] <= '9' && name[1] == 0) {
+        int idx = name[0] - '1';
+        int k = 0;
+        if (idx < g_shell_pargc) {
+            while (g_shell_pargs[idx][k] != 0 && k < cap - 1) { out[k] = g_shell_pargs[idx][k]; k++; }
+        }
+        out[k] = 0;
+        return k;
+    }
     if (strcmp(name, "home") == 0) {
         int k = 0;
         char* pfx = "/usr/";
@@ -69,20 +128,20 @@ fn void shell_expand(char* in, char* out, int cap)
     int o = 0;
     int i = 0;
     while (in[i] != 0 && o < cap - 1) {
-        if (in[i] == '$' && sh_name_start(in[i + 1])) {
-            i++;
+        if (in[i] == '$') {
             char[32] name @noinit;
-            int n = 0;
-            while (sh_name_char(in[i]) && n < 31) { name[n] = in[i]; n++; i++; }
-            name[n] = 0;
-            char[256] val @noinit;
-            int vl = shell_var_value(&name[0], &val[0], 256);
-            for (int k = 0; k < vl && o < cap - 1; k++) { out[o] = val[k]; o++; }
-        } else {
-            out[o] = in[i];
-            o++;
-            i++;
+            int consumed = sh_read_varname(in, i + 1, &name[0]);
+            if (consumed > 0) {
+                i += 1 + consumed;
+                char[256] val @noinit;
+                int vl = shell_var_value(&name[0], &val[0], 256);
+                for (int k = 0; k < vl && o < cap - 1; k++) { out[o] = val[k]; o++; }
+                continue;
+            }
         }
+        out[o] = in[i];
+        o++;
+        i++;
     }
     out[o] = 0;
 }
@@ -142,11 +201,10 @@ fn int shell_expand_q(char* in, char* out, char* qmask, int cap)
                     i += 2;
                     continue;
                 }
-                if (in[i] == '$' && sh_name_start(in[i + 1])) {
-                    i++;
-                    char[32] nm @noinit; int n = 0;
-                    while (sh_name_char(in[i]) && n < 31) { nm[n] = in[i]; n++; i++; }
-                    nm[n] = 0;
+                char[32] nm @noinit;
+                int consumed = in[i] == '$' ? sh_read_varname(in, i + 1, &nm[0]) : 0;
+                if (consumed > 0) {
+                    i += 1 + consumed;
                     char[256] val @noinit;
                     int vl = shell_var_value(&nm[0], &val[0], 256);
                     for (int k = 0; k < vl && o < cap - 1; k++) { out[o] = val[k]; qmask[o] = 1; o++; }
@@ -157,15 +215,16 @@ fn int shell_expand_q(char* in, char* out, char* qmask, int cap)
             }
             continue;
         }
-        if (c == '$' && sh_name_start(in[i + 1])) {
-            i++;
-            char[32] nm @noinit; int n = 0;
-            while (sh_name_char(in[i]) && n < 31) { nm[n] = in[i]; n++; i++; }
-            nm[n] = 0;
-            char[256] val @noinit;
-            int vl = shell_var_value(&nm[0], &val[0], 256);
-            for (int k = 0; k < vl && o < cap - 1; k++) { out[o] = val[k]; qmask[o] = 0; o++; }
-            continue;
+        if (c == '$') {
+            char[32] nm @noinit;
+            int consumed = sh_read_varname(in, i + 1, &nm[0]);
+            if (consumed > 0) {
+                i += 1 + consumed;
+                char[256] val @noinit;
+                int vl = shell_var_value(&nm[0], &val[0], 256);
+                for (int k = 0; k < vl && o < cap - 1; k++) { out[o] = val[k]; qmask[o] = 0; o++; }
+                continue;
+            }
         }
         out[o] = c; qmask[o] = 0; o++;
         i++;

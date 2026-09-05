@@ -84,6 +84,96 @@ int g_shell_status = 0;
 // expansion) in user/shell_words.c3 — same `module user`, so everything
 // here just calls across.
 
+// --- script execution (§2.5 S2) --------------------------------------
+// `. file` / `source file`, and a `#!`-first file run by name, execute
+// their lines in *this* shell process (racccoon can't re-exec the shell
+// — it's embedded in the kernel image, not a /bin binary), so `cd` in a
+// script sticks and `exit` would kill the interactive shell. To make
+// `exit` behave, shell_run_script bumps g_shell_script_depth; the `exit`
+// builtin, when that's non-zero, just sets g_shell_script_stop and the
+// line loop unwinds instead of calling exit().
+const int SH_SCRIPT_MAX = 8192;
+int  g_shell_script_depth = 0;
+bool g_shell_script_stop  = false;
+
+// Read `path` and run it line by line. A leading `#!` line and any line
+// whose first non-blank char is `#` are skipped (comments). argv[0..argc)
+// become $1.., $#, $* for the duration (saved/restored around a nested
+// source). Returns the status of the last line run.
+fn int shell_run_script(char* path, char** argv, int argc)
+{
+    char[SH_SCRIPT_MAX] buf @noinit;
+    int n = fs_read(path, &buf[0], SH_SCRIPT_MAX - 1);
+    if (n < 0) {
+        print("rc: cannot read ");
+        print(path);
+        print("\n");
+        return 1;
+    }
+    buf[n] = 0;
+
+    char[SH_PARG_LEN][SH_PARG_MAX] saved_pargs = g_shell_pargs;
+    int  saved_pargc = g_shell_pargc;
+    bool saved_stop  = g_shell_script_stop;
+
+    g_shell_pargc = argc < SH_PARG_MAX ? argc : SH_PARG_MAX;
+    for (int a = 0; a < g_shell_pargc; a++) {
+        int k = 0;
+        while (argv[a][k] != 0 && k < SH_PARG_LEN - 1) { g_shell_pargs[a][k] = argv[a][k]; k++; }
+        g_shell_pargs[a][k] = 0;
+    }
+
+    g_shell_script_depth++;
+    g_shell_script_stop = false;
+
+    int status = 0;
+    int line_start = 0;
+    for (int p = 0; ; p++) {
+        char c = buf[p];
+        if (c != '\n' && c != 0) { continue; }
+        buf[p] = 0;
+        char* line = &buf[line_start];
+        int s = 0;
+        while (line[s] == ' ' || line[s] == '\t') { s++; }
+        if (line[s] != 0 && line[s] != '#') {
+            status = shell_exec_line(line);
+        }
+        if (g_shell_script_stop || c == 0) { break; }
+        line_start = p + 1;
+    }
+
+    g_shell_script_depth--;
+    g_shell_pargs = saved_pargs;
+    g_shell_pargc = saved_pargc;
+    g_shell_script_stop = saved_stop;
+    return status;
+}
+
+// The exec target the shell would use for `cmd` — mirrors shell_spawn:
+// a name with a '/' is a path (absolute as-is, else cwd-relative via
+// shell_resolve_path); a bare name is /bin/<cmd>. `out` >= 100 bytes.
+fn void shell_exec_target(char* cmd, char* out)
+{
+    bool is_path = false;
+    for (int i = 0; cmd[i] != 0; i++) { if (cmd[i] == '/') { is_path = true; break; } }
+    if (is_path) {
+        if (cmd[0] == '/') {
+            int i = 0;
+            while (cmd[i] != 0 && i < 99) { out[i] = cmd[i]; i++; }
+            out[i] = 0;
+        } else {
+            shell_resolve_path(cmd, out);
+        }
+    } else {
+        int o = 0;
+        char* pfx = "/bin/";
+        while (pfx[o] != 0) { out[o] = pfx[o]; o++; }
+        int j = 0;
+        while (cmd[j] != 0 && o < 99) { out[o] = cmd[j]; o++; j++; }
+        out[o] = 0;
+    }
+}
+
 fn void shell_refresh_user()
 {
     g_shell_uid = getuid();
@@ -461,7 +551,30 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
             print("\n");
             return true;
         } else if (strcmp(cmd, "exit") == 0) {
+            // Inside a `. script` / `#!` run: unwind the script instead
+            // of killing the (interactive) shell. `exit N` sets $status.
+            if (g_shell_script_depth > 0) {
+                if (cmd_argc >= 1 && cmd_argv[0][0] >= '0' && cmd_argv[0][0] <= '9') {
+                    int ec = 0;
+                    for (int k = 0; cmd_argv[0][k] >= '0' && cmd_argv[0][k] <= '9'; k++) {
+                        ec = ec * 10 + (cmd_argv[0][k] - '0');
+                    }
+                    g_shell_status = ec;
+                }
+                g_shell_script_stop = true;
+                return true;
+            }
             exit();
+        } else if (strcmp(cmd, ".") == 0 || strcmp(cmd, "source") == 0) {
+            if (cmd_argc < 1) {
+                print("usage: . <script> [args...]\n");
+                g_shell_status = 1;
+                return true;
+            }
+            char[100] scr @noinit;
+            shell_exec_target(cmd_argv[0], &scr[0]);
+            g_shell_status = shell_run_script(&scr[0], &cmd_argv[1], cmd_argc - 1);
+            return true;
         } else if (strcmp(cmd, "mountusb") == 0) {
             // Idempotent: retires whatever a previous mountusb run left
             // behind (a successful mount, or a fsd that never found
@@ -735,6 +848,17 @@ fn int shell_spawn_stage(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out
 // command's exit status (127 if it couldn't be spawned).
 fn int shell_exec_external(char* cmd, char** cmd_argv, int cmd_argc)
 {
+            // A `#!` script run by name: racccoon's exec() loads a flat /
+            // ELF image and would fault on shell text, so interpret it in
+            // this shell instead (§2.5 S2). Peek the first two bytes of
+            // whatever exec would have run.
+            char[100] xt @noinit;
+            shell_exec_target(cmd, &xt[0]);
+            char[2] magic @noinit;
+            if (fs_read(&xt[0], &magic[0], 2) == 2 && magic[0] == '#' && magic[1] == '!') {
+                return shell_run_script(&xt[0], cmd_argv, cmd_argc);
+            }
+
             uint sh_gen = 0;
             int sh_r = shell_spawn(cmd, cmd_argv, cmd_argc, &sh_gen, -1, -1);
             if (sh_r <= 0) { return 127; }

@@ -122,6 +122,7 @@ ext2_seed_tree() {
   dd if=/dev/zero of=build/disk.img bs=1M count=64 status=none
   mkfs.vfat -F 32 build/disk.img > /dev/null
   mcopy -i build/disk.img disk/*.txt ::
+  mcopy -i build/disk.img disk/greet.rc ::greet.rc   # §2.5 shell-script fixture
   # "My Long File Name.txt" — a real VFAT long-filename (LFN) fixture,
   # exercising fat32.c3's own LFN read support (see docs/devlog.md and
   # shell_test.c3's own lfntest). mcopy itself (a real, independent
@@ -230,6 +231,7 @@ ext2_seed_tree() {
   dd if=/dev/zero of=build/disk_ext2.img bs=1M count=448 status=none
   mke2fs -q -F -b 1024 build/disk_ext2.img
   debugfs -w -R "write disk-ext2/hello.txt hello.txt" build/disk_ext2.img > /dev/null
+  debugfs -w -R "write disk-ext2/greet.rc greet.rc" build/disk_ext2.img > /dev/null   # §2.5 shell-script fixture
   # disk-ext2/subdir/ exercises ext2.c3's read-only subdirectory support
   # (see docs/devlog.md), same purpose as disk/subdir/ above.
   debugfs -w -R "mkdir subdir" build/disk_ext2.img > /dev/null
