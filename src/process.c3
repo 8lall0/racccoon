@@ -769,12 +769,22 @@ fn bool ns_mount_try(char* prefix, char* srv_name)
 }
 
 // RV64 port: sd/ld instead of sw/lw, 8*N offsets instead of 4*N — every
-// register (including satp/sscratch's own carrier args) is now 8 bytes,
-// not 4. Same 13-word (ra + s0-s11) shape as the RV32 version, just twice
-// the byte stride. satp is a genuine ulong here (Sv39's MODE field lives
-// in the top 4 bits of a 64-bit register, not RV32's single top bit — see
+// register (including satp's own carrier arg) is now 8 bytes, not 4.
+// Same 13-word (ra + s0-s11) shape as the RV32 version, just twice the
+// byte stride. satp is a genuine ulong here (Sv39's MODE field lives in
+// the top 4 bits of a 64-bit register, not RV32's single top bit — see
 // page.c3's SATP_SV39), not merely "an address happens to be pointer-sized".
-fn void switch_context(uptr* prev_sp, uptr* next_sp, ulong satp, uptr sscratch) @naked @noinline
+//
+// SMP Stage C1: a3 (`kstack_top` = the resumed process's kernel-stack
+// top) is written into `HartScratch.kstack` (offset 0, via `tp` — the
+// per-hart pointer, valid because switch_context is only ever reached
+// from kernel C code) instead of straight into `sscratch`. sscratch now
+// permanently holds &hart_scratch[thishart] (kernel_entry needs it to
+// find the per-hart block on the next trap); the frame-build anchor it
+// used to carry moved into that block. Behaviour on one hart is
+// identical — kernel_entry reads the same value back, just one
+// indirection later.
+fn void switch_context(uptr* prev_sp, uptr* next_sp, ulong satp, uptr kstack_top) @naked @noinline
 {
 	asm(`
         addi sp, sp, -13 * 8
@@ -796,7 +806,7 @@ fn void switch_context(uptr* prev_sp, uptr* next_sp, ulong satp, uptr sscratch) 
         sfence.vma
         csrw satp, a2
         sfence.vma
-        csrw sscratch, a3
+        sd a3, 0(tp)
 
         ld sp, (a1)
         ld ra,  0  * 8(sp)

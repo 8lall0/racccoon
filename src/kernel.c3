@@ -58,7 +58,10 @@ extern char[] _binary_netd_bin_end @cname("_binary_netd_bin_end");
 extern char[] _binary_gpiod_bin_start @cname("_binary_gpiod_bin_start");
 extern char[] _binary_gpiod_bin_end @cname("_binary_gpiod_bin_end");
 
-fn void boot() @naked @export("boot") @section(".text.boot") @noinline @nostrip @used
+// @section(".text.boot.entry") — pinned first in .text.boot by kernel.ld
+// so OpenSBI's fixed 0x80200000 payload-entry jump always lands here and
+// not in smp.c3's secondary_entry (which shares .text.boot).
+fn void boot() @naked @export("boot") @section(".text.boot.entry") @noinline @nostrip @used
 {
 	// OpenSBI enters S-mode here with a0 = the boot hart's id, a1 = the
 	// DTB address. Stash a0 for src/smp.c3 before setting up the stack —
@@ -78,25 +81,21 @@ fn void kernel_main() @export("kernel_main") @noinline @nostrip
 
 	io::print("1: BSS cleared\n");
 
-	// SMP Stage A: publish which hart booted us before anything that
-	// takes a Stage B lock (create_process -> proc_table_lock, alloc_lock)
-	// runs — those index per-hart state by this_hartid(), which reads
-	// boot_hartid. smp_start_secondaries() (called much later) re-runs the
-	// same assignment harmlessly.
+	// SMP Stage A/C1: establish the boot hart's identity before anything
+	// that takes a Stage B lock (create_process -> proc_table_lock,
+	// alloc_lock — indexed by this_hartid()) and before any trap can
+	// fire. This points `tp` + `sscratch` at hart_scratch[boot_hartid]
+	// and seeds its .kstack with the bare-mode trap-frame anchor
+	// (boot_trap_stack — see its comment in entry.c3: a dedicated buffer,
+	// not __stack_top, which kernel_main is itself running on). Replaces
+	// the old plain `write_csr("sscratch", &boot_trap_stack_top)`.
+	// smp_start_secondaries() (much later) re-runs the Hart bookkeeping
+	// half harmlessly.
 	smp_init_boot_hart();
 
 	self_test_pte_roundtrip();
 
 	write_reg("stvec", "kernel_entry");
-
-	// Trap-frame anchor for traps taken *before* the first switch_context
-	// call (i.e. while running kernel_main itself, bare-mode, no process
-	// yet). See boot_trap_stack's comment in entry.c3 for why this is a
-	// dedicated buffer and not __stack_top itself. Must be set before any
-	// interrupt can actually fire — kernel_entry's very first instruction
-	// (csrrw sp, sscratch, sp) would otherwise swap in garbage and build
-	// the trap frame at a bogus address.
-	write_csr("sscratch", (uptr)&boot_trap_stack + boot_trap_stack.len);
 
 	board::plic_init();
 

@@ -374,13 +374,24 @@ fn void enable_user_timer_access()
 // 124.
 fn void kernel_entry() @align(4) @section(".text.trap") @export("kernel_entry") @noinline @nostrip
 {
+	// SMP Stage C1 — per-hart trap entry. `sscratch` holds
+	// &hart_scratch[thishart] (kernel.c3 / smp.c3), NOT a bare stack
+	// pointer. Swap it with `tp` (so tp = the per-hart block, and the
+	// user's tp is parked in sscratch for a moment), stash the user sp in
+	// HartScratch.tmp (+8), build the 31-slot frame on HartScratch.kstack
+	// (+0), then recover user tp (from sscratch) and user sp (from tmp)
+	// into their frame slots, and restore sscratch = tp for the next
+	// trap. On one hart this reproduces the old behaviour exactly, one
+	// indirection later. (Frame layout: ra=0 gp=1 tp=2 t0=3 ... sp=30.)
 	asm(`
-        csrrw sp, sscratch, sp
+        csrrw tp, sscratch, tp
+
+        sd sp, 8(tp)
+        ld sp, 0(tp)
 
         addi sp, sp, -8 * 31
         sd ra,  8 * 0(sp)
         sd gp,  8 * 1(sp)
-        sd tp,  8 * 2(sp)
         sd t0,  8 * 3(sp)
         sd t1,  8 * 4(sp)
         sd t2,  8 * 5(sp)
@@ -409,12 +420,13 @@ fn void kernel_entry() @align(4) @section(".text.trap") @export("kernel_entry") 
         sd s10, 8 * 28(sp)
         sd s11, 8 * 29(sp)
 
-        csrr a0, sscratch
-        sd a0, 8 * 30(sp)
+        csrr t0, sscratch
+        sd t0, 8 * 2(sp)
 
-        addi a0, sp, 8 * 31
+        ld t0, 8(tp)
+        sd t0, 8 * 30(sp)
 
-        csrw sscratch, a0
+        csrw sscratch, tp
         mv a0, sp
         call handle_trap
 

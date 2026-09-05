@@ -58,6 +58,11 @@ SECTIONS {
     __kernel_base = .;
 
     .text.boot : {
+        /* boot() must be first — see src/kernel.ld's matching comment
+           (c3c emission order once put smp.c3's secondary_entry ahead of
+           it; the FSBL jumps to __kernel_base and would land in the
+           wrong function). Pinned via its own subsection. */
+        KEEP(*(.text.boot.entry));
         KEEP(*(.text.boot));
     } :text
 
