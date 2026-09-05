@@ -4,6 +4,108 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — WASM passive segments: `memory.init`/`data.drop` + `table.init`/`elem.drop`/`table.copy`
+
+Picked up where the previous entry's bulk-memory work left off: the
+"needs passive-segment tracking" half.
+
+**`/bin/wasm` (`user/bin/wasm.c3`):**
+- `SEC_DATA` now tracks *every* segment (not just active/mode-0) in a
+  new `g_data[]` table (`WData{off,len}` — `off` into `g_mod`'s raw
+  bytes). Modes 0/2 (active) still copy into linear memory at decode
+  time exactly as before, but now ALSO get `len` zeroed immediately
+  after — matching the spec's "an active segment behaves as if
+  `data.drop`'d right after instantiation" rule. Mode 1 (passive) just
+  records the byte range for a later `memory.init`. `len==0` doubles as
+  the "dropped" state — no separate flag needed, since `data.drop`
+  writing `len=0` and the auto-drop-after-init case are literally the
+  same operation.
+- `SEC_ELEM` gets the identical treatment: `g_elem[]` (`WElem{off,len}`,
+  `off` indexing a new flat `g_elemvals[]` funcidx pool) covers modes
+  0/2 (active — still fill the table immediately, then auto-drop) and
+  1/3 (passive / declarative — declarative starts pre-dropped, since
+  it exists only for `ref.func` validation and is never `table.init`-able).
+  Modes 4-7 (the reftype/expr-vector encoding, needed only for non-
+  funcref reference types) still die as unsupported — not needed by
+  anything racccoon runs today.
+- Five new `0xfc` subops: `memory.init`(8), `data.drop`(9),
+  `table.init`(12), `elem.drop`(13), `table.copy`(14, overlap-safe like
+  `memory.copy`). `table.grow`/`size`/`fill` (the reference-types
+  proposal, not part of passive-segment support) still unimplemented.
+- `next_instr`'s load-time scanner extended for the three new
+  multi-immediate subops (2 LEB128 each for `memory.init`/`table.init`/
+  `table.copy`, 1 for `data.drop`/`elem.drop`) — same class of bug the
+  previous entry's bulk-memory scanner fix caught, would have desynced
+  the block sidetable for any function using them.
+
+**New fixtures** (`test/mkwasm.py`, `wasmtest` sweep 11 → 13 fixtures):
+`datainit.wasm` (passive data segment → `memory.init` → `data.drop` →
+a second `memory.init` with `n=0` post-drop, which must NOT trap even
+though the segment is now empty — → `156`) and `tableinit.wasm`
+(passive element segment → `table.init` → `elem.drop` → `table.copy`,
+verified via `call_indirect` through all four resulting table slots →
+`99`).
+
+**Found and fixed a real, unrelated latent bug along the way**: the
+first `datainit.wasm` run showed `ls`'s directory listing splicing
+`datainit.wasm`'s entry together with the unrelated `My Long File
+Name.txt` entry into `datainit.wasmName.txt`. Root cause: FAT32's VFAT
+long-filename decoder (`user/fs/fat32.c3`, `fat32_lfn_finish`) finds a
+reconstructed name's length by scanning `lfn_buf` for the first zero
+byte — but per the VFAT spec, when a name's length is an *exact*
+multiple of 13 (`fat32_lfn_finish`'s 13-UTF16-chars-per-entry unit —
+`datainit.wasm` is exactly 13 characters), the last LFN entry is
+entirely full of real characters with **no terminator at all**, and
+`lfn_buf` is one buffer the caller reuses across every directory entry
+in a scan without clearing it between files — so the scan ran straight
+past the real name into whatever the *previous* file's longer name had
+left behind at higher offsets. Fixed by zeroing the whole `lfn_buf`
+whenever a fresh LFN chain begins (`fat32_lfn_feed`'s `is_last`
+branch) — any file whose long name lands on a 13-character boundary
+(13, 26, 39, …) would have hit this. ext2 (the real Duo's actual root
+fs) has no LFN concept and was never affected.
+
+**Verified in QEMU**: full `wasmtest` sweep (13 fixtures) green on
+both the FAT32 image (`disk.img`, where the LFN bug above was caught
+and fixed) and the ext2 image (`disk_ext2.img`, the real Duo's fs
+topology) — `datainit.wasm` → `156`, `tableinit.wasm` → `99`, no
+regressions on any of the other 11.
+
+**Verified on real Milk-V Duo — with a detour worth recording.** First
+attempt: `bulkmem.wasm` ran fine (`367`), then `wasm
+/tmp/datainit.wasm` hung indefinitely (60+ s, no output, no prompt —
+and racccoon's shell has no `^C`/signal support, so recovering needed
+a physical power-cycle). Next boot's own SD-card cold-start flaked
+independently (`ACMD41 gave up` → supervisor respawned `sdd` → `fsd`'s
+one-shot ext2-mount attempt had already failed against the pre-respawn
+card and never retried — a real but separate gap: `fsd` doesn't
+re-attempt its mount after a driver it depends on gets respawned later
+in the same boot). A second power-cycle gave a clean boot: `datainit.wasm`
+then ran instantly and correctly **6/6** times in a row, plus
+`tableinit.wasm` and `bulkmem.wasm` clean, across a full fixture
+re-sweep. Conclusion: the original hang almost certainly was not a bug
+in the new opcode logic (which is now byte-for-byte the same binary
+that ran clean 6/6 afterward) but a symptom of the same class of
+transient hardware/driver init flakiness independently observed on the
+very next boot — consistent with this project's prior experience that
+an unreproducing hang deserves a real control experiment before being
+attributed to new code (see the compare_fps / SYS_EXIT-hang entries
+below). Not chasing further since it didn't reproduce once isolated;
+noted here in case it resurfaces.
+
+**Also noted, not fixed (separate, pre-existing gap):** `fsd` mounting
+once at boot and never retrying if the block driver it depends on
+(`sdd`) gets supervisor-respawned later in the same boot — surfaced by
+the second power-cycle above, unrelated to WASM. Worth a look if it
+recurs.
+
+**Files changed:** `user/bin/wasm.c3` (new opcodes + segment tables +
+scanner fix), `user/fs/fat32.c3` (LFN buffer-reuse fix),
+`test/mkwasm.py` (two new fixtures), `user/shell_test.c3` (`wasmtest`
+sweep, 11 → 13).
+
+---
+
 ## 2026-09-05 — WASM bulk-memory: `memory.copy` (overlap-safe) + `memory.fill`
 
 Parked the c3c self-host arc (previous entries) and picked up

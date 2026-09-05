@@ -190,6 +190,80 @@ code = [body([], start_body)]
 fixtures["bulkmem.wasm"] = module(t, imp, fn, exp, code, mem=mem, data=data)
 
 
+# --- datainit.wasm : memory.init (passive) + data.drop -> "156" -------
+# (roadmap §4 bulk-memory follow-up, part 2.) Data segment 0 is
+# passive: [10,20,30,40,50]. Segment 1 is active @ offset 0: [1,2,3]
+# (auto-dropped right after instantiation, per spec). memory.init(dst=
+# 10, src=0, n=5, seg#0) copies segment 0 into mem[10..14]; data.drop(0)
+# then marks it dropped; a second memory.init(dst=20, src=0, n=0, seg#0)
+# is a no-op that must NOT trap even though the segment is now empty
+# (n=0 never traps). Sum of mem[0..14] as unsigned bytes:
+# (1+2+3) + 0*7 + (10+20+30+40+50) = 6 + 150 = 156.
+t = [functype([], []), functype([I32], [])]
+imp = [import_func("racccoon", "print_i32", 1)]           # funcidx 0
+fn  = [0]                                                  # funcidx 1: _start
+exp = [export_func("_start", 1)]
+mem = b"\x00" + uleb(1)
+I32_LOAD8_U = lambda off: b"\x2d\x00" + uleb(off)
+MEMORY_INIT = lambda di: b"\xfc" + uleb(8) + uleb(di) + uleb(0)   # data idx, reserved memidx
+DATA_DROP   = lambda di: b"\xfc" + uleb(9) + uleb(di)
+data = [
+    uleb(1) + uleb(5) + bytes([10, 20, 30, 40, 50]),        # segment 0: passive
+    uleb(0) + i32c(0) + END + uleb(3) + bytes([1, 2, 3]),   # segment 1: active @ 0
+]
+loads = [i32c(0) + I32_LOAD8_U(k) for k in range(15)]
+sum_body = loads[0]
+for l in loads[1:]:
+    sum_body += l + I32_ADD
+start_body = (
+    i32c(10) + i32c(0) + i32c(5) + MEMORY_INIT(0) +
+    DATA_DROP(0) +
+    i32c(20) + i32c(0) + i32c(0) + MEMORY_INIT(0) +   # post-drop, n=0: must not trap
+    sum_body + call(0)
+)
+code = [body([], start_body)]
+fixtures["datainit.wasm"] = module(t, imp, fn, exp, code, mem=mem, data=data)
+
+
+# --- tableinit.wasm : table.init (passive) + elem.drop + table.copy ---
+# -> "99". Element segment 0 is passive: [funcA, funcB]. Segment 1 is
+# active @ table offset 2: [funcC] (auto-dropped right after
+# instantiation). table.init(dst=0, src=0, n=2, seg#0) fills table[0]=
+# funcA, table[1]=funcB; elem.drop(0) then marks it dropped;
+# table.copy(dst=3, src=2, n=1) duplicates table[2] (funcC) into
+# table[3]. call_indirect through slots 0..3: funcA(11) + funcB(22) +
+# funcC(33) + funcC-via-copy(33) = 99.
+t = [functype([], []), functype([I32], []), functype([], [I32])]
+imp = [import_func("racccoon", "print_i32", 1)]     # funcidx 0
+fn  = [2, 2, 2, 0]                                  # funcidx 1:A 2:B 3:C 4:_start
+exp = [export_func("_start", 4)]
+table = b"\x70\x00" + uleb(4)                       # funcref, min 4
+TABLE_INIT = lambda ei: b"\xfc" + uleb(12) + uleb(ei) + uleb(0)   # elem idx, reserved tableidx
+ELEM_DROP  = lambda ei: b"\xfc" + uleb(13) + uleb(ei)
+TABLE_COPY = b"\xfc" + uleb(14) + uleb(0) + uleb(0)               # reserved dst/src tableidx
+CALL_IND = lambda ti: b"\x11" + uleb(ti) + b"\x00"
+elems = [
+    uleb(1) + bytes([0x00]) + vec([uleb(1), uleb(2)]),      # passive: [funcA, funcB]
+    uleb(0) + i32c(2) + END + vec([uleb(3)]),               # active @ table[2]: [funcC]
+]
+code = [
+    body([], i32c(11)),   # funcA
+    body([], i32c(22)),   # funcB
+    body([], i32c(33)),   # funcC
+    body([], (
+        i32c(0) + i32c(0) + i32c(2) + TABLE_INIT(0) +
+        ELEM_DROP(0) +
+        i32c(3) + i32c(2) + i32c(1) + TABLE_COPY +
+        i32c(0) + CALL_IND(2) +
+        i32c(1) + CALL_IND(2) + I32_ADD +
+        i32c(2) + CALL_IND(2) + I32_ADD +
+        i32c(3) + CALL_IND(2) + I32_ADD +
+        call(0)
+    )),
+]
+fixtures["tableinit.wasm"] = module(t, imp, fn, exp, code, table=table, elems=elems)
+
+
 # --- fac.wasm : recursion + if/else -> fac(5) = "120" -----------------
 # type 0: () -> ()        _start
 # type 1: (i32) -> ()     racccoon.print_i32

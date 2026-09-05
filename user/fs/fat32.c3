@@ -375,6 +375,16 @@ fn void fat32_lfn_feed(char* entry, char* lfn_buf, int* io_expected_seq, char* i
 			*io_valid = false;
 			return;
 		}
+		// A fresh chain starts here — clear the whole buffer first.
+		// lfn_buf is one caller-owned array reused across every
+		// directory entry in the scan, and a name whose length is an
+		// exact multiple of 13 fills its last (first-written) entry
+		// with real characters and no 0x0000/0xFFFF terminator at all
+		// (per VFAT spec, not a bug in this entry). Without this reset,
+		// fat32_lfn_finish's terminator scan would run past those 13*N
+		// real chars into whatever the PREVIOUS file's longer name left
+		// behind at higher offsets, splicing its tail onto this name.
+		for (int z = 0; z < FAT32_LFN_NAME_MAX; z++) { lfn_buf[z] = 0; }
 		for (int i = 0; i < 13; i++) lfn_buf[(seq - 1) * 13 + i] = chars[i];
 		*io_checksum = entry[FAT32_LFN_CHECKSUM];
 		*io_expected_seq = seq - 1;

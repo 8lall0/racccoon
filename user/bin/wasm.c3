@@ -22,6 +22,9 @@ import std::nolibc::mem;
 // reinterpret/promote/demote. Hardware FP (§3): the operators lower to
 // fadd.d etc. directly; sqrt and the roundings use small @naked asm.
 //
+// Bulk-memory follow-up: memory.copy/fill, memory.init/data.drop, and
+// table.init/elem.drop/table.copy for passive data/element segments.
+//
 // Next: milestone 3 — real compiled programs (raise limits, decide
 // AssemblyScript / `env` import compat).
 //
@@ -170,13 +173,17 @@ const uint FC_I32_TRUNC_SAT_F32_S = 0; const uint FC_I32_TRUNC_SAT_F32_U = 1;
 const uint FC_I32_TRUNC_SAT_F64_S = 2; const uint FC_I32_TRUNC_SAT_F64_U = 3;
 const uint FC_I64_TRUNC_SAT_F32_S = 4; const uint FC_I64_TRUNC_SAT_F32_U = 5;
 const uint FC_I64_TRUNC_SAT_F64_S = 6; const uint FC_I64_TRUNC_SAT_F64_U = 7;
-// bulk-memory (roadmap §4 follow-up): memory.copy/memory.fill only —
-// the "easy" half (bounds-checked memmove/memset, no passive segments).
-// memory.init/data.drop need SEC_DATA to track passive segments (mode
-// 1/2), which decode_data (active-only today) doesn't; table.*
-// likewise needs SEC_ELEM passive-segment tracking. Left for later.
+// bulk-memory (roadmap §4 follow-up). memory.copy/memory.fill (the
+// "easy" half — bounds-checked memmove/memset, no passive segments)
+// plus memory.init/data.drop and table.init/elem.drop/table.copy for
+// passive data/element segments (SEC_DATA/SEC_ELEM mode 1, and mode 2/3
+// where practical — see decode_data/decode_elem). table.grow/size/fill
+// (reference-types proposal, not needed for passive segments) still
+// unimplemented.
 const uint FC_MEMORY_INIT = 8;  const uint FC_DATA_DROP  = 9;
 const uint FC_MEMORY_COPY = 10; const uint FC_MEMORY_FILL = 11;
+const uint FC_TABLE_INIT  = 12; const uint FC_ELEM_DROP  = 13;
+const uint FC_TABLE_COPY  = 14;
 
 const int WPAGE = 65536;             // wasm linear-memory page size
 const int MEM_HARD_CAP_PAGES = 240;  // ~15 MiB — under HEAP_MAX_BYTES with room for the other allocs
@@ -206,6 +213,9 @@ const int MODULE_MAX   = 512 * 1024;
 const int BLOCKS_MAX   = 4096;   // block/loop/if opcodes across the whole module
 const int CTL_MAX      = 1024;   // active control-stack entries
 const int SCAN_MAX     = 512;    // block nesting depth during the load-time scan
+const int DATA_MAX     = 128;    // data segments (active + passive)
+const int ELEM_MAX     = 64;     // element segments (active + passive)
+const int ELEM_VALS_MAX = 4096;  // total funcidx values across all element segments
 
 // blocktype byte
 const char BT_VOID = 0x40;
@@ -264,6 +274,21 @@ struct WCtl
     char arity;
 }
 
+// a data segment (SEC_DATA). `off`/`len` point into g_mod's raw bytes.
+// An active segment (mode 0/2) is copied into linear memory at decode
+// time, then immediately treated as dropped (len=0) — matching the
+// spec's "active segments behave as if data.drop'd right after
+// instantiation". `len==0` IS the dropped state; data.drop just zeroes
+// it, no separate flag needed.
+struct WData { uint off; uint len; }
+
+// an element segment (SEC_ELEM), same shape: `off` indexes into the
+// flat g_elemvals funcidx pool, `len` is the live element count (0 =
+// dropped, including declarative segments which start dropped and
+// active segments which are auto-dropped right after filling the
+// table).
+struct WElem { int off; int len; }
+
 // --- module state (all map_pages'd in wasm_alloc) ---------------------
 char*   g_mod;      uint g_mod_len;
 WType*  g_types;    int  g_ntypes;
@@ -285,6 +310,10 @@ WCtl*   g_ctl;      int  g_ctop;
 
 int*    g_table;    int  g_table_len; // funcref table: slot -> funcidx (-1 = null)
 int     g_start_func = -1;            // SEC_START, run before _start
+
+WData*  g_data;     int  g_ndata;         // data segments (memory.init/data.drop)
+WElem*  g_elem;     int  g_nelem;         // element segments (table.init/elem.drop/table.copy)
+int*    g_elemvals; int  g_nelemvals;     // flat funcidx pool referenced by g_elem[].off
 
 // argv for the host `arg` import — set in main
 String[] g_args;
@@ -519,23 +548,64 @@ fn void decode_table(Cur* c)
     for (int i = 0; i < g_table_len; i++) { g_table[i] = -1; }
 }
 
+// SEC_ELEM=9. Modes 0/2 are active (funcidx vector, applied to the
+// table immediately, then auto-dropped — see WElem's doc comment);
+// modes 1/3 are passive/declarative (funcidx vector, kept live for a
+// later table.init unless mode 3, which starts dropped since
+// declarative segments are never table.init'able, only there for
+// ref.func validation). Modes 4-7 (the reftype/expr-vector encoding,
+// needed only for non-funcref reference types) are not supported.
 fn void decode_elem(Cur* c)
 {
     uint n = read_u32(c);
+    if ((int)n > ELEM_MAX) { die("too many element segments"); }
+    g_nelem = (int)n;
     for (uint i = 0; i < n; i++)
     {
         uint mode = read_u32(c);
-        if (mode != 0) { die("non-active element segment unsupported"); }
-        long off = read_const_expr(c);   // table offset (i32)
-        uint cnt = read_u32(c);
-        for (uint k = 0; k < cnt; k++)
+        WElem* el = &g_elem[i];
+        if (mode == 0 || mode == 2)
         {
-            uint fidx = read_u32(c);
-            long slot = off + (long)k;
-            if (slot < 0 || slot >= g_table_len) { die("element out of table bounds"); }
-            if ((int)fidx >= g_nfuncs) { die("element funcidx"); }
-            g_table[slot] = (int)fidx;
+            if (mode == 2)
+            {
+                uint tidx = read_u32(c);
+                if (tidx != 0) { die("multi-table unsupported"); }
+            }
+            long off = read_const_expr(c);   // table offset (i32)
+            uint cnt = read_u32(c);
+            if (g_nelemvals + (int)cnt > ELEM_VALS_MAX) { die("too many element values"); }
+            int base = g_nelemvals;
+            for (uint k = 0; k < cnt; k++)
+            {
+                uint fidx = read_u32(c);
+                long slot = off + (long)k;
+                if (slot < 0 || slot >= g_table_len) { die("element out of table bounds"); }
+                if ((int)fidx >= g_nfuncs) { die("element funcidx"); }
+                g_table[slot] = (int)fidx;
+                g_elemvals[base + (int)k] = (int)fidx;
+            }
+            g_nelemvals += (int)cnt;
+            el.off = base;
+            el.len = 0;                 // active: auto-dropped right after init
         }
+        else if (mode == 1 || mode == 3)
+        {
+            char ek = cur_byte(c);       // elemkind — only funcref (0x00) supported
+            if (ek != 0) { die("non-funcref element segment unsupported"); }
+            uint cnt = read_u32(c);
+            if (g_nelemvals + (int)cnt > ELEM_VALS_MAX) { die("too many element values"); }
+            int base = g_nelemvals;
+            for (uint k = 0; k < cnt; k++)
+            {
+                uint fidx = read_u32(c);
+                if ((int)fidx >= g_nfuncs) { die("element funcidx"); }
+                g_elemvals[base + (int)k] = (int)fidx;
+            }
+            g_nelemvals += (int)cnt;
+            el.off = base;
+            el.len = mode == 3 ? 0 : (int)cnt;   // declarative: never usable, starts dropped
+        }
+        else { die("non-funcref element segment unsupported"); }
     }
 }
 
@@ -618,26 +688,50 @@ fn void decode_mem(Cur* c)
     g_has_mem = true;
 }
 
-// SEC_DATA=11 — active data segments only (mode 0: memidx implicit 0,
-// offset is a const expr). Runs after decode_mem alloc'd g_mem.
+// SEC_DATA=11. Modes 0/2 are active (memidx implicit 0 / explicit,
+// offset is a const expr) — copied into linear memory here, then
+// auto-dropped (len=0), same reasoning as decode_elem. Mode 1 is
+// passive: just a byte vector, kept live in g_mod for a later
+// memory.init. Runs after decode_mem alloc'd g_mem.
 fn void decode_data(Cur* c)
 {
     uint n = read_u32(c);
+    if ((int)n > DATA_MAX) { die("too many data segments"); }
+    g_ndata = (int)n;
     for (uint i = 0; i < n; i++)
     {
         uint mode = read_u32(c);
-        if (mode != 0) { die("passive/explicit data segment unsupported"); }
-        // offset expr: a single i32.const then END
-        if (cur_byte(c) != OP_I32_CONST) { die("data offset not i32.const"); }
-        int off = read_i32(c);
-        if (cur_byte(c) != OP_END) { die("data offset not END-terminated"); }
-        uint len = read_u32(c);
-        if (len > c.end - c.p) { die("data segment past end"); }
-        if (!g_has_mem) { die("data segment with no memory"); }
-        long lim = (long)g_mem_pages * WPAGE;
-        if (off < 0 || (long)off + (long)len > lim) { die("data segment out of bounds"); }
-        for (uint k = 0; k < len; k++) { g_mem[(uint)off + k] = g_mod[c.p + k]; }
-        c.p += len;
+        WData* d = &g_data[i];
+        if (mode == 0 || mode == 2)
+        {
+            if (mode == 2)
+            {
+                uint midx = read_u32(c);
+                if (midx != 0) { die("multi-memory unsupported"); }
+            }
+            // offset expr: a single i32.const then END
+            if (cur_byte(c) != OP_I32_CONST) { die("data offset not i32.const"); }
+            int off = read_i32(c);
+            if (cur_byte(c) != OP_END) { die("data offset not END-terminated"); }
+            uint len = read_u32(c);
+            if (len > c.end - c.p) { die("data segment past end"); }
+            if (!g_has_mem) { die("data segment with no memory"); }
+            long lim = (long)g_mem_pages * WPAGE;
+            if (off < 0 || (long)off + (long)len > lim) { die("data segment out of bounds"); }
+            for (uint k = 0; k < len; k++) { g_mem[(uint)off + k] = g_mod[c.p + k]; }
+            d.off = c.p;
+            d.len = 0;               // active: auto-dropped right after init
+            c.p += len;
+        }
+        else if (mode == 1)
+        {
+            uint len = read_u32(c);
+            if (len > c.end - c.p) { die("data segment past end"); }
+            d.off = c.p;
+            d.len = len;
+            c.p += len;
+        }
+        else { die("bad data segment mode"); }
     }
 }
 
@@ -744,11 +838,15 @@ fn char next_instr(Cur* c)
     else if ((uint)op == 0xfc)
     {
         uint sub = read_u32(c);
-        // memory.copy: 2 reserved memidx bytes; memory.fill: 1. Both
-        // LEB128-encoded (always 0x00 in the MVP single-memory case),
-        // so read_u32 (not a raw byte skip) reads them correctly.
-        if (sub == FC_MEMORY_COPY) { read_u32(c); read_u32(c); }
-        else if (sub == FC_MEMORY_FILL) { read_u32(c); }
+        // memory.init/table.init/table.copy: 2 LEB128 immediates
+        // (segment idx + reserved mem/tableidx, or dst/src tableidx for
+        // table.copy); memory.copy: 2 (reserved dst/src memidx);
+        // memory.fill/data.drop/elem.drop: 1. All always-0x00 in the
+        // MVP single-memory/single-table case, so read_u32 (not a raw
+        // byte skip) reads them correctly regardless.
+        if (sub == FC_MEMORY_INIT || sub == FC_MEMORY_COPY
+         || sub == FC_TABLE_INIT || sub == FC_TABLE_COPY) { read_u32(c); read_u32(c); }
+        else if (sub == FC_MEMORY_FILL || sub == FC_DATA_DROP || sub == FC_ELEM_DROP) { read_u32(c); }
     }
     // everything else: no immediates
     return op;
@@ -1538,6 +1636,60 @@ fn void interp()
                         uint fd = (uint)vpop();
                         char* fdst = mem_ptr(fd, fn_);
                         for (uint i = 0; i < fn_; i++) { fdst[i] = fval; }
+                    // memory.init: stack [d, s, n] (dest mem addr, src
+                    // offset into the data segment, count). dseg.len is
+                    // 0 once dropped (active segments auto-drop right
+                    // after decode) so an out-of-range n>0 correctly
+                    // traps post-drop, while n=0 stays a no-op.
+                    case FC_MEMORY_INIT:
+                        uint midi = imm_u32(fr);
+                        imm_u32(fr);                // reserved memidx (always 0)
+                        uint min_ = (uint)vpop();
+                        uint mis = (uint)vpop();
+                        uint mid = (uint)vpop();
+                        if ((int)midi >= g_ndata) { die("memory.init: bad data index"); }
+                        WData* dseg = &g_data[midi];
+                        if ((long)mis + (long)min_ > (long)dseg.len) { die("memory.init: source out of bounds"); }
+                        char* midst = mem_ptr(mid, min_);
+                        for (uint i = 0; i < min_; i++) { midst[i] = g_mod[dseg.off + mis + i]; }
+                    case FC_DATA_DROP:
+                        uint ddi = imm_u32(fr);
+                        if ((int)ddi >= g_ndata) { die("data.drop: bad data index"); }
+                        g_data[ddi].len = 0;
+                    // table.init: stack [d, s, n] (dest table slot, src
+                    // offset into the element segment, count).
+                    case FC_TABLE_INIT:
+                        uint tii = imm_u32(fr);      // element segment index
+                        imm_u32(fr);                 // reserved tableidx (always 0)
+                        uint tin = (uint)vpop();
+                        uint tis = (uint)vpop();
+                        uint tid = (uint)vpop();
+                        if ((int)tii >= g_nelem) { die("table.init: bad elem index"); }
+                        WElem* eseg = &g_elem[tii];
+                        if ((long)tis + (long)tin > (long)eseg.len) { die("table.init: source out of bounds"); }
+                        if ((long)tid + (long)tin > (long)g_table_len) { die("table.init: dest out of bounds"); }
+                        for (uint i = 0; i < tin; i++) { g_table[tid + i] = g_elemvals[eseg.off + (int)tis + (int)i]; }
+                    case FC_ELEM_DROP:
+                        uint edi = imm_u32(fr);
+                        if ((int)edi >= g_nelem) { die("elem.drop: bad elem index"); }
+                        g_elem[edi].len = 0;
+                    // table.copy: stack [d, s, n], all table slots.
+                    // Overlap-safe like memory.copy.
+                    case FC_TABLE_COPY:
+                        imm_u32(fr); imm_u32(fr);    // reserved dst/src tableidx (always 0)
+                        uint tcn = (uint)vpop();
+                        uint tcs = (uint)vpop();
+                        uint tcd = (uint)vpop();
+                        if ((long)tcs + (long)tcn > (long)g_table_len) { die("table.copy: source out of bounds"); }
+                        if ((long)tcd + (long)tcn > (long)g_table_len) { die("table.copy: dest out of bounds"); }
+                        if (tcd <= tcs)
+                        {
+                            for (uint i = 0; i < tcn; i++) { g_table[tcd + i] = g_table[tcs + i]; }
+                        }
+                        else
+                        {
+                            for (uint i = tcn; i > 0; i--) { g_table[tcd + i - 1] = g_table[tcs + i - 1]; }
+                        }
                     default: die("unimplemented 0xfc subop");
                 }
 
@@ -1586,6 +1738,9 @@ fn void main(String[] args)
     g_blocks   = (WBlock*)wasm_alloc((uint)(BLOCKS_MAX * WBlock::size));
     g_ctl      = (WCtl*)wasm_alloc((uint)(CTL_MAX * WCtl::size));
     g_table    = (int*)wasm_alloc((uint)(TABLE_MAX * 4));
+    g_data     = (WData*)wasm_alloc((uint)(DATA_MAX * WData::size));
+    g_elem     = (WElem*)wasm_alloc((uint)(ELEM_MAX * WElem::size));
+    g_elemvals = (int*)wasm_alloc((uint)(ELEM_VALS_MAX * 4));
 
     // args after the .wasm path are the guest program's argv (host `arg`)
     g_args = args[1..];
