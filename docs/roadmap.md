@@ -248,9 +248,23 @@ not bourne. Interleaved with §1/§2 rather than a phase of its own.
   builtins (`cd`, `su`, `mount`, …) stay out — a child can't deliver
   their effect; they 127 in a pipeline.
 
+**Scripts + control flow. DONE** (2026-09-05 devlog) —
+- `/bin/test` + `[`, `/bin/expr` (the condition primitives).
+- `. file` / `source`, `#!`-first files run by name, `$1`..`$9` /
+  `$#` / `$*`.
+- `shell_exec_block()` — a statement-splitter layer over
+  `shell_exec_line()`. `if (COND) BODY [else BODY]`, `for (VAR in
+  WORD...) BODY`, `while (COND) BODY`, `break` / `continue`;
+  `NAME=value` shell-locals; `` `{cmd} `` / `` `cmd` `` command
+  substitution. Multi-line at the interactive prompt via a `> `
+  continuation reader (production shell); the test shell does
+  single-line control flow + `. script` for multi-line.
+- Known gap: `"$x"` with `x` empty produces no argv word (`test -n
+  "$x"` misfires) — pre-existing tokeniser limitation, workaround
+  `test $# -ge 1` / `test x$x = x`.
+
 **Still to do:**
-- `#!` scripts + `if` / `for` / `while` — the big structural one, much
-  later.
+- proper functions (`fn name { }`), `switch` / `case` — not needed yet.
 
 ---
 

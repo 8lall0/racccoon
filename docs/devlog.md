@@ -4,6 +4,69 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — Shell scripts + control flow (§2.5's last big item)
+
+`#!` scripts + `if` / `for` / `while` — the roadmap called this "the big
+structural one". Staged S1–S5, each committed and QEMU-verified (FAT32 +
+ext2); real-Duo verification (the production shell's multi-line prompt)
+is S6, pending a reflash.
+
+- **S1** (`752d791`) — `/bin/test` + `[`, `/bin/expr`. `test`:
+  `-e/-f/-d/-s PATH`, `-z/-n STR`, `S1 =/!= S2`, `N -eq/-ne/-lt/-le/-gt/
+  -ge N`, `!`, one-arg non-empty; `[` drops a trailing `]`, same
+  binary. `expr`: `+ - * / %` with `* / %` binding tighter, plus
+  `S1 OP S2` comparison. Both on the std::io /bin path.
+- **S2** (`0478fde`) — `. file` / `source`, and a `#!`-first file run by
+  name (shell_exec_external peeks the first two bytes of what exec would
+  load and interprets it — racccoon's exec can't run shell text).
+  Scripts run line-by-line in the current shell (no re-exec). `$1`..`$9`
+  / `$#` / `$*` (shell_words.c3's `sh_read_varname` handles `$digit` /
+  `$#` / `$*`). `exit` in a script unwinds it instead of killing the
+  interactive shell.
+- **S3** (`8e46b45`) — `shell_exec_block()`, the new top layer:
+  splits a text blob (newlines / `;` / `{ }`) into statements and runs
+  each; `if (COND) BODY [else BODY]` (BODY a `{ }` group or a bare
+  statement, nested / `else if` by recursion) and `NAME=value`
+  shell-locals live here, everything else flows through
+  `shell_exec_line` unchanged. Parses in place (temporary NUL at each
+  statement end) — no per-recursion buffer. `shell_run_script` feeds
+  the whole file to it, so scripts get multi-line control flow. The
+  production shell reads a *block* now — `shell_read_block` /
+  `shell_text_balanced` give a `> ` continuation prompt while a `(` /
+  `{` / quote is open.
+- **S4 + S5** (`ecb2164`) — `for (VAR in WORD...) BODY` (list
+  `$var`-expanded, whitespace-split, `* ?` globbed), `while (COND) BODY`
+  (1e6-iteration guard), `break` / `continue` (gated on
+  `g_shell_loop_depth`, propagate through `{ }` and `if`). Command
+  substitution `` `{cmd} `` (rc's form) and `` `cmd` `` — one command
+  (no pipeline) with stdout to a pipe, drained, trailing newlines
+  trimmed, internal newlines → spaces. That's what makes a `while`
+  counter usable: `i=`expr $i + 1``.
+
+**Verified (QEMU FAT32 + ext2)**: `test`/`expr` all forms; `. /greet.rc`
+with 0 / file / dir args exercising positional params, locals, nested
+if/else, `for`, `while` with a `` `expr` `` counter, `break`/`continue`
+in a `for (n in 1..5)`; `for (f in *.c3)`; `n=`whoami``; a
+multi-statement `while` body on one line at the prompt; no wasmtest /
+killtest / rforktest / oomtest / maptest regression. Fixture
+`disk/greet.rc` + `disk-ext2/greet.rc` on the images.
+
+**Known gap** (pre-existing, not this work): `"$x"` where `x` is
+empty/unset produces no argv word rather than an empty one, so
+`test -n "$x"` misfires. Workaround `test $# -ge 1` / `test x$x = x`. A
+real fix needs empty-quoted-word tracking through the tokeniser.
+
+**S6 pending**: reflash the Duo (production `shell.c3`, which is the
+one with the multi-line `> ` continuation prompt — untested since the
+test shell keeps its single-line reader) and run the same script sweep.
+
+**Files**: `user/bin/test.c3` + `user/bin/expr.c3` (new),
+`user/shell_words.c3`, `user/shell_common.c3`, `user/shell.c3`,
+`user/shell_test.c3`, `disk/greet.rc` + `disk-ext2/greet.rc` (new),
+`scripts/build.sh`, `scripts/build_user.sh`, `scripts/populate_duo_bin.sh`.
+
+---
+
 ## 2026-09-05 — SMP scheduler, Stage C (C1 + C2) on branch `smp-stage-c`, C3 parked
 
 Roadmap §8. After Stages A + B (below, on master, Duo-verified), Stage C
