@@ -1594,34 +1594,51 @@ fn int shell_do_for(char* s)
         while (wexp[wi] == ' ' && wqm[wi] == 0) { wi++; }
         if (wexp[wi] == 0) { break; }
 
-        // one word -> wbuf, SH_QMARK stripped, tracking an unquoted metachar
+        // one word -> wbuf (SH_QMARK stripped), wqmb its qmask, tracking
+        // an unquoted `{` for brace expansion.
         char[256] wbuf @noinit;
+        char[256] wqmb @noinit;
         int wb = 0;
-        bool has_meta = false;
+        bool has_brace = false;
         while (wexp[wi] != 0 && !(wexp[wi] == ' ' && wqm[wi] == 0)) {
             if (wexp[wi] != SH_QMARK) {
-                if (wb < 255) { wbuf[wb] = wexp[wi]; wb++; }
-                if (wqm[wi] == 0 && (wexp[wi] == '*' || wexp[wi] == '?')) { has_meta = true; }
+                if (wb < 255) { wbuf[wb] = wexp[wi]; wqmb[wb] = wqm[wi]; wb++; }
+                if (wqm[wi] == 0 && wexp[wi] == '{') { has_brace = true; }
             }
             wi++;
         }
         wbuf[wb] = 0;
-        char* word = &wbuf[0];
 
-        char[512] gnames @noinit;
-        int gnb = 0;
-        char*[16] gwords @noinit;
-        int gsw = 0;
-        int gn = has_meta ? shell_glob_into(word, &gnames[0], &gnb, 512, &gwords[0], &gsw, 16) : 0;
+        // `for (i in {1,2,3})` / `pre{a,b}post` — brace-expand the word
+        // first (rc: per word, before globbing).
+        char[512] bbuf @noinit;
+        int bbo = 0;
+        char*[16] bres @noinit;
+        int brn = 0;
+        if (has_brace) { shell_brace_expand(&wbuf[0], &wqmb[0], &bbuf[0], &bbo, 512, &bres[0], &brn, 16); }
+        int bn = (has_brace && brn > 0) ? brn : 1;
 
-        int matches = gn > 0 ? gn : 1;
-        for (int m = 0; m < matches; m++) {
-            char* iter = gn > 0 ? gwords[m] : word;
-            shell_local_set(&loopvar[0], iter);
-            int after = 0;
-            st = sh_run_body(s, body_at, true, &after);
-            if (g_shell_loop_continue) { g_shell_loop_continue = false; continue; }
-            if (g_shell_loop_break || g_shell_script_stop) { break; }
+        bool stop = false;
+        for (int bi = 0; bi < bn && !stop; bi++) {
+            char* word = (has_brace && brn > 0) ? bres[bi] : &wbuf[0];
+
+            bool has_meta = false;
+            for (int g = 0; word[g] != 0; g++) { if (word[g] == '*' || word[g] == '?') { has_meta = true; break; } }
+            char[512] gnames @noinit;
+            int gnb = 0;
+            char*[16] gwords @noinit;
+            int gsw = 0;
+            int gn = has_meta ? shell_glob_into(word, &gnames[0], &gnb, 512, &gwords[0], &gsw, 16) : 0;
+
+            int matches = gn > 0 ? gn : 1;
+            for (int m = 0; m < matches; m++) {
+                char* iter = gn > 0 ? gwords[m] : word;
+                shell_local_set(&loopvar[0], iter);
+                int after = 0;
+                st = sh_run_body(s, body_at, true, &after);
+                if (g_shell_loop_continue) { g_shell_loop_continue = false; continue; }
+                if (g_shell_loop_break || g_shell_script_stop) { stop = true; break; }
+            }
         }
         if (g_shell_loop_break || g_shell_script_stop) { break; }
     }

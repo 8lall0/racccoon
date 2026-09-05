@@ -952,41 +952,55 @@ fn int pipe_write(int id, char* buf, int len) @export("pipe_write") { return sys
 fn int pipe_hold(int id, int as_writer, int delta) @export("pipe_hold") { return syscall(SYS_PIPE_HOLD, id, as_writer, delta); }
 
 // Fill `out` (must be >= 100 bytes) with `rel` resolved against the
-// caller's cwd. Absolute paths (and the empty path = root) pass through
-// unchanged; a relative path from the root cwd also passes through
-// unchanged (it was already root-relative before cwd existed). No `.`
-// / `..` collapsing here — the shell's `cd` normalises those into the
-// stored cwd, and `cat ../x` from a non-root dir just won't resolve for
-// now.
+// caller's cwd, collapsing `.` / `..` / `//`. An absolute `rel` is
+// normalised too (`/a/../b` -> `/b`). The empty path means "the cwd".
+// `..` at the root stays at the root. Matches the shell's own
+// shell_resolve_path — needed because e.g. FAT32's fsd won't resolve a
+// literal `.` path component the way ext2 happens to (`ls .`, `echo
+// *.wasm` whose glob dir is `.`).
 fn void fs_abspath(char* rel, char* out) @export("fs_abspath") {
-    // Absolute: pass through.
-    if (rel[0] == '/') {
-        int i = 0;
-        while (rel[i] != 0 && i < 99) { out[i] = rel[i]; i++; }
-        out[i] = 0;
-        return;
+    // Un-normalised form first: absolute rel as-is, else cwd + "/" + rel.
+    char[128] raw @noinit;
+    int r = 0;
+    bool absolute = rel[0] == '/';
+    if (absolute) {
+        while (rel[r] != 0 && r < 127) { raw[r] = rel[r]; r++; }
+    } else {
+        char[100] cw @noinit;
+        int n = getcwd(&cw[0], 100);
+        if (n > 0) {
+            for (int i = 0; i < n && r < 127; i++) { raw[r] = cw[i]; r++; }
+            absolute = true;                 // the cwd is absolute
+        }
+        if (rel[0] != 0) {
+            if (r > 0 && r < 127) { raw[r] = '/'; r++; }
+            for (int i = 0; rel[i] != 0 && r < 127; i++) { raw[r] = rel[i]; r++; }
+        }
     }
-    // Empty (e.g. `ls` with no arg) means "the cwd" — not root.
-    char[100] cw @noinit;
-    int n = getcwd(&cw[0], 100);
-    if (rel[0] == 0) {
-        int i = 0;
-        while (i < n && i < 99) { out[i] = cw[i]; i++; }
-        out[i] = 0;
-        return;
-    }
-    // Relative from root cwd: the bare name is already root-relative,
-    // unchanged from before cwd existed.
-    if (n <= 0) {
-        int i = 0;
-        while (rel[i] != 0 && i < 99) { out[i] = rel[i]; i++; }
-        out[i] = 0;
-        return;
-    }
+    raw[r] = 0;
+
+    // Collapse `.` / `..` / `//`. A bare relative name from the root cwd
+    // keeps its no-leading-slash form (`hello.txt`) — the namespace
+    // catch-all mount matches it; anything rooted comes out `/...`. `""`
+    // (root, or `.` from the root cwd) resolves the same as the mount's
+    // own empty prefix.
     int o = 0;
-    for (int i = 0; i < n && o < 99; i++) { out[o] = cw[i]; o++; }
-    if (o < 99) { out[o] = '/'; o++; }
-    for (int i = 0; rel[i] != 0 && o < 99; i++) { out[o] = rel[i]; o++; }
+    int i = 0;
+    while (raw[i] != 0) {
+        while (raw[i] == '/') { i++; }
+        if (raw[i] == 0) { break; }
+        int s = i;
+        while (raw[i] != 0 && raw[i] != '/') { i++; }
+        int seglen = i - s;
+        if (seglen == 1 && raw[s] == '.') { continue; }
+        if (seglen == 2 && raw[s] == '.' && raw[s + 1] == '.') {
+            while (o > 0 && out[o - 1] != '/') { o--; }
+            if (o > 0) { o--; }
+            continue;
+        }
+        if ((absolute || o > 0) && o < 99) { out[o] = '/'; o++; }
+        for (int k = s; k < i && o < 99; k++) { out[o] = raw[k]; o++; }
+    }
     out[o] = 0;
 }
 
