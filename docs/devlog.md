@@ -4,6 +4,58 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-05 — `sandbox` shell builtin: §2's last open item
+
+`sandbox <cmd> [args...]` (`user/shell_common.c3`'s
+`shell_dispatch_common`, so both shells have it) — the
+`newns`/`sandbox` helper roadmap §2 item 3 had flagged as "still to
+do", generalising `shell_test.c3`'s own `sandboxtest` (which just
+proved the raw mechanism inline) into a real, argv-taking command.
+
+What it does: `rfork(RFPROC)` a child (independent namespace copy —
+same reasoning as `sandboxtest`/`mountusb`), then in the child:
+1. `ns_bind_flags("/bin/", "/bin", 0)` — pin `/bin/` (resolved now,
+   while the root mount is still there, to whatever serves it) so it
+   survives the next step.
+2. `ns_unmount` everything else it inherited: `/srv/echo/`,
+   `/mnt/fs2/`, `/proc/`, `/env/`, and `""` (the root catch-all).
+3. `setuid(none)` — 65534, one-way, exactly like `su`. Resolves the
+   name through `/adm/users` if it's there, hardcoded-fallback to
+   65534 if not (a FAT32/exFAT root has no user db at all, and a
+   sandbox that drops privilege + trims the namespace is still worth
+   having there).
+4. exec `/bin/<cmd>` (or an explicit path) with the remaining args.
+
+The parent `join()`s and takes the child's exit status into
+`$status`. Net effect: the sandboxed command can run `/bin` binaries
+but can't read one data file (not even a world-readable one — the
+root mount is gone), touch another process, read/write an env var,
+reach the second disk or the echo service; and as `none` it owns
+nothing, so it can't write anywhere ext2 permission-checks. The
+parent shell's own namespace and uid are untouched — verified with
+`whoami` before/after.
+
+This is the Plan 9 "the namespace is the security boundary, not the
+uid" stance (roadmap §2) made usable — not a `setuid` bit and a
+`sudo`, but "give the child a namespace that only has what it needs".
+
+**Verified**: QEMU, both `disk_ext2.img` and `disk.img` (FAT32) —
+`sandbox echo hi` works, `sandbox whoami` → `65534` (dropped, and
+can't resolve its own name since `/adm/users` is denied — correct),
+`sandbox ls` / `sandbox cat <anyfile>` / `sandbox ls /proc` all →
+"not found" (denied), `sandbox true`/`false`/`nonexistent` set
+`$status` to 0/1/127, `whoami` still `root` after. Not re-verified on
+the Duo: the shell is compiled into `kernel.elf` (a full reflash to
+test), and this feature is pure userspace logic over syscall
+primitives already Duo-verified elsewhere (`setuid` via `su`,
+`rfork`+`exec` via `mountusb`, `ns_unmount` via `sandboxtest`) — no
+plausible hardware-divergence surface.
+
+**Files changed:** `user/shell_common.c3` (the `sandbox` builtin),
+`docs/roadmap.md` (§2 item 3b marked done).
+
+---
+
 ## 2026-09-05 — std::io: `%f`/`%e`/`%g` confirmed working
 
 Loose end from the std::io port: `user/std_racccoon/

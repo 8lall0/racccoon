@@ -123,9 +123,19 @@ More than you'd expect:
 3. **Read enforcement. DONE** (`05aa0bf`) — `ext2_read_allowed` /
    `ext2_may_read`; `fsd`'s read/list/stat/`P9_OPEN` paths pass the
    requester uid. ext2 only (FAT32/exFAT have no ownership); root
-   bypasses. `65534:none` is in `/adm/users`; a `newns`/`sandbox`
-   helper that does `su none` + a namespace trim (generalising
-   `sandboxtest`) is still to do.
+   bypasses. `65534:none` is in `/adm/users`.
+3b. **`sandbox` builtin. DONE** (2026-09-05) — `sandbox <cmd> [args]`
+   (`shell_common.c3`, both shells): rfork's a child, binds `/bin/`
+   (so it can still exec tools) then unmounts *everything* else it
+   inherited (`""` root, `/proc/`, `/env/`, `/mnt/fs2/`, `/srv/echo/`),
+   drops to `none` (65534 — one-way, hardcoded fallback if `/adm/users`
+   has no entry, so it works on a FAT32/exFAT root too), execs `<cmd>`,
+   the parent joins and takes its exit status. The sandboxed command
+   can run `/bin` binaries but can't read one data file, touch a
+   process, read/write an env var, or reach the second disk / the echo
+   service; the parent shell's own namespace and uid are untouched.
+   The `newns`/`sandboxtest`-generalisation this line used to say was
+   "still to do".
 4. **`chmod`/`chown`. DONE** — `FS_CHMOD` (29) / `FS_CHOWN` (30) verbs
    through the `Fs_ops` table; `ext2_chmod` (owner-or-root, keeps
    i_mode's format nibble) / `ext2_chown` (root-only — POSIX, and the

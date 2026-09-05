@@ -341,6 +341,82 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
             }
             shell_refresh_user();
             return true;
+        } else if (strcmp(cmd, "sandbox") == 0) {
+            // sandbox <cmd> [args...] — run <cmd> in an rfork'd child
+            // whose namespace has been trimmed down to just /bin/ (so it
+            // can still exec tools) and whose uid has been dropped to
+            // `none` (65534 — one-way, exactly like `su` above). The
+            // parent shell's own namespace and uid are untouched, since
+            // the child got its own copy at fork time, not a reference
+            // (same reasoning as sandboxtest / mountusb).
+            //
+            // This is the Plan 9 "the namespace is the security
+            // boundary, not the uid" stance (docs/roadmap.md §2) made
+            // usable: the sandboxed command can run /bin binaries but
+            // can't read a single data file (not even world-readable
+            // ones — the root mount is gone), touch another process
+            // (/proc gone), read or write env vars (/env gone), reach
+            // the second disk (/mnt/fs2 gone) or the echo service
+            // (/srv/echo gone); and as `none` it owns nothing, so it
+            // can't write anywhere ext2 permission-checks. Generalises
+            // shell_test.c3's own sandboxtest into a real, argv-taking
+            // command.
+            if (cmd_argc < 1) {
+                print("usage: sandbox <cmd> [args...]\n");
+                g_shell_status = 1;
+                return true;
+            }
+            // `none` is uid 65534 by fixed convention (docs/roadmap.md
+            // §2, and `/adm/users` seeds it as `65534:none`). Resolve
+            // the name if the user db has it, but don't depend on the
+            // db — a FAT32/exFAT root has no `/adm/users` at all, and a
+            // sandbox that drops privilege + trims the namespace is
+            // still worth having there.
+            int sb_none = user_uid_by_name("none");
+            if (sb_none < 0) { sb_none = 65534; }
+            uint sb_gen = 0;
+            int sb_r = rfork(RFPROC, &sb_gen);
+            if (sb_r < 0) {
+                print("sandbox: rfork failed (no free process slot)\n");
+                g_shell_status = 1;
+                return true;
+            }
+            if (sb_r == 0) {
+                // Pin /bin/ (resolved now, while the root mount is still
+                // here, to whatever serves it) so it survives dropping
+                // the root catch-all; then strip every mount this
+                // process inherited.
+                ns_bind_flags("/bin/", "/bin", 0);
+                ns_unmount("/srv/echo/");
+                ns_unmount("/mnt/fs2/");
+                ns_unmount("/proc/");
+                ns_unmount("/env/");
+                ns_unmount("");
+                setuid(sb_none);
+
+                // Same /bin/<name> vs. explicit-path handling as
+                // shell_spawn.
+                bool sb_is_path = false;
+                for (int ci = 0; cmd_argv[0][ci] != 0; ci++) { if (cmd_argv[0][ci] == '/') { sb_is_path = true; break; } }
+                char[100] sb_bin @noinit;
+                char* sb_target = cmd_argv[0];
+                if (!sb_is_path) {
+                    int p = 0;
+                    char* pfx = "/bin/";
+                    while (pfx[p] != 0) { sb_bin[p] = pfx[p]; p++; }
+                    int j = 0;
+                    while (cmd_argv[0][j] != 0 && p < 99) { sb_bin[p] = cmd_argv[0][j]; p++; j++; }
+                    sb_bin[p] = 0;
+                    sb_target = &sb_bin;
+                }
+                exec(sb_target, exec_buf(), exec_buf_max(), 0, &cmd_argv[1], cmd_argc - 1);
+                print("sandbox: ");
+                print(cmd_argv[0]);
+                print(": command not found (or unreadable in the sandbox)\n");
+                exitcode(127);
+            }
+            g_shell_status = join(sb_r, sb_gen);
+            return true;
         } else if (strcmp(cmd, "cd") == 0) {
             char[100] dst @noinit;
             if (cmd_argc < 1) {
