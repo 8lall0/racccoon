@@ -9,6 +9,15 @@ module user;
 fn bool sh_name_start(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
 fn bool sh_name_char(char c)  { return sh_name_start(c) || (c >= '0' && c <= '9'); }
 
+// Quote anchor (§2.5 follow-up): shell_expand_q emits one of these
+// (qmask=1) the moment a `'` or `"` opens, so a quoted region that
+// expands to nothing (`""`, `"$unset"`) still leaves a byte in the
+// output for the tokeniser to hang a word on. shell_run_pipeline's
+// tokeniser strips them out of each finished token — a token that is
+// nothing but the marker becomes the empty string, so `test -n "$x"`
+// with an empty `x` is two args (`-n` and ``), not one.
+const char SH_QMARK = 1;   // 0x01 SOH — never meaningful in a shell word
+
 // Positional parameters for `. script a b c` / `#!` scripts (§2.5 S2).
 // $1..$9, $#, $* — set by shell_run_script (shell_common.c3), saved and
 // restored around a nested source so `. inner` doesn't clobber the
@@ -271,6 +280,7 @@ fn int shell_expand_q(char* in, char* out, char* qmask, int cap)
         }
         if (c == '\'') {
             i++;
+            if (o < cap - 1) { out[o] = SH_QMARK; qmask[o] = 1; o++; }
             for (;;) {
                 if (in[i] == 0) { return -1; }
                 if (in[i] == '\'') {
@@ -287,6 +297,7 @@ fn int shell_expand_q(char* in, char* out, char* qmask, int cap)
         }
         if (c == '"') {
             i++;
+            if (o < cap - 1) { out[o] = SH_QMARK; qmask[o] = 1; o++; }
             for (;;) {
                 if (in[i] == 0) { return -1; }
                 if (in[i] == '"') { i++; break; }

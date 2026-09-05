@@ -1024,6 +1024,17 @@ fn int shell_run_pipeline(char* seg, int seg_len, bool bg)
             if (qm[q] == 0 && (exp[q] == '*' || exp[q] == '?')) { tg = true; }
         }
         tok_glob[nt] = tg && !tok_op[nt];
+
+        // Strip the SH_QMARK quote anchors now that the token boundary
+        // is fixed (tok_op/tok_glob already computed). A token that was
+        // nothing but anchors — `""` / `"$unset"` — becomes "", but it
+        // still counts as an argv word.
+        int w = ts;
+        for (int r = ts; r < te; r++) {
+            if (exp[r] != SH_QMARK) { exp[w] = exp[r]; qm[w] = qm[r]; w++; }
+        }
+        exp[w] = 0;
+
         nt++;
     }
     if (nt == 0) { return 0; }
@@ -1429,9 +1440,17 @@ fn int sh_do_assign(char* s)
     int n = 0;
     while (sh_name_char(s[n]) && n < SH_VNAME_MAX - 1) { name[n] = s[n]; n++; }
     name[n] = 0;
-    // s[n] == '='
+    // s[n] == '='. Quote-aware: `x="a b"` / `x='$lit'` / `x=$y` — via
+    // shell_expand_q (strips the quotes, expands $ inside "..."), then
+    // drop the SH_QMARK anchors. No word-splitting (an assignment is
+    // always one value).
     char[SH_VVAL_MAX] val @noinit;
-    shell_expand(&s[n + 1], &val[0], SH_VVAL_MAX);
+    char[SH_VVAL_MAX] vqm @noinit;
+    int vl = shell_expand_q(&s[n + 1], &val[0], &vqm[0], SH_VVAL_MAX);
+    if (vl < 0) { print("rc: unterminated quote in assignment\n"); g_shell_status = 2; return 2; }
+    int w = 0;
+    for (int r = 0; r < vl; r++) { if (val[r] != SH_QMARK) { val[w] = val[r]; w++; } }
+    val[w] = 0;
     shell_local_set(&name[0], &val[0]);
     g_shell_status = 0;
     return 0;
