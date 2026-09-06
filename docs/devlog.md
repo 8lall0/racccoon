@@ -28,14 +28,29 @@ Verified QEMU FAT32: full regression sweep green (runtest, rfork, kill,
 wasm ×12, stdio, map, oom, hungservertest — echod respawn, threadtest,
 racetest `a=1 b=1`), `ps` / `dmesg` / `ping` / normal boot clean.
 
-**`fsdkilltest` still hangs under QEMU-TCG** — but that is a *separate*,
-pre-existing bug: after `svc: respawned fsd` the freshly-created fsd
-runs and never yields or traps again (an infinite loop somewhere in its
-post-respawn mount path — reads garbage, spins a probe parser?). The
-scheduler bookkeeping is doing its job (HK ticks continue right up to
-the respawn); the respawned process itself is the one that wedges. fsd/
-sdd respawn is verified working on the *real Duo* (`racccoon_supervisor_respawn`),
-so this is TCG-specific. Not chased further this session.
+**`fsdkilltest` still hangs under QEMU-TCG** — a *separate*, pre-existing
+bug (freezes on clean master too). Chased it with gdb (`qemu -s`,
+halted mid-freeze):
+
+- `pc = sepc = stval = 0x80200020` (`kernel_entry`), `scause = 0xc`
+  (instruction page fault), `SPP = 1` → a **fault storm**: the kernel
+  can't fetch its own trap handler and re-faults on it forever.
+- `satp` root (`0x81009000` phys) is **all zeros** — the running page
+  table maps nothing.
+- `current_proc` is **corrupted** — points ~96 B into `procs[3]` (fsd's
+  slot), not a Process boundary. `sscratch` / `sp` unaligned, same
+  region.
+
+So the fsd respawn clobbers `current_proc` (+ a Process's `page_table` →
+a zeroed page); `switch_context` then loads a garbage `satp` and the CPU
+storms. Not root-caused — leading suspect is a stack overflow in the
+deep `handle_trap → … → supervisor_spawn → create_process` path for
+fsd's ~100 KiB image (echod's ~66 KiB respawn via `hungservertest` does
+NOT corrupt). The scheduler bookkeeping is doing its job — HK ticks
+continue right to the respawn; the respawned process is what wedges.
+fsd/sdd respawn is verified on the real Duo, so this is TCG-specific.
+Full write-up + next step (watchpoint on `current_proc`) in
+`racccoon_fsd_respawn_corruption` memory.
 
 ---
 
