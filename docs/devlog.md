@@ -41,16 +41,25 @@ halted mid-freeze):
   slot), not a Process boundary. `sscratch` / `sp` unaligned, same
   region.
 
-So the fsd respawn clobbers `current_proc` (+ a Process's `page_table` →
-a zeroed page); `switch_context` then loads a garbage `satp` and the CPU
-storms. Not root-caused — leading suspect is a stack overflow in the
-deep `handle_trap → … → supervisor_spawn → create_process` path for
-fsd's ~100 KiB image (echod's ~66 KiB respawn via `hungservertest` does
-NOT corrupt). The scheduler bookkeeping is doing its job — HK ticks
-continue right to the respawn; the respawned process is what wedges.
-fsd/sdd respawn is verified on the real Duo, so this is TCG-specific.
-Full write-up + next step (watchpoint on `current_proc`) in
-`racccoon_fsd_respawn_corruption` memory.
+Went deeper with gdb watchpoints on `procs[3]`'s fields across the
+respawn: the respawned fsd, once running its own kernel `sys_ipc_call`,
+has a kernel `sp` that points **into `procs[2]` (diskd)'s stack**, not
+its own. So its trap frame got built on the wrong stack (`sscratch` was
+wrong when it first trapped) → its later writes land in the neighbouring
+Process struct / the `page_table` field → garbage `satp` on the next
+`switch_context` → fault storm.
+
+Prime suspect: `supervisor_tick`'s **dead-detection** branch calls
+`supervisor_spawn` (→ `create_process`, slot reuse) *immediately*, with
+none of the `live == current_proc` guard the *wedged* branch has — and
+that branch's own comment spells out this exact hazard ("create_process
+would reuse this same slot … yield() would then save the trap context
+into the fresh process, corrupting it"). `fsdkilltest`'s `kill()` takes
+the dead path; `hungservertest`'s echod takes the wedged path (guarded)
+— which is why echod respawn is fine and fsd's isn't.
+
+Not fully root-caused (the exact bad write). Full write-up + the gdb
+recipe in the `racccoon_fsd_respawn_corruption` memory.
 
 ---
 
