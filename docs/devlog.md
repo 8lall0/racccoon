@@ -4,6 +4,41 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-06 — scheduler: bookkeeping survives an all-blocked cascade + a SYS_IPC_CALL timeout
+
+The kernel's own `enable_timer_interrupts()` comment already spelled out
+the flaw: every blocking syscall spins a `yield()` loop *inside its own
+open trap*, and hardware keeps `sstatus.SIE` cleared until an `sret`. If
+every runnable process ends up in such a loop — a client blocked on a
+server that is itself blocked on a third, mid-respawn — no `sret` ever
+happens, the timer stops firing, and `supervisor_tick()` (+ anything
+else timer-driven) dies with it. Total freeze.
+
+Fix: `kernel_housekeeping()` (entry.c3) — the supervisor watchdog plus a
+new `SYS_IPC_CALL` timeout sweep, self-rate-limited to ~1/s off the
+`time` CSR — is now called from **`yield()`** as well as the timer tick.
+Whatever loop is spinning, the bookkeeping still ticks. `SYS_IPC_CALL`
+arms `Process.ipc_call_deadline` (15 s, `IPC_CALL_DEADLINE_TICKS`); the
+sweep flips `ipc_timed_out` + marks the caller RUNNABLE (same shape as
+`sys_kill`'s `ipc_wake_waiters_on` / `ipc_peer_died`), its phase 1/2/3
+loops then abort with -1, and phase 2 yanks the un-consumed request back
+out of the peer's inbox so the watchdog doesn't see a phantom stall.
+
+Verified QEMU FAT32: full regression sweep green (runtest, rfork, kill,
+wasm ×12, stdio, map, oom, hungservertest — echod respawn, threadtest,
+racetest `a=1 b=1`), `ps` / `dmesg` / `ping` / normal boot clean.
+
+**`fsdkilltest` still hangs under QEMU-TCG** — but that is a *separate*,
+pre-existing bug: after `svc: respawned fsd` the freshly-created fsd
+runs and never yields or traps again (an infinite loop somewhere in its
+post-respawn mount path — reads garbage, spins a probe parser?). The
+scheduler bookkeeping is doing its job (HK ticks continue right up to
+the respawn); the respawned process itself is the one that wedges. fsd/
+sdd respawn is verified working on the *real Duo* (`racccoon_supervisor_respawn`),
+so this is TCG-specific. Not chased further this session.
+
+---
+
 ## 2026-09-06 — a complete manual (`docs/manual.md`)
 
 `docs/manual.md` — one file, everything: architecture + boot sequence,

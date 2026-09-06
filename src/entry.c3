@@ -165,6 +165,18 @@ const EXEC_MAX_ELF_SEGMENTS = 8;
 const int RFPROC = 1 << 0;
 const int RFMEM  = 1 << 1;
 
+// Wall-clock ceiling on SYS_IPC_CALL. Without it a client blocks forever
+// against a server that is alive but not yet in its ipc_recv loop (a
+// freshly respawned fsd/sdd still running its init), and the message it
+// deposited sits unconsumed long enough for the supervisor watchdog to
+// (wrongly) kill that server too. On a timeout the caller gets -1 to
+// retry, and phase 2 yanks its un-consumed request back out of the
+// peer's inbox so the watchdog never sees a stall. Generous — a real
+// fsd op is sub-second; this only fires on a genuine wedge. Enforced by
+// kernel_housekeeping() (below), not the call's own loop, because a
+// PROC_BLOCKED caller never runs to check.
+const ulong IPC_CALL_DEADLINE_TICKS = board::TIMEBASE_HZ * 15;
+
 // Sentinel msg_type handle_trap posts to wake an interrupt-driven
 // driver when its PLIC source fires (see handle_trap's interrupt branch
 // and the Irq_route table in process.c3) — distinguishes "your device
@@ -802,6 +814,8 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		child.ipc_wait_generation = 0;
 		child.ipc_peer_died = false;
 		child.in_call_reply_wait = false;
+		child.ipc_call_deadline = 0;
+		child.ipc_timed_out = false;
 		child.is_boot_server = false; // an rfork child is user work, not a boot server
 		// a2 / a4 (optional, RFPROC only): wire the child's stdout / stdin
 		// to these pipe ids atomically, as part of the fork. Both the c3
@@ -1644,18 +1658,24 @@ fn void sys_ipc_call(Trap_frame* f) @noinline
 	current_proc.ipc_wait_pid = call_dest;
 	current_proc.ipc_wait_generation = call_target.generation;
 	current_proc.ipc_peer_died = false;
+	current_proc.ipc_timed_out = false;
 	// Reserve our inbox for call_target's reply for the whole call —
 	// from here so a stray sender is held off even during phases 1/2.
 	current_proc.in_call_reply_wait = true;
+	// Arm the timeout — kernel_housekeeping() (run from yield() and the
+	// timer) flips ipc_timed_out + wakes us if the peer never gets to
+	// us. See IPC_CALL_DEADLINE_TICKS.
+	current_proc.ipc_call_deadline = read_reg("time") + IPC_CALL_DEADLINE_TICKS;
 
 	// Phase 1: deposit the request into the target's inbox.
 	while (!ipc_inbox_available(call_target))
 	{
 		yield();
-		if (ipc_peer_gone())
+		if (ipc_peer_gone() || current_proc.ipc_timed_out)
 		{
 			current_proc.in_call_reply_wait = false;
 			current_proc.ipc_wait_pid = 0;
+			current_proc.ipc_call_deadline = 0;
 			f.a0 = (ulong)(-1);
 			return;
 		}
@@ -1671,10 +1691,25 @@ fn void sys_ipc_call(Trap_frame* f) @noinline
 	// Phase 2: wait for the target to consume the request.
 	while (!current_proc.msg_acked)
 	{
-		if (ipc_peer_gone())
+		if (ipc_peer_gone() || current_proc.ipc_timed_out)
 		{
+			// On a timeout the target never picked our request up (still
+			// in its own init, or wedged). Pull it back out of the
+			// target's inbox — safe here because on one hart the target
+			// is not running while we are, so `has_message` still true
+			// and still ours means it was never consumed. Leaving it
+			// there is what let the supervisor watchdog kill an
+			// otherwise-fine server (see IPC_CALL_DEADLINE_TICKS).
+			if (current_proc.ipc_timed_out
+				&& call_target.has_message
+				&& call_target.msg_from == current_proc.pid
+				&& call_target.msg_from_generation == current_proc.generation)
+			{
+				call_target.has_message = false;
+			}
 			current_proc.in_call_reply_wait = false;
 			current_proc.ipc_wait_pid = 0;
+			current_proc.ipc_call_deadline = 0;
 			current_proc.state = PROC_RUNNABLE;
 			f.a0 = (ulong)(-1);
 			return;
@@ -1684,13 +1719,18 @@ fn void sys_ipc_call(Trap_frame* f) @noinline
 	}
 
 	// Phase 3: wait for the reply. in_call_reply_wait keeps our inbox
-	// reserved, so whatever lands is call_target's reply.
+	// reserved, so whatever lands is call_target's reply. The target has
+	// our request now and is committed to replying (or dying) — the
+	// timeout still applies so a target stuck in an infinite compute
+	// loop (never an ipc_call, so the watchdog is the only other hope)
+	// doesn't pin us forever.
 	while (!current_proc.has_message)
 	{
-		if (ipc_peer_gone())
+		if (ipc_peer_gone() || current_proc.ipc_timed_out)
 		{
 			current_proc.in_call_reply_wait = false;
 			current_proc.ipc_wait_pid = 0;
+			current_proc.ipc_call_deadline = 0;
 			current_proc.state = PROC_RUNNABLE;
 			f.a0 = (ulong)(-1);
 			return;
@@ -1706,6 +1746,7 @@ fn void sys_ipc_call(Trap_frame* f) @noinline
 	current_proc.ipc_progress++;
 	current_proc.in_call_reply_wait = false;
 	current_proc.ipc_wait_pid = 0;
+	current_proc.ipc_call_deadline = 0;
 
 	// Ack the replier — it's parked in sys_ipc_reply's phase B.
 	Process* call_replier = proc_by_pid(call_reply_from);
@@ -3423,6 +3464,54 @@ fn bool try_lazy_fault(ulong scause, ulong stval) @noinline
 	return true;
 }
 
+// Periodic kernel bookkeeping: the supervisor watchdog + the SYS_IPC_CALL
+// timeout sweep. Runs at most once per ~second (g_housekeeping_deadline,
+// wall-clock via the `time` CSR).
+//
+// Called from TWO places, deliberately:
+//   - the SCAUSE_SUPERVISOR_TIMER case below — the normal path, while
+//     the system is making progress and traps keep returning to sret.
+//   - yield() (src/process.c3) — the fallback that makes this kernel
+//     not-freeze. Every blocking syscall (SYS_IPC_RECV/CALL, SYS_GETCHAR,
+//     SYS_JOIN, ...) spins a yield() loop *inside its own open trap*,
+//     never reaching sret; hardware keeps sstatus.SIE cleared the whole
+//     time (see enable_timer_interrupts()'s comment). If every runnable
+//     process ends up in such a loop — a client blocked on a server that
+//     is itself blocked on a third, mid-respawn — no sret ever happens,
+//     the timer never fires again, and supervisor_tick() + the IPC
+//     timeout would never run. Driving them from yield() instead of the
+//     interrupt closes that: whatever loop is spinning, this still ticks.
+//
+// Returns true if the supervisor tore down current_proc (the timer case
+// must then force a reschedule rather than sret back into a dead slot).
+ulong g_housekeeping_deadline = 0;
+
+fn bool kernel_housekeeping() @noinline
+{
+	ulong hk_now = read_reg("time");
+	if (hk_now < g_housekeeping_deadline)
+	{
+		return false;
+	}
+	g_housekeeping_deadline = hk_now + board::TIMEBASE_HZ;
+
+	// SYS_IPC_CALL timeout sweep — wake any caller past its deadline so
+	// its own loop (phase 1/2/3) can abort with -1. Same shape as
+	// sys_kill's ipc_wake_waiters_on / ipc_peer_died.
+	for (int hk_i = 0; hk_i < PROCS_MAX; hk_i++)
+	{
+		Process* hk_p = &procs[hk_i];
+		if (hk_p.ipc_call_deadline != 0 && hk_now >= hk_p.ipc_call_deadline)
+		{
+			hk_p.ipc_timed_out = true;
+			hk_p.ipc_call_deadline = 0;
+			if (hk_p.state == PROC_BLOCKED) { hk_p.state = PROC_RUNNABLE; }
+		}
+	}
+
+	return supervisor_tick();
+}
+
 fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 {
 	ulong scause  = read_reg("scause");
@@ -3455,14 +3544,15 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 			arm_timer(board::TIMEBASE_HZ);
 			timer_tick_count += 1;
 
-			// Boot-server supervision (src/supervisor.c3, docs/roadmap.md
-			// §5.2): re-spawn fsd/fsd2/procd/envd if they've exited. Runs
-			// here, not from the idle loop, because idle is starved
-			// whenever any process stays permanently PROC_RUNNABLE
-			// (usbd on the Duo, netd's link poll on QEMU). Cheap when
-			// nothing has died (SVC_MAX * O(1)); create_process() is
-			// already trap-safe (SYS_RFORK does the same work).
-			bool svc_killed_current = supervisor_tick();
+			// Boot-server supervision + the IPC-call timeout sweep, both
+			// via kernel_housekeeping() (above) so the *same* work also
+			// runs from yield() when the timer has stopped firing. The
+			// g_housekeeping_deadline guard rate-limits it to ~1/s
+			// regardless of which path calls it, so calling it here every
+			// tick and from yield() every spin costs almost nothing when
+			// it isn't due. create_process() (the respawn path) is
+			// already trap-safe — SYS_RFORK does the same work.
+			bool svc_killed_current = kernel_housekeeping();
 
 			// Real preemption: force a reschedule on every tick, not
 			// just when a process happens to yield() on its own. See

@@ -476,6 +476,18 @@ struct Process
 	uint ipc_wait_generation;
 	bool ipc_peer_died;
 
+	// SYS_IPC_CALL timeout. A process parked in phase 2/3 of a call is
+	// PROC_BLOCKED and never runs, so it can't check a deadline itself —
+	// kernel_housekeeping() (entry.c3), run once/second from the timer
+	// tick AND from yield() (the fallback that matters: if every process
+	// is blocked in a kernel loop, no sret ever happens, SIE stays
+	// cleared, and the timer never fires again), sweeps this and sets
+	// ipc_timed_out + marks the process RUNNABLE, exactly as sys_kill's
+	// ipc_wake_waiters_on does with ipc_peer_died. The call's own loops
+	// then see the flag and abort with -1. 0 = not in a timed call.
+	ulong ipc_call_deadline;
+	bool  ipc_timed_out;
+
 	// True for the whole duration of a SYS_IPC_CALL — reserves this
 	// process's inbox so only ipc_wait_pid (the call target) can write
 	// it, and the reply can't be pre-empted by a stray ipc_send from a
@@ -1246,6 +1258,8 @@ fn Process* create_process(void* image, uint image_size)
 	proc.ipc_wait_generation = 0;
 	proc.ipc_peer_died = false;
 	proc.in_call_reply_wait = false;
+	proc.ipc_call_deadline = 0;
+	proc.ipc_timed_out = false;
 	// A reused slot must not start life with a previous occupant's
 	// unconsumed inbox message (sys_rfork clears this for the same
 	// reason). Missing this let a supervisor-respawned server "consume"
@@ -1663,6 +1677,19 @@ ulong[64] g_prof_syscall_hist;
 fn void yield() @noinline
 {
 	g_prof_yields++;
+
+	// Periodic kernel bookkeeping (supervisor watchdog + SYS_IPC_CALL
+	// timeout sweep), driven off the wall clock, not the timer
+	// interrupt — because every blocking syscall spins its yield() loop
+	// inside an open trap with sstatus.SIE cleared, so if the whole
+	// system ends up blocked-on-blocked the timer stops firing and this
+	// is the only thing that still ticks. Self-rate-limited to ~1/s
+	// (kernel_housekeeping's own g_housekeeping_deadline guard), so the
+	// cost per yield() when it isn't due is one `time` CSR read. Does
+	// not call yield() back (create_process / supervisor_tick don't), so
+	// no recursion.
+	kernel_housekeeping();
+
 	Process* next = idle_proc;
 	for (int i = 0; i < PROCS_MAX; i++)
 	{
