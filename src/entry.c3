@@ -173,7 +173,7 @@ const int RFMEM  = 1 << 1;
 // retry, and phase 2 yanks its un-consumed request back out of the
 // peer's inbox so the watchdog never sees a stall. Generous — a real
 // fsd op is sub-second; this only fires on a genuine wedge. Enforced by
-// kernel_housekeeping() (below), not the call's own loop, because a
+// ipc_timeout_sweep() (below), not the call's own loop, because a
 // PROC_BLOCKED caller never runs to check.
 const ulong IPC_CALL_DEADLINE_TICKS = board::TIMEBASE_HZ * 15;
 
@@ -1662,9 +1662,9 @@ fn void sys_ipc_call(Trap_frame* f) @noinline
 	// Reserve our inbox for call_target's reply for the whole call —
 	// from here so a stray sender is held off even during phases 1/2.
 	current_proc.in_call_reply_wait = true;
-	// Arm the timeout — kernel_housekeeping() (run from yield() and the
-	// timer) flips ipc_timed_out + wakes us if the peer never gets to
-	// us. See IPC_CALL_DEADLINE_TICKS.
+	// Arm the timeout — ipc_timeout_sweep() (run ~1/s from yield() and
+	// the timer) flips ipc_timed_out + wakes us if the peer never gets
+	// to us. See IPC_CALL_DEADLINE_TICKS.
 	current_proc.ipc_call_deadline = read_reg("time") + IPC_CALL_DEADLINE_TICKS;
 
 	// Phase 1: deposit the request into the target's inbox.
@@ -3464,40 +3464,34 @@ fn bool try_lazy_fault(ulong scause, ulong stval) @noinline
 	return true;
 }
 
-// Periodic kernel bookkeeping: the supervisor watchdog + the SYS_IPC_CALL
-// timeout sweep. Runs at most once per ~second (g_housekeeping_deadline,
-// wall-clock via the `time` CSR).
-//
-// Called from TWO places, deliberately:
-//   - the SCAUSE_SUPERVISOR_TIMER case below — the normal path, while
-//     the system is making progress and traps keep returning to sret.
-//   - yield() (src/process.c3) — the fallback that makes this kernel
-//     not-freeze. Every blocking syscall (SYS_IPC_RECV/CALL, SYS_GETCHAR,
-//     SYS_JOIN, ...) spins a yield() loop *inside its own open trap*,
-//     never reaching sret; hardware keeps sstatus.SIE cleared the whole
-//     time (see enable_timer_interrupts()'s comment). If every runnable
-//     process ends up in such a loop — a client blocked on a server that
-//     is itself blocked on a third, mid-respawn — no sret ever happens,
-//     the timer never fires again, and supervisor_tick() + the IPC
-//     timeout would never run. Driving them from yield() instead of the
-//     interrupt closes that: whatever loop is spinning, this still ticks.
-//
-// Returns true if the supervisor tore down current_proc (the timer case
-// must then force a reschedule rather than sret back into a dead slot).
+// Periodic kernel bookkeeping, rate-limited to ~1/s (g_housekeeping_deadline,
+// wall clock via the `time` CSR). Split in two:
+//   - ipc_timeout_sweep() — cheap, allocation-free; runs from BOTH the
+//     timer tick AND yield(). The yield() path is what keeps the
+//     SYS_IPC_CALL timeout alive when the system is blocked-on-blocked
+//     and the timer has stopped firing (every blocking syscall spins its
+//     yield() loop inside an open trap with SIE cleared — see
+//     enable_timer_interrupts()'s comment — so no sret, no timer).
+//   - kernel_housekeeping() — the sweep plus supervisor_tick(); ONLY
+//     from the timer case. supervisor_tick can proc_destroy(current_proc)
+//     and have its slot reused, which is unsafe to trigger from an
+//     arbitrary yield() call depth.
 ulong g_housekeeping_deadline = 0;
 
-fn bool kernel_housekeeping() @noinline
+// The SYS_IPC_CALL timeout half only — a cheap, allocation-free scan.
+// Safe to run from yield() at any call depth. Wakes any caller past its
+// deadline so its own phase 1/2/3 loop aborts with -1 (same shape as
+// sys_kill's ipc_wake_waiters_on / ipc_peer_died). Rate-limited by the
+// shared deadline guard so it does real work at most ~1/s.
+fn void ipc_timeout_sweep() @noinline
 {
 	ulong hk_now = read_reg("time");
 	if (hk_now < g_housekeeping_deadline)
 	{
-		return false;
+		return;
 	}
 	g_housekeeping_deadline = hk_now + board::TIMEBASE_HZ;
 
-	// SYS_IPC_CALL timeout sweep — wake any caller past its deadline so
-	// its own loop (phase 1/2/3) can abort with -1. Same shape as
-	// sys_kill's ipc_wake_waiters_on / ipc_peer_died.
 	for (int hk_i = 0; hk_i < PROCS_MAX; hk_i++)
 	{
 		Process* hk_p = &procs[hk_i];
@@ -3508,7 +3502,15 @@ fn bool kernel_housekeeping() @noinline
 			if (hk_p.state == PROC_BLOCKED) { hk_p.state = PROC_RUNNABLE; }
 		}
 	}
+}
 
+// Full pass — the IPC sweep plus the supervisor watchdog. Only from the
+// SCAUSE_SUPERVISOR_TIMER case, never yield(): supervisor_tick can
+// proc_destroy(current_proc) and its slot be reused while yield() is
+// mid-flight through this call.
+fn bool kernel_housekeeping() @noinline
+{
+	ipc_timeout_sweep();
 	return supervisor_tick();
 }
 
@@ -3545,13 +3547,8 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 			timer_tick_count += 1;
 
 			// Boot-server supervision + the IPC-call timeout sweep, both
-			// via kernel_housekeeping() (above) so the *same* work also
-			// runs from yield() when the timer has stopped firing. The
-			// g_housekeeping_deadline guard rate-limits it to ~1/s
-			// regardless of which path calls it, so calling it here every
-			// tick and from yield() every spin costs almost nothing when
-			// it isn't due. create_process() (the respawn path) is
-			// already trap-safe — SYS_RFORK does the same work.
+			// via kernel_housekeeping(): ipc_timeout_sweep() (also run
+			// from yield(), ~1/s) + the supervisor watchdog (timer only).
 			bool svc_killed_current = kernel_housekeeping();
 
 			// Real preemption: force a reschedule on every tick, not

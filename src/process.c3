@@ -478,13 +478,13 @@ struct Process
 
 	// SYS_IPC_CALL timeout. A process parked in phase 2/3 of a call is
 	// PROC_BLOCKED and never runs, so it can't check a deadline itself —
-	// kernel_housekeeping() (entry.c3), run once/second from the timer
-	// tick AND from yield() (the fallback that matters: if every process
-	// is blocked in a kernel loop, no sret ever happens, SIE stays
-	// cleared, and the timer never fires again), sweeps this and sets
-	// ipc_timed_out + marks the process RUNNABLE, exactly as sys_kill's
-	// ipc_wake_waiters_on does with ipc_peer_died. The call's own loops
-	// then see the flag and abort with -1. 0 = not in a timed call.
+	// ipc_timeout_sweep() (entry.c3), run ~1/s from both the timer tick
+	// and yield() (the fallback that matters: if every process is blocked
+	// in a kernel loop, no sret ever happens, SIE stays cleared, and the
+	// timer never fires again), sets ipc_timed_out + marks the process
+	// RUNNABLE, exactly as sys_kill's ipc_wake_waiters_on does with
+	// ipc_peer_died. The call's own loops then see the flag and abort
+	// with -1. 0 = not in a timed call.
 	ulong ipc_call_deadline;
 	bool  ipc_timed_out;
 
@@ -1678,17 +1678,18 @@ fn void yield() @noinline
 {
 	g_prof_yields++;
 
-	// Periodic kernel bookkeeping (supervisor watchdog + SYS_IPC_CALL
-	// timeout sweep), driven off the wall clock, not the timer
-	// interrupt — because every blocking syscall spins its yield() loop
-	// inside an open trap with sstatus.SIE cleared, so if the whole
-	// system ends up blocked-on-blocked the timer stops firing and this
-	// is the only thing that still ticks. Self-rate-limited to ~1/s
-	// (kernel_housekeeping's own g_housekeeping_deadline guard), so the
-	// cost per yield() when it isn't due is one `time` CSR read. Does
-	// not call yield() back (create_process / supervisor_tick don't), so
-	// no recursion.
-	kernel_housekeeping();
+	// The SYS_IPC_CALL timeout sweep, driven off the wall clock rather
+	// than the timer interrupt — every blocking syscall spins its
+	// yield() loop *inside its own open trap* with sstatus.SIE cleared,
+	// so if the whole system ends up blocked-on-blocked the timer stops
+	// firing (see enable_timer_interrupts()'s comment) and a timed-out
+	// SYS_IPC_CALL would never be released. Running it here means
+	// whatever loop is spinning still lets it tick. Self-rate-limited to
+	// ~1/s; the cost per yield() when it isn't due is one `time` CSR
+	// read. NOT the full supervisor pass — that (create_process, slot
+	// reuse) is unsafe to run from an arbitrary yield() depth; it stays
+	// on the timer tick.
+	ipc_timeout_sweep();
 
 	Process* next = idle_proc;
 	for (int i = 0; i < PROCS_MAX; i++)
