@@ -63,6 +63,34 @@ recipe in the `racccoon_fsd_respawn_corruption` memory.
 
 ---
 
+## 2026-09-06 — tried fixes for the fsd-respawn freeze; one landed (safer yield), the bug didn't
+
+Attempts:
+- **Split `kernel_housekeeping()` — `ipc_timeout_sweep()` from `yield()`,
+  `supervisor_tick()` timer-only (`888a725`).** `2c0dc24` had run the
+  full pass from `yield()`; `supervisor_tick` can `proc_destroy(current_proc)`
+  + slot-reuse from an arbitrary `yield()` depth, exactly the hazard the
+  supervisor's own comment flags. This is the right split regardless —
+  full regression green. **Did not fix `fsdkilltest`.**
+- **Ruled out nested traps.** Added a `SPP==1` counter in `handle_trap`;
+  zero nested traps during `fsdkilltest`. So the corruption is not a
+  kernel-mode fault re-entering `kernel_entry` (`try_lazy_fault` refuses
+  S-mode faults and `handle_trap` panics on them anyway).
+- **gdb watchpoints on `procs[3]` across the respawn:** `create_process`
+  sets `procs[3].page_table = 0x81009000`; the storm's `satp` is that
+  same page, and it reads back **all zeros**. So the respawned fsd's
+  page table is invalid — switching to it faults on the very first
+  instruction (`user_entry` at `0x8020xxxx`), `stvec` sends it back to
+  `kernel_entry`, re-fault, storm.
+
+Not root-caused: why `create_process`'s kernel-identity map loop leaves
+that root zeroed **only** for a respawn (all 10 boot `create_process`
+calls are fine). Next: gdb `create_process` itself — break after
+`alloc_pages`, watch the map loop fill (or not fill) `page_table[2]`.
+Full recipe in the `racccoon_fsd_respawn_corruption` memory.
+
+---
+
 ## 2026-09-06 — a complete manual (`docs/manual.md`)
 
 `docs/manual.md` — one file, everything: architecture + boot sequence,
