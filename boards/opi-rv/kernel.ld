@@ -17,7 +17,15 @@ SECTIONS {
     __kernel_map_base = .;
     __kernel_base = .;
 
+    /* boot() lives in .text.boot.entry and MUST be linked first here —
+       it shares .text.boot with smp.c3's secondary_entry, and c3c's
+       emission order is unstable (any kernel edit can reorder them).
+       Getting this wrong means OpenSBI's fixed jump to the entry point
+       lands on secondary_entry instead of boot() — silent brick, no
+       output. See src/kernel.ld / boards/duo/kernel.ld's matching
+       comment and docs/devlog.md's ".text.boot ordering" entry. */
     .text.boot : {
+        KEEP(*(.text.boot.entry));
         KEEP(*(.text.boot));
     } :text
 

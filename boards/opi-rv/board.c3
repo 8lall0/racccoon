@@ -76,6 +76,24 @@ const uptr PLIC_PRIORITY_PAGE = PLIC_PRIORITY_BASE & (uptr)~(kernel::PAGE_SIZE -
 const uptr PLIC_ENABLE_PAGE   = PLIC_ENABLE_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
 const uptr PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uptr)~(kernel::PAGE_SIZE - 1);
 
+// PLIC_BASE above IS the physical address (0x0c000000, well below DRAM's
+// 0x40000000 base, so no QEMU-style aliasing is needed — see
+// boards/qemu/board.c3's PLIC_PHYS_BASE comment for the case where it
+// would collide with the free_ram pool). Identity-mapped, same stance
+// as boards/duo/board.c3.
+const uptr PLIC_PHYS_BASE = PLIC_BASE;
+const uptr PLIC_PRIORITY_PHYS_PAGE = PLIC_PRIORITY_PAGE;
+const uptr PLIC_ENABLE_PHYS_PAGE   = PLIC_ENABLE_PAGE;
+const uptr PLIC_CLAIM_PHYS_PAGE    = PLIC_CLAIM_PAGE;
+
+// Ceiling on the harts src/smp.c3's scaffold will try to bring up. Kept
+// at 1 for Stage 1 first-boot bring-up: racccoon runs on whichever
+// single U74 OpenSBI hands it, and SMP is an explicit non-goal until
+// this port itself is booted and verified (docs/opi-rv-plan.md's
+// "Non-goals"). Raise when resuming SMP Stage C3 on this board — see
+// the smp memory note (racccoon_smp) — not before.
+const uint SMP_MAX_HARTS = 1;
+
 // --- Block storage -----------------------------------------------------
 // The JH7110 has no virtio-mmio; its storage is a Synopsys DesignWare
 // MSHC ("snps,dw-mshc" / "starfive,jh7110-mmc", sdio0 @ 0x16010000,
@@ -209,3 +227,12 @@ fn int console_getchar()
 {
 	return sbi::__getchar();
 }
+
+// Largest image SYS_EXEC will install (src/entry.c3's EXEC_MAX_IMAGE_SIZE)
+// and the per-process SYS_MAP ceiling (src/entry.c3's HEAP_MAX_BYTES).
+// Sized like boards/duo/board.c3, not boards/qemu/board.c3: the Stage 0
+// kernel.ld window here is a flat 64 MiB free_ram pool (same scale as
+// the Duo's 64 MiB total DRAM), not QEMU's 1792 MiB. Raise both once
+// kernel.ld's window is widened (docs/opi-rv-plan.md open question #4).
+const EXEC_MAX_IMAGE_SIZE = 1048576;
+const uptr HEAP_MAX_BYTES = 16 * 1024 * 1024;
