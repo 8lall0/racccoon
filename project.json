@@ -23,6 +23,11 @@
       "target":  "elf-riscv64",
       "type": "object-files",
       "sources": [ "boards/opi-rv/**" ]
+    },
+    "racccoon-opi-qemu": {
+      "target":  "elf-riscv64",
+      "type": "object-files",
+      "sources": [ "boards/opi-rv-qemu/**" ]
     }
   },
   "cpu": "generic",

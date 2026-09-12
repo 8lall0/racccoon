@@ -4,6 +4,148 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-09 — Orange Pi RV: a QEMU `sifive_u` harness boots Stage 1/2 in emulation, and surfaces 3 real bugs
+
+The real board is still SD-probe blocked (2026-09-08 entry; the UART
+isolator to test the ground-loop theory arrives tomorrow), so this
+session brought Stage 1 + Stage 2 up in emulation instead. QEMU's
+`-machine sifive_u` is the right proxy: unlike `virt`, it has an
+S-mode-less monitor hart 0 and application harts 1..N — exactly the
+JH7110's S7 + U74 split, so OpenSBI is forced to hand racccoon's S-mode
+payload to hart 1, and its PLIC enumerates context 2 = hart-1 S-mode.
+The two things the real board's open questions #1 were about.
+
+New files: `boards/opi-rv-qemu/{board.c3,kernel.ld}` (a deliberate
+near-duplicate of `boards/opi-rv/`, differing only in `TIMEBASE_HZ` —
+sifive_u's DT says 1 MHz vs the JH7110's 4 MHz — and the link address,
+0x80200000, which makes the ELF non-hardware-loadable on purpose),
+`scripts/build_opi_qemu.sh`, `scripts/launch_opi_qemu.sh`, and a
+`racccoon-opi-qemu` target in `project.json`.
+
+**It boots clean to `root / #`.** OpenSBI: `Boot HART ID: 1`. Kernel:
+`SMP: boot hart 1 only`. Interactive — `echo`, `ns`, pipes all work
+(no fs, so file commands fail cleanly, as designed). That retires open
+questions #1 (boot hart / `PLIC_S_CONTEXT = 2` — correct, interrupts
+fire), #2 (`rdtime` native in S-mode on the U54), and #3 (SBI console
+wired — no raw 16550 needed). Stage 2 also verified with an
+`OPI_TEST_SHELL=1` build: `faulttest` (a userspace store to 0xC0000000
+faults with scause 0xf; the kernel kills just that process and the
+shell keeps running), `maptest`, `hungservertest` (supervisor kills a
+wedged echod and respawns it).
+
+Three real bugs the harness caught that no existing board could — every
+one of QEMU `virt`, the Duo, and `sifive_e` boots on hart 0, so all
+three latent issues need a non-zero boot hart to show:
+
+1. **`boot_hartid` was always 0.** `boot()` did `sd a0, boot_hartid_raw`
+   — but that symbol is in `.bss`, and `kernel_main`'s very first line
+   zeroes `.bss`, wiping the stashed hart id right back to 0. Every
+   `this_hartid()` and the per-hart arrays silently indexed slot 0 on a
+   board that actually booted on hart 1. Fix: don't touch memory in
+   `boot()` — leave a0 in a0 (nothing between clobbers it) and pick it
+   up as `kernel_main(ulong boot_hart)`'s parameter, writing the global
+   after the `.bss` clear. `src/kernel.c3`, `src/smp.c3`.
+2. **`smp_start_secondaries()` poked the S7 monitor core.** With
+   `board::SMP_MAX_HARTS = 1` (both shipping boards) and a boot hart
+   != 0, the `for h in 0..max` start loop fell through to
+   `sbi_hart_start(0)` — hart 0, the JH7110's S7 monitor, an explicit
+   non-target (QEMU's HSM happily started it and ran our
+   `secondary_entry` on it). Guarded with `max > 1`. `src/smp.c3`.
+3. **The production shell's boot delays were raw `rdtime` tick counts.**
+   `shell_boot_settle(150e6)` and `shell_login`'s fs-probe deadline
+   (`rdtime() + 250e6`) were written for ~25 MHz — 150 s / 250 s on the
+   1 MHz sifive_u, and 37 s / 62 s on the real 4 MHz JH7110 (the
+   production shell, not just `shell_test.c3`, is what the opi boards
+   build). Switched to `timebase_hz() * seconds`, the idiom
+   `shell_test.c3` already uses in ~15 places. `user/shell.c3`,
+   `user/shell_common.c3`, `user/shell_test.c3` (+ `faulttest`'s
+   liveness probe made no-fs-aware).
+
+Regression-checked: QEMU `virt` still boots to `root / #` and passes
+`faulttest`; the Duo and real-opi builds still link. The harness earns
+its keep past Stage 1 — boot-path / trap / scheduler changes can now be
+shaken out in seconds in QEMU instead of on the one scarce board.
+
+Also started Stage 3: `user/block/dw_mshc.c3`, a first draft of the
+Synopsys DW-MSHC SD driver — the JH7110's storage controller, a
+completely different register model from the Duo's Cvitek SDHCI. Written
+against U-Boot's generic `dw_mmc.c` / `dwmmc.h`, Linux's
+`dw_mmc-starfive.c`, and the mainline JH7110 devicetree (all fetched
+this session). **Never run — no board, no QEMU model.** Compiles and
+links as a clean drop-in for `sdhci.c3` (`sdd.c3 + dw_mshc.c3` → a valid
+`sdd` binary, `sdd.c3` unchanged). Has: the full register map, the
+DW-MSHC "update clock only" dance, `dw_send_cmd` (RINTSTS-polled), the
+SD spec enumeration lifted verbatim from `sdd_enumerate()`, and a PIO
+single-block read/write path. Deliberately omits, in bring-up order:
+IDMAC/DMA (PIO only), the JH7110 syscrg clock/reset bring-up
+(`dw_mshc_soc_init()` bets U-Boot already ungated SDIO0, same bet
+`sdhci.c3` makes on the Duo BootROM), card-detect, wide-bus/high-speed.
+Not wired into any build; `board::HAS_SD_BLOCK` stays false. Remaining-
+work list in `docs/opi-rv-plan.md`'s Stage 3 section.
+
+---
+
+## 2026-09-08 — Orange Pi RV: the board arrived, Stage 1 bring-up blocked on a flaky SD probe
+
+The JH7110 board arrived. Rebased `opi-rv-port` (Stage 0 scaffold from
+2026-08-31) onto master and immediately hit two real gaps the branch
+predated: `board.c3` was missing `SMP_MAX_HARTS` / `EXEC_MAX_IMAGE_SIZE`
+/ `HEAP_MAX_BYTES` / the `PLIC_*_PHYS_PAGE` identity-map constants that
+landed on master since, and `kernel.ld`'s `.text.boot` only kept
+`.text.boot`, not `.text.boot.entry` — the pinning fix from the SMP
+Stage C1 work that keeps `boot()` first against c3c's unstable emission
+order. Without it this board's first hardware boot would have silently
+jumped into `smp.c3`'s `secondary_entry` instead — the exact landmine
+flagged after the Duo hit it once already. Verified fixed: ELF entry
+`0x40200000` now disassembles to `boot()`. Both fixed, commit `09133d6`;
+QEMU + Duo builds unaffected.
+
+Then the actual hardware session: serial console up, vendor Debian's SD
+card swapped into this PC to drop `kernel_opi.elf` onto its boot
+partition, card back in the board. OpenSBI's banner confirmed **Boot
+HART ID: 1** on real hardware — matches the plan's `PLIC_S_CONTEXT = 2`
+assumption exactly, no change needed there.
+
+The actual blocker turned out to be beneath racccoon entirely: the
+vendor U-Boot (`2021.10-orangepi`, Oct 2024) hits `Card did not respond
+to voltage select! : -110` on the SD roughly half the power-ups — a
+known, documented JH7110/VisionFive2 dw_mmc voltage-switch bug,
+reportedly fixed upstream in U-Boot ≥2025.01. Confirmed via a byte-
+identical failure signature on a *freshly re-`dd`'d* vendor image's
+very first cold boot — not caused by our file or the FAT32 write.
+Considered reflashing the board's SPI NOR U-Boot/OpenSBI firmware (a
+Google Drive link from the Orange Pi RV's own forum had the 3 files a
+`flashcp` update needs), but stopped short: no clear procedure for
+which file goes where, and JH7110 SPL images bake in per-board DRAM
+training parameters — guessing wrong risks a hard brick. Also directly
+contradicts this port's own stated non-goal ("no SPL/OpenSBI surgery"),
+so left alone rather than done as a side effect of chasing this bug.
+
+Separately, the user noticed the failure seems to track whether the
+USB-serial adapter's GND pin is connected (connected → fails more;
+disconnected → boots, but then there's no console) — a plausible
+ground-loop/noise theory, though not proven deterministic (same power
+strip, different USB port, different GND pin on the header all made no
+difference). Suspect the adapter itself; next thing to try is a
+different one.
+
+Regardless of the adapter question, built a software workaround that
+should help either way: `boards/opi-rv/boot.cmd` → `mkimage`'d into
+`boot.scr`, pushed to the SD boot partition (transferred as base64 over
+the same serial console, into the vendor Debian's own already-mounted
+`/boot`), with `/boot/extlinux/extlinux.conf` renamed to `.conf.bak` so
+U-Boot's `scan_dev_for_boot` macro falls through to it instead of the
+vendor's Linux entry. This removes the human-reaction-time race of
+catching the U-Boot prompt and typing `load`/`bootelf` by hand — once
+the SD probe succeeds (whatever ends up fixing that), it loads and
+jumps into `kernel_opi.elf` fully unattended. **Not yet verified
+end-to-end** — never got a clean SD probe after deploying it this
+session. Paused hardware bring-up here pending a different serial
+adapter to test the ground-loop theory. Full state and revert
+instructions in `docs/opi-rv-plan.md`'s Stage 1 section.
+
+---
+
 ## 2026-09-06 — scheduler: bookkeeping survives an all-blocked cascade + a SYS_IPC_CALL timeout
 
 The kernel's own `enable_timer_interrupts()` comment already spelled out

@@ -25,8 +25,11 @@ import sbi;
 // the per-board *policy* limit and is clamped to this.
 const uint SMP_MAX_HARTS = 8;
 
-// The hart that OpenSBI handed control to in S-mode — captured from a0
-// in boot() (kernel.c3) into boot_hartid_raw before anything else runs.
+// The hart that OpenSBI handed control to in S-mode — a0 at the S-mode
+// entry, carried as kernel_main's parameter and written here right after
+// the .bss clear (this var is IN .bss — see boot()/kernel_main). Was
+// previously stashed by boot() itself and silently zeroed by that clear;
+// harmless on a hart-0 boot, wrong on the sifive_u harness (hart 1).
 ulong boot_hartid_raw @export("boot_hartid_raw");
 ulong boot_hartid;
 
@@ -154,8 +157,15 @@ fn void smp_start_secondaries() @noinline
 		hart_online[(uint)boot_hartid] = true;
 	}
 
+	// board::SMP_MAX_HARTS <= 1 is the "single-hart, no SMP" policy both
+	// shipping boards set (boards/duo, boards/opi-rv). Nothing to start,
+	// whatever hart we booted on — and the guard matters: with a boot hart
+	// other than 0 (the Orange Pi RV / JH7110 boots on hart 1) the loop
+	// below would otherwise iterate to h=0 and sbi_hart_start() the JH7110's
+	// S7 monitor core, an explicit non-target. Invisible on the Duo, whose
+	// boot hart 0 is caught by the h == boot_hartid check.
 	uint started = 0;
-	for (ulong h = 0; h < max; h++)
+	for (ulong h = 0; max > 1 && h < max; h++)
 	{
 		if (h == boot_hartid) { continue; }
 

@@ -523,7 +523,7 @@ fn void shell_login()
     // through to a root console once it expires.
     char[8] probe @noinit;
     bool have_db = false;
-    ulong deadline = rdtime() + 250000000; // ~10s at the Duo's 25MHz
+    ulong deadline = rdtime() + timebase_hz() * 10; // 10s wall-clock, any board
     while (rdtime() < deadline) {
         if (fs_read("/adm/users", &probe[0], 8) >= 0) { have_db = true; break; }
         yield();

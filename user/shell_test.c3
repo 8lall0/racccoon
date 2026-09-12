@@ -151,10 +151,11 @@ fn void mutex_thread_body(void* arg) {
 }
 
 fn void main() {
-    // QEMU timebase is 10 MHz — ~3 s covers the (fast) virtio boot
-    // chatter; automated test runs wait much longer than this before
-    // sending anything anyway.
-    shell_boot_settle(30000000);
+    // ~3 s covers the (fast) virtio boot chatter; automated test runs
+    // wait much longer than this before sending anything anyway.
+    // timebase_hz() so an OPI_TEST_SHELL=1 build on the sifive_u harness
+    // (1 MHz) settles in 3 s, not 30.
+    shell_boot_settle(timebase_hz() * 3);
     shell_bind_user_bin();   // union /usr/root/bin onto /bin (docs/bin-layout.md)
     for (;;) {
         shell_prompt();
@@ -2639,12 +2640,18 @@ fn void main() {
                 // shell just needs a non-zero (failed) code and to
                 // still be alive to run the next command.
                 char[8] ft_probe @noinit;
-                int ft_alive = fs_read("bin/echod", &ft_probe, 8); // shell still works?
-                if (ft_code != 0 && ft_alive >= 0) {
+                // shell still works? On a board with a filesystem, re-read
+                // a known file. On a no-fs board (the sifive_u opi
+                // harness) fs_read is always -1, so a plain syscall
+                // round-trip stands in — either way this only has to show
+                // the shell survived the child's fault and can still run.
+                int ft_alive = fs_read("bin/echod", &ft_probe, 8);
+                bool ft_shell_ok = (ft_alive >= 0) || (getuid() >= 0);
+                if (ft_code != 0 && ft_shell_ok) {
                     print("faulttest: ok (faulting child killed, kernel + shell fine)\n");
                 } else {
                     print("faulttest: FAILED code="); print_uint((uint)ft_code);
-                    print(" alive="); print_uint((uint)(ft_alive >= 0)); putchar('\n');
+                    print(" alive="); print_uint((uint)ft_shell_ok); putchar('\n');
                 }
             }
         } else if (strcmp(cmd, "fputest") == 0) {

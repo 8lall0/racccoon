@@ -10,10 +10,14 @@ import std::nolibc::main_stub;
 // what scripts/build.sh embeds for QEMU. See docs/devlog.md for why
 // this split exists (shell.c3 used to carry both).
 fn void main() {
-    // Duo timebase is 25 MHz — ~6 s, long enough to cover sdd/usb/ethd
-    // bring-up (this shell is only ever built for the Duo; QEMU gets
-    // shell_test.c3).
-    shell_boot_settle(150000000);
+    // ~6 s, long enough to cover sdd/usb/ethd bring-up. timebase_hz() so
+    // it's the same wall-clock time on every board: the raw-tick version
+    // it replaced was "150e6, ~6s at the Duo's 25 MHz" but the production
+    // shell is built for the Orange Pi RV too now (4 MHz -> was 37 s) and
+    // the sifive_u harness (1 MHz -> was 150 s). QEMU (10 MHz) drops from
+    // 15 s to 6 s — a shorter settle only risks a little boot chatter
+    // after the first prompt, never a hang.
+    shell_boot_settle(timebase_hz() * 6);
 
     // The console comes up needing a login — `login: <name>`, matched
     // against /adm/users, then setuid + cd $home. `root` is always

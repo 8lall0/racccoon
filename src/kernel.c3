@@ -68,20 +68,29 @@ extern char[] _binary_gpiod_bin_end @cname("_binary_gpiod_bin_end");
 fn void boot() @naked @export("boot") @section(".text.boot.entry") @noinline @nostrip @used
 {
 	// OpenSBI enters S-mode here with a0 = the boot hart's id, a1 = the
-	// DTB address. Stash a0 for src/smp.c3 before setting up the stack —
-	// secondary harts are started separately (sbi_hart_start), they land
-	// at secondary_entry, not here.
+	// DTB address. a0 is left untouched (la/j don't clobber it) and picked
+	// up as kernel_main's first parameter — NOT stashed to memory here:
+	// boot_hartid_raw lives in .bss and kernel_main's first act is to zero
+	// .bss, which would wipe it straight back to 0. That bug was invisible
+	// on every board whose boot hart is hart 0 (QEMU virt, the Milk-V Duo)
+	// and only surfaced on the sifive_u harness, whose boot hart is 1 —
+	// see docs/devlog.md. Secondary harts are started separately
+	// (sbi_hart_start) and land at secondary_entry, not here.
 	asm(`
-        la t0, boot_hartid_raw
-        sd a0, 0(t0)
         la sp, __stack_top
         j kernel_main
     `);
 }
 
-fn void kernel_main() @export("kernel_main") @noinline @nostrip
+fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 {
 	mem::set(&__bss, 0, (sz)((uptr)&__bss_end - (uptr)&__bss));
+
+	// a0 from boot() — the hart OpenSBI handed the S-mode payload to.
+	// Written only now, after the .bss clear above, because that is where
+	// boot_hartid_raw lives (see boot()'s comment). smp_init_boot_hart()
+	// just below copies it into boot_hartid.
+	boot_hartid_raw = boot_hart;
 
 	io::print("1: BSS cleared\n");
 
