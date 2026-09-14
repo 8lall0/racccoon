@@ -126,7 +126,6 @@ const uptr HEAP_MAX_BYTES = board::HEAP_MAX_BYTES;
 // While true, SYS_PUTCHAR from a process with is_boot_server set is
 // dropped — keeps late server init chatter off the prompt.
 bool g_boot_quiet = false;
-bool g_diag_putchar_seen = false; // TEMP DIAGNOSTIC — see SYS_PUTCHAR's own comment
 
 // Cap on the image SYS_EXEC will install — board-specific
 // (board::EXEC_MAX_IMAGE_SIZE). racccoon's own binaries (build/user/*.bin)
@@ -2541,13 +2540,6 @@ fn void handle_syscall(Trap_frame* f) @noinline
 	switch (f.a3)
 	{
 		case SYS_PUTCHAR:
-			// TEMP DIAGNOSTIC — opi-rv shell-output investigation, remove
-			// once resolved. Uses io::print (the SAME S-mode-direct path
-			// the boot-time messages already used successfully) to
-			// confirm whether SYS_PUTCHAR is even being entered at all,
-			// distinct from whether sbi::console_emit's own output
-			// actually reaches the console.
-			if (!g_diag_putchar_seen) { g_diag_putchar_seen = true; io::print("DIAG: SYS_PUTCHAR entered\n"); }
 			if (current_proc.stdout_pipe >= 0)
 			{
 				// Redirected (a `|` or `>`): into the pipe, blocking
