@@ -112,7 +112,15 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 	// interrupt can actually fire — kernel_entry's very first instruction
 	// (csrrw sp, sscratch, sp) would otherwise swap in garbage and build
 	// the trap frame at a bogus address.
-	write_csr("sscratch", (uptr)&boot_trap_stack + boot_trap_stack.len);
+	//
+	// & ~15: same alignment requirement as process.c3's own per-process
+	// sscratch computation (see its comment — the real Orange Pi RV bug
+	// this session found) — a `char[]` global's own start address isn't
+	// guaranteed 8-byte aligned just because it's a global. This one
+	// hasn't been caught misaligned yet, but nothing guarantees it stays
+	// that way after some unrelated global gets added/reordered ahead of
+	// it in BSS; fixing it defensively now costs nothing.
+	write_csr("sscratch", ((uptr)&boot_trap_stack + boot_trap_stack.len) & ~(uptr)15);
 
 	board::plic_init();
 

@@ -4,6 +4,90 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-14 — Orange Pi RV: real hardware unblocked, first-ever boot + a real kernel bug fixed, then a firmware-upgrade misadventure with a full recovery
+
+**Real board unblocked.** The isolator (tested successfully on the Duo
+earlier this same day) did NOT fix the SD-probe bug — 9 consecutive
+`mmc dev 0` failures across 2 fresh cold boots with it inline, no
+improvement over the baseline. A web search found this is a genuinely
+unresolved *upstream* U-Boot bug (reproduces on VisionFive2 even on
+v2026.07), so a newer U-Boot wouldn't have helped either — but the same
+report named the real workaround: booting via USB mass storage instead
+of SD works fine. Confirmed: `usb start` finds the (USB-adapter'd SD)
+card as a storage device; `bootelf` on the ELF crashes inside U-Boot
+itself (a separate real bug, first time ever tried on real hardware);
+`load usb 0:1 <addr> kernel_opi.bin` + `go <addr>` (the raw `.bin`, not
+the ELF) works.
+
+**First-ever real racccoon boot on this board — hit a real, previously
+latent kernel bug immediately after.** `scause=6` (store/AMO address
+misaligned) on `kernel_entry`'s very first instruction (`sd ra,0(sp)`,
+right after `csrrw sp,sscratch,sp`). Root cause: `sscratch`'s computed
+value (`process.c3`'s `switch_context` call site: `(uptr)&next.stack +
+STACK_SIZE`) equals `&next + sizeof(Process)` — the *next array
+element's own start address* in the `procs[]` table, a struct/array
+boundary with no alignment guarantee of its own (`stack` is a trailing
+`char[]` field after a long run of mixed-size fields; only
+`sizeof(Process)` being a multiple of 8 is guaranteed, not `stack`'s
+own offset). Whether the result happens to come out aligned is pure
+luck of where the linker places `procs[]` in BSS — the opi-rv-qemu
+harness's different link address (`0x80200000` vs opi-rv's
+`0x40200000`) shifted the overall layout enough to land aligned there
+and not on the real board; same source, same struct layout, nothing
+ever caught it before. Two more call sites computed the same "top of
+`.stack`" value the same unguarded way (`process.c3`'s
+`create_process`, `entry.c3`'s `rfork`) — fixed all three by masking to
+16 bytes (`& ~(uptr)15`); `kernel.c3`'s own `boot_trap_stack` anchor got
+the same defensive treatment even though it hadn't been caught
+misaligned yet. Regression-checked: QEMU `virt`, opi-rv-qemu (still
+boots clean), and the Duo build all unaffected. **Result: `root / #` on
+real Orange Pi RV hardware for the first time ever.**
+
+**Found a second, separate, real bug — this one in firmware, not
+racccoon.** This board's OpenSBI logs `sbi_ecall_handler: Invalid error
+N for ext=0x2 func=0x0` for every legacy `console_getchar` call that
+returns an actual character (confirmed via the real opensbi
+`sbi_ecall.c` source: newer OpenSBI explicitly excludes
+`SBI_EXT_0_1_CONSOLE_GETCHAR` from the check that clamps "unexpected"
+positive return values to `SBI_ERR_FAILED`; this board's older OpenSBI
+lacks that exclusion, so every real keystroke gets silently turned into
+"no char available"). `SYS_PUTCHAR` itself is fine (confirmed via a
+diagnostic print) — only input is affected.
+
+**User chose to fix it via a firmware upgrade** (safer to do from a
+trusted, running Linux environment than blind `sf write` at the U-Boot
+prompt) rather than a raw-UART software workaround. Full detail of the
+attempt, the 3 identical crashes, the proven recovery procedure, and
+where it was set aside is in `docs/opi-rv-plan.md`'s new "Firmware
+upgrade attempt" section — short version: `apt` has no live upgrade
+path for this board's U-Boot package, mainline U-Boot has real
+`xunlong,orangepi-rv` support (same binary as
+`starfive_visionfive2_defconfig`), 3 build variants (unpinned OpenSBI,
+OpenSBI pinned to the documented v1.7, +board-specific devicetree) all
+crashed identically at the same address, and a genuine JH7110 Mask ROM
+UART/X-modem recovery procedure was discovered and used successfully
+**3 times** to restore the board to its original, fully-working state
+after each failed attempt. The likely real cause (untested): the
+original 2021-era vendor SPL (`mtd0`, never touched) may simply not be
+ABI-compatible with a U-Boot-proper built from today's mainline source,
+regardless of that U-Boot-proper's own OpenSBI version or devicetree —
+fixing that would mean also rebuilding and flashing SPL itself, a
+materially higher-risk operation. Set aside deliberately with the user
+rather than pursued further.
+
+**Real workflow lesson**: `screen -X stuff` only recognizes octal
+escapes (`\003` for Ctrl-C) — not `\xHH` hex notation. `"\x03"` sends
+the 4 literal characters, silently doing nothing useful. Cost real
+confusion this session before the console's own echoed-back garbage
+made it obvious.
+
+**Files changed:** `src/process.c3` (the actual bug fix, 2 call
+sites), `src/entry.c3` (the 3rd call site), `src/kernel.c3` (defensive
+hardening), `docs/opi-rv-plan.md`, this entry. No lasting changes to
+the board's own firmware — it's back to exactly its original state.
+
+---
+
 ## 2026-09-09 — Orange Pi RV: a QEMU `sifive_u` harness boots Stage 1/2 in emulation, and surfaces 3 real bugs
 
 The real board is still SD-probe blocked (2026-09-08 entry; the UART

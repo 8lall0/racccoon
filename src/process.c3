@@ -1178,8 +1178,11 @@ fn Process* create_process(void* image, uint image_size)
 		panic::panic("no free process slots");
 	}
 
-	uptr* sp = (uptr*)&proc.stack;
-	sp += STACK_SIZE / 8;
+	// & ~15: same struct/array-boundary alignment hazard as this file's
+	// own switch_context call site below (see its comment) —
+	// `&proc.stack + STACK_SIZE` is `&proc + sizeof(Process)`, the next
+	// array element's own start, with no alignment guarantee of its own.
+	uptr* sp = (uptr*)(((uptr)&proc.stack + STACK_SIZE) & ~(uptr)15);
 	for (int j = 0; j < 12; j++)
 	{
 		*(--sp) = 0;
@@ -1730,5 +1733,23 @@ fn void yield() @noinline
 	write_csr("sstatus", (read_reg("sstatus") & ~SSTATUS_FS_MASK) | SSTATUS_FS_CLEAN);
 
 	g_prof_switches++;
-	switch_context(&prev.sp, &next.sp, ((ulong)(uptr)next.page_table >> 12) | SATP_SV39, (uptr)&next.stack + STACK_SIZE);
+	// & ~15: kernel_entry's very first trap-entry instruction (entry.c3)
+	// is `sd ra, 0(sp)` against this exact value (swapped in from
+	// sscratch) — it must be a naturally-aligned stack pointer. `stack`
+	// is a `char[STACK_SIZE]` field preceded by a long run of mixed-size
+	// fields (ints, bools, ulongs); nothing guarantees its own start
+	// address lands on an 8-byte boundary, only that Process's *total*
+	// size does. Whether `&next.stack` (and so this whole expression)
+	// happens to come out aligned is pure luck of where the linker
+	// places the `procs` array in BSS — found the hard way on the
+	// Orange Pi RV's real hardware (first-ever real boot, immediate
+	// "store/AMO address misaligned" fault on kernel_entry's first
+	// instruction, scause=6): the opi-rv-qemu build's different link
+	// address (0x80200000 vs opi-rv's 0x40200000) shifted overall BSS
+	// layout enough to happen to land aligned there and not here — same
+	// source, same struct layout, no earlier build ever caught this.
+	// STACK_SIZE is 64 KiB; losing up to 15 bytes off the very top is
+	// immaterial.
+	uptr next_sscratch = ((uptr)&next.stack + STACK_SIZE) & ~(uptr)15;
+	switch_context(&prev.sp, &next.sp, ((ulong)(uptr)next.page_table >> 12) | SATP_SV39, next_sscratch);
 }

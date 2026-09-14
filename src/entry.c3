@@ -126,6 +126,7 @@ const uptr HEAP_MAX_BYTES = board::HEAP_MAX_BYTES;
 // While true, SYS_PUTCHAR from a process with is_boot_server set is
 // dropped — keeps late server init chatter off the prompt.
 bool g_boot_quiet = false;
+bool g_diag_putchar_seen = false; // TEMP DIAGNOSTIC — see SYS_PUTCHAR's own comment
 
 // Cap on the image SYS_EXEC will install — board-specific
 // (board::EXEC_MAX_IMAGE_SIZE). racccoon's own binaries (build/user/*.bin)
@@ -772,8 +773,14 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		// otherwise inherit. See fork_entry's own comment in
 		// process.c3 for how this block gets consumed. 32 words of
 		// 8 bytes now (Sv64 port), not 4.
-		uptr* child_sp = (uptr*)&child.stack;
-		child_sp += STACK_SIZE / 8;
+		// & ~15: see process.c3's own switch_context call site comment —
+		// `&child.stack + STACK_SIZE` is exactly `&child + sizeof(Process)`
+		// (the next array element's own start), a struct/array boundary
+		// with no alignment guarantee of its own. Masked here for the
+		// same reason, even though this particular result then moves 256
+		// bytes further in (less likely to straddle a page than the raw
+		// top, but not guaranteed either).
+		uptr* child_sp = (uptr*)(((uptr)&child.stack + STACK_SIZE) & ~(uptr)15);
 		child_sp -= 32;
 
 		mem::copy((void*)child_sp, f, (sz)Trap_frame::size);
@@ -2534,6 +2541,13 @@ fn void handle_syscall(Trap_frame* f) @noinline
 	switch (f.a3)
 	{
 		case SYS_PUTCHAR:
+			// TEMP DIAGNOSTIC — opi-rv shell-output investigation, remove
+			// once resolved. Uses io::print (the SAME S-mode-direct path
+			// the boot-time messages already used successfully) to
+			// confirm whether SYS_PUTCHAR is even being entered at all,
+			// distinct from whether sbi::console_emit's own output
+			// actually reaches the console.
+			if (!g_diag_putchar_seen) { g_diag_putchar_seen = true; io::print("DIAG: SYS_PUTCHAR entered\n"); }
 			if (current_proc.stdout_pipe >= 0)
 			{
 				// Redirected (a `|` or `>`): into the pipe, blocking

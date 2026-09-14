@@ -198,8 +198,99 @@ picked up in a later session:
     perturbing the SD controller's sensitive 1.8V switch), but not
     conclusively proven deterministic in a single A/B trial — same
     outlet/strip and a different USB port / GND pin didn't fix it.
-    Next thing to try: a different (ideally galvanically isolated)
-    USB-serial adapter.
+  - **Tested 2026-09-13 with the serial isolator** (the same device
+    verified working on the Milk-V Duo earlier that session): inserted
+    inline between the USB-serial adapter and the board's UART, GND
+    included through the isolator rather than direct. Result: **9
+    consecutive `mmc dev 0` failures**, identical `-110` signature,
+    across 2 independent fresh cold power-cycles plus in-session
+    retries — no improvement. This weakens the ground-loop/noise-
+    coupling theory (an isolator should have broken that specific
+    coupling path if it were the cause) and points back toward this
+    being the documented upstream dw_mmc voltage-switch bug itself
+    (fixed in U-Boot ≥2025.01), independent of the serial adapter.
+    `mmc dev 1` (a different, non-SD device — likely the AP6256 WiFi's
+    SDIO) continues to probe fine in the same sessions, confirming the
+    controller/bus itself isn't universally broken, just this
+    specific card-voltage-switch sequence on `mmc dev 0`.
+  - A web search (2026-09-13) found this is a known, currently
+    **unresolved upstream U-Boot bug**, reproduced on VisionFive2 (same
+    JH7110) with multiple different SD cards, on both v2026.07 and
+    v2026.07-rc4 — so a newer U-Boot would *not* have fixed it either;
+    good to know before ever reconsidering a firmware reflash. The same
+    report names a real workaround: **booting via USB mass storage
+    works fine** — sidesteps the SD controller's specific voltage-
+    switch bug entirely rather than fixing it.
+
+**USB mass storage boot — unblocked Stage 1, 2026-09-13.** This
+board's U-Boot has a working XHCI/USB stack (`usb start` finds storage
+devices fine); loaded `kernel_opi.elf`/`kernel_opi.bin` off a USB-
+adapter'd SD card (`usb part` showed a GPT `bootfs` partition,
+`fatload`-equivalent `load usb 0:1 ...` works) instead of `mmc dev 0`.
+
+- `bootelf 0x40200000` on the ELF **crashed inside U-Boot itself**
+  (`Unhandled exception: Load access fault`, fault address inside
+  U-Boot's own relocated image, board watchdog-reset itself) — a real
+  `bootelf`+ELF compatibility bug in this vendor U-Boot build, first
+  time ever attempted on real hardware. Not pursued further; sidestep
+  it instead.
+- `load usb 0:1 0x40200000 kernel_opi.bin` + `go 0x40200000` (the raw
+  binary + direct jump, `build_opi.sh`'s own documented fallback)
+  **works** — this is now the real, working load path for this board,
+  not `bootelf`. Update any future instructions/scripts accordingly.
+
+**First-ever real hardware boot — hit a real, previously-latent kernel
+bug** (`scause=6`, store/AMO address misaligned, `sd ra,0(sp)` — the
+very first instruction of `kernel_entry`, right after `csrrw sp,
+sscratch, sp`): `sscratch`'s computed value (`(uptr)&next.stack +
+STACK_SIZE`, in `process.c3`'s own `switch_context` call site) is
+exactly `&next + sizeof(Process)` — the next array element's own start
+address in the `procs[]` table, a struct/array boundary with **no
+alignment guarantee of its own** (`stack` is a trailing `char[]` field
+after a long run of mixed-size fields; nothing enforces its own start
+address land on an 8-byte boundary, only that `sizeof(Process)` does).
+Whether the resulting address happens to come out aligned is pure luck
+of where the linker places `procs[]` in BSS — the opi-rv-qemu build's
+different link address (`0x80200000` vs opi-rv's `0x40200000`) shifted
+overall layout enough to land aligned there and not on the real board;
+same source, same struct layout, no earlier build (including the
+QEMU harness that supposedly validated this exact boot path) ever
+caught it. Two more call sites computed the same "top of `.stack`"
+value the same unguarded way (`process.c3`'s `create_process`,
+`entry.c3`'s `rfork`) — fixed all three by masking to a 16-byte
+boundary (`& ~(uptr)15`) at each computation; `kernel.c3`'s own
+`boot_trap_stack` anchor got the same defensive treatment even though
+it hadn't been caught misaligned yet. Regression-checked: QEMU `virt`,
+`opi-rv-qemu` (still boots clean to `root / #`), and the Duo build all
+still boot/link unchanged.
+
+**Result after the fix: `root / #` on real Orange Pi RV hardware for
+the first time ever.** Boots clean through BSS clear → trap handler →
+idle/procd/envd/shell creation → SMP hart-1 detection → shell prompt.
+
+**New, separate, real hardware quirk found immediately after**: this
+board's specific OpenSBI firmware build prints `sbi_ecall_handler:
+Invalid error N for ext=0x2 func=0x0` (N = the ASCII value of the
+character just read) for **every legacy `sbi_console_getchar()` call
+that returns an actual character** — i.e. once per keystroke, on the
+same shared UART our own console output uses. The characters
+themselves are read correctly (the logged N values spell out exactly
+what was typed), so this isn't a bug in `sbi::__getchar()` — it's
+OpenSBI's own firmware being unexpectedly chatty about extension 0x2's
+completely normal legacy behavior (returning the char via a0 directly,
+not the standard {error,value} pair legacy calls don't use). Typing a
+longer string (a full `echo ...` command) over the noisy link appears
+to have dropped some later characters before the shell even saw them
+(consistent with the M-mode firmware's own blocking UART print for
+each spam line stealing enough real time that a small hardware RX FIFO
+overruns) — after that, the shell accepted further Enter presses
+(each newline was correctly read, per the same spam trail) but never
+printed any command output or a fresh prompt. **Not yet root-caused —
+picked up next.** Worth checking: does the shell echo input at all on
+this platform (no echoed characters were seen distinct from OpenSBI's
+own diagnostic lines), and does a short, single-character-at-a-time
+input sequence (avoiding whatever dropped characters in the longer
+string) behave differently.
 - **Software workaround staged, ready regardless of the adapter fix**:
   `boards/opi-rv/boot.cmd` → `mkimage`'d into `boot.scr`, deployed to
   the SD boot partition root, with `/boot/extlinux/extlinux.conf`
@@ -221,6 +312,92 @@ Testable at this stage (no fs needed): `echo`, pipes, brace/glob
 expansion, `ns`, `ping` (IPC to echod), and — with
 `OPI_TEST_SHELL=1` — `maptest` (SYS_MAP), `hungservertest` (supervisor
 respawn of a wedged echod), `mutextest`/`threadtest`.
+
+#### Firmware upgrade attempt (2026-09-14) — set aside, real recovery procedure proven along the way
+
+User's own plan: fix the OpenSBI legacy-`console_getchar` bug (see
+above) by upgrading firmware from a running, trusted Linux environment
+rather than risky blind `sf write` at the U-Boot prompt. Booted the
+standard vendor Debian image via the same USB-mass-storage path
+(`sysboot usb 0:1 any 0x44000000 /extlinux/extlinux.conf` once
+`extlinux.conf` is confirmed present — no need to rename anything on
+this particular card). `apt` has no live upgrade path for
+`linux-u-boot-orangepirv-current` (a local-only package, only a frozen
+2022 debian-ports snapshot repo configured, no network on the board
+anyway). Board's SPI NOR is 3 real MTD partitions confirmed via
+`/proc/mtd`: `mtd0`="spl" (256K, DRAM training — never touched),
+`mtd1`="uboot" (3M, OpenSBI+U-Boot FIT image — the only one touched),
+`mtd2`="data" (1M). Backed up the original working `mtd1` first (raw
+`dd`, verified via md5sum, kept on the PC) before touching anything.
+
+**Found mainline U-Boot has real upstream support for
+`xunlong,orangepi-rv`** (same `starfive_visionfive2_defconfig` binary
+as VisionFive2 — only the devicetree filename differs, and that only
+matters for the Linux kernel later, not for U-Boot/OpenSBI itself) and
+a real, working recovery path: this board has 3 physical buttons
+("uart boot", "flash", "power" — found by asking, not guessing;
+"flash" alone does nothing, only **"uart boot" + power** enters JH7110
+Mask ROM UART/X-modem recovery, `(C)StarFive` banner then continuous
+`C` bytes at 115200). `lrzsz`'s `sx -X` got continuous NAKs from this
+receiver for unknown reasons; a from-scratch ~100-line Python
+XMODEM-CRC sender worked where it didn't (128-byte blocks, CRC16-CCITT
+poly 0x1021, 0x1A padding — not saved to the repo, recreate if ever
+needed). The *specific*, documented recovery bootstrap matters: the
+newer "devkits" variant produced total silence; the older, exactly
+`jh7110-recovery-20221205.bin` (from `github.com/starfive-tech/Tools`
+`recovery/`) works and shows the documented menu (`0`=SPL-in-flash,
+`2`=uboot-in-flash, `5`=exit).
+
+**Three build/flash attempts, three identical crashes, firmware
+upgrade set aside for now:**
+1. Unpinned latest-HEAD OpenSBI + latest-HEAD U-Boot →
+   `Unhandled exception: Load access fault` inside OpenSBI/U-Boot
+   itself, crash-loop, `EPC` reloc-adjusted to `0x4023d882`,
+   `TVAL` a mangled/sign-extended-looking address. Hypothesis: OpenSBI
+   version skew (docs.u-boot.org pins `OpenSBI v1.7` specifically for
+   this defconfig).
+2. Rebuilt with OpenSBI **exactly v1.7** as documented, same U-Boot —
+   **identical crash, same `EPC`.** Ruled out the version-skew
+   hypothesis.
+3. Same OpenSBI v1.7, U-Boot rebuilt with `CONFIG_DEFAULT_DEVICE_TREE`
+   switched to the real `starfive/jh7110-orangepi-rv` (confirmed
+   already present in `CONFIG_OF_LIST`, i.e. the upstream board-support
+   patch has landed in current mainline U-Boot) instead of
+   VisionFive2's default — **identical crash again, same `EPC`.** Ruled
+   out the devicetree-mismatch hypothesis too.
+
+Real remaining hypothesis, not yet tested: **`mtd0` (SPL) was never
+touched, in any of the 3 attempts** — every build used the *original
+2021-era vendor SPL* to load a *U-Boot-proper built from today's
+mainline source*. The SPL→U-Boot-proper handoff (FIT image parsing,
+load addresses, board-init expectations) isn't a stable ABI across
+years of drift; this vendor SPL and mainline U-Boot-proper may simply
+not be able to talk to each other, regardless of which U-Boot-proper
+config is used. Fixing that would mean *also* rebuilding and flashing
+SPL — a materially higher-risk operation (bad SPL affects DRAM
+training itself, and could make even the proven recovery path harder
+to use) — **not attempted, set aside deliberately with the user rather
+than pursued further this session.**
+
+**Recovered successfully all 3 times** using the procedure above
+(restore the backed-up original `mtd1` via the same recovery menu) —
+confirmed via the exact original vendor boot banner (`U-Boot SPL
+2021.10-orangepi (Oct 24 2024 - 20:33:18 +0800)`, `OpenSBI v1.2`, same
+EEPROM info) reappearing each time. **Board is back to its original,
+fully working state** as of session end — same OpenSBI getchar bug
+still present (never fixed), same SD-probe bug still present (never
+attempted), but not bricked. This 3x-proven recovery procedure is
+itself the most valuable output of this sub-arc if firmware work is
+ever resumed: the physical button combo, the specific recovery binary,
+and a working from-scratch XMODEM sender are all now known-good.
+
+Next step if resumed: either build a *matching* SPL from the same
+mainline source (and flash `mtd0` too, accepting the higher risk with
+the now-proven recovery path as a safety net), or drop the firmware
+route entirely in favor of the software workaround already identified
+(read UART0's raw 16550 registers directly for input, bypassing the
+buggy legacy SBI `console_getchar` call in racccoon's own kernel —
+zero firmware risk, works regardless of vendor SPL/U-Boot vintage).
 
 ### Stage 2 — timer + traps under load
 
