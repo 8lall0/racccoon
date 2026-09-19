@@ -1329,6 +1329,11 @@ fn void sys_exec(Trap_frame* f) @noinline
 		// image — the data was always right, only the CPU's own
 		// cached mapping to it was stale.
 		flush_tlb();
+		// Same class of bug one level down: the new image was just WRITTEN
+		// with ordinary stores, and instruction fetch does not see those
+		// without a fence.i (real cores with a separate I-cache, e.g. the
+		// U74) — see sync_icache() in process.c3.
+		sync_icache();
 
 		// Redirect execution: the standard trap-return path
 		// restores this into the real sepc CSR before sret, so the

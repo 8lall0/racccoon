@@ -815,6 +815,25 @@ fn void flush_tlb() @naked @noinline
     `);
 }
 
+// Instruction-cache synchronisation (Zifencei `fence.i`). The kernel writes
+// a program's code with ordinary stores (create_process's image copy,
+// SYS_EXEC's, rfork's page copy, even alloc_pages' zero-fill of a reused
+// page), and RISC-V does NOT make those stores visible to instruction fetch
+// by itself: without a `fence.i` the hart can keep executing STALE code from
+// its I-cache — whatever program last ran out of those same physical pages.
+// QEMU's translator always sees the new bytes, and the T-Head C906 evidently
+// tolerated it, which is why this never showed until the SiFive U74 (the
+// Orange Pi RV: separate, non-coherent I-cache): after a few `ls` runs, `cat`
+// (exec'd into recycled pages) took an illegal-instruction fault on a jump
+// into its own zeroed .data. Call after any code is written, before it runs.
+fn void sync_icache() @naked @noinline
+{
+	asm(`
+        fence.i
+        ret
+    `);
+}
+
 // Targeted flush for a single just-mapped page (a0 = its virtual
 // address) — the lazy-SYS_MAP demand-fault path (entry.c3) runs on
 // every touched page of a Go arena, so a global sfence.vma each time
@@ -993,6 +1012,7 @@ fn void user_entry() @naked @noinline @noreturn
 	// a leftover kernel-boot-time value nothing had zeroed before —
 	// harmless as long as nothing used tp, same as a0/a1 above.
 	asm(`
+        fence.i
         li t0, 0x1000000
         csrw sepc, t0
         li t1, 0x42020
@@ -1028,6 +1048,7 @@ fn void user_entry() @naked @noinline @noreturn
 fn void fork_entry() @naked @noinline @noreturn
 {
 	asm(`
+        fence.i
         addi t0, sp, 8 * 31
         ld t0, 0(t0)
         csrw sepc, t0
