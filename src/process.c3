@@ -164,48 +164,16 @@ fn Irq_route* irq_route_by_pid(int pid)
 	return null;
 }
 
-// The filesystem server (see user/fsd.c3) — 0 until created, consulted
-// only by create_process below to populate every new process's default
-// namespace. Unlike diskd, fsd is meant to be reached by ordinary
-// clients (the shell), so it's addressed through namespace resolution,
-// not a hardcoded pid — see the "" catch-all mount below.
-int fsd_pid = 0;
-
-// The IPC test/demo server (user/echod.c3) — spawned first of all, so it
-// used to be guaranteed pid 2 and the default namespace hardcoded that.
-// Captured here now (kernel.c3 sets it) and read into namespace[0] like
-// every other server, so echod can move slots / be respawned by the
-// supervisor without anything breaking.
-int echod_pid = 0;
-
-// The block-storage driver (diskd on QEMU, sdd on the Duo — mutually
-// exclusive). fsd's only client; fsd used to hardcode its pid as 3.
-// Handed to fsd via SYS_FS_PARTITION_INFO now (kernel.c3 sets it at
-// spawn). 0 on a board with no block device.
+// The block-storage driver's pid (diskd on QEMU, sdd on the Duo / Orange Pi —
+// mutually exclusive). fsd's only client; fsd used to hardcode its pid as 3.
+// Handed to fsd via SYS_FS_PARTITION_INFO (service_boot's pid_global sets it at
+// spawn, and again on a respawn). 0 on a board with no block device.
+//
+// (There used to be a pid global per server here — fsd_pid, fsd2_pid, echod_pid,
+// procd_pid, envd_pid — read only by create_process to seed the default
+// namespace. That mapping now comes from the service table: each boot service
+// registers its mount prefix, see seed_default_namespace in supervisor.c3.)
 int storage_pid = 0;
-
-// A second, simultaneously-mounted fsd instance (see kernel.c3's own
-// spawn code, gated on board::HAS_SECOND_FS_PARTITION) — reachable under
-// the "/2/" prefix instead of fsd_pid's "" catch-all. Exactly two static
-// mounts, not a general N — see docs/devlog.md for why a fully dynamic
-// runtime mount syscall wasn't needed to solve the actual problem this
-// was built for (testing FAT32 and ext2 simultaneously without
-// physically swapping board::FS_PARTITION_START_SECTOR and reflashing).
-int fsd2_pid = 0;
-
-// The process-info server (see user/procd.c3) — 0 until created,
-// reachable under the "/proc/" prefix. Unlike fsd/fsd2, spawned
-// unconditionally on every board (kernel.c3) — it has no storage
-// hardware dependency, just SYS_PROC_INFO, which every process can
-// already call.
-int procd_pid = 0;
-
-// The per-process environment-variable server (see user/envd.c3) — 0
-// until created, reachable under the "/env/" prefix. Same "no storage
-// hardware dependency, spawned unconditionally" reasoning as procd_pid
-// above: envd only ever needs SYS_IPC_RECV_GEN/SYS_PROC_INFO, which
-// every process can already reach regardless of board.
-int envd_pid = 0;
 
 const NS_MOUNTS_MAX = 16;  // Five static entries at boot ("/srv/echo/" ->
                             // echod, "" -> fsd, "/2/" -> fsd2, "/proc/" ->
@@ -1255,68 +1223,12 @@ fn Process* create_process(void* image, uint image_size)
 	// fcsr — yield()'s fp_restore loads this on the first schedule.
 	for (int k = 0; k < 33; k++) { proc.fp_area[k] = 0; }
 
-	// Default namespace: "/srv/echo/" resolves to echod, which is always
-	// pid 2 (see kernel.c3 — it's the first process spawned after idle,
-	// deterministically). Real Plan 9 convention: /srv is where server
-	// processes get *named* in the namespace — this is the mount's
-	// original placeholder binding (shell.c3's p9test used to hardcode
-	// pid 2 directly) finally landing on the right prefix, not just a
-	// real lookup replacing a hardcoded one. It used to be bound to bare
-	// "/" instead — semantically backwards (echod is a service, not the
-	// filesystem root) and purely an artifact of predating this rename;
-	// see docs/devlog.md. Trailing slash deliberately, matching "/2/"'s
-	// own convention below, so a future "/srv/echo2" can't accidentally
-	// prefix-match too.
-	str_copy(&proc.namespace[0].prefix[0], "/srv/echo/", NS_PREFIX_MAX);
-	proc.namespace[0].server_pid = echod_pid;
-	proc.namespace[0].server_generation = mount_generation(echod_pid);
-
-	// "" is a catch-all — str_starts_with treats an empty prefix as
-	// matching everything, and its zero length always loses a longest-
-	// prefix-match tie against any of the real prefixes above/below — so
-	// this only ever wins for paths that don't start with "/" at all:
-	// plain filenames like "hello.txt", exactly how user.c3's
-	// fs_read/fs_write call ns_resolve(). Also, now that nothing claims
-	// bare "/" anymore, this transparently catches absolute paths like
-	// "/hello.txt" too — no separate "/" -> fsd mount needed. Routes to
-	// fsd (0 — "unused" — for any process created before fsd exists,
-	// namely idle/echod/diskd themselves, none of which ever need this).
-	str_copy(&proc.namespace[1].prefix[0], "", NS_PREFIX_MAX);
-	proc.namespace[1].server_pid = fsd_pid;
-	proc.namespace[1].server_generation = mount_generation(fsd_pid);
-
-	// "/mnt/fs2/" — the second, simultaneously-mounted fsd instance (see
-	// fsd2_pid's own comment above), Plan9-style: an ordinary directory
-	// other services get mounted onto, not root itself (see
-	// docs/devlog.md). Same "harmless 0 for any process created before
-	// it exists" pattern as namespace[1] — SYS_NS_RESOLVE (entry.c3)
-	// already skips any mount with server_pid == 0. This default binding
-	// stays statically set here rather than raced against fsd2's own
-	// boot-time mount via a real ns_mount() call — see user/fsd.c3's own
-	// comment for why fsd2 also srv_post()s itself under "fs2", proven
-	// genuinely rebindable post-boot by shell.c3's own mounttest.
-	str_copy(&proc.namespace[2].prefix[0], "/mnt/fs2/", NS_PREFIX_MAX);
-	proc.namespace[2].server_pid = fsd2_pid;
-	proc.namespace[2].server_generation = mount_generation(fsd2_pid);
-
-	// "/proc/" — the process-info server (see procd_pid's own comment
-	// above, user/procd.c3). Same harmless-0-before-creation pattern as
-	// namespace[1]/[2].
-	str_copy(&proc.namespace[3].prefix[0], "/proc/", NS_PREFIX_MAX);
-	proc.namespace[3].server_pid = procd_pid;
-	proc.namespace[3].server_generation = mount_generation(procd_pid);
-
-	// "/env/" — the per-process environment-variable server (see
-	// envd_pid's own comment above, user/envd.c3). Same harmless-0-
-	// before-creation pattern as namespace[1]/[2]/[3].
-	str_copy(&proc.namespace[4].prefix[0], "/env/", NS_PREFIX_MAX);
-	proc.namespace[4].server_pid = envd_pid;
-	proc.namespace[4].server_generation = mount_generation(envd_pid);
-
-	for (int m = 5; m < NS_MOUNTS_MAX; m++)
-	{
-		proc.namespace[m].server_pid = 0;
-	}
+	// Default namespace: one mount per boot service that registered a mount
+	// prefix (echod "/srv/echo/", fsd "", fsd2 "/mnt/fs2/", procd "/proc/", envd
+	// "/env/"), in registration order, skipping any not up yet — see
+	// seed_default_namespace (supervisor.c3). Idle, echod and the storage driver,
+	// created before fsd, simply don't get the later ones.
+	seed_default_namespace(proc);
 
 	// Every boot-seeded mount is a plain, identity binding (no rewrite, no
 	// union). Explicit, not relied-on zero-init — a reused procs[] slot

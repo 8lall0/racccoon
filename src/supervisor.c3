@@ -58,6 +58,8 @@ struct Service
 	char* bin_start;
 	char* bin_end;
 
+	char* mount_prefix;    // where this server appears in every new process's default
+	                       // namespace ("/proc/", "" for the root fs, ...), or null: none
 	int   device;          // index into board::DEVICES (device.c3) to hand this
 	                       // server on every (re)spawn, or -1: it owns no hardware
 	bool  is_fsd;          // an fsd instance: also run setup_fsd_mappings
@@ -71,9 +73,9 @@ struct Service
 	// respawn-on-exit — a driver that panic()s comes back.
 	bool  watch_hangs;
 
-	// The kernel global the default-namespace seeding reads for this
-	// server (fsd_pid / fsd2_pid / echod_pid / procd_pid / envd_pid /
-	// storage_pid), or null.
+	// A kernel global kept pointing at this server's live pid across respawns
+	// (storage_pid, handed to fsd via SYS_FS_PARTITION_INFO), or null. The default
+	// namespace no longer needs one per server — it reads mount_prefix/pid above.
 	int*  pid_global;
 
 	int   pid;
@@ -102,13 +104,15 @@ int service_count;
 // Start `name`'s embedded binary (`bin_start`/`bin_end`) as a boot server
 // and put it under supervision. Called from kernel_main for every boot
 // server; the returned Process is the freshly spawned instance.
-//   pid_global   the kernel global the default-namespace seeding reads for
-//                this server (fsd_pid / echod_pid / storage_pid / …), or null
+//   mount        the prefix this server is mounted at in every new process's
+//                default namespace (see seed_default_namespace), or null
+//   pid_global   a kernel global to keep pointing at this server's live pid
+//                (storage_pid, which SYS_FS_PARTITION_INFO hands to fsd), or null
 //   device       board::DEVICES index this server drives (device_find), -1 none
 //   is_fsd       an fsd instance, with its partition / secondary flag
 //   watch_hangs  hang watchdog applies (see the field's comment above)
 fn Process* service_boot(char* name, char* bin_start, char* bin_end,
-	int* pid_global = null, int device = -1, bool watch_hangs = true,
+	char* mount = null, int* pid_global = null, int device = -1, bool watch_hangs = true,
 	bool is_fsd = false, uint fsd_partition = 0, bool fsd_secondary = false)
 {
 	if (service_count >= SVC_MAX) { panic::panic("service table full"); }
@@ -122,6 +126,7 @@ fn Process* service_boot(char* name, char* bin_start, char* bin_end,
 	s.fsd_secondary  = fsd_secondary;
 	s.watch_hangs    = watch_hangs;
 	s.pid_global     = pid_global;
+	s.mount_prefix   = mount;
 	s.restarts       = 0;
 	s.given_up       = false;
 
@@ -134,6 +139,46 @@ fn Process* service_boot(char* name, char* bin_start, char* bin_end,
 	s.used = true;
 	service_count++;
 	return p;
+}
+
+// Populate a new process's default namespace from the service table: one mount
+// per registered service that has a mount prefix and is currently up, in
+// registration order (echod, fsd, fsd2, procd, envd on QEMU — the same order and
+// slots the old hardcoded seeding used). Called from create_process.
+//
+// What the mounts mean:
+//  - "/srv/echo/" -> echod. Real Plan 9 convention: /srv is where server
+//    processes get *named*. Trailing slash deliberately, so a future
+//    "/srv/echo2" can't prefix-match it.
+//  - "" (empty) -> fsd: a catch-all. str_starts_with treats an empty prefix as
+//    matching everything, and its zero length always loses a longest-prefix
+//    tie against any real prefix, so it only wins for paths that don't start
+//    with one of the others — plain filenames like "hello.txt" (how
+//    user.c3's fs_read/fs_write call ns_resolve) and, since nothing claims bare
+//    "/", absolute paths like "/hello.txt" too. A process created before fsd
+//    exists (idle, echod, the storage driver) just gets no such mount.
+//  - "/mnt/fs2/" -> the second fsd, Plan9-style: an ordinary directory other
+//    services get mounted onto, not root. Statically set rather than raced
+//    against fsd2's own boot-time mount — see user/fsd.c3 and shell.c3's mounttest.
+//  - "/proc/" -> procd, "/env/" -> envd.
+// SYS_NS_RESOLVE skips any mount with server_pid == 0, so a service that isn't up
+// is harmless either way; it just isn't listed. Remaining slots are cleared.
+fn void seed_default_namespace(Process* proc)
+{
+	int slot = 0;
+	for (int i = 0; i < service_count && slot < NS_MOUNTS_MAX; i++)
+	{
+		Service* s = &services[i];
+		if (!s.used || s.mount_prefix == null || s.pid == 0) { continue; }
+		str_copy(&proc.namespace[slot].prefix[0], s.mount_prefix, NS_PREFIX_MAX);
+		proc.namespace[slot].server_pid = s.pid;
+		proc.namespace[slot].server_generation = mount_generation(s.pid);
+		slot++;
+	}
+	for (int m = slot; m < NS_MOUNTS_MAX; m++)
+	{
+		proc.namespace[m].server_pid = 0;
+	}
 }
 
 // Re-point every namespace mount that named (old_pid) at (new_pid,
@@ -163,6 +208,14 @@ fn void reseat_namespace_mounts(int old_pid, int new_pid, uint new_generation)
 // seeding read. Shared by first boot (service_boot) and respawn.
 fn Process* service_instantiate(Service* s)
 {
+	// Not up until the new instance exists: seed_default_namespace (called from
+	// create_process just below) skips a service whose pid is 0, so the
+	// replacement's own namespace treats it as "not up yet" — exactly like first
+	// boot — instead of inheriting the dead instance's pid. (supervisor_spawn
+	// saved old_pid first.) Fixed up by s.pid = p.pid below and by
+	// reseat_namespace_mounts for everyone else.
+	s.pid = 0;
+
 	// Null the global first so the new instance's own create_process()
 	// namespace seeding treats this server as "not up yet" (server_pid
 	// 0 — SYS_NS_RESOLVE skips it), exactly like first boot, rather than

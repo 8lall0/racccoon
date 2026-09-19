@@ -165,10 +165,10 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 
 	// The IPC test server (see docs/devlog.md). Supervised like the rest
 	// now; the shell's "ping" resolves it through the namespace
-	// ("/srv/echo/" -> echod_pid, healed on respawn by the supervisor),
+	// ("/srv/echo/" -> echod, healed on respawn by the supervisor),
 	// so its slot/pid is no longer load-bearing.
 	service_boot("echod", (char*)&_binary_echod_bin_start, (char*)&_binary_echod_bin_end,
-		pid_global: &echod_pid);
+		mount: "/srv/echo/");
 	io::print("Idle process started\n");
 
 	// diskd/fsd (see user/diskd.c3 and user/fsd.c3, microkernel plan
@@ -176,8 +176,8 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 	// board::DEVICES (device.c3): "sd" (real SD card, user/sdd.c3) or
 	// "virtio-blk" (QEMU, user/diskd.c3), mutually exclusive. A board with
 	// neither (the Orange Pi RV scaffold, for now — no storage driver yet)
-	// skips all of this: fsd_pid stays 0, and every later create_process's
-	// default "" -> fsd namespace mount just never resolves to anything,
+	// skips all of this: fsd is never registered, so no later process's default
+	// namespace gets a "" -> fsd mount (seed_default_namespace skips it),
 	// so the shell's readfile/writefile commands fail cleanly instead of
 	// hanging on a server that was never spawned.
 	//
@@ -207,31 +207,31 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 		// Created after the storage driver so it's already registered
 		// (storage_pid) by the time fsd's own fs_init() (run the first
 		// time the scheduler picks it, same as any other process) sends
-		// it a request. fsd_pid has to be set before ANY later
-		// create_process call populates a default namespace, since that's
-		// where it's actually consumed — every process created from here
+		// it a request. fsd has to be registered (service_boot) before ANY later
+		// create_process call populates a default namespace, since the seeding
+		// reads the service table — every process created from here
 		// on (i.e. every shell) gets a working "" -> fsd mount;
 		// idle/echod/the storage driver, created before this line, don't
 		// and don't need to (see process.c3's create_process).
 		service_boot("fsd", (char*)&_binary_fsd_bin_start, (char*)&_binary_fsd_bin_end,
-			pid_global: &fsd_pid, is_fsd: true,
+			mount: "", is_fsd: true,
 			fsd_partition: board::FS_PARTITION_START_SECTOR, fsd_secondary: false);
 		io::print("fsd created\n");
 
 		// A second, simultaneously-mounted fsd instance, reachable under
-		// the "/2/" prefix (see fsd2_pid's own comment in process.c3) —
+		// the "/mnt/fs2/" prefix (its `mount:` below) —
 		// spawned from the *same* fsd binary, just pointed at a different
 		// partition. Exactly two static mounts, not a general N; see
 		// docs/devlog.md for why that's the right scope for the actual
 		// problem this solves (testing FAT32 and ext2 simultaneously,
 		// without physically swapping FS_PARTITION_START_SECTOR and
-		// reflashing). Same "must be set before any later create_process
+		// reflashing). Same "registered before any later create_process
 		// call populates a default namespace" ordering constraint as
-		// fsd_pid above.
+		// fsd above.
 		if (board::HAS_SECOND_FS_PARTITION)
 		{
 			service_boot("fsd2", (char*)&_binary_fsd_bin_start, (char*)&_binary_fsd_bin_end,
-				pid_global: &fsd2_pid, is_fsd: true,
+				mount: "/mnt/fs2/", is_fsd: true,
 				fsd_partition: board::FS_PARTITION_2_START_SECTOR, fsd_secondary: true);
 			io::print("fsd2 created\n");
 		}
@@ -245,9 +245,9 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 	// fsd.c3's own DISKD_PID=3) regardless of which of
 	// the board has storage / HAS_SECOND_FS_PARTITION is set. Same "must be set
 	// before any later create_process call populates a default
-	// namespace" ordering constraint as fsd_pid/fsd2_pid above.
+	// namespace" ordering constraint as fsd/fsd2 above.
 	service_boot("procd", (char*)&_binary_procd_bin_start, (char*)&_binary_procd_bin_end,
-		pid_global: &procd_pid);
+		mount: "/proc/");
 	io::print("procd created\n");
 
 	// envd (the "/env/" server, user/envd.c3) — same unconditional,
@@ -257,7 +257,7 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 	// board), and ordering still matters for the same reason
 	// (create_process's default namespace population, right below).
 	service_boot("envd", (char*)&_binary_envd_bin_start, (char*)&_binary_envd_bin_end,
-		pid_global: &envd_pid);
+		mount: "/env/");
 	io::print("envd created\n");
 
 	// The shell — created explicitly here, BEFORE usbd below, not left
