@@ -10,13 +10,20 @@ import panic;
 // three in sync if this ever changes.
 const USER_BASE = 0x1000000;
 
-char[] __kernel_base @export("__kernel_base");
-char[] __kernel_map_base @export("__kernel_map_base");
-char[] __bss @export("__bss");
-char[] __bss_end @export("__bss_end");
-char[] __stack_top @export("__stack_top");
-char[] __free_ram @export("__free_ram");
-char[] __free_ram_end @export("__free_ram_end");
+// Linker-script symbols (src/kernel.ld / boards/*/kernel.ld) — declared
+// `extern ... @cname`, NOT `char[] X @export("X")`. c3c 0.8.4 turned the
+// latter into a real 16-byte .bss *definition* of the same name, so `&X`
+// resolved to that object instead of the linker-script address: the boot
+// self-test (self_test_pte_roundtrip) saw a non-page-aligned __free_ram
+// and panicked on every board. (0.8.3 emitted a bare symbol, which is why
+// this worked before — by accident.) `extern` says what these really are.
+extern char[] __kernel_base @cname("__kernel_base");
+extern char[] __kernel_map_base @cname("__kernel_map_base");
+extern char[] __bss @cname("__bss");
+extern char[] __bss_end @cname("__bss_end");
+extern char[] __stack_top @cname("__stack_top");
+extern char[] __free_ram @cname("__free_ram");
+extern char[] __free_ram_end @cname("__free_ram_end");
 // _bin_end (a real address, objcopy-provided), not _bin_size: RV64 port.
 // _bin_size is an objcopy convention where the symbol's "address" isn't
 // a real memory location at all — it's the byte count itself, encoded
