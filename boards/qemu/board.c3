@@ -137,6 +137,7 @@ const Device[*] DEVICES = {
 		.mmio = { VIRTIO_BLK_PADDR },
 		.irq = IRQ_VIRTIO_BLK,
 		.irq_level = false,
+		.irq_armed = true,
 		.dma = { { .pages = kernel::VIRTQ_PAGES, .cached = true },
 		         { .pages = kernel::VIRTIO_BLK_REQ_PAGES, .cached = true } },
 		.disk_arena = true,
@@ -189,27 +190,31 @@ const uptr CONSOLE_MMIO_PAGE = 0;
 
 fn void plic_init()
 {
-	// Runs from kernel_main *before* the first switch_context — i.e.
-	// bare-mode, satp still 0, so vaddr == paddr and the PLIC alias
-	// (PLIC_BASE, virtual, not mapped yet) would hit nothing. Use the
-	// physical addresses directly here; plic_claim/plic_complete/
-	// plic_set_enabled all run later from inside a trap, with some
-	// process's page table active, so they go through the alias.
+	// Runs from kernel_main *before* the first switch_context — bare-mode, satp
+	// still 0, so vaddr == paddr and the PLIC alias (PLIC_BASE, virtual, not
+	// mapped yet) would hit nothing: use the physical addresses. Which sources
+	// get armed is not decided here — see plic_arm() and the Device table.
 	uptr poff = PLIC_PHYS_BASE - PLIC_BASE;
-
-	// Priority must be > 0 for the PLIC to ever forward the interrupt at
-	// all (0 means "never interrupt", regardless of enable bits).
-	uint* priority = (uint*)(PLIC_PRIORITY_BASE + poff + 4 * IRQ_VIRTIO_BLK);
-	mem::store(priority, 1u, 4, true);
-
-	// Enable this IRQ for our S-mode context.
-	uint* enable = (uint*)(PLIC_ENABLE_BASE + poff);
-	mem::store(enable, (1u << IRQ_VIRTIO_BLK), 4, true);
 
 	// Threshold 0: forward any interrupt with priority > 0 (i.e. all of
 	// them, since we only ever set priority 1).
 	uint* threshold = (uint*)(PLIC_THRESHOLD + poff);
 	mem::store(threshold, 0u, 4, true);
+}
+
+// Arm one PLIC source for the S-mode context at boot: priority 1 (0 means
+// "never interrupt") plus its enable bit (one word per 32 sources). Called by
+// kernel.c3's plic_arm_devices() for every board Device with `irq_armed` —
+// bare mode, satp still 0, so PHYSICAL addresses. Runtime enable/disable of an
+// already-routed source is plic_set_enabled() below (through the mapped alias).
+fn void plic_arm(uint irq)
+{
+	uptr poff = PLIC_PHYS_BASE - PLIC_BASE;
+	uint* priority = (uint*)(PLIC_PRIORITY_BASE + poff + (uptr)(4 * irq));
+	mem::store(priority, 1u, 4, true);
+	uint* enable = (uint*)(PLIC_ENABLE_BASE + poff + (uptr)((irq / 32) * 4));
+	uint cur = mem::load(enable, 4, true);
+	mem::store(enable, cur | (1u << (irq % 32)), 4, true);
 }
 
 // Claiming an IRQ both tells us which one fired and acknowledges it to

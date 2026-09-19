@@ -91,7 +91,7 @@ fn void map_disk_arena(Process* proc)
 // gets ONE route registered by device_setup (device.c3) from its board
 // Device entry. Adding another
 // interrupt-driven driver (ethd RX, gpiod) is then a one-line
-// irq_route_register() call plus arming the source in board::plic_init;
+// irq_route_register() call plus `irq_armed` in its Device entry (device.c3);
 // no handle_trap or syscall edit.
 //
 // handle_trap looks the claimed IRQ up here, wakes the owning process

@@ -339,6 +339,7 @@ const Device[*] DEVICES = {
 		.mmio = { SD_MMIO_BASE, SD_TOP_PAGE, SD_PINMUX_PAGE, SD_CLOCK_PAGE },
 		.irq = IRQ_SDHCI,
 		.irq_level = true,
+		.irq_armed = INTERRUPT_DRIVEN_SD,
 		.dma = { { .pages = 1, .cached = false } },
 	},
 	{
@@ -346,6 +347,7 @@ const Device[*] DEVICES = {
 		.mmio = { USB_MMIO_BASE, USB_TOP_CTRL_PAGE, USB_TOP_RST_PAGE, USB_CLK_PAGE, USB_PINMUX_PAGE },
 		.irq = IRQ_USB,
 		.irq_level = true,
+		.irq_armed = INTERRUPT_DRIVEN_USB,
 		.dma = { { .pages = 1, .cached = false } },
 	},
 	{
@@ -388,45 +390,25 @@ const uint FS_PARTITION_2_START_SECTOR = 2048;
 // safe.
 fn void plic_init()
 {
-	uint* priority_virtio = (uint*)(PLIC_PRIORITY_BASE + 4 * IRQ_VIRTIO_BLK);
-	mem::store(priority_virtio, 1u, 4, true);
-	uint* enable = (uint*)PLIC_ENABLE_BASE;
-	mem::store(enable, (1u << IRQ_VIRTIO_BLK), 4, true);
-
-	// IRQ_SDHCI (36) falls outside the first 32 IRQs IRQ_VIRTIO_BLK's
-	// own enable word covers — needs its own priority word (still inside
-	// PLIC_PRIORITY_PAGE: priorities are one word per IRQ, and IRQ 36's
-	// offset is well within the first page) and the *second* enable word
-	// (IRQ/32 = 1, i.e. PLIC_ENABLE_BASE+4 — still inside PLIC_ENABLE_PAGE,
-	// just 4 bytes further into the same page).
-	uint* priority_sdhci = (uint*)(PLIC_PRIORITY_BASE + 4 * IRQ_SDHCI);
-	mem::store(priority_sdhci, 1u, 4, true);
-
-	// Arm the driver PLIC sources. Both use the handle_trap
-	// disable-on-fire / SYS_DRIVER_IRQ_ARM re-arm pattern so the
-	// level-high device line is harmless between fire and the driver's
-	// own status clear. USB: DWC2 GINTMSK unmasked only mid-transfer.
-	// SD: only fires in the SDMA path (sdd clears SD_INT_STATUS right
-	// after the wait).
-	if (INTERRUPT_DRIVEN_USB)
-	{
-		uint* priority_usb = (uint*)(PLIC_PRIORITY_BASE + 4 * IRQ_USB);
-		mem::store(priority_usb, 1u, 4, true);
-		uint* enable_word0 = (uint*)PLIC_ENABLE_BASE;
-		uint cur = mem::load(enable_word0, 4, true);
-		mem::store(enable_word0, cur | (1u << IRQ_USB), 4, true); // IRQ_USB (30) < 32 → word 0
-	}
-	if (INTERRUPT_DRIVEN_SD)
-	{
-		// priority_sdhci is already written above. IRQ_SDHCI (36) → the
-		// SECOND enable word (36/32 = 1), bit 36 % 32 = 4.
-		uint* enable_word1 = (uint*)(PLIC_ENABLE_BASE + 4);
-		uint cur = mem::load(enable_word1, 4, true);
-		mem::store(enable_word1, cur | (1u << (IRQ_SDHCI % 32)), 4, true);
-	}
-
+	// Which sources get armed is not decided here — see plic_arm() and the
+	// Device table's `irq_armed` (sd: INTERRUPT_DRIVEN_SD, usb:
+	// INTERRUPT_DRIVEN_USB; eth is routed but deliberately left masked).
 	uint* threshold = (uint*)PLIC_THRESHOLD;
 	mem::store(threshold, 0u, 4, true);
+}
+
+// Arm one PLIC source for the S-mode context at boot: priority 1 (0 means
+// "never interrupt") plus its enable bit (one word per 32 sources). Called by
+// kernel.c3's plic_arm_devices() for every board Device with `irq_armed` —
+// bare mode, satp still 0, so PHYSICAL addresses. Runtime enable/disable of an
+// already-routed source is plic_set_enabled() below (through the mapped alias).
+fn void plic_arm(uint irq)
+{
+	uint* priority = (uint*)(PLIC_PRIORITY_BASE + (uptr)(4 * irq));
+	mem::store(priority, 1u, 4, true);
+	uint* enable = (uint*)(PLIC_ENABLE_BASE + (uptr)((irq / 32) * 4));
+	uint cur = mem::load(enable, 4, true);
+	mem::store(enable, cur | (1u << (irq % 32)), 4, true); // e.g. IRQ_SDHCI 36 -> second word, bit 4
 }
 
 // Toggle a single S-context enable bit. handle_trap disables a

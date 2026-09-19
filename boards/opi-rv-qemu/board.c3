@@ -129,6 +129,20 @@ fn void plic_init()
 	mem::store(threshold, 0u, 4, true);
 }
 
+// Arm one PLIC source for the S-mode context at boot: priority 1 (0 means
+// "never interrupt") plus its enable bit (one word per 32 sources). Called by
+// kernel.c3's plic_arm_devices() for every board Device with `irq_armed` —
+// bare mode, satp still 0, so PHYSICAL addresses. Runtime enable/disable of an
+// already-routed source is plic_set_enabled() below (through the mapped alias).
+fn void plic_arm(uint irq)
+{
+	uint* priority = (uint*)(PLIC_PRIORITY_BASE + (uptr)(4 * irq));
+	mem::store(priority, 1u, 4, true);
+	uint* enable = (uint*)(PLIC_ENABLE_BASE + (uptr)((irq / 32) * 4));
+	uint cur = mem::load(enable, 4, true);
+	mem::store(enable, cur | (1u << (irq % 32)), 4, true);
+}
+
 fn void plic_set_enabled(uint irq, bool on)
 {
 	uint* word = (uint*)(PLIC_ENABLE_BASE + (uptr)((irq / 32) * 4));

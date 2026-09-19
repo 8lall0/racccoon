@@ -46,6 +46,9 @@ struct Device
 	uint  irq;                      // PLIC source routed to the driver, 0 = none
 	bool  irq_level;                // level source (handle_trap masks it, the driver re-arms
 	                                //   via SYS_DRIVER_IRQ_ARM) vs edge/latched (left enabled)
+	bool  irq_armed;                // enable the PLIC source at boot (plic_arm_devices). False =
+	                                //   the route is registered but the source stays masked
+	                                //   (polled driver, or interrupts not proven on this board yet)
 	Dev_dma[] dma;                  // DMA regions (<= DEV_DMA_MAX), in the order
 	                                //   SYS_DEV_INFO reports them
 	bool  disk_arena;               // this device's driver shares the fsd payload arena
@@ -84,6 +87,19 @@ fn bool device_board_has_disk_arena()
 fn int device_dma_count(int dev)
 {
 	return (int)board::DEVICES[dev].dma.len;
+}
+
+// Arm, at boot, every PLIC source a board device asks for (`irq_armed`) —
+// replaces the hand-written per-board lists that used to live in each
+// plic_init(). The register writes themselves are the board's (board::plic_arm:
+// its PLIC layout/aliasing); WHICH sources is now data. Called right after
+// board::plic_init() (threshold), still bare-mode with interrupts off.
+fn void plic_arm_devices()
+{
+	foreach (d : board::DEVICES)
+	{
+		if (d.irq != 0 && d.irq_armed) { board::plic_arm(d.irq); }
+	}
 }
 
 // Give `proc` everything board::DEVICES[dev] describes: its MMIO windows,
