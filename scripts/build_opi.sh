@@ -37,7 +37,7 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # User-mode binaries have no board dependency (see build_duo.sh's own
   # comment — every board:: reference in user/ is in a comment; the
   # real board facts reach user code by syscall).
-  bash scripts/build_user.sh
+  SDD_SOC_SRC=user/block/dw_mshc.c3 bash scripts/build_user.sh
 
   echo "==> Compiling kernel to LLVM IR (racccoon-opi target)..."
   rm -rf build/obj build/llvm build/obj_medany build/kernel_opi.*

@@ -117,13 +117,26 @@ const uint SMP_MAX_HARTS = 1;
 //         driver is a partial head start — but the StarFive glue
 //         (clock/reset/PHY-mode via syscon) and the external RJ45 PHY chip
 //         are new.
-const Device[] DEVICES = {};
+const Device[*] DEVICES = {
+	// The microSD slot: sdio1's DW-MSHC (mmc1, 0x16020000 — registers all sit
+	// in the first page; the FIFO data port is at +0x200) plus the sys-syscon
+	// page (0x13030000) holding its sample-phase field (offset 0x9c). PIO and
+	// polled for now — no DMA region, no IRQ (75 once interrupt-driven).
+	// U-Boot has already ungated the SDIO1 clocks and released its reset (it
+	// loaded this very kernel off the card), which dw_mshc.c3 relies on.
+	{
+		.name = "sd",
+		.mmio = { 0x16020000, 0x13030000 },
+	},
+};
 
-// fsd's per-board partition offset (learned via syscall, see fsd.c3).
-// Meaningless until an "sd" device exists; the real value comes from
-// `sfdisk`/`lsblk` against the actual Orange Pi RV SD card once the
-// dw-mshc driver can read it.
-const uint FS_PARTITION_START_SECTOR = 0;
+// fsd's per-board partition offset (learned via syscall, see fsd.c3): the
+// first filesystem racccoon mounts here is the vendor image's FAT32 `bootfs`
+// (partition 1, starts at sector 8192 per `lsblk`) — the only partition type on
+// this card fsd can read (rootfs is ext4). It is also the partition holding
+// kernel_opi.bin + the boot env file, so don't write to it casually; a
+// dedicated ext2 partition is the real root, later.
+const uint FS_PARTITION_START_SECTOR = 8192;
 
 const bool HAS_SECOND_FS_PARTITION  = false;
 const uint FS_PARTITION_2_START_SECTOR = 0;

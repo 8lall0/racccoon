@@ -4,6 +4,70 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-19 (evening) — Orange Pi RV: storage works (SD driver, FAT32 mount, `ls`/`cat`), and a missing `fence.i` that only a real core exposes
+
+**Storage bring-up, first try on hardware.** The never-run `dw_mshc.c3` draft
+(retargeted to sdio1 earlier) was wired in: `scripts/build_user.sh` builds `sdd`
+from `${SDD_SOC_SRC:-user/block/sdhci.c3}` and only `build_opi.sh` sets it to
+`dw_mshc.c3` (each board script runs `build_user.sh` first, so every board gets
+its own `sdd`); `boards/opi-rv/board.c3` got its first real `DEVICES` entry
+(`"sd"`: mmio `0x16020000` + the sys-syscon page `0x13030000`, polled, no DMA —
+the device table's first use for new hardware, no kernel code touched) and
+`FS_PARTITION_START_SECTOR = 8192` (the vendor card's FAT32 `bootfs`; rootfs is
+ext4, which fsd can't read). Enumeration worked immediately (CMD0/8/ACMD41/2/3/7,
+raise clock) and `fsd: FAT32 mounted` — `ls /` listed the Debian boot partition.
+
+**PIO drain overrun (fixed).** ~1 read in 3 failed with `rintsts=0x808`
+(FRUN, FIFO under/overrun; retried away by fsd, so nothing visibly broke). The
+drain loop spent ~4 register accesses (RINTSTS, STATUS, RXDR clear, …) per 1-2
+words, and register accesses on this SoC are slow, so the CPU fell behind a
+25 MHz card and the 32-word FIFO overflowed. Now: poll `FIFO_COUNT`, then burst-read
+≥16 words (or all remaining) with nothing but DATA reads between them; the write
+path fills by free space. Result: the flood of failures became a handful in the
+first second after enumeration, then none in 2000+ transfers. Verbose per-sector
+tracing is off (it printed 2 lines/read into `dmesg`'s 32K ring) and failures are
+rate-limited (first 8 + a summary every 512 transfers). **Residual:** the first
+reads after enumeration still fail transiently (`0x828` = FRUN|RXDR|DTO), cause
+not found; `dw_block_rw` now retries a block up to 4× after a FIFO reset +
+status clear so `fsd` no longer sees "no recognized filesystem" and re-probes.
+Possible follow-ups: IDMAC DMA (the `"sd"` entry can take a DMA region), or a
+settle delay after the clock raise.
+
+**`cat` crashed on real hardware only — missing `fence.i` (fixed, confirmed).**
+`cat /vf2_uEnv.txt` died with `user fault scause=2 stval=0 sepc=0x101a542`: an
+illegal-instruction fault at an address inside `cat`'s own `.data` (executing
+zeros). It ran fine on QEMU for every file size. Diagnosis: the kernel loads a
+program image with ordinary stores (create_process, SYS_EXEC, rfork's page copy,
+even alloc_pages' zero-fill) and **never executes `fence.i`** — grep found only
+`sfence.vma`. RISC-V does not make stores visible to instruction fetch by
+itself; QEMU's translator always sees the new bytes and the Duo's C906 evidently
+tolerated it, but the Orange Pi's SiFive U74 has a separate, non-coherent I-cache,
+so a program exec'd into recycled physical pages (here `cat` after several `ls`)
+could run STALE code left by the previous occupant. Fix: `sync_icache()`
+(`process.c3`) called after SYS_EXEC's image load, and a `fence.i` at
+`user_entry` (first entry of a fresh image) and `fork_entry` (the rfork child).
+After flashing, `cat` works repeatedly after `ls` on the board. QEMU regression
+(runtest, elftest, argvtest, rforktest, threadtest, pathtest, faulttest,
+killtest, p9fstest, hotplugtest, maptest) green; the Duo kernel compiles but
+**has not been run on the Duo since this change** — `fence.i` is standard
+Zifencei and the C906 supports it, but boot a Duo build before relying on it.
+
+**`cat` printed only the first 1023 bytes (fixed).** Separate, pre-existing:
+`user/bin/cat.c3` was ONE `fs_read(path, &buf, 1023)` and printed it as a C
+string (so it also stopped at the first NUL). Found because the 1141-byte env
+file lost its last line. Now loops `fs_read_at` in 1 KiB chunks to EOF, writes
+exactly the bytes read, and adds a trailing newline only if the file lacked one.
+Verified on QEMU: byte counts through `wc` match the files exactly (1281, 5121,
+1141); missing file still reports `not found`.
+
+**Flashing:** `scripts/flash_opi.sh` now also copies 26 command binaries into
+`bootfs/bin/` (the shell's `ls`/`cat`/… are exec'd off the mounted filesystem, not
+linked into the kernel); `OPI_NO_BIN=1` skips it. **Caution:** racccoon mounts the
+same partition that holds `kernel_opi.bin` and `vf2_uEnv.txt` — don't `write`/`rm`/
+`mv` there until it has a dedicated ext2 partition.
+
+---
+
 ## 2026-09-19 (later) — Orange Pi RV: the "flaky SD probe" was `mmc 0`, the Wi-Fi; the microSD (`mmc 1`) works fine
 
 **What the user's vendor-Debian boot log showed:** `mmc1 is current device` →

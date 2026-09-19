@@ -74,7 +74,15 @@ module user;
 // (dw-prefixed here vs sd-prefixed in sdhci.c3; see the shim aliases at
 // the bottom).
 
-const bool DWMSHC_VERBOSE = false;
+const bool DWMSHC_VERBOSE = false; // per-sector trace; on it prints 2 lines/read and floods dmesg's 32K ring
+
+// Failure reporting is rate-limited: a marginal PIO read is retried by fsd,
+// so it must not turn every read into console output. First few are printed
+// in full, then a summary every DW_STATS_EVERY transfers.
+const uint DW_FAIL_PRINT_MAX = 8;
+const uint DW_STATS_EVERY    = 512;
+uint g_dw_xfers = 0;
+uint g_dw_fails = 0;
 
 const uint SECTOR_SIZE = 512; // shared with sdd.c3's wire-protocol layout
 
@@ -518,7 +526,7 @@ fn uint dw_fifo_count()
 // drain keeps up with SD default-speed without the shallow-FIFO timing
 // hazard sdhci.c3's PIO path fights — but do NOT print() inside the
 // drain loop regardless (same discipline as sdhci.c3).
-fn bool dw_block_rw(char* data, uint sector, bool is_write)
+fn bool dw_block_rw_once(char* data, uint sector, bool is_write)
 {
 	uint* words = (uint*)data;
 
@@ -547,43 +555,38 @@ fn bool dw_block_rw(char* data, uint sector, bool is_write)
 
 		if (is_write)
 		{
-			// Fill while there's room and data left.
-			while (got < SECTOR_SIZE / 4 && (dw_read(DWMCI_STATUS) & DWMCI_STATUS_FIFO_FULL) == 0)
-			{
-				dw_write(DWMCI_DATA, words[got]);
-				got++;
-			}
-			dw_write(DWMCI_RINTSTS, DWMCI_INT_TXDR);
+			// Count-driven burst fill: ask the FIFO once how much room is
+			// left, then push that many words back to back — no STATUS poll
+			// per word (register accesses on this SoC are slow; a poll per
+			// word underruns the FIFO against a 25 MHz card).
+			uint want = SECTOR_SIZE / 4 - got;
+			uint room = DW_FIFO_DEPTH - dw_fifo_count();
+			uint n = room < want ? room : want;
+			for (uint i = 0; i < n; i++) { dw_write(DWMCI_DATA, words[got + i]); }
+			got += n;
 		}
 		else
 		{
-			// Drain whatever's in the FIFO.
+			// Count-driven BURST drain. The old loop did ~4 register accesses
+			// (RINTSTS read, STATUS read, RXDR clear, ...) per 1-2 words, i.e.
+			// slower than the card fills the 32-word FIFO -> FRUN
+			// (rintsts bit 11) on ~1 read in 3. Instead wait until at least
+			// half a FIFO (16 words) is waiting — or everything that's left —
+			// then read that many words with nothing but DATA reads between
+			// them, which drains faster than the card refills.
+			uint want = SECTOR_SIZE / 4 - got;
 			uint avail = dw_fifo_count();
-			while (avail > 0 && got < SECTOR_SIZE / 4)
+			uint thresh = want < 16 ? want : 16;
+			if (avail >= thresh)
 			{
-				words[got] = dw_read(DWMCI_DATA);
-				got++;
-				avail--;
+				uint n = avail < want ? avail : want;
+				for (uint i = 0; i < n; i++) { words[got + i] = dw_read(DWMCI_DATA); }
+				got += n;
 			}
-			dw_write(DWMCI_RINTSTS, DWMCI_INT_RXDR);
 		}
 
-		if ((r & DWMCI_INT_DTO) != 0)
-		{
-			// Data transfer over. For a read, drain any final residue the
-			// DTO race left in the FIFO.
-			if (!is_write)
-			{
-				uint avail = dw_fifo_count();
-				while (avail > 0 && got < SECTOR_SIZE / 4)
-				{
-					words[got] = dw_read(DWMCI_DATA);
-					got++;
-					avail--;
-				}
-			}
-			break;
-		}
+		if ((r & DWMCI_INT_DTO) != 0 && got == SECTOR_SIZE / 4) { break; }
+		if ((r & DWMCI_INT_DTO) != 0 && is_write) { break; }
 
 		if (rdtime() - start > budget) { break; }
 	}
@@ -605,19 +608,32 @@ fn bool dw_block_rw(char* data, uint sector, bool is_write)
 		}
 	}
 
+	g_dw_xfers++;
 	if (!ok)
 	{
-		print("dw_mshc: ");
-		print(is_write ? "write" : "read");
-		print(" sector ");
-		print_hex32(sector);
-		print(" FAILED got=");
-		print_uint(got);
-		print(" rintsts=");
-		print_hex32(r);
-		print("\n");
+		g_dw_fails++;
+		if (g_dw_fails <= DW_FAIL_PRINT_MAX)
+		{
+			print("dw_mshc: ");
+			print(is_write ? "write" : "read");
+			print(" sector ");
+			print_hex32(sector);
+			print(" FAILED got=");
+			print_uint(got);
+			print(" rintsts=");
+			print_hex32(r);
+			print("\n");
+		}
 	}
-	else if (DWMSHC_VERBOSE)
+	if (g_dw_xfers % DW_STATS_EVERY == 0)
+	{
+		print("dw_mshc: ");
+		print_uint(g_dw_fails);
+		print(" failed / ");
+		print_uint(g_dw_xfers);
+		print(" transfers\n");
+	}
+	if (ok && DWMSHC_VERBOSE)
 	{
 		uint us = (uint)((rdtime() - start) * 1000000 / g_dw_timebase_hz);
 		print("dw_mshc: ");
@@ -629,6 +645,40 @@ fn bool dw_block_rw(char* data, uint sector, bool is_write)
 		print("us\n");
 	}
 	return ok;
+}
+
+// A data-phase error (FRUN — FIFO under/overrun — in practice) is transient on
+// this controller: on the real board the first second or so after enumeration
+// saw ~1 read in 3 fail, then thousands in a row succeeded. Retrying the
+// single block is safe (a read is idempotent; a write rewrites the same
+// sector), but only after resetting the FIFO and the sticky RINTSTS bits, or
+// the leftovers poison the next attempt. Without this, fsd's first probe
+// reads failed and it declared "no recognized filesystem" and had to retry
+// its whole mount. Failures are still counted/reported by the once() version.
+const uint DW_RW_ATTEMPTS = 4;
+
+fn bool dw_block_rw(char* data, uint sector, bool is_write)
+{
+	for (uint attempt = 0; attempt < DW_RW_ATTEMPTS; attempt++)
+	{
+		if (dw_block_rw_once(data, sector, is_write)) { return true; }
+
+		// Reset the FIFO (self-clearing) and clear every pending status bit.
+		dw_write(DWMCI_CTRL, dw_read(DWMCI_CTRL) | DWMCI_CTRL_FIFO_RESET);
+		ulong start = rdtime();
+		ulong budget = dw_us_to_ticks(DW_RESET_US);
+		while ((dw_read(DWMCI_CTRL) & DWMCI_CTRL_FIFO_RESET) != 0)
+		{
+			if (rdtime() - start > budget) { break; }
+		}
+		dw_write(DWMCI_RINTSTS, DWMCI_INT_ALL);
+
+		// Brief settle (~200us) before the next attempt.
+		ulong t = rdtime();
+		ulong settle = dw_us_to_ticks(200);
+		while (rdtime() - t < settle) { }
+	}
+	return false;
 }
 
 // ---------------------------------------------------------------------
