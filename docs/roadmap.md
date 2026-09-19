@@ -527,7 +527,8 @@ Generation counters back most of the stale-reference handling:
    (storage driver).
    `src/supervisor.c3`: a `Service` table registered from `kernel_main`,
    `supervisor_tick()` from the timer trap (~1/s) respawns any exited
-   server, updates its `*_pid` global, and `reseat_namespace_mounts()`
+   server, keeps `storage_pid` pointing at the live storage driver (the default
+   namespace is seeded from the service table's mount prefixes), and `reseat_namespace_mounts()`
    re-points every live process's mounts at the replacement. Restart
    cap 5. `fsdkilltest` / `storagekilltest` in `shell_test.c3`.
    Covers **every server and every device driver**: fsd, fsd2, echod,

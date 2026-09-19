@@ -1015,9 +1015,17 @@ service: exited → respawn; inbox stuck with no IPC progress for
 once → kill + respawn. First boot and respawn share one path
 (`service_instantiate`): a respawn re-runs `device_setup()` for the
 server's device (fresh DMA regions, PLIC route overwritten in place),
-updates the `*_pid` global the default namespace reads, and reseats every
-live process's matching mount entry. Gives up after `SVC_RESTART_LIMIT`
-(5).
+keeps `storage_pid` (the one pid global left, handed to fsd) pointing at the
+live storage driver, and reseats every live process's matching mount entry.
+Gives up after `SVC_RESTART_LIMIT` (5).
+
+**The default namespace comes from the service table.** Each boot service
+registers the prefix it is mounted at (`service_boot(..., mount: "/proc/")`:
+echod `/srv/echo/`, fsd `""`, fsd2 `/mnt/fs2/`, procd `/proc/`, envd `/env/`);
+`seed_default_namespace()` (`supervisor.c3`, called from `create_process`) gives
+a new process one mount per registered, currently-up service, in registration
+order. A service that isn't up yet (or was never registered on this board) simply
+isn't listed.
 
 ---
 
@@ -1029,7 +1037,10 @@ servers `import board` and never `#ifdef`.
 
 What a board provides:
 
-- **PLIC** layout (`PLIC_*_BASE`, `plic_init/claim/complete/set_enabled`).
+- **PLIC** layout (`PLIC_*_BASE`, `plic_init/plic_arm/claim/complete/set_enabled`).
+  `plic_init` only sets the threshold; **which sources get armed at boot is data** —
+  a `Device` with `irq_armed` in `DEVICES` — and `plic_arm(irq)` is the board's
+  priority + enable write for one source (`plic_arm_devices()`, `device.c3`).
 - **PTE bits** — `PTE_DEVICE_BITS` (the Duo needs bit 63 set for
   strong-ordered MMIO; getting this wrong caused the "PLIC storm").
 - **`DEVICES`** — a `Device[]` table (type in `src/device.c3`), one entry

@@ -4,6 +4,45 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-19 (late) — small cleanups: PLIC arming and the default namespace come from tables; master pushed
+
+**Pushed** the hardware-verified state to `origin/master` (`9a495cc..ff2646e`, plain
+fast-forward, 12 commits). `origin/opi-rv-port` still holds the pre-rebase Stage 0
+scaffold commit — updating it would need a force-push; deleting the remote branch
+is cleaner (local `opi-rv-port` == `master`).
+
+Two more kernel/board couplings moved into data (both QEMU-verified; **Duo and Orange
+Pi build but were not booted with them** — both touch boot-sensitive code):
+- **`412618a` PLIC arming.** Each board's `plic_init()` hand-armed its sources. `Device`
+  gains `irq_armed`; `plic_arm_devices()` (`device.c3`) arms every Device with an irq
+  and `irq_armed` after `board::plic_init()` (now threshold only); each board keeps a
+  tiny `plic_arm(irq)` (priority 1 + the enable bit, physical address, bare mode).
+  Duo: sd → `INTERRUPT_DRIVEN_SD`, usb → `INTERRUPT_DRIVEN_USB`, eth-mac false (routed,
+  masked) — decoded from the built ELF: sd(36) and usb(30) armed, nothing else, same
+  as before; the meaningless IRQ-0 write is gone. QEMU: `diskd` is interrupt-driven, so
+  an unarmed source would hang every read — fs tests + `storagekilltest` pass, logs
+  byte-identical.
+- **`5dc5557` default namespace.** `create_process` hardcoded five mounts fed by five
+  pid globals (`echod_pid`, `fsd_pid`, `fsd2_pid`, `procd_pid`, `envd_pid`) that existed
+  only for it. `Service` gains `mount_prefix`; `service_boot(..., mount:)`;
+  `seed_default_namespace()` (`supervisor.c3`) mounts every registered, up service in
+  registration order. Globals deleted (`storage_pid` stays for
+  `SYS_FS_PARTITION_INFO`). `service_instantiate` zeroes `s.pid` while a replacement is
+  created so its own namespace sees it "not up yet", as on first boot. `ns` output/order/
+  pids byte-identical on QEMU (single + dual image, sifive_u); respawn re-seating,
+  mounttest, srvtest, nstest and the 9p/fs/path tests pass.
+- **Not done:** the third item on the list — `SYS_FS_PARTITION_INFO`/fsd's partition
+  parameters — needs argument passing to kernel-spawned servers (there is none);
+  left. Boot-time spawn order and the embedded service binaries are still the kernel's
+  (Stage B).
+
+**To confirm on hardware** (boot-order sensitive; this project's history has real
+Duo hangs from exactly this kind of change): Duo — login/root prompt, `ls /`,
+`storagekilltest`, and SD + USB still interrupt-driven; Orange Pi — boots to a shell
+and mounts the ext2 root.
+
+---
+
 ## 2026-09-19 (night) — ONE racccoon card boots BOTH boards; Duo re-verified with `fence.i`
 
 The Orange Pi kept failing with the Duo card in it (`Failed to load 'vf2_uEnv.txt'`,
