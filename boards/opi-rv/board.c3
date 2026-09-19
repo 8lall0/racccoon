@@ -130,13 +130,16 @@ const Device[*] DEVICES = {
 	},
 };
 
-// fsd's per-board partition offset (learned via syscall, see fsd.c3): the
-// first filesystem racccoon mounts here is the vendor image's FAT32 `bootfs`
-// (partition 1, starts at sector 8192 per `lsblk`) — the only partition type on
-// this card fsd can read (rootfs is ext4). It is also the partition holding
-// kernel_opi.bin + the boot env file, so don't write to it casually; a
-// dedicated ext2 partition is the real root, later.
-const uint FS_PARTITION_START_SECTOR = 8192;
+// fsd's per-board partition offset (learned via syscall, see fsd.c3). This is
+// the RACCCOON CARD layout shared with the Milk-V Duo (boards/duo/board.c3):
+// DUOBOOT (FAT32, 1 GiB from sector 2048) then the ext2 root at 2099200 — the
+// same card, and the same root filesystem (/bin, /adm/users, /usr/root), boots
+// in either board. The Orange Pi's U-Boot reads DUOBOOT (mmc 1:1) for
+// vf2_uEnv.txt + kernel_opi.bin; racccoon then mounts the ext2 root.
+// (A vendor-Debian card instead has FAT32 `bootfs` at sector 8192 and an ext4
+// rootfs fsd can't read — set 8192 and rebuild to mount that bootfs; it's also
+// where kernel_opi.bin lives there, so don't write to it casually.)
+const uint FS_PARTITION_START_SECTOR = 2099200;
 
 const bool HAS_SECOND_FS_PARTITION  = false;
 const uint FS_PARTITION_2_START_SECTOR = 0;

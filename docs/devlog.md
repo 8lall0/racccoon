@@ -4,6 +4,35 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-19 (night) — ONE racccoon card boots BOTH boards; Duo re-verified with `fence.i`
+
+The Orange Pi kept failing with the Duo card in it (`Failed to load 'vf2_uEnv.txt'`,
+no dtb) — because I had only ever flashed the Duo half (`fip.bin`) onto the
+racccoon card; nothing told the Orange Pi's U-Boot (which reads `mmc 1:1` = the
+card's first FAT partition, DUOBOOT) to start racccoon. Fix: put
+`vf2_uEnv.txt` + `kernel_opi.bin` next to the Duo's `fip.bin` in DUOBOOT (the Duo
+boot ROM only reads `fip.bin`), and point the Orange Pi kernel's
+`FS_PARTITION_START_SECTOR` at the card's ext2 root (2099200 — the SAME root
+filesystem the Duo mounts: `/bin`, `/adm/users`, `/usr/root`) instead of the Debian
+card's FAT32 bootfs (8192). Now `scripts/flash_opi.sh` detects the layout — `fip.bin`
+⇒ racccoon card (copy the two boot files only), `Image` + `extlinux/` ⇒ Debian card
+(rename extlinux.conf, populate bootfs/bin/) — and refuses anything else. **Orange Pi
+booted off the racccoon card** (user-confirmed). A Debian card still boots racccoon
+but has no filesystem for it unless the constant is set back to 8192 and rebuilt.
+
+**Duo, first boot with the `fence.i` kernel (latest master, dev shell): all green on
+the real board.** Boot to the root shell; `devinfotest` ok; `storagekilltest`,
+`gpiodkilltest`, `usbdkilltest` ok (each driver killed, respawned through
+`device_setup`, working again); hub enumerated, ext2 mounted, SDMA enabled. That
+retires the one untested-on-Duo caveat of `c596cc5`. Oddity persisting from the
+earlier Duo run: `storagekilltest` prints `svc: respawned sdd` TWICE (test kills
+once) — so the first respawned sdd exits and is respawned again. Likely the known
+card-state flake after a mid-transaction kill (`ACMD41 gave up` → respawn, above);
+respawned servers are silent after SYS_BOOT_QUIET, so the reason isn't visible —
+`loud` before `storagekilltest` would show sdd's output. Not chased; the test passes.
+
+---
+
 ## 2026-09-19 (evening) — Orange Pi RV: storage works (SD driver, FAT32 mount, `ls`/`cat`), and a missing `fence.i` that only a real core exposes
 
 **Storage bring-up, first try on hardware.** The never-run `dw_mshc.c3` draft

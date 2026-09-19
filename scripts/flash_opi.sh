@@ -1,13 +1,16 @@
 #!/bin/bash
 #
-# Put racccoon on an Orange Pi RV's vendor-Debian microSD so the board boots
-# it unattended — no sudo (udisksctl), no USB, no SPI-flash writes.
+# Make a microSD boot racccoon on an Orange Pi RV, unattended — no sudo
+# (udisksctl), no USB, no SPI-flash writes. Works on either card layout:
 #
-#   build_opi.sh (kernel_opi.bin)
-#     -> udisksctl-mount the card's `bootfs` (FAT, partition 1)
-#     -> rename extlinux/extlinux.conf -> .bak   (else the Linux boot wins)
-#     -> copy kernel_opi.bin + boards/opi-rv/vf2_uEnv.txt (also as uEnv.txt)
-#     -> copy the shell's command binaries (ls, cat, ...) into bootfs/bin/
+#   racccoon card (the Milk-V Duo's card: DUOBOOT + ext2 root) — copies
+#     kernel_opi.bin + vf2_uEnv.txt next to the Duo's fip.bin, so the SAME card
+#     boots in both boards, and racccoon on the Orange Pi mounts the ext2 root
+#     (its /bin, /adm/users, /usr/root) that the Duo uses.
+#   Orange Pi vendor-Debian card (bootfs) — also renames extlinux.conf so the
+#     Linux boot doesn't win, and copies the shell's commands into bootfs/bin/.
+#
+#   build_opi.sh (kernel_opi.bin) -> mount the FAT boot partition -> copy.
 #
 # How it boots: the vendor U-Boot reads mmc1 (the microSD), loads
 # /vf2_uEnv.txt, imports it and runs `boot2` — which loads kernel_opi.bin and
@@ -19,7 +22,7 @@
 #   OPI_BOOT_PART=/dev/sda1 bash scripts/flash_opi.sh
 #
 # Env:
-#   OPI_BOOT_PART  the card's boot (bootfs, FAT32, label opi_boot) partition —
+#   OPI_BOOT_PART  the card's FAT boot partition (racccoon: DUOBOOT; Debian: bootfs) —
 #                  REQUIRED, no default (device paths vary; `lsblk` shows it)
 #   OPI_TEST_SHELL=1  embed shell_test.c3's dev builtins (passed to build_opi.sh)
 #   SKIP_BUILD=1   flash the existing build/kernel_opi.bin as-is
@@ -42,14 +45,26 @@ MNT=$(findmnt -n -o TARGET --source "$OPI_BOOT_PART" | head -1)
 [ -n "$MNT" ] || { echo "could not mount $OPI_BOOT_PART" >&2; exit 1; }
 echo "==> bootfs mounted at $MNT"
 
-# Refuse anything that isn't the vendor Debian boot partition (a Duo card's
-# DUOBOOT, say): it must hold the kernel image + an extlinux dir.
-if [ ! -f "$MNT/Image" ] || [ ! -d "$MNT/extlinux" ]; then
-  echo "$MNT has no Image + extlinux/ — not an Orange Pi vendor bootfs, refusing." >&2
+# Two card layouts are supported; refuse anything else (so it can't hit some
+# unrelated card):
+#   racccoon  the Milk-V Duo card — DUOBOOT (FAT32, holds the Duo's fip.bin) +
+#             an ext2 root. Add the Orange Pi boot files next to fip.bin; the
+#             SAME card then boots in both boards. Its ext2 root already has bin/.
+#   debian    the Orange Pi vendor image's bootfs (Image + extlinux/). Rename
+#             extlinux.conf so the Linux boot doesn't win. NOTE the kernel mounts
+#             the racccoon card's ext2 root (board FS_PARTITION_START_SECTOR), so on
+#             this card racccoon has no filesystem unless rebuilt with 8192.
+if [ -f "$MNT/fip.bin" ]; then
+  MODE=racccoon
+elif [ -f "$MNT/Image" ] && [ -d "$MNT/extlinux" ]; then
+  MODE=debian
+else
+  echo "$MNT is neither a racccoon/Duo DUOBOOT (fip.bin) nor an Orange Pi vendor bootfs (Image + extlinux/) — refusing." >&2
   exit 1
 fi
+echo "==> card layout: $MODE"
 
-if [ -f "$MNT/extlinux/extlinux.conf" ]; then
+if [ "$MODE" = debian ] && [ -f "$MNT/extlinux/extlinux.conf" ]; then
   echo "==> extlinux.conf -> extlinux.conf.bak (so the vendor Linux boot doesn't win)"
   mv "$MNT/extlinux/extlinux.conf" "$MNT/extlinux/extlinux.conf.bak"
 fi
@@ -64,8 +79,9 @@ cp boards/opi-rv/vf2_uEnv.txt "$MNT/uEnv.txt"
 # partition racccoon mounts (board::FS_PARTITION_START_SECTOR = this bootfs).
 # Same list scripts/populate_duo_bin.sh uses, minus the Duo-only hardware tools
 # (usbrw, gpio) and the boot servers that are linked into the kernel (echod,
-# fsd). OPI_NO_BIN=1 skips it.
-if [ "${OPI_NO_BIN:-0}" != "1" ]; then
+# fsd). Debian card only (the racccoon card's ext2 root already has bin/).
+# OPI_NO_BIN=1 skips it.
+if [ "$MODE" = debian ] && [ "${OPI_NO_BIN:-0}" != "1" ]; then
   BINARIES="cat ls echo true false ed grep wc sort find cmp tr dmesg ps top head whoami write rm mkdir mv chmod chown test expr wasm"
   for b in $BINARIES; do
     [ -f "build/user/$b.bin" ] || { echo "build/user/$b.bin missing — run scripts/build_user.sh" >&2; exit 1; }
