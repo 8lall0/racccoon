@@ -15,7 +15,7 @@
 # `-smp 5` (1 monitor + 4 U54) also works — the 3 extra harts just
 # announce themselves and park (no SMP scheduler; non-goal).
 #
-# No disk: this board is HAS_BLOCK_DEVICE = false, exactly like the
+# No disk: this board's DEVICES table is empty, exactly like the
 # opi-rv Stage-1 scaffold. `ls` / file commands fail cleanly; `echo`,
 # pipes, `ns`, `ping`, and (with an OPI_TEST_SHELL=1 build) maptest /
 # faulttest / hungservertest / mutextest are the testable surface.

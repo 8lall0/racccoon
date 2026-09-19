@@ -4,6 +4,124 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-19 — device table: the kernel stops knowing what each driver's hardware is (branch `device-table`), and c3c 0.8.4 broke every kernel boot
+
+**Prompted by:** "the services have some stuff related to them mapped
+inside the kernel, i don't think that's a good separation of concerns".
+True, and wider than the mappings: `process.c3` had seven
+`setup_<driver>_mappings()` functions (MMIO pages, PLIC route, DMA
+allocation per driver), six `SYS_*_INFO` syscalls to hand DMA addresses
+back, ~10 per-driver `*_paddr` globals, an `SVC_KIND_*` enum, and
+`kernel.c3` had a hand-written spawn block per driver. Every board also
+carried pages of `0`-valued stub constants (`SD_MMIO_BASE = 0`,
+`HAS_USB = false`, …) purely so the kernel compiled on hardware that
+lacks the device.
+
+**Found first, and it blocked all verification: c3c 0.8.4 (upgraded
+2026-09-14) breaks the boot of every kernel built from this tree.**
+`char[] __free_ram @export("__free_ram")` — the pattern kernel.c3 used
+for all seven linker-script symbols — now emits a real 16-byte `.bss`
+object of that name instead of a bare symbol, so `&__free_ram` resolved to
+that object (0x80515938) rather than the linker-script value
+(0x8053e000). `self_test_pte_roundtrip` correctly saw a non-page-aligned
+"free RAM" and panicked right after `1: BSS cleared`, on QEMU virt and
+sifive_u alike — and on the pre-existing `build/kernel.elf` built the same
+afternoon, so it wasn't the refactor. Diagnosed from the disassembly
+(`auipc`+`addi` landing at the wrong address), confirmed by the older
+kernels (`kernel_tcc.elf` etc.) still booting on the same host. Fix:
+declare them `extern char[] X @cname("X")` — what they actually are, and
+the form the `_binary_*` symbols already used. Comment left in kernel.c3.
+**The Duo / Orange Pi kernels built since 2026-09-14 with c3c 0.8.4 had
+the same bug; rebuild before flashing anything.**
+
+**The refactor (Stage A of the plan discussed this session):**
+- `src/device.c3` (new): `Device` / `Dev_dma` types and `device_setup(proc,
+  dev)` — one routine that maps a device's MMIO pages, allocates + maps its
+  DMA regions (`cached` or uncached), registers its PLIC route, and maps
+  the fsd arena if the device carries one. `Process.device` records which
+  device a process was given (`-1` otherwise, set in `create_process` and
+  `sys_rfork`).
+- Each board exports `board::DEVICES`, a table. Duo: `sd`, `usb`,
+  `eth-mac`, `gpio`. QEMU: `virtio-blk` (+ arena), `virtio-net`. Both
+  Orange Pi boards: empty (no driver yet). `kernel_main` spawns a driver
+  only when `device_find(name)` finds its entry — the `HAS_*` flags are
+  gone, as are all the `0` stubs.
+- `SYS_DEV_INFO` (60) replaces `SYS_DISKD/USBD/NETD/ETHD/SDD_INFO` (numbers
+  9/28/29/30/33 left unused, same convention as 4/5). It returns the
+  caller's DMA region bases in declaration order and the region count, or
+  -1 for a non-driver. The `user.c3` wrappers (`diskd_info`, `usbd_info`,
+  `netd_info`, `ethd_info`) kept their signatures, now over `dev_info`, so
+  the drivers needed no change beyond `sdd.c3`'s one direct `syscall`.
+- `supervisor.c3`: `service_boot()` spawns *and* registers; first boot and
+  respawn now share `service_instantiate()` (they had duplicated the
+  create/name/setup/bookkeeping sequence). `SVC_KIND_*` and
+  `supervisor_register` are gone. The Service entry is published (`used`)
+  only after the process exists — a timer tick landing mid-`kernel_main`
+  must never see a half-built entry.
+- Net: 7 setup functions, 5 syscalls, ~10 globals and 6 spawn blocks
+  collapse into one function + one syscall + one table per board.
+
+**Verified:**
+- All four targets build (`racccoon`, `-duo`, `-opi`, `-opi-qemu`).
+- QEMU virt: boot log, `ps`, `ls`, `cat`, `ns`, `killtest`,
+  `netdkilltest` (netd killed → respawned through the new path),
+  `faulttest`, and on the dual FAT32+ext2 image
+  `p9fstest`/`p9fswritetest`/`p9mkdirtest`/`mounttest`/`pathtest`/
+  `fspermtest`/`lfntest`/`bigreadtest`/`chmodtest`, `hungservertest`,
+  `ipcdeathtest`, `hotplugtest`, `maptest`, and **`storagekilltest`**
+  (diskd killed, respawned through `device_setup` incl. the arena, reads
+  work) — output **byte-identical** to the pre-refactor kernel run through
+  the same script, except one `sepc` value (the test shell's code moved).
+  opi-rv-qemu: same, incl. `hungservertest`.
+- New `devinfotest` (shell_test): a non-driver, an over-capacity request,
+  and an `rfork` child all get -1 — QEMU + opi-rv-qemu.
+- Duo table decoded straight out of the built ELF and compared with the
+  removed functions: every MMIO page (same order), IRQ number/level,
+  DMA page count/cacheability identical.
+
+**Verified on the real Duo (same day, `reflash_duo.sh`, dev-shell kernel then
+production):** boots clean through `sdd created … gpiod created`; the SD card
+enumerates, `sdd: SDMA enabled` (proof `SYS_DEV_INFO` returned sdd's uncached
+DMA region) and `fsd: ext2 mounted`; ethd brings the PHY up (its DMA region);
+usbd enumerates the hub on the real bus (its DMA region + IRQ route);
+`devinfotest` ok; `gpiodkilltest`, `storagekilltest` and `usbdkilltest` all
+ok — each driver killed, respawned through `device_setup`, and working again.
+The production kernel (login prompt) booted to a root shell in `/usr/root`
+with a mounted ext2 root before that. One oddity, most likely pre-existing and
+non-fatal: `storagekilltest` printed `svc: respawned sdd` twice (the test
+kills once, so the first respawned instance exited and was respawned again —
+consistent with the known card-state flake after a mid-transaction kill, cf.
+the `ACMD41 gave up` → respawn pattern above); the test still reports ok. Not
+chased. The USB-keyboard re-enum after `usbdkilltest` ("press a key") was not
+reported. The card was left on the **production** kernel; a rollback copy of
+the dev-shell one is `fip.bin.bak-*` on DUOBOOT.
+
+**Deliberately left (Stage B, not started):** `kernel_main` still names
+which binary drives which device, the `*_pid` globals still seed the
+default namespace, `Device.disk_arena` still lets the fsd payload arena
+ride on the device table, and `setup_fsd_mappings` still carries fsd's
+partition. Moving spawn/supervision to a userspace init that is *granted*
+devices out of this table is the real microkernel split; this table is the
+backing store for it. First consumer to build on Stage A: the Orange Pi
+`dw_mshc` driver — one `"sd"` entry in `boards/opi-rv/board.c3` (plus the
+syscrg/sysreg pages) instead of an eighth `setup_*` function.
+
+**Also from this session (Orange Pi, not yet acted on):** mainline Linux's
+`jh7110-orangepi-rv.dts` puts the microSD on `mmc1` (0x16020000, card-detect
+GPIO 41) and the Wi-Fi on `mmc0` (0x16010000) — the opposite of what
+`docs/opi-rv-plan.md` and the `dw_mshc.c3` draft assume. Check with
+`mmc list` / `fdt print /aliases` at the U-Boot prompt before writing the
+`"sd"` entry. Linux's StarFive glue driver has no voltage-switch quirk;
+the difference is the generic MMC core's power-cycle-and-retry-at-3.3V.
+U-Boot's `-110` means the card never answered CMD55/ACMD41 at all.
+
+**Files:** `src/device.c3` (new), `src/{kernel,process,entry,supervisor,
+virtio}.c3`, `boards/*/board.c3`, `user/user.c3`, `user/block/sdd.c3`,
+`user/shell_test.c3` (+ comment fixes), `docs/{manual,roadmap,ipc-rings,
+opi-rv-plan}.md`, two script comments.
+
+---
+
 ## 2026-09-14 — Orange Pi RV: real hardware unblocked, first-ever boot + a real kernel bug fixed, then a firmware-upgrade misadventure with a full recovery
 
 **Real board unblocked.** The isolator (tested successfully on the Duo

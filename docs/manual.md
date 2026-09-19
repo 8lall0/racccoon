@@ -107,9 +107,13 @@ Everything else is a user process that reaches the kernel only through
    `diskd` on QEMU), `fsd` (+ a second `fsd` on dual-partition setups),
    `procd`, `envd`, `shell`, then `usbd` / `ethd` / `netd` / `gpiod`
    where the board has them.
-4. Each server is registered with the supervisor and, if it needs
-   MMIO/DMA, gets a `setup_*_mappings()` call to identity-map its device
-   pages and hand back physical addresses via a driver-info syscall.
+4. Each server is started through `service_boot()`
+   (`src/supervisor.c3`), which spawns it and registers it with the
+   supervisor. A driver names its board device (`device_find("sd")` …);
+   `device_setup()` (`src/device.c3`) then identity-maps that device's
+   MMIO pages, allocates its DMA regions, and routes its PLIC source —
+   all from the board's `DEVICES` table. A board without the device
+   simply doesn't spawn the driver.
 5. `kernel_main()` falls into the idle loop: schedule, and re-spawn the
    shell if nothing runnable is left.
 6. The kernel prints ~13 progress lines; the servers print their own
@@ -427,13 +431,23 @@ completeness but only the matching server can use them.
 
 ### Driver-only
 
-`SYS_DISKD_INFO` (9), `SYS_FS_PARTITION_INFO` (14), `SYS_USBD_INFO`
-(28), `SYS_NETD_INFO` (29), `SYS_ETHD_INFO` (30), `SYS_SDD_INFO` (33),
+`SYS_DEV_INFO` (60), `SYS_FS_PARTITION_INFO` (14),
 `SYS_DRIVER_IRQ_ARM` (32), `SYS_DRIVER_IRQ_WAIT` (55),
-`SYS_DISK_ARENA_INFO` (56) — hand a driver its device MMIO / DMA
-physical addresses, or wait on an interrupt. The kernel sets these up in
-`setup_<server>_mappings()` at spawn time and only the matching pid may
-call them.
+`SYS_DISK_ARENA_INFO` (56) — hand a driver its DMA physical addresses,
+or wait on an interrupt.
+
+`SYS_DEV_INFO(out*, cap)` is the one syscall every hardware driver uses to
+learn its DMA regions: it writes the physical base of each region the
+caller's board device declared (`Dev_dma` list, `src/device.c3`) into
+`out[]`, in declaration order, and returns the region count — or -1 for a
+process that owns no device (the shell, an `rfork` child) or a `cap` over
+4. The kernel allocated and identity-mapped those regions at spawn time
+(`device_setup()`), so the returned number is both the driver's pointer and
+the address the device's DMA engine needs. `SYS_DISKD_INFO` (9),
+`SYS_USBD_INFO` (28), `SYS_NETD_INFO` (29), `SYS_ETHD_INFO` (30) and
+`SYS_SDD_INFO` (33) were folded into it and are unused numbers; `user.c3`'s
+`diskd_info` / `usbd_info` / `netd_info` / `ethd_info` wrappers still
+exist, now over `dev_info`.
 
 ---
 
@@ -998,9 +1012,12 @@ slot is transparent.
 `src/supervisor.c3`. Once per timer tick it checks every registered
 service: exited → respawn; inbox stuck with no IPC progress for
 `SVC_STALL_LIMIT` (5) ticks *and* it has reached its recv loop at least
-once → kill + respawn. A respawn re-runs `setup_*_mappings`, updates the
-`*_pid` global the default namespace reads, and reseats every live
-process's matching mount entry. Gives up after `SVC_RESTART_LIMIT` (5).
+once → kill + respawn. First boot and respawn share one path
+(`service_instantiate`): a respawn re-runs `device_setup()` for the
+server's device (fresh DMA regions, PLIC route overwritten in place),
+updates the `*_pid` global the default namespace reads, and reseats every
+live process's matching mount entry. Gives up after `SVC_RESTART_LIMIT`
+(5).
 
 ---
 
@@ -1015,13 +1032,18 @@ What a board provides:
 - **PLIC** layout (`PLIC_*_BASE`, `plic_init/claim/complete/set_enabled`).
 - **PTE bits** — `PTE_DEVICE_BITS` (the Duo needs bit 63 set for
   strong-ordered MMIO; getting this wrong caused the "PLIC storm").
-- **Capability flags** — `HAS_SD_BLOCK` / `HAS_VIRTIO_BLOCK` /
-  `HAS_USB` / `HAS_GPIO` / `HAS_ETH_MAC` / `HAS_VIRTIO_NET` /
-  `HAS_SECOND_FS_PARTITION`. `kernel_main` reads these to decide which
-  servers to spawn.
-- **Device MMIO bases** — `SD_MMIO_BASE`, `USB_MMIO_BASE`,
-  `ETH_MMIO_BASE`, plus the CV1800B's clock / pinmux / reset pages
-  (`0` on QEMU).
+- **`DEVICES`** — a `Device[]` table (type in `src/device.c3`), one entry
+  per piece of driver-owned hardware the board has: `name` (`"sd"`,
+  `"usb"`, `"eth-mac"`, `"gpio"`, `"virtio-blk"`, `"virtio-net"`), the
+  page-aligned `mmio` pages the driver needs, its PLIC `irq` and
+  `irq_level`, and its `dma` regions (`pages` + `cached`; real bus masters
+  must be `cached = false`). `kernel_main` spawns a driver only if
+  `device_find(name)` finds its entry, so a board with no entry (the
+  Orange Pi RV scaffold: an empty table) just doesn't run that driver.
+  Adding hardware is a new table entry — no kernel function, no new
+  syscall.
+- **`HAS_SECOND_FS_PARTITION`** — whether a second `fsd` is spawned (this
+  is filesystem layout, not a device).
 - **`FS_PARTITION_START_SECTOR`** — where the ext2 root lives
   (`2099200` on the Duo card, `0` on the QEMU whole-disk image).
 - **`TIMEBASE_HZ`** (10 MHz QEMU / 25 MHz Duo), **`SMP_MAX_HARTS`** (8),
@@ -1131,11 +1153,13 @@ Deliberate or just not done — the honest list:
 src/
   entry.c3          trap entry, the syscall switch, SYS_* consts, exec/rfork
   process.c3        Process struct, scheduler, create_process, context switch,
-                    fork_entry, setup_<server>_mappings
+                    fork_entry, setup_fsd_mappings
+  device.c3         Device / Dev_dma types, device_setup(): a board device
+                    table -> MMIO maps + DMA regions + PLIC route
   page.c3           Sv39 map_page / map_device_page / walk
   allocation.c3     physical page bitmap allocator
   kernel.c3         boot(), kernel_main(), the server spawn sequence
-  supervisor.c3     the respawn watchdog
+  supervisor.c3     service_boot() + the respawn watchdog
   pipe.c3           anonymous kernel pipes
   kbd.c3            the keystroke queue a USB kbd feeds SYS_GETCHAR
   smp.c3            hart scaffold (parked)

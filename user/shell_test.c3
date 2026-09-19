@@ -2092,7 +2092,7 @@ fn void main() {
         } else if (strcmp(cmd, "storagekilltest") == 0) {
             // Like fsdkilltest, one layer down: kill the block-storage
             // driver (diskd on QEMU / sdd on the Duo) and confirm the
-            // supervisor re-inits it (SVC_KIND_DISKD/_SDD re-run the
+            // supervisor re-inits it (device_setup re-runs the
             // MMIO+DMA setup) and fsd re-resolves its new pid on the
             // next read (user/fs/fsd.c3's diskd_rw). docs/roadmap.md §5.
             uint sk_part = 0;
@@ -2654,6 +2654,32 @@ fn void main() {
                     print(" alive="); print_uint((uint)ft_shell_ok); putchar('\n');
                 }
             }
+        } else if (strcmp(cmd, "devinfotest") == 0) {
+            // SYS_DEV_INFO (src/device.c3): only a process a board device
+            // was handed to — a hardware driver — gets an answer. The shell
+            // owns no device, so it gets -1, as does a request bigger than
+            // the reply capacity, and so does a forked child (rfork resets
+            // Process.device, so a child landing in a slot a killed driver
+            // just vacated never reads that driver's DMA addresses — run
+            // netdkilltest first on QEMU to exercise exactly that).
+            uptr[4] dv_out;
+            int dv_shell = dev_info(&dv_out[0], 4);
+            int dv_big   = dev_info(&dv_out[0], 5);
+            uint dv_gen = 0;
+            int dv_c = rfork(RFPROC, &dv_gen);
+            if (dv_c == 0) {
+                uptr[4] dv_child;
+                exitcode(dev_info(&dv_child[0], 4) == -1 ? 7 : 1);
+            }
+            int dv_code = -1;
+            if (dv_c > 0) { dv_code = join(dv_c, dv_gen); }
+            if (dv_shell == -1 && dv_big == -1 && dv_code == 7) {
+                print("devinfotest: ok (non-driver processes get -1)\n");
+            } else {
+                print("devinfotest: FAILED shell="); print_uint((uint)dv_shell);
+                print(" big="); print_uint((uint)dv_big);
+                print(" child="); print_uint((uint)dv_code); putchar('\n');
+            }
         } else if (strcmp(cmd, "fputest") == 0) {
             // Hardware FPU (roadmap §3): prove f-registers survive a
             // context switch and a fork. No %f in the print path — scale
@@ -2710,7 +2736,7 @@ fn void main() {
         } else if (strcmp(cmd, "netdkilltest") == 0) {
             // The storage driver's supervisor path (storagekilltest),
             // one driver over: kill netd and confirm the supervisor
-            // re-inits it (SVC_KIND_NETD -> setup_netd_mappings) and the
+            // re-inits it (device_setup re-runs for the "virtio-net" device) and the
             // namespace reseat points "/net/" back at the fresh pid.
             if (ns_mount("/net/", "netd") < 0) {
                 print("netdkilltest: FAILED (netd not posted)\n");
@@ -2807,7 +2833,7 @@ fn void main() {
         } else if (strcmp(cmd, "gpiodkilltest") == 0) {
             // §5.5, Duo-only: gpiod isn't spawned on QEMU (no GPIO
             // controller on the virt board). Kill it, let the supervisor
-            // respawn it (SVC_KIND_GPIOD -> setup_gpiod_mappings re-maps
+            // respawn it (device_setup re-maps the "gpio" device's
             // bank A/C + the pinmux page), then send a real SET_DIR to
             // confirm the fresh gpiod re-mapped its MMIO, rebuilt its pin
             // table, and services IPC.
@@ -2857,8 +2883,8 @@ fn void main() {
             }
         } else if (strcmp(cmd, "usbdkilltest") == 0) {
             // §5.5, Duo-only: usbd isn't spawned on QEMU. Kill it, let
-            // the supervisor respawn it (SVC_KIND_USBD ->
-            // setup_usbd_mappings re-maps the DWC2 MMIO + DMA ring), and
+            // the supervisor respawn it (device_setup re-maps the
+            // "usb" device's DWC2 MMIO + DMA ring), and
             // confirm the fresh usbd came back and re-posted /srv/usbd/.
             // A full HID re-enumeration check needs a device on the bus
             // and a keystroke — this covers the respawn + MMIO re-map +

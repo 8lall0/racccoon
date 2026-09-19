@@ -59,8 +59,8 @@ const ulong PTE_DEVICE_BITS = (1UL << 63) | (1UL << 60);
 // plic_claim()'s own "0 = nothing pending" sentinel, so the
 // diskd-wake check in entry.c3's handle_trap (`irq == IRQ_VIRTIO_BLK`)
 // can never spuriously match a real interrupt. Harmless either way
-// since HAS_BLOCK_DEVICE below means diskd never actually gets
-// spawned, so diskd_pid stays 0 and that check's other half already
+// since this board's DEVICES table has no "virtio-blk" entry, diskd
+// never actually gets spawned, so diskd_pid stays 0 and that check's other half already
 // short-circuits it — but 0 here is the more honest value than
 // pretending a real vendor IRQ number.
 const uint IRQ_VIRTIO_BLK = 0;
@@ -134,7 +134,7 @@ const uptr HEAP_MAX_BYTES = 16 * 1024 * 1024;
 // One-time SD pad/power/clock bring-up (see user/sdd.c3's sdd_init) needs
 // three more, separate MMIO pages besides SD_MMIO_BASE itself — none of
 // them adjacent to it or to each other, so all three (plus SD_MMIO_BASE)
-// get mapped individually by setup_sdd_mappings (process.c3). Register
+// get mapped individually by device_setup (src/device.c3). Register
 // offsets within these pages are sdd.c3's concern, not this file's — this
 // is just the page-granularity access list the page table needs.
 const uptr SD_TOP_PAGE    = 0x03000000; // REG_TOP_SD_PWRSW_CTRL @ +0x1F4
@@ -143,17 +143,6 @@ const uptr SD_PINMUX_PAGE = 0x03001000; // PAD_SDIO0_* function-select +
                                           // strength regs, both in range
 const uptr SD_CLOCK_PAGE  = 0x03002000; // pll_reg @ +0x70,
                                           // CLOCK_BYPASS_SELECT_REGISTER @ +0x30
-
-// This board has a block device (real SD storage, via sdd — see
-// user/sdd.c3) but no virtio-mmio (a QEMU paravirtual device with no
-// physical equivalent on real hardware). HAS_BLOCK_DEVICE gates whether
-// kernel.c3 spawns *any* storage driver + fsd; HAS_SD_BLOCK/HAS_VIRTIO_BLOCK
-// (mutually exclusive, both boards define both) tell it *which* driver
-// process and kernel-side mapping helper to use for the one this board
-// has. See boards/qemu/board.c3 for the mirror image.
-const bool HAS_BLOCK_DEVICE = true;
-const bool HAS_SD_BLOCK     = true;
-const bool HAS_VIRTIO_BLOCK = false;
 
 // USB host controller (Synopsys DesignWare USB2 OTG core, "DWC2") —
 // see user/usbd.c3 for the driver (Phase 1: host-mode bring-up + HPRT
@@ -200,7 +189,6 @@ const uptr USB_CLK_PAGE      = 0x03002000;
 // until now.
 const uptr USB_PINMUX_PAGE   = 0x03001000;
 const uint IRQ_USB           = 30; // CV1800B USB PLIC source (cv180x dtsi SOC_PERIPHERAL_IRQ(14)=30; confirmed via milkv-duos-rs)
-const bool HAS_USB           = true;
 
 // Interrupt-driven USB transfer completion (docs/usb-interrupt-plan.md).
 // Depends on the map_device_page SO fix (PTE_DEVICE_BITS) — before that
@@ -288,16 +276,6 @@ const uptr ETH_SD1_SELPHY_PAGE = 0x05027000;
 const uptr ETH_EFUSE_PAGE_0 = 0x03050000; // EPHY_EFUSE_VALID_BIT_BASE @ +0x120
 const uptr ETH_EFUSE_PAGE_1 = 0x03051000; // trim values @ +0x020, +0x024
 const uint IRQ_ETH            = 31; // declared, not wired into plic_init() yet — Phase 1 polls PHY link status directly, same reasoning as IRQ_USB above
-const bool HAS_ETH            = true;
-const bool HAS_ETH_MAC        = true;
-const bool HAS_VIRTIO_NET     = false;
-
-// process.c3's setup_netd_mappings references these unconditionally,
-// same reasoning as IRQ_VIRTIO_BLK's own "0 = not applicable" pattern
-// above — this board has a real MAC, no virtio-mmio at all, never
-// dereferenced since HAS_VIRTIO_NET is false here.
-const uptr VIRTIO_NET_PADDR = 0;
-const uint IRQ_VIRTIO_NET   = 0;
 
 // GPIO: Synopsys DesignWare APB GPIO (5 independent single-port banks,
 // confirmed via u-boot-2021.10/arch/riscv/dts/cv180x_base.dtsi's own
@@ -320,7 +298,62 @@ const uptr GPIO_BANK_C_BASE = 0x03022000;
 // in cv180x_reg_fmux_gpio.h, same as every other pinmux register this
 // project has ever used).
 const uptr GPIO_PINMUX_PAGE = 0x03001000;
-const bool HAS_GPIO = true;
+
+// The devices the kernel hands to boot drivers (src/device.c3) — the MMIO
+// pages each driver needs, its PLIC source, and the DMA regions the kernel
+// allocates for it. This board has an SD controller (sdd), a DWC2 USB core
+// (usbd), a DesignWare Ethernet MAC (ethd) and GPIO (gpiod), and no
+// virtio-mmio at all, so diskd/netd never spawn here.
+//
+// Every DMA region is uncached (`cached = false`, map_device_page): the
+// SDHCI SDMA engine, the DWC2 DMA engine and the MAC's DMA are all real AHB
+// bus masters, and a cacheable mapping risks them reading memory the CPU's
+// write never got past its own cache line for — a persistent, deterministic
+// STALL on usbd's very first control transfer was exactly this signature
+// (see docs/devlog.md, usbd Phase 2).
+//
+// The MMIO lists are the fixed register pages each driver touches, several
+// sharing the same physical page for unrelated bits (independent
+// per-process page tables, no conflict) — see each *_PAGE constant's own
+// comment above for why the driver needs it.
+//   sd:  controller, TOP pad/power switch, pinmux, clock (level IRQ, cleared
+//        by sdd writing SD_INT_STATUS; inert unless INTERRUPT_DRIVEN_SD)
+//   usb: DWC2 core + TOP PHY ctrl/reset + PHY clocks + VBUS pinmux (level
+//        IRQ; inert unless INTERRUPT_DRIVEN_USB and dwc2 unmasks it)
+//   eth-mac: MAC, its DMA block, embedded PHY, clock controller, LED pinmux,
+//        SD1 PHY-select, two efuse trim pages (level IRQ, cleared by ethd
+//        writing the DMA status register — registered now so interrupt-driven
+//        RX needs no kernel routing edit; never fires until plic_init arms it)
+//   gpio: banks A and C + the shared pinmux page — a fixed set of
+//        compile-time-known registers, no DMA region, no IRQ
+const Device[*] DEVICES = {
+	{
+		.name = "sd",
+		.mmio = { SD_MMIO_BASE, SD_TOP_PAGE, SD_PINMUX_PAGE, SD_CLOCK_PAGE },
+		.irq = IRQ_SDHCI,
+		.irq_level = true,
+		.dma = { { .pages = 1, .cached = false } },
+	},
+	{
+		.name = "usb",
+		.mmio = { USB_MMIO_BASE, USB_TOP_CTRL_PAGE, USB_TOP_RST_PAGE, USB_CLK_PAGE, USB_PINMUX_PAGE },
+		.irq = IRQ_USB,
+		.irq_level = true,
+		.dma = { { .pages = 1, .cached = false } },
+	},
+	{
+		.name = "eth-mac",
+		.mmio = { ETH_MMIO_BASE, ETH_DMA_PAGE, ETH_PHY_PAGE, ETH_CLK_PAGE,
+		          ETH_LED_PINMUX_PAGE, ETH_SD1_SELPHY_PAGE, ETH_EFUSE_PAGE_0, ETH_EFUSE_PAGE_1 },
+		.irq = IRQ_ETH,
+		.irq_level = true,
+		.dma = { { .pages = 1, .cached = false } },
+	},
+	{
+		.name = "gpio",
+		.mmio = { GPIO_BANK_A_BASE, GPIO_BANK_C_BASE, GPIO_PINMUX_PAGE },
+	},
+};
 
 // fsd mounts EXT2TEST (ext2) as this board's own root — the real,
 // physical start sector, confirmed via `sfdisk`/`lsblk` against the
@@ -368,7 +401,7 @@ fn void plic_init()
 	// own status clear. USB: DWC2 GINTMSK unmasked only mid-transfer.
 	// SD: only fires in the SDMA path (sdd clears SD_INT_STATUS right
 	// after the wait).
-	if (INTERRUPT_DRIVEN_USB && HAS_USB)
+	if (INTERRUPT_DRIVEN_USB)
 	{
 		uint* priority_usb = (uint*)(PLIC_PRIORITY_BASE + 4 * IRQ_USB);
 		mem::store(priority_usb, 1u, 4, true);
@@ -376,7 +409,7 @@ fn void plic_init()
 		uint cur = mem::load(enable_word0, 4, true);
 		mem::store(enable_word0, cur | (1u << IRQ_USB), 4, true); // IRQ_USB (30) < 32 → word 0
 	}
-	if (INTERRUPT_DRIVEN_SD && HAS_BLOCK_DEVICE)
+	if (INTERRUPT_DRIVEN_SD)
 	{
 		// priority_sdhci is already written above. IRQ_SDHCI (36) → the
 		// SECOND enable word (36/32 = 1), bit 36 % 32 = 4.

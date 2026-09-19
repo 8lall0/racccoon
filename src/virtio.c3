@@ -2,17 +2,16 @@ module kernel;
 
 // The kernel no longer talks to the virtio-blk device directly — diskd
 // (user/diskd.c3) owns it now (see docs/devlog.md, microkernel phase 4).
-// What's left here is just what src/process.c3's setup_diskd_mappings
-// still needs: the struct shapes, to size diskd's virtqueue/request
-// buffer correctly, and the few constants other kernel code (fs.c3's
-// sector-size math, process.c3's MMIO mapping) still references. The
+// What's left here is just the struct shapes, so a board's Device table
+// (boards/qemu/board.c3) can size diskd's / netd's virtqueue and request
+// buffers correctly, and the few constants other kernel code still
+// references. The
 // struct definitions are duplicated in user/diskd.c3 — kernel and user
 // are separate c3c compilations with no shared header, same convention
 // already used for the syscall numbers in user/user.c3.
 
 const uint SECTOR_SIZE       = 512;
 const uint VIRTQ_ENTRY_NUM   = 16;
-const uint VIRTIO_BLK_PADDR  = 0x10001000;
 
 struct Virtq_desc @packed
 {
@@ -59,7 +58,7 @@ struct Virtio_virtq @packed
 // (15) consecutive sectors for DISKD_READ_MULTI — virtio-blk transfers
 // them in one queue op (descs[1].len = count * 512). Kept in sync by
 // hand with user/block/diskd.c3's copy; the ::size here sizes the DMA
-// region alloc in process.c3's setup_diskd_mappings (now 2 pages).
+// region alloc (VIRTIO_BLK_REQ_PAGES below — 2 pages).
 struct Virtio_blk_req @packed
 {
 	uint          type;
@@ -68,3 +67,9 @@ struct Virtio_blk_req @packed
 	char[15 * 512] data;
 	char          status;
 }
+
+// Pages one virtqueue / one blk request buffer span — what a board's
+// Device table asks device_setup to allocate (alloc_pages guarantees the
+// physical contiguity the legacy virtio layout needs).
+const uint VIRTQ_PAGES          = (uint)((Virtio_virtq::size + PAGE_SIZE - 1) / PAGE_SIZE);
+const uint VIRTIO_BLK_REQ_PAGES = (uint)((Virtio_blk_req::size + PAGE_SIZE - 1) / PAGE_SIZE);

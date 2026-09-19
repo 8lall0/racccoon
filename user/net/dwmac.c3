@@ -205,10 +205,10 @@ const uint DESC_RXSTS_FRMLENSHFT  = 16;
 const uint ETH_DMA_BUF_SIZE = 1600; // MAC_MAX_FRAME_SZ in the real driver — covers a full 1514-byte frame with slack
 const uint ETH_ZLEN = 60; // minimum real Ethernet frame size — short frames are zero-padded up to this before transmit, matching the real driver's own _dw_eth_send()
 
-// Fixed layout within the single physical page setup_ethd_mappings
-// allocates (see src/process.c3): tx descriptor, rx descriptor, tx
+// Fixed layout within the single physical page device_setup
+// allocates for the "eth-mac" device (see src/device.c3): tx descriptor, rx descriptor, tx
 // buffer, rx buffer, back to back — computed once from the base
-// physical address SYS_ETHD_INFO hands back.
+// physical address SYS_DEV_INFO hands back.
 Dw_dma_desc* eth_tx_desc;
 Dw_dma_desc* eth_rx_desc;
 char* eth_tx_buf;

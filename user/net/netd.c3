@@ -1,6 +1,6 @@
 module user;
 
-// netd: the virtio-net driver — QEMU only (board::HAS_VIRTIO_NET;
+// netd: the virtio-net driver — QEMU only (the board's "virtio-net" device;
 // the real Duo has an actual Ethernet MAC instead, see
 // user/net/ethd.c3), mirroring diskd.c3's own structure closely (same
 // virtio-mmio legacy register layout, same virtqueue struct shapes)

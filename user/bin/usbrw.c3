@@ -39,7 +39,7 @@ const uint USB_SECTOR_SIZE = 512;
 // spawned server (present well before any interactive command could
 // possibly run), so this should succeed on its very first attempt in
 // practice; generous headroom costs nothing since it only retries at
-// all if usbd is genuinely missing (e.g. board::HAS_USB is false, a
+// all if usbd is genuinely missing (e.g. the board has no "usb" device, a
 // QEMU build).
 const ulong USBD_MOUNT_WAIT_ATTEMPTS = 20;
 

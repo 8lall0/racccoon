@@ -184,8 +184,8 @@ fn void free_pages(uptr paddr, uint n)
 	// Bounds check: a process's page table can legitimately contain
 	// PAGE_U leaf entries that were never alloc_pages()'d at all — an
 	// MMIO identity-mapping like diskd's VIRTIO_BLK_PADDR or sdd's
-	// SD_MMIO_BASE/SD_TOP_PAGE/etc (see setup_diskd_mappings/
-	// setup_sdd_mappings, process.c3), both flagged PAGE_U for the same
+	// SD_MMIO_BASE/SD_TOP_PAGE/etc (see device_setup,
+	// device.c3), both flagged PAGE_U for the same
 	// reason any other private mapping is. entry.c3's SYS_EXIT free loop
 	// walks every PAGE_U leaf and frees it unconditionally, so without
 	// this check, a real MMIO physical address (numerically far below

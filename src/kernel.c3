@@ -166,66 +166,55 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 	// now; the shell's "ping" resolves it through the namespace
 	// ("/srv/echo/" -> echod_pid, healed on respawn by the supervisor),
 	// so its slot/pid is no longer load-bearing.
-	Process* echod_proc = create_process((void*)&_binary_echod_bin_start, (uint)((uptr)&_binary_echod_bin_end - (uptr)&_binary_echod_bin_start));
-	echod_proc.is_boot_server = true;
-	echod_pid = echod_proc.pid;
-	supervisor_register("echod", (char*)&_binary_echod_bin_start, (char*)&_binary_echod_bin_end,
-		SVC_KIND_PLAIN, 0, false, true, &echod_pid, echod_proc);
+	service_boot("echod", (char*)&_binary_echod_bin_start, (char*)&_binary_echod_bin_end,
+		pid_global: &echod_pid);
 	io::print("Idle process started\n");
 
 	// diskd/fsd (see user/diskd.c3 and user/fsd.c3, microkernel plan
-	// phases 4/5) need a real block device — board::HAS_BLOCK_DEVICE is
-	// false on any platform without one (Milk-V Duo, for now: no
-	// virtio-mmio equivalent, no storage driver yet — see
-	// docs/devlog.md). Skipped entirely there: fsd_pid stays 0, and
-	// every later create_process's default "" -> fsd namespace mount
-	// just never resolves to anything, so the shell's
-	// readfile/writefile commands fail cleanly instead of hanging on a
-	// server that was never spawned.
-	if (board::HAS_BLOCK_DEVICE)
+	// phases 4/5) need a real block device — the board declares one in
+	// board::DEVICES (device.c3): "sd" (real SD card, user/sdd.c3) or
+	// "virtio-blk" (QEMU, user/diskd.c3), mutually exclusive. A board with
+	// neither (the Orange Pi RV scaffold, for now — no storage driver yet)
+	// skips all of this: fsd_pid stays 0, and every later create_process's
+	// default "" -> fsd namespace mount just never resolves to anything,
+	// so the shell's readfile/writefile commands fail cleanly instead of
+	// hanging on a server that was never spawned.
+	//
+	// fsd learns whichever pid the driver lands at from
+	// SYS_FS_PARTITION_INFO (storage_pid), not a fixed slot, and
+	// re-queries it if the driver respawns — so the two are supervised.
+	bool have_storage = false;
+	int sd_dev = device_find("sd");
+	int vblk_dev = device_find("virtio-blk");
+	if (sd_dev >= 0)
 	{
-		// Which driver — board::HAS_SD_BLOCK/HAS_VIRTIO_BLOCK (mutually
-		// exclusive, see board.c3) pick real-SD (Duo, user/sdd.c3) vs
-		// virtio-blk (QEMU, user/diskd.c3). fsd learns whichever pid this
-		// lands at from SYS_FS_PARTITION_INFO (storage_pid), not a fixed
-		// slot, and re-queries it if the driver respawns — so the two are
-		// supervised now (SVC_KIND_DISKD / _SDD re-run the MMIO+DMA setup).
-		if (board::HAS_SD_BLOCK)
-		{
-			Process* sdd_proc = create_process((void*)&_binary_sdd_bin_start, (uint)((uptr)&_binary_sdd_bin_end - (uptr)&_binary_sdd_bin_start));
-			sdd_proc.is_boot_server = true;
-			setup_sdd_mappings(sdd_proc);
-			storage_pid = sdd_proc.pid;
-			supervisor_register("sdd", (char*)&_binary_sdd_bin_start, (char*)&_binary_sdd_bin_end,
-				SVC_KIND_SDD, 0, false, true, &storage_pid, sdd_proc);
-			io::print("sdd created\n");
-		}
-		else if (board::HAS_VIRTIO_BLOCK)
-		{
-			Process* diskd_proc = create_process((void*)&_binary_diskd_bin_start, (uint)((uptr)&_binary_diskd_bin_end - (uptr)&_binary_diskd_bin_start));
-			diskd_proc.is_boot_server = true;
-			setup_diskd_mappings(diskd_proc);
-			storage_pid = diskd_proc.pid;
-			supervisor_register("diskd", (char*)&_binary_diskd_bin_start, (char*)&_binary_diskd_bin_end,
-				SVC_KIND_DISKD, 0, false, true, &storage_pid, diskd_proc);
-			io::print("diskd created\n");
-		}
+		service_boot("sdd", (char*)&_binary_sdd_bin_start, (char*)&_binary_sdd_bin_end,
+			pid_global: &storage_pid, device: sd_dev);
+		io::print("sdd created\n");
+		have_storage = true;
+	}
+	else if (vblk_dev >= 0)
+	{
+		service_boot("diskd", (char*)&_binary_diskd_bin_start, (char*)&_binary_diskd_bin_end,
+			pid_global: &storage_pid, device: vblk_dev);
+		io::print("diskd created\n");
+		have_storage = true;
+	}
 
+	if (have_storage)
+	{
 		// Created after the storage driver so it's already registered
-		// (diskd_pid/sdd_pid) by the time fsd's own fs_init() (run the
-		// first time the scheduler picks it, same as any other process)
-		// sends it a request. fsd_pid has to be set before ANY later
+		// (storage_pid) by the time fsd's own fs_init() (run the first
+		// time the scheduler picks it, same as any other process) sends
+		// it a request. fsd_pid has to be set before ANY later
 		// create_process call populates a default namespace, since that's
 		// where it's actually consumed — every process created from here
 		// on (i.e. every shell) gets a working "" -> fsd mount;
 		// idle/echod/the storage driver, created before this line, don't
 		// and don't need to (see process.c3's create_process).
-		Process* fsd_proc = create_process((void*)&_binary_fsd_bin_start, (uint)((uptr)&_binary_fsd_bin_end - (uptr)&_binary_fsd_bin_start));
-		fsd_proc.is_boot_server = true;
-		setup_fsd_mappings(fsd_proc, board::FS_PARTITION_START_SECTOR, false);
-		fsd_pid = fsd_proc.pid;
-		supervisor_register("fsd", (char*)&_binary_fsd_bin_start, (char*)&_binary_fsd_bin_end,
-			SVC_KIND_FSD, board::FS_PARTITION_START_SECTOR, false, true, &fsd_pid, fsd_proc);
+		service_boot("fsd", (char*)&_binary_fsd_bin_start, (char*)&_binary_fsd_bin_end,
+			pid_global: &fsd_pid, is_fsd: true,
+			fsd_partition: board::FS_PARTITION_START_SECTOR, fsd_secondary: false);
 		io::print("fsd created\n");
 
 		// A second, simultaneously-mounted fsd instance, reachable under
@@ -240,12 +229,9 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 		// fsd_pid above.
 		if (board::HAS_SECOND_FS_PARTITION)
 		{
-			Process* fsd2_proc = create_process((void*)&_binary_fsd_bin_start, (uint)((uptr)&_binary_fsd_bin_end - (uptr)&_binary_fsd_bin_start));
-			fsd2_proc.is_boot_server = true;
-			setup_fsd_mappings(fsd2_proc, board::FS_PARTITION_2_START_SECTOR, true);
-			fsd2_pid = fsd2_proc.pid;
-			supervisor_register("fsd2", (char*)&_binary_fsd_bin_start, (char*)&_binary_fsd_bin_end,
-				SVC_KIND_FSD, board::FS_PARTITION_2_START_SECTOR, true, true, &fsd2_pid, fsd2_proc);
+			service_boot("fsd2", (char*)&_binary_fsd_bin_start, (char*)&_binary_fsd_bin_end,
+				pid_global: &fsd2_pid, is_fsd: true,
+				fsd_partition: board::FS_PARTITION_2_START_SECTOR, fsd_secondary: true);
 			io::print("fsd2 created\n");
 		}
 	}
@@ -256,14 +242,11 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 	// call. Spawned last, after every board-conditional server above, so
 	// it never disturbs their own hardcoded pid conventions (echod=2,
 	// fsd.c3's own DISKD_PID=3) regardless of which of
-	// HAS_BLOCK_DEVICE/HAS_SECOND_FS_PARTITION are set. Same "must be set
+	// the board has storage / HAS_SECOND_FS_PARTITION is set. Same "must be set
 	// before any later create_process call populates a default
 	// namespace" ordering constraint as fsd_pid/fsd2_pid above.
-	Process* procd_proc = create_process((void*)&_binary_procd_bin_start, (uint)((uptr)&_binary_procd_bin_end - (uptr)&_binary_procd_bin_start));
-	procd_proc.is_boot_server = true;
-	procd_pid = procd_proc.pid;
-	supervisor_register("procd", (char*)&_binary_procd_bin_start, (char*)&_binary_procd_bin_end,
-		SVC_KIND_PLAIN, 0, false, true, &procd_pid, procd_proc);
+	service_boot("procd", (char*)&_binary_procd_bin_start, (char*)&_binary_procd_bin_end,
+		pid_global: &procd_pid);
 	io::print("procd created\n");
 
 	// envd (the "/env/" server, user/envd.c3) — same unconditional,
@@ -272,11 +255,8 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 	// SYS_PROC_INFO, both already usable by every process regardless of
 	// board), and ordering still matters for the same reason
 	// (create_process's default namespace population, right below).
-	Process* envd_proc = create_process((void*)&_binary_envd_bin_start, (uint)((uptr)&_binary_envd_bin_end - (uptr)&_binary_envd_bin_start));
-	envd_proc.is_boot_server = true;
-	envd_pid = envd_proc.pid;
-	supervisor_register("envd", (char*)&_binary_envd_bin_start, (char*)&_binary_envd_bin_end,
-		SVC_KIND_PLAIN, 0, false, true, &envd_pid, envd_proc);
+	service_boot("envd", (char*)&_binary_envd_bin_start, (char*)&_binary_envd_bin_end,
+		pid_global: &envd_pid);
 	io::print("envd created\n");
 
 	// The shell — created explicitly here, BEFORE usbd below, not left
@@ -307,69 +287,59 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 	proc_set_name(shell_proc, "shell");
 	io::print("shell created\n");
 
-	// usbd (the USB host-controller driver, user/usbd.c3) — Duo only
-	// (board::HAS_USB; QEMU's own riscv64 virt machine has no DWC2
-	// equivalent). Spawned last, after every other server (including
-	// the shell above): unlike diskd/fsd, nothing hardcodes usbd's pid
-	// yet (Phase 1 is bring-up + HPRT polling only, no IPC clients), so
-	// there's no fixed-slot convention to preserve by spawning it
-	// earlier.
-	if (board::HAS_USB)
+	// The remaining hardware drivers — each spawns only on a board that
+	// declares its device (board::DEVICES, device.c3), and gets exactly
+	// what that entry describes: no per-driver kernel setup code.
+	//
+	// All spawned last, after every other server (including the shell
+	// above): nothing hardcodes these pids (no fixed-slot convention to
+	// preserve) and none has IPC clients until something dynamically
+	// ns_mount_wait()s its "/srv/<name>/" the way mountusb does for usbd.
+	//
+	// usbd (user/usb/usbd.c3, DWC2 host — Duo). watch_hangs = false for
+	// usbd/ethd: their bring-up (a USB bus reset + 1s settle, an Ethernet
+	// PHY train, …) can legitimately not touch their IPC poll for
+	// seconds, which would false-trip the has_message stall check. They
+	// still get respawn-on-exit — a driver that panic()s comes back.
+	int usb_dev = device_find("usb");
+	if (usb_dev >= 0)
 	{
-		Process* usbd_proc = create_process((void*)&_binary_usbd_bin_start, (uint)((uptr)&_binary_usbd_bin_end - (uptr)&_binary_usbd_bin_start));
-		usbd_proc.is_boot_server = true;
-		setup_usbd_mappings(usbd_proc);
+		service_boot("usbd", (char*)&_binary_usbd_bin_start, (char*)&_binary_usbd_bin_end,
+			device: usb_dev, watch_hangs: false);
 		io::print("usbd created\n");
-		supervisor_register("usbd", (char*)&_binary_usbd_bin_start, (char*)&_binary_usbd_bin_end,
-			SVC_KIND_USBD, 0, false, false, null, usbd_proc);
 	}
 
-	// ethd (the real Ethernet MAC driver, user/ethd.c3) — Duo only —
-	// or netd (virtio-net, user/netd.c3) — QEMU only — mutually
-	// exclusive, same board::HAS_ETH_MAC/HAS_VIRTIO_NET shape as
-	// board::HAS_SD_BLOCK/HAS_VIRTIO_BLOCK gates diskd vs sdd. Spawned
-	// last, same reasoning as usbd above: no fixed-slot convention to
-	// preserve yet, Phase 1 has no IPC clients.
-	if (board::HAS_ETH_MAC)
+	// ethd (the real Ethernet MAC driver, user/net/ethd.c3 — Duo) or netd
+	// (virtio-net, user/net/netd.c3 — QEMU): mutually exclusive, same
+	// device-presence shape as "sd" vs "virtio-blk" above.
+	int eth_dev = device_find("eth-mac");
+	if (eth_dev >= 0)
 	{
-		Process* ethd_proc = create_process((void*)&_binary_ethd_bin_start, (uint)((uptr)&_binary_ethd_bin_end - (uptr)&_binary_ethd_bin_start));
-		ethd_proc.is_boot_server = true;
-		setup_ethd_mappings(ethd_proc);
+		service_boot("ethd", (char*)&_binary_ethd_bin_start, (char*)&_binary_ethd_bin_end,
+			device: eth_dev, watch_hangs: false);
 		io::print("ethd created\n");
-		supervisor_register("ethd", (char*)&_binary_ethd_bin_start, (char*)&_binary_ethd_bin_end,
-			SVC_KIND_ETHD, 0, false, false, null, ethd_proc);
 	}
-	if (board::HAS_VIRTIO_NET)
+	int vnet_dev = device_find("virtio-net");
+	if (vnet_dev >= 0)
 	{
-		Process* netd_proc = create_process((void*)&_binary_netd_bin_start, (uint)((uptr)&_binary_netd_bin_end - (uptr)&_binary_netd_bin_start));
-		netd_proc.is_boot_server = true;
-		setup_netd_mappings(netd_proc);
+		service_boot("netd", (char*)&_binary_netd_bin_start, (char*)&_binary_netd_bin_end,
+			device: vnet_dev);
 		io::print("netd created\n");
-		supervisor_register("netd", (char*)&_binary_netd_bin_start, (char*)&_binary_netd_bin_end,
-			SVC_KIND_NETD, 0, false, true, null, netd_proc);
 	}
 
-	// gpiod (the GPIO driver, user/gpio/gpiod.c3) — Duo only
-	// (board::HAS_GPIO; QEMU's own riscv64 virt machine has no matching
-	// hardware). Spawned last, same reasoning as usbd/ethd above: no
-	// fixed-slot convention to preserve, no IPC clients until something
-	// dynamically ns_mount_wait()s "/srv/gpiod/" the way mountusb does
-	// for usbd.
-	if (board::HAS_GPIO)
+	// gpiod (the GPIO driver, user/gpio/gpiod.c3 — Duo). watch_hangs =
+	// true (unlike usbd/ethd): gpiod's bring-up is three MMIO writes, not
+	// a multi-second bus reset / PHY train, and its poll loop clears
+	// has_message every iteration — so a stuck inbox for SVC_STALL_LIMIT
+	// ticks genuinely means wedged. Gives the driver-respawn path (§5.5) a
+	// safety net: a respawned gpiod that fails to re-init gets killed +
+	// respawned rather than hanging every client that IPCs it forever.
+	int gpio_dev = device_find("gpio");
+	if (gpio_dev >= 0)
 	{
-		Process* gpiod_proc = create_process((void*)&_binary_gpiod_bin_start, (uint)((uptr)&_binary_gpiod_bin_end - (uptr)&_binary_gpiod_bin_start));
-		gpiod_proc.is_boot_server = true;
-		setup_gpiod_mappings(gpiod_proc);
+		service_boot("gpiod", (char*)&_binary_gpiod_bin_start, (char*)&_binary_gpiod_bin_end,
+			device: gpio_dev);
 		io::print("gpiod created\n");
-		// watch_hangs = true (unlike usbd/ethd): gpiod's bring-up is
-		// three MMIO writes, not a multi-second bus reset / PHY train,
-		// and its poll loop clears has_message every iteration — so a
-		// stuck inbox for SVC_STALL_LIMIT ticks genuinely means wedged.
-		// Gives the driver-respawn path (§5.5) a safety net: a respawned
-		// gpiod that fails to re-init gets killed + respawned rather
-		// than hanging every client that IPCs it forever.
-		supervisor_register("gpiod", (char*)&_binary_gpiod_bin_start, (char*)&_binary_gpiod_bin_end,
-			SVC_KIND_GPIOD, 0, false, true, null, gpiod_proc);
 	}
 
 	// Multi-core scaffold (src/smp.c3): enumerate + start whatever harts

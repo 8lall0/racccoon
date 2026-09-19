@@ -532,9 +532,10 @@ Generation counters back most of the stale-reference handling:
    cap 5. `fsdkilltest` / `storagekilltest` in `shell_test.c3`.
    Covers **every server and every device driver**: fsd, fsd2, echod,
    procd, envd, the block-storage driver (diskd / sdd), and
-   usbd / ethd / netd / gpiod. `Service.kind` (SVC_KIND_*) says which
-   `setup_*_mappings` to re-run after `create_process` — the MMIO + DMA
-   re-mapping; PLIC routes self-heal (`irq_route_register` overwrites in
+   usbd / ethd / netd / gpiod. `Service.device` (an index into the board's
+   `DEVICES` table, `src/device.c3`) says which device `device_setup()`
+   re-establishes after `create_process` — the MMIO + DMA re-mapping;
+   PLIC routes self-heal (`irq_route_register` overwrites in
    place). No more hardcoded pids: the shell's `ping` resolves echod
    through `/srv/echo/`, fsd learns the storage pid from
    `SYS_FS_PARTITION_INFO` and re-queries on an IPC failure, and the
@@ -549,7 +550,7 @@ Generation counters back most of the stale-reference handling:
      watchdog (`hungservertest`) — all pass.
    - **Fault-tested, real Duo** (2026-08-30, `DUO_TEST_SHELL=1` kernel):
      - `usbdkilltest` — **PASS.** usbd killed, supervisor respawns it,
-       `setup_usbd_mappings` re-maps the DWC2 MMIO + DMA, `/srv/usbd/`
+       `device_setup` re-maps the DWC2 MMIO + DMA, `/srv/usbd/`
        re-posts. (Full HID re-enum unverified — no device on the bus.)
      - `gpiodkilltest` — **PASS.** Respawned gpiod re-maps its MMIO,
        rebuilds its pin table, and services a real SET_DIR on GPIOC24.

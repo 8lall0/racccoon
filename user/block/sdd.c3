@@ -14,8 +14,8 @@ import std::nolibc::main_stub;
 //
 // sdd is the real-hardware SD storage driver for the Milk-V Duo,
 // mutually exclusive with diskd (user/block/diskd.c3, QEMU's
-// virtio-blk driver) — see board::HAS_SD_BLOCK/HAS_VIRTIO_BLOCK
-// (kernel.c3) for how exactly one of the two ever gets spawned.
+// virtio-blk driver) — see kernel.c3 (whichever of the board's
+// "sd" / "virtio-blk" DEVICES entries exists picks which one spawns).
 // Speaks the identical DISKD_READ/DISKD_WRITE wire protocol diskd
 // does, so fsd.c3 (its only client) needs zero changes to work
 // against either.
@@ -23,9 +23,9 @@ import std::nolibc::main_stub;
 // --- Shared with the kernel / fsd — kept in sync by hand, same wire
 // protocol as user/block/diskd.c3. sdd implements the *inline* verbs
 // (DISKD_READ/WRITE/READ_MULTI); it has no shared payload arena (that's
-// setup_diskd_mappings, virtio-only), so fsd never sends it the _ARENA
-// verbs — src/process.c3's setup_fsd_mappings only maps the arena on
-// board::HAS_VIRTIO_BLOCK. Any other verb gets a rejection reply (never
+// device_setup's `disk_arena`, virtio-blk only), so fsd never sends it the
+// _ARENA verbs — src/process.c3's setup_fsd_mappings only maps the arena
+// on a board whose storage device carries one. Any other verb gets a rejection reply (never
 // a silent drop — a dropped verb would hang fsd's p9_call forever).
 const uint DISKD_READ        = 210;
 const uint DISKD_WRITE       = 211;
@@ -45,14 +45,14 @@ fn void sdd_init()
 	}
 	print("sdd: card ready\n");
 
-	// SDMA staging buffer (identity-mapped, uncached — SYS_SDD_INFO,
-	// same pattern as usbd/ethd) + the controller's own SDMA capability
+	// SDMA staging buffer (identity-mapped, uncached — the SD device's one
+	// DMA region, dev_info(), same pattern as usbd/ethd) + the controller's own SDMA capability
 	// bit. Both must be present for sdd_block_rw to take the DMA path;
 	// otherwise it stays PIO. See sdhci.c3's SDD_USE_DMA.
 	if (SDD_USE_DMA)
 	{
 		uptr dma_paddr = 0;
-		syscall(SYS_SDD_INFO, (long)&dma_paddr, 0, 0);
+		dev_info(&dma_paddr, 1);
 		g_sdd_dma_paddr = dma_paddr;
 		uint caps = sd_reg_read(SD_CAPABILITIES);
 		g_sdd_dma_ok = dma_paddr != 0 && (caps & SD_CAP_SDMA) != 0;

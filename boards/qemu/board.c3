@@ -84,17 +84,6 @@ const uptr PLIC_PRIORITY_PHYS_PAGE = (PLIC_PRIORITY_PAGE - PLIC_BASE) + PLIC_PHY
 const uptr PLIC_ENABLE_PHYS_PAGE   = (PLIC_ENABLE_PAGE - PLIC_BASE) + PLIC_PHYS_BASE;
 const uptr PLIC_CLAIM_PHYS_PAGE    = (PLIC_CLAIM_PAGE - PLIC_BASE) + PLIC_PHYS_BASE;
 
-// QEMU's virt board always has virtio-blk attached (see scripts/launch64.sh) —
-// diskd/fsd get spawned and the shell has real file access.
-const bool HAS_BLOCK_DEVICE = true;
-
-// Which driver process/kernel mapping helper kernel.c3 should use for the
-// block device HAS_BLOCK_DEVICE above promises — QEMU has virtio-mmio, not
-// real SD hardware. See boards/duo/board.c3 for the mirror image (SD, no
-// virtio-mmio).
-const bool HAS_SD_BLOCK     = false;
-const bool HAS_VIRTIO_BLOCK = true;
-
 // fsd.c3 (see its own header comment) adds this to every logical sector
 // number before touching the disk — see boards/duo/board.c3's matching
 // comment. QEMU's own default test image (scripts/build.sh's disk.img)
@@ -121,84 +110,45 @@ const uint FS_PARTITION_START_SECTOR = 0;
 const bool HAS_SECOND_FS_PARTITION = true;
 const uint FS_PARTITION_2_START_SECTOR = 18432;
 
-// process.c3's setup_sdd_mappings references these unconditionally (one
-// kernel source tree, compiled separately per board — see this file's
-// header comment), even though QEMU never actually calls it
-// (HAS_SD_BLOCK is false here). No real SD hardware on QEMU, so no real
-// addresses to source — 0 is fine, same reasoning as IRQ_VIRTIO_BLK's "0
-// = not applicable on this board" convention in boards/duo/board.c3.
-const uptr SD_MMIO_BASE   = 0;
-const uptr SD_TOP_PAGE    = 0;
-const uptr SD_PINMUX_PAGE = 0;
-const uptr SD_CLOCK_PAGE  = 0;
+// virtio-mmio transport: QEMU virt's own is 8 fixed slots at
+// 0x10001000-0x10008000 (0x1000 apart, IRQ = slot number) — confirmed via
+// `-machine virt,dumpdtb=...` + dtc, same sourcing this project's own
+// TIMEBASE_HZ below already used. Slot 0 (IRQ 1) is virtio-blk
+// (scripts/launch64.sh), slot 1 virtio-net.
+const uptr VIRTIO_BLK_PADDR = 0x10001000;
+const uptr VIRTIO_NET_PADDR = 0x10002000;
+const uint IRQ_VIRTIO_NET   = 2; // declared, not routed: netd is fully poll-driven
 
-// entry.c3's handle_trap references board::IRQ_SDHCI unconditionally,
-// same reasoning as the SD_* constants above — 0 is this PLIC's own
-// "nothing pending" sentinel, so it can never spuriously match a real
-// claimed IRQ, matching IRQ_VIRTIO_BLK's own "0 = not applicable"
-// convention on the Duo.
-const uint IRQ_SDHCI = 0;
-
-// process.c3's setup_usbd_mappings references these unconditionally,
-// same reasoning as the SD_* constants above — QEMU's riscv64 virt
-// machine has no DWC2 equivalent at all (its own USB path, if any, is
-// PCIe+XHCI — a completely different controller, later phase), so 0 is
-// fine, never dereferenced since HAS_USB is false here.
-const uptr USB_MMIO_BASE     = 0;
-const uptr USB_TOP_CTRL_PAGE = 0;
-const uptr USB_TOP_RST_PAGE  = 0;
-const uptr USB_CLK_PAGE      = 0;
-const uptr USB_PINMUX_PAGE   = 0;
-const uint IRQ_USB           = 0;
-const bool HAS_USB           = false;
-
-// GPIO — no meaningful QEMU virt equivalent for "toggle a real pin";
-// same Duo-only reasoning as HAS_USB above. process.c3's
-// setup_gpiod_mappings references GPIO_BANK_C_BASE/GPIO_PINMUX_PAGE
-// unconditionally (same "0 = not applicable, never dereferenced since
-// HAS_GPIO is false" pattern as USB_MMIO_BASE etc. above), and
-// kernel.c3 still links gpiod.bin.o in on this board even though
-// HAS_GPIO gates it from ever actually spawning — see
-// scripts/build_duo.sh's own comment on diskd/sdd for why.
-const uptr GPIO_BANK_A_BASE = 0;
-const uptr GPIO_BANK_C_BASE = 0;
-const uptr GPIO_PINMUX_PAGE = 0;
-const bool HAS_GPIO = false;
-
-// Ethernet — QEMU's virt board has no real DesignWare MAC equivalent,
-// but unlike USB it DOES have a genuine, real network path via
-// virtio-net on the same virtio-mmio bus virtio-blk already uses. This
-// board gets its own driver, user/netd.c3 (Phase 1: virtio-net device
-// bring-up and link-status query only, mirroring user/ethd.c3's own
-// Phase 1 scope on the Duo — see boards/duo/board.c3's own comment) —
-// see HAS_ETH_MAC/HAS_VIRTIO_NET below for which driver kernel.c3
-// spawns on which board, same shape as HAS_SD_BLOCK/HAS_VIRTIO_BLOCK
-// above.
+// The devices the kernel hands to boot drivers (src/device.c3). QEMU virt
+// has virtio-blk (diskd) and virtio-net (netd) and nothing else — no SD
+// controller, no DWC2 USB, no real Ethernet MAC, no GPIO — so those
+// drivers simply never spawn here. Nothing on this board is real DMA
+// hardware (virtio is a software model), so every region is `cached`.
 //
-// QEMU virt's own virtio-mmio transport is 8 fixed slots at
-// 0x10001000-0x10008000 (0x1000 apart, IRQ = slot number) — confirmed
-// via `-machine virt,dumpdtb=...` + dtc, same sourcing this project's
-// own TIMEBASE_HZ above already used. Slot 0 (0x10001000, IRQ 1) is
-// virtio-blk (scripts/launch64.sh); slot 1 here for virtio-net.
-const uptr VIRTIO_NET_PADDR  = 0x10002000;
-const uint IRQ_VIRTIO_NET    = 2;
-const bool HAS_ETH           = true;
-const bool HAS_ETH_MAC       = false;
-const bool HAS_VIRTIO_NET    = true;
-
-// process.c3's setup_ethd_mappings references these unconditionally,
-// same reasoning as the SD_*/USB_* constants above — QEMU has no real
-// DesignWare MAC or embedded PHY at all, never dereferenced since
-// HAS_ETH_MAC is false here.
-const uptr ETH_MMIO_BASE = 0;
-const uptr ETH_DMA_PAGE  = 0;
-const uptr ETH_PHY_PAGE  = 0;
-const uptr ETH_CLK_PAGE  = 0;
-const uptr ETH_LED_PINMUX_PAGE = 0;
-const uptr ETH_SD1_SELPHY_PAGE = 0;
-const uptr ETH_EFUSE_PAGE_0 = 0;
-const uptr ETH_EFUSE_PAGE_1 = 0;
-const uint IRQ_ETH       = 0;
+// virtio-blk: a virtqueue and a request buffer, in the order diskd's
+// diskd_info() reads them, plus the fsd<->diskd payload arena
+// (docs/ipc-rings.md). Edge/latched interrupt, acked via the virtio ISR
+// register in diskd itself.
+// virtio-net: RX and TX virtqueues plus a packet-buffer page (Ethernet
+// Phase 2 — user/net/netd.c3's own fixed offsets), in netd_info()'s order.
+const Device[*] DEVICES = {
+	{
+		.name = "virtio-blk",
+		.mmio = { VIRTIO_BLK_PADDR },
+		.irq = IRQ_VIRTIO_BLK,
+		.irq_level = false,
+		.dma = { { .pages = kernel::VIRTQ_PAGES, .cached = true },
+		         { .pages = kernel::VIRTIO_BLK_REQ_PAGES, .cached = true } },
+		.disk_arena = true,
+	},
+	{
+		.name = "virtio-net",
+		.mmio = { VIRTIO_NET_PADDR },
+		.dma = { { .pages = kernel::VIRTQ_PAGES, .cached = true },
+		         { .pages = kernel::VIRTQ_PAGES, .cached = true },
+		         { .pages = 1, .cached = true } },
+	},
+};
 
 // Real, confirmed timebase-frequency, not guessed — extracted directly
 // from this exact qemu-system-riscv64 binary via
@@ -274,7 +224,7 @@ fn void plic_complete(uint irq)
 
 // See boards/duo/board.c3's plic_set_enabled — kept here for symbol
 // parity (shared kernel code calls it). Never exercised on QEMU
-// (HAS_USB false, usbd never spawned).
+// (no "usb" device, usbd never spawned).
 fn void plic_set_enabled(uint irq, bool on)
 {
 	uint* word = (uint*)(PLIC_ENABLE_BASE + (uptr)((irq / 32) * 4));

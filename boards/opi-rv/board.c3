@@ -9,9 +9,9 @@ import sbi;
 // behind every value below.
 //
 // STATUS: scaffold. This compiles and is shaped to boot to the embedded
-// shell with NO filesystem (HAS_BLOCK_DEVICE = false), the same first
-// milestone the Milk-V Duo port started from. Every peripheral flag is
-// false; the addresses that are filled in are sourced from the JH7110
+// shell with NO filesystem (an empty DEVICES table), the same first
+// milestone the Milk-V Duo port started from. No peripheral is declared
+// yet; the addresses that are filled in are sourced from the JH7110
 // devicetree / VisionFive 2 U-Boot (the Orange Pi RV shares the SoC),
 // the ones left at 0 are honest "not sourced / not needed yet" stubs
 // exactly as boards/qemu/board.c3 does for its absent peripherals.
@@ -94,82 +94,39 @@ const uptr PLIC_CLAIM_PHYS_PAGE    = PLIC_CLAIM_PAGE;
 // the smp memory note (racccoon_smp) — not before.
 const uint SMP_MAX_HARTS = 1;
 
-// --- Block storage -----------------------------------------------------
-// The JH7110 has no virtio-mmio; its storage is a Synopsys DesignWare
-// MSHC ("snps,dw-mshc" / "starfive,jh7110-mmc", sdio0 @ 0x16010000,
-// sdio1 @ 0x16020000) — a DIFFERENT controller from the Duo's Cvitek
-// SDHCI (user/block/sdhci.c3), so it needs its own driver. Milestone 3
-// in docs/opi-rv-plan.md. Until then this board boots with no fs, the
-// same way the Duo port's Stage 1 did: HAS_BLOCK_DEVICE false, diskd /
-// fsd never spawn, the shell's file commands fail cleanly.
-const bool HAS_BLOCK_DEVICE = false;
-const bool HAS_SD_BLOCK     = false;
-const bool HAS_VIRTIO_BLOCK = false;
-
-// Not applicable until the dw-mshc driver lands (see above). 0 stubs,
-// same convention as boards/qemu/board.c3's absent SD hardware —
-// process.c3's setup_sdd_mappings references these unconditionally but
-// never runs them while HAS_SD_BLOCK is false.
-const uptr SD_MMIO_BASE   = 0;
-const uptr SD_TOP_PAGE    = 0;
-const uptr SD_PINMUX_PAGE = 0;
-const uptr SD_CLOCK_PAGE  = 0;
-const uint IRQ_SDHCI      = 0;
+// --- Devices ------------------------------------------------------------
+// No boot-driver hardware is declared yet — DEVICES below is empty, so
+// sdd/diskd/fsd, usbd, ethd/netd and gpiod never spawn: this board boots
+// with no fs, the same way the Duo port's Stage 1 did, and the shell's
+// file commands fail cleanly. As each driver lands it gets one entry in
+// DEVICES (src/device.c3) — its MMIO pages, PLIC source, DMA regions —
+// and nothing in the kernel changes. What the entries will describe:
+//
+//  "sd"   Synopsys DesignWare MSHC ("snps,dw-mshc" / "starfive,jh7110-mmc",
+//         sdio0 @ 0x16010000, sdio1 @ 0x16020000 — see docs/opi-rv-plan.md
+//         on which one the microSD slot really is) — a DIFFERENT controller
+//         from the Duo's Cvitek SDHCI (user/block/sdhci.c3), so it needs its
+//         own driver (Milestone 3), plus the syscrg clock/reset, sysreg
+//         syscon and pinmux pages it depends on.
+//  "usb"  Cadence USBSS-DRD ("cdns,usb3" @ 0x10100000) — not the Duo's DWC2.
+//  "gpio" "starfive,jh7110-sys-pinctrl" @ 0x13040000 — not the Duo's
+//         Synopsys DW-APB GPIO.
+//  "eth-mac" two GMACs ("starfive,jh7110-dwmac", a Synopsys DWMAC 5.20,
+//         gmac0 @ 0x16030000, gmac1 @ 0x16040000). The core is the same
+//         DesignWare MAC family user/net/dwmac.c3 already targets, so that
+//         driver is a partial head start — but the StarFive glue
+//         (clock/reset/PHY-mode via syscon) and the external RJ45 PHY chip
+//         are new.
+const Device[] DEVICES = {};
 
 // fsd's per-board partition offset (learned via syscall, see fsd.c3).
-// Meaningless while HAS_BLOCK_DEVICE is false; the real value comes from
+// Meaningless until an "sd" device exists; the real value comes from
 // `sfdisk`/`lsblk` against the actual Orange Pi RV SD card once the
 // dw-mshc driver can read it.
 const uint FS_PARTITION_START_SECTOR = 0;
 
 const bool HAS_SECOND_FS_PARTITION  = false;
 const uint FS_PARTITION_2_START_SECTOR = 0;
-
-// --- USB -------------------------------------------------------------
-// JH7110 USB is a Cadence USBSS-DRD controller ("cdns,usb3" @
-// 0x10100000) — not the Duo's DWC2. Needs its own driver; deferred well
-// past this scaffold. 0 stubs, same as boards/qemu/board.c3.
-const uptr USB_MMIO_BASE     = 0;
-const uptr USB_TOP_CTRL_PAGE = 0;
-const uptr USB_TOP_RST_PAGE  = 0;
-const uptr USB_CLK_PAGE      = 0;
-const uptr USB_PINMUX_PAGE   = 0;
-const uint IRQ_USB           = 0;
-const bool HAS_USB           = false;
-
-// --- GPIO -----------------------------------------------------------
-// JH7110 pin control is "starfive,jh7110-sys-pinctrl" @ 0x13040000 — a
-// different block from the Duo's Synopsys DW-APB GPIO. Deferred. 0
-// stubs, same as boards/qemu/board.c3.
-const uptr GPIO_BANK_A_BASE = 0;
-const uptr GPIO_BANK_C_BASE = 0;
-const uptr GPIO_PINMUX_PAGE = 0;
-const bool HAS_GPIO = false;
-
-// --- Ethernet ------------------------------------------------------
-// JH7110 has two GMACs ("starfive,jh7110-dwmac" wrapping a Synopsys
-// DWMAC 5.20, gmac0 @ 0x16030000, gmac1 @ 0x16040000). The core is the
-// same DesignWare MAC family user/net/dwmac.c3 already targets for the
-// Duo, so that driver is a partial head start — but the StarFive glue
-// (clock/reset/PHY-mode via syscon) and the external PHY (the Orange Pi
-// RV uses a real PHY chip on the RJ45, not a SoC-internal one like the
-// Duo) are new. Deferred. 0 stubs, same as boards/qemu/board.c3's
-// absent MAC.
-const uptr VIRTIO_NET_PADDR  = 0;
-const uint IRQ_VIRTIO_NET    = 0;
-const bool HAS_ETH           = false;
-const bool HAS_ETH_MAC       = false;
-const bool HAS_VIRTIO_NET    = false;
-
-const uptr ETH_MMIO_BASE       = 0;
-const uptr ETH_DMA_PAGE        = 0;
-const uptr ETH_PHY_PAGE        = 0;
-const uptr ETH_CLK_PAGE        = 0;
-const uptr ETH_LED_PINMUX_PAGE = 0;
-const uptr ETH_SD1_SELPHY_PAGE = 0;
-const uptr ETH_EFUSE_PAGE_0    = 0;
-const uptr ETH_EFUSE_PAGE_1    = 0;
-const uint IRQ_ETH             = 0;
 
 // rdtime()'s tick rate. JH7110 devicetree: `cpus { timebase-frequency =
 // <4000000>; }` — 4 MHz, well-known for this SoC (VisionFive 2, Star64,

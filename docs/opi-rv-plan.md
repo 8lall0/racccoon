@@ -88,7 +88,7 @@ board — OpenSBI's own banner said `Boot HART ID: 1`. #4 still open.
 ### Stage 1 — first boot to the shell
 
 Goal: `build_opi.sh` output boots over serial to the embedded shell
-prompt. No filesystem (`HAS_BLOCK_DEVICE = false`), so this is purely:
+prompt. No filesystem (an empty `board::DEVICES` table), so this is purely:
 BSS clear → trap vector → `plic_init` → FPU enable → timer interrupts →
 idle + echod + shell processes → cooperative scheduler → prompt.
 
@@ -117,7 +117,7 @@ and the only QEMU machine that exercises what `virt` cannot (boot hart
   `boards/opi-rv/`, differing only in `TIMEBASE_HZ` (sifive_u DT says
   1 MHz, JH7110 says 4 MHz) and the link address (`kernel.ld`,
   0x80200000 not 0x40200000 — so this ELF is **not** hardware-loadable,
-  by design). `HAS_BLOCK_DEVICE = false`, same as the opi-rv scaffold.
+  by design). Empty `DEVICES` table, same as the opi-rv scaffold.
 - `scripts/build_opi_qemu.sh` (→ `build/kernel_opi_qemu.elf`,
   `OPI_TEST_SHELL=1` for the killtest/faulttest dev shell) +
   `scripts/launch_opi_qemu.sh` (`-machine sifive_u -smp 2`, no U-Boot,
@@ -440,16 +440,19 @@ DT-sourced facts already in the file: base `0x16010000`, PLIC IRQ 74,
 
 Build integration when ready: `scripts/build_opi{,_qemu}.sh` rebuild
 `sdd` from `dw_mshc.c3 + sdd.c3` (a 1-line `build_user_program`
-override) before the link step; flip `board::HAS_BLOCK_DEVICE` +
-`HAS_SD_BLOCK`.
+override) before the link step; add the `"sd"` entry to
+`board::DEVICES` (see below).
 
 Reference sources used (all fetched 2026-09-09):
 - U-Boot `include/dwmmc.h`, `drivers/mmc/dw_mmc.c` (generic core).
 - Linux `drivers/mmc/host/dw_mmc-starfive.c` (JH7110 phase/tuning).
 - Linux mainline `arch/riscv/boot/dts/starfive/jh7110.dtsi` `mmc@…`.
 
-Then: `board::HAS_BLOCK_DEVICE = true` + `HAS_SD_BLOCK = true`, fill
-`SD_MMIO_BASE` and any pinmux/clock pages, wire `setup_sdd_mappings`.
+Then: add an `"sd"` entry to `boards/opi-rv/board.c3`'s `DEVICES` table
+(`src/device.c3`) — the controller's MMIO page plus the syscrg
+clock/reset, sysreg-syscon and pinmux pages, its PLIC source, and one
+uncached DMA region for the IDMAC descriptor ring. `kernel_main` then
+spawns `sdd` on its own; no kernel code changes.
 Find the ext2 root partition's start sector with `sfdisk`/`lsblk` on the
 real card → `FS_PARTITION_START_SECTOR`.
 

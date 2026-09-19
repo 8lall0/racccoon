@@ -34,8 +34,8 @@ import sbi;
 //
 // WHAT IT DOES *NOT* validate: every actual JH7110 peripheral (DW-MSHC
 // SD, Cadence USB, StarFive DWMAC) — sifive_u has none of them, and this
-// board keeps HAS_BLOCK_DEVICE = false, same as the opi-rv Stage-1
-// scaffold. It also runs at DRAM base 0x80000000 (see kernel.ld), not the
+// board declares no devices (an empty DEVICES table), same as the
+// opi-rv Stage-1 scaffold. It also runs at DRAM base 0x80000000 (see kernel.ld), not the
 // JH7110's 0x40000000 — irrelevant to the boot/trap/PLIC machinery under
 // test, but it means kernel_opi_qemu.elf is not loadable on real hardware.
 //
@@ -100,55 +100,17 @@ const uptr PLIC_CLAIM_PHYS_PAGE    = PLIC_CLAIM_PAGE;
 // secondaries just announce and park (no SMP scheduler — non-goal).
 const uint SMP_MAX_HARTS = 1;
 
-// --- Block storage ---------------------------------------------------
+// --- Devices ---------------------------------------------------------
 // sifive_u has no virtio-mmio and racccoon has no SPI-SD driver, so this
-// harness boots with no filesystem — exactly the opi-rv Stage-1 state.
-// diskd / sdd / fsd never spawn; the shell's file commands fail cleanly.
-const bool HAS_BLOCK_DEVICE = false;
-const bool HAS_SD_BLOCK     = false;
-const bool HAS_VIRTIO_BLOCK = false;
-
-const uptr SD_MMIO_BASE   = 0;
-const uptr SD_TOP_PAGE    = 0;
-const uptr SD_PINMUX_PAGE = 0;
-const uptr SD_CLOCK_PAGE  = 0;
-const uint IRQ_SDHCI      = 0;
+// harness declares no boot-driver hardware (DEVICES is empty) and boots with
+// no filesystem — exactly the opi-rv Stage-1 state. diskd / sdd / fsd /
+// usbd / ethd / netd / gpiod never spawn; the shell's file commands fail
+// cleanly.
+const Device[] DEVICES = {};
 
 const uint FS_PARTITION_START_SECTOR = 0;
 const bool HAS_SECOND_FS_PARTITION  = false;
 const uint FS_PARTITION_2_START_SECTOR = 0;
-
-// --- USB -----------------------------------------------------------
-const uptr USB_MMIO_BASE     = 0;
-const uptr USB_TOP_CTRL_PAGE = 0;
-const uptr USB_TOP_RST_PAGE  = 0;
-const uptr USB_CLK_PAGE      = 0;
-const uptr USB_PINMUX_PAGE   = 0;
-const uint IRQ_USB           = 0;
-const bool HAS_USB           = false;
-
-// --- GPIO --------------------------------------------------------
-const uptr GPIO_BANK_A_BASE = 0;
-const uptr GPIO_BANK_C_BASE = 0;
-const uptr GPIO_PINMUX_PAGE = 0;
-const bool HAS_GPIO = false;
-
-// --- Ethernet -------------------------------------------------
-const uptr VIRTIO_NET_PADDR  = 0;
-const uint IRQ_VIRTIO_NET    = 0;
-const bool HAS_ETH           = false;
-const bool HAS_ETH_MAC       = false;
-const bool HAS_VIRTIO_NET    = false;
-
-const uptr ETH_MMIO_BASE       = 0;
-const uptr ETH_DMA_PAGE        = 0;
-const uptr ETH_PHY_PAGE        = 0;
-const uptr ETH_CLK_PAGE        = 0;
-const uptr ETH_LED_PINMUX_PAGE = 0;
-const uptr ETH_SD1_SELPHY_PAGE = 0;
-const uptr ETH_EFUSE_PAGE_0    = 0;
-const uptr ETH_EFUSE_PAGE_1    = 0;
-const uint IRQ_ETH             = 0;
 
 // sifive_u: rdtime()'s tick rate. The sifive_u devicetree says
 // `timebase-frequency = <1000000>` (1 MHz) — DIFFERENT from the JH7110's

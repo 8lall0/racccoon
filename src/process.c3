@@ -50,18 +50,6 @@ const MSG_MAX = 8192;
                      // PROC_BLOCKED is automatically skipped without any
                      // scheduler change.
 
-// The disk driver process (see user/diskd.c3). diskd_vq_paddr/
-// diskd_req_paddr are the physical addresses of its virtqueue and
-// request buffer, allocated once at diskd's creation time (see
-// setup_diskd_mappings) and handed back to diskd itself via the
-// SYS_DISKD_INFO syscall — diskd's own user-mode code has no other way
-// to learn them, since it can't call alloc_pages() directly and its own
-// per-page image mapping can't guarantee the physical contiguity DMA
-// needs. Its PLIC interrupt is routed to it via the Irq_route table
-// below (registered by setup_diskd_mappings).
-uptr diskd_vq_paddr;
-uptr diskd_req_paddr;
-
 // The fsd<->diskd shared data arena (docs/ipc-rings.md Phase 1, step 2).
 // One physically-contiguous run, identity-mapped (vaddr == paddr) into
 // BOTH diskd (which hands `disk_arena_paddr + off` to a virtio data
@@ -69,11 +57,12 @@ uptr diskd_req_paddr;
 // payloads for the DISKD_*_ARENA verbs travel here instead of through
 // the 8 KiB kernel IPC bounce buffer — the device DMAs straight into
 // the region fsd reads. Allocated lazily on the first
-// setup_diskd_mappings / setup_fsd_mappings call (diskd is spawned
-// first), re-mapped for free on a supervisor respawn since both setup
-// functions map it every time. 0 until then. Cacheable map_page(), same
-// as diskd_vq_paddr/diskd_req_paddr and for the same reason — virtio-blk
-// is QEMU-only (board::HAS_VIRTIO_BLOCK), no real DMA-coherency effect.
+// device_setup (a board device with `disk_arena`, device.c3) /
+// setup_fsd_mappings call (the storage driver is spawned first),
+// re-mapped for free on a supervisor respawn since both map it every
+// time. 0 until then. Cacheable map_page(), same as a `cached` DMA
+// region and for the same reason — the only device that carries it is
+// QEMU's virtio-blk, no real DMA-coherency effect.
 const uint DISK_ARENA_PAGES = 8; // 32 KiB — 64 sectors, room past DISKD_MAX_SECTORS (15)
 uptr disk_arena_paddr;
 uint disk_arena_size;
@@ -81,7 +70,7 @@ int  disk_arena_diskd_pid;
 int  disk_arena_fsd_pid;
 
 // Allocate the arena once, then identity-map it into `proc`. Shared by
-// setup_diskd_mappings and setup_fsd_mappings (primary only).
+// device_setup (device.c3) and setup_fsd_mappings (primary only).
 fn void map_disk_arena(Process* proc)
 {
 	if (disk_arena_paddr == 0)
@@ -95,61 +84,12 @@ fn void map_disk_arena(Process* proc)
 	}
 }
 
-// sdd (see user/sdd.c3) is Duo's real-hardware counterpart to diskd,
-// mutually exclusive with it at runtime (board::HAS_SD_BLOCK/
-// HAS_VIRTIO_BLOCK, kernel.c3). Its PLIC source is routed via the
-// Irq_route table below.
-// sdd's SDMA staging buffer — one identity-mapped, uncached page,
-// allocated at spawn (setup_sdd_mappings) and handed back via
-// SYS_SDD_INFO. Same pattern/reasoning as usbd_dma_paddr: the SDHCI
-// SDMA engine's own address register needs a real physical address and
-// sdd can't learn its virtual pages' physical backing otherwise. sdd
-// only ever moves one 512-byte block per request, so one page is
-// plenty. 0 until sdd is spawned (Duo only — HAS_SD_BLOCK).
-uptr sdd_dma_paddr;
-
-// usbd's own single-page DMA buffer (Phase 2: control transfers over
-// the DWC2 host channels) — same pattern as diskd_vq_paddr/
-// diskd_req_paddr above: allocated once at usbd's creation time
-// (setup_usbd_mappings below), identity-mapped into its own page
-// table, handed back via SYS_USBD_INFO. One page is comfortably enough
-// for control-transfer payloads this phase needs (an 8-byte SETUP
-// packet, an 18-byte device descriptor, a handful-of-bytes hub
-// descriptor, a 4-byte port status) — nothing here approaches 4KB.
-uptr usbd_dma_paddr;
-
-// ethd's own single-page DMA region (Ethernet Phase 2: real packet
-// TX/RX) — one TX descriptor, one RX descriptor, one TX buffer, one RX
-// buffer, back to back (user/net/dwmac.c3's own eth_dma_init() knows
-// the fixed offsets) — same pattern as usbd_dma_paddr above, allocated
-// once at ethd's creation time (setup_ethd_mappings below), uncached-
-// mapped (map_device_page, not map_page — same real-DMA-cache-
-// incoherency reasoning as usbd_dma_paddr's own comment; ethd is the
-// first driver doing genuine DMA against real Duo hardware since
-// usbd), handed back via SYS_ETHD_INFO.
-uptr ethd_dma_paddr;
-
-// The virtio-net driver process (see user/net/netd.c3) — QEMU only
-// (board::HAS_VIRTIO_NET). A real pair of virtqueues, unlike ethd —
-// virtio-net's spec requires an RX and TX queue configured before
-// DRIVER_OK. Fully poll-driven (netd busy-polls used.index), so no
-// Irq_route entry.
-uptr netd_rxq_paddr;
-uptr netd_txq_paddr;
-// netd's own packet-buffer page (Ethernet Phase 2) — RX buffer at
-// offset 0, TX buffer right after (user/net/netd.c3's own fixed
-// offsets), each big enough for a legacy virtio-net header (10 bytes)
-// plus a full Ethernet frame. Cacheable map_page(), same as the
-// virtqueues above and for the same reason — QEMU-only, no real
-// cache-incoherency to hit.
-uptr netd_pktbuf_paddr;
-
 // --- Interrupt-driven driver IRQ routing -----------------------------
 // Replaces the per-device `if (irq == board::IRQ_X && X_pid != 0)`
 // branches that used to accumulate in handle_trap, and the pid-switch
 // in SYS_DRIVER_IRQ_ARM. Each driver that services a device PLIC source
-// registers ONE route from its setup_*_mappings below — it knows its
-// own pid and its board::IRQ_* constant right there. Adding another
+// gets ONE route registered by device_setup (device.c3) from its board
+// Device entry. Adding another
 // interrupt-driven driver (ethd RX, gpiod) is then a one-line
 // irq_route_register() call plus arming the source in board::plic_init;
 // no handle_trap or syscall edit.
@@ -540,13 +480,19 @@ struct Process
 
 	// fsd-only: which partition SYS_FS_PARTITION_INFO (entry.c3) hands
 	// back to *this specific* process. Per-process, not a plain kernel
-	// global the way diskd_vq_paddr etc. are — those stay globals because
-	// there's only ever one diskd; now that two fsd instances can exist
-	// simultaneously, each needs its own answer to the same syscall. Set
-	// by setup_fsd_mappings() right after create_process() spawns an fsd,
-	// same "extra per-process setup after the generic call" pattern as
-	// setup_diskd_mappings()/setup_sdd_mappings() below.
+	// global the way a driver's DMA addresses are (dev_dma_paddr,
+	// device.c3) — those are per-device and there's only ever one owner;
+	// now that two fsd instances can exist simultaneously, each needs its
+	// own answer to the same syscall. Set by setup_fsd_mappings() right
+	// after create_process() spawns an fsd, same "extra per-process setup
+	// after the generic call" pattern as device_setup() (device.c3).
 	uint fs_partition_start;
+
+	// Index into board::DEVICES of the device this process was given by
+	// device_setup (device.c3) — the key SYS_DEV_INFO uses to hand back the
+	// caller's own DMA regions. -1 for every process that owns no device
+	// (everything but a hardware driver), set explicitly in create_process.
+	int device;
 
 	// True for every kernel-spawned boot server (fsd, sdd/diskd, usbd,
 	// ethd, netd, gpiod, procd, envd, echod) — set right after
@@ -1195,11 +1141,11 @@ fn Process* create_process(void* image, uint image_size)
 	{
 		map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
 	}
-	// virtio-blk MMIO is deliberately NOT mapped here anymore: diskd (see
-	// user/diskd.c3) is now the sole owner of the device, mapped only
-	// into its own page table by setup_diskd_mappings below. No other
-	// process — including the kernel's own S-mode code — touches it
-	// directly; everyone else talks to diskd over IPC.
+	// Device MMIO (virtio-blk, SD, USB, …) is deliberately NOT mapped
+	// here: each driver is the sole owner of its device, mapped only into
+	// its own page table by device_setup (device.c3). No other process —
+	// including the kernel's own S-mode code — touches it directly;
+	// everyone else talks to the driver over IPC.
 
 	// PLIC registers: handle_trap's plic_claim()/plic_complete() run
 	// under whichever process's page table happens to be active when the
@@ -1361,6 +1307,7 @@ fn Process* create_process(void* image, uint image_size)
 		proc.namespace[m].flags = 0;
 	}
 
+	proc.device = -1; // meaningful only once device_setup() (device.c3) sets it
 	proc.fs_partition_start = 0; // meaningful only once setup_fsd_mappings() sets it
 	proc.is_secondary_fs = false; // same — meaningful only once setup_fsd_mappings() sets it
 
@@ -1373,283 +1320,38 @@ fn Process* create_process(void* image, uint image_size)
 	return proc;
 }
 
-// Maps a small, fixed list of device-register pages (identity-mapped,
-// the standard PAGE_U|R|W a driver process needs for its own MMIO)
-// into a process's page table — the repeated shape every setup_xxx_
-// mappings function below used to spell out one map_device_page() call
-// at a time, each restating proc.page_table and the same flags. NOT
-// for a DMA buffer's own multi-page allocation (diskd/usbd/ethd/netd's
-// own dma_paddr/vq_paddr loops still do that by hand, page by page,
-// since alloc_pages() has to run first and map_page() — not
-// map_device_page() — is the right call for some of them) — just the
-// fixed, compile-time-known register pages a driver already knows by
-// address before it's even created.
-fn void map_device_pages(Process* proc, uptr* addrs, int count)
-{
-	for (int i = 0; i < count; i++)
-	{
-		map_device_page(proc.page_table, addrs[i], addrs[i], PAGE_U | PAGE_R | PAGE_W);
-	}
-}
-
 // Called once, right after create_process() spawns an fsd instance (see
-// kernel.c3 — called for both the first and, if board::
-// HAS_SECOND_FS_PARTITION, the second), to tell it which partition it
-// owns. No MMIO/paging work needed here, unlike setup_diskd_mappings/
-// setup_sdd_mappings below — fsd never touches hardware directly, it
-// only needs these two facts, handed back via SYS_FS_PARTITION_INFO
+// service_boot in supervisor.c3 — called for both the first and, if
+// board::HAS_SECOND_FS_PARTITION, the second), to tell it which
+// partition it owns. No MMIO/paging work needed for the device itself,
+// unlike device_setup (device.c3) — fsd never touches hardware directly,
+// it only needs these two facts, handed back via SYS_FS_PARTITION_INFO
 // (entry.c3) reading current_proc.fs_partition_start/is_secondary_fs.
-// is_secondary is a plain bool kernel.c3 already knows unambiguously
-// at each of its own two call sites (its own code is what conditionally
-// creates the second instance at all) — see is_secondary_fs's own
-// comment for why fsd.c3 needs this at all.
+// is_secondary is a plain bool the spawn site already knows
+// unambiguously (its own code is what conditionally creates the second
+// instance at all) — see is_secondary_fs's own comment for why fsd.c3
+// needs this at all.
 fn void setup_fsd_mappings(Process* proc, uint partition_start, bool is_secondary)
 {
 	proc.fs_partition_start = partition_start;
 	proc.is_secondary_fs = is_secondary;
 
-	// The primary fsd (only) shares diskd's payload arena — the hot
-	// virtio-blk path (docs/ipc-rings.md P1 step 2). fsd2 keeps the
-	// inline-IPC diskd verbs (it's the rarely-hot /mnt/fs2 partition, and
-	// a single shared arena with two producers would need locking). Maps
-	// every call, so a supervisor respawn re-establishes it for free.
+	// The primary fsd (only) shares the storage driver's payload arena —
+	// the hot virtio-blk path (docs/ipc-rings.md P1 step 2). fsd2 keeps
+	// the inline-IPC diskd verbs (it's the rarely-hot /mnt/fs2 partition,
+	// and a single shared arena with two producers would need locking).
+	// Maps every call, so a supervisor respawn re-establishes it for free.
 	//
-	// Only on a board with diskd (virtio-blk): sdd (Duo's real SD driver)
-	// has no arena of its own — setup_sdd_mappings doesn't map one — so
-	// handing fsd an arena there would just make it send DISKD_READ_ARENA
-	// verbs sdd can't answer, hanging the mount. sdd speaks the inline
-	// verbs only.
-	if (!is_secondary && board::HAS_VIRTIO_BLOCK)
+	// Only on a board whose storage device carries an arena (QEMU's
+	// virtio-blk, see device.c3's Device.disk_arena): sdd (Duo's real SD
+	// driver) has none, so handing fsd one there would just make it send
+	// DISKD_READ_ARENA verbs sdd can't answer, hanging the mount. sdd
+	// speaks the inline verbs only.
+	if (!is_secondary && device_board_has_disk_arena())
 	{
 		map_disk_arena(proc);
 		disk_arena_fsd_pid = proc.pid;
 	}
-}
-
-// Called once, right after create_process() spawns diskd (see kernel.c3),
-// to give it what it needs to own the virtio-blk device: MMIO access, plus
-// a virtqueue and request buffer diskd can actually use for DMA.
-//
-// The virtqueue/request buffer can't just be ordinary bytes within
-// diskd's own process image: create_process's per-page image-copy loop
-// calls alloc_pages(1) once per page, so consecutive *virtual* pages of
-// an image have no guaranteed relationship between their *physical*
-// backing — but the device's QUEUE_PFN and descriptor addr fields are
-// physical, and the legacy virtio layout derives the avail/used ring
-// locations from a single physical base, so this memory has to be one
-// physically contiguous run. alloc_pages(n) (unlike the per-page image
-// loop) guarantees that.
-//
-// Mapped identity (vaddr == paddr) rather than at some other chosen
-// virtual address: that way the same number diskd's own pointers resolve
-// to *is* the physical address the device needs, and diskd never needs a
-// virtual-to-physical translation of its own — it just gets told the
-// number once, via SYS_DISKD_INFO (src/entry.c3), and uses it both ways.
-fn void setup_diskd_mappings(Process* proc)
-{
-	map_device_page(proc.page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, PAGE_U | PAGE_R | PAGE_W);
-
-	uint vq_pages = (uint)(mem::aligned_offset((sz)Virtio_virtq::size, PAGE_SIZE) / PAGE_SIZE);
-	uptr vq_paddr = alloc_pages(vq_pages);
-	for (uint off = 0; off < vq_pages * PAGE_SIZE; off += PAGE_SIZE)
-	{
-		map_page(proc.page_table, vq_paddr + off, vq_paddr + off, PAGE_U | PAGE_R | PAGE_W);
-	}
-
-	uint req_pages = (uint)(mem::aligned_offset((sz)Virtio_blk_req::size, PAGE_SIZE) / PAGE_SIZE);
-	uptr req_paddr = alloc_pages(req_pages);
-	for (uint off = 0; off < req_pages * PAGE_SIZE; off += PAGE_SIZE)
-	{
-		map_page(proc.page_table, req_paddr + off, req_paddr + off, PAGE_U | PAGE_R | PAGE_W);
-	}
-
-	// virtio-mmio interrupt: edge/latched, acked via the virtio ISR
-	// register in diskd itself — level=false, handle_trap leaves the
-	// PLIC source enabled.
-	irq_route_register(board::IRQ_VIRTIO_BLK, proc.pid, false);
-	diskd_vq_paddr  = vq_paddr;
-	diskd_req_paddr = req_paddr;
-
-	// The fsd<->diskd shared payload arena (docs/ipc-rings.md P1 step 2).
-	map_disk_arena(proc);
-	disk_arena_diskd_pid = proc.pid;
-}
-
-// Called once, right after create_process() spawns sdd (see kernel.c3),
-// to give it access to the SDHCI controller's MMIO registers. Identity-
-// mapped for the same reason as diskd's virtio-blk MMIO above — not that
-// it matters for translation here (PIO never needs sdd to hand a physical
-// address to the device), just kept consistent with this codebase's one
-// existing MMIO-mapping convention. No virtqueue/request-buffer
-// allocation, no SYS_*_INFO syscall needed: unlike diskd, sdd never has
-// to tell the kernel-allocated DMA buffer's physical address to a device,
-// because there isn't one — block data is read/written one 32-bit word at
-// a time through the SDHCI buffer-data-port register, into/out of
-// ordinary memory already inside sdd's own process image.
-fn void setup_sdd_mappings(Process* proc)
-{
-	// SD_MMIO_BASE, then the pad/power/clock one-time bring-up registers
-	// (see board.c3's own comment on those three) — separate pages from
-	// SD_MMIO_BASE and from each other.
-	uptr[4] sdd_pages = { board::SD_MMIO_BASE, board::SD_TOP_PAGE, board::SD_PINMUX_PAGE, board::SD_CLOCK_PAGE };
-	map_device_pages(proc, &sdd_pages[0], 4);
-
-	// SDMA staging buffer — identity-mapped, uncached (map_device_page,
-	// not map_page — same real-hardware DMA cache-incoherency reasoning
-	// as usbd_dma_paddr's own comment).
-	uptr dma_paddr = alloc_pages(1);
-	map_device_page(proc.page_table, dma_paddr, dma_paddr, PAGE_U | PAGE_R | PAGE_W);
-	sdd_dma_paddr = dma_paddr;
-
-	// SDHCI interrupt: level-high, cleared by sdd writing SD_INT_STATUS
-	// — same handle_trap disable / SYS_DRIVER_IRQ_ARM re-arm dance as
-	// usbd. Inert unless board::plic_init armed IRQ_SDHCI
-	// (INTERRUPT_DRIVEN_SD) and sdd unmasked the controller interrupt.
-	irq_route_register(board::IRQ_SDHCI, proc.pid, true);
-}
-
-fn void setup_usbd_mappings(Process* proc)
-{
-	// USB_MMIO_BASE, the TOP-block one-time bring-up registers (see
-	// board.c3's own comment on those two — separate pages from
-	// USB_MMIO_BASE and from each other), the USB PHY's own reference
-	// clocks (USB_CLK_PAGE), and PAD_USB_VBUS_DET's pinmux function-
-	// select (USB_PINMUX_PAGE) — see each constant's own comment in
-	// board.c3 for why it's needed.
-	uptr[5] usbd_pages = { board::USB_MMIO_BASE, board::USB_TOP_CTRL_PAGE, board::USB_TOP_RST_PAGE, board::USB_CLK_PAGE, board::USB_PINMUX_PAGE };
-	map_device_pages(proc, &usbd_pages[0], 5);
-
-	// Phase 2's own DMA buffer — see usbd_dma_paddr's own comment above
-	// for why this is identity-mapped, the same reasoning as diskd's
-	// virtqueue/request buffers (setup_diskd_mappings above): the DWC2
-	// host channel's HCDMA register needs a real physical address, and
-	// usbd (like every other user process) otherwise has no way to
-	// learn its own virtual pages' physical backing.
-	//
-	// map_device_page(), NOT map_page(), despite this being ordinary
-	// RAM, not a hardware register — deliberately uncached. This is
-	// the one real difference from diskd's own virtqueue mapping, and
-	// it matters here in a way it never has before: diskd only ever
-	// runs against QEMU's virtio-mmio (HAS_VIRTIO_BLOCK is QEMU-only),
-	// a software-emulated device that just reads the guest's memory
-	// buffer directly — no real cache-incoherency effect exists to
-	// hit there at all. usbd is the first driver in this project's
-	// history doing genuine DMA against real Duo hardware, where a
-	// cacheable mapping (map_page()'s own PTE_EXTRA_BITS = SHARE|
-	// CACHE|BUF, see its own comment) risks the DWC2 core's own DMA
-	// engine — a separate AHB bus master — reading stale memory the
-	// CPU's write never made it past its own cache line for. A real
-	// hardware round hit a persistent, deterministic STALL on the
-	// very first control transfer, unaffected by every content/timing
-	// fix tried, which is exactly the signature of the *actual*
-	// transmitted bytes silently differing from what this driver's
-	// own debug prints (reading the original stack buffer, not the
-	// DMA buffer) had been trusted as confirming correct.
-	uptr dma_paddr = alloc_pages(1);
-	map_device_page(proc.page_table, dma_paddr, dma_paddr, PAGE_U | PAGE_R | PAGE_W);
-	usbd_dma_paddr = dma_paddr;
-
-	// DWC2 core interrupt (GINTMSK.HCHINT etc., see user/usb/dwc2.c3):
-	// level-high, cleared only by usbd writing HCINT — handle_trap
-	// disables the source on each fire, usbd re-arms via
-	// SYS_DRIVER_IRQ_ARM. Inert unless board::plic_init armed IRQ_USB
-	// (INTERRUPT_DRIVEN_USB) and dwc2.c3 unmasked the core interrupt.
-	irq_route_register(board::IRQ_USB, proc.pid, true);
-}
-
-// Called once, right after create_process() spawns gpiod (see
-// kernel.c3), to give it access to GPIO bank C's own registers and the
-// shared pinmux page every pad's own function-select register lives
-// on — see board::GPIO_BANK_C_BASE/GPIO_PINMUX_PAGE's own comments.
-// No DMA buffer, no SYS_GPIOD_INFO syscall needed: same reasoning as
-// setup_sdd_mappings above — every register gpiod touches is a fixed,
-// compile-time-known physical address, not something kernel-allocated
-// at spawn time.
-fn void setup_gpiod_mappings(Process* proc)
-{
-	uptr[3] gpiod_pages = { board::GPIO_BANK_A_BASE, board::GPIO_BANK_C_BASE, board::GPIO_PINMUX_PAGE };
-	map_device_pages(proc, &gpiod_pages[0], 3);
-}
-
-// Called once, right after create_process() spawns ethd (see
-// kernel.c3), to give it access to the DesignWare Ethernet MAC's own
-// registers, the embedded PHY's register block, the clock-controller
-// page it needs one bit in, and (Ethernet Phase 2) a single-page DMA
-// region for its descriptor ring/packet buffers. Identity-mapped for
-// the same reason as every other real-device MMIO mapping in this
-// file.
-fn void setup_ethd_mappings(Process* proc)
-{
-	// ETH_MMIO_BASE; ETH_DMA_PAGE (the MAC's own DMA register block,
-	// Ethernet Phase 2 — a separate mapping from ETH_MMIO_BASE);
-	// ETH_PHY_PAGE (the embedded PHY's own register block);
-	// ETH_CLK_PAGE (clk_500m_eth0/clk_axi4_eth0 — same physical page
-	// USB_CLK_PAGE/SD_CLOCK_PAGE also map, for their own unrelated
-	// bits); ETH_LED_PINMUX_PAGE/ETH_SD1_SELPHY_PAGE
-	// (cv180x_ephy_led_pinmux()'s own two register pages); and the real,
-	// complete PHY analog bring-up's own efuse trim pages
-	// (ETH_EFUSE_PAGE_0/_1). See each constant's own comment in
-	// board.c3 for why it's needed.
-	uptr[8] ethd_pages = {
-		board::ETH_MMIO_BASE, board::ETH_DMA_PAGE, board::ETH_PHY_PAGE, board::ETH_CLK_PAGE,
-		board::ETH_LED_PINMUX_PAGE, board::ETH_SD1_SELPHY_PAGE, board::ETH_EFUSE_PAGE_0, board::ETH_EFUSE_PAGE_1
-	};
-	map_device_pages(proc, &ethd_pages[0], 8);
-
-	// Phase 2's own DMA region — see ethd_dma_paddr's own comment above
-	// for the layout and why this is uncached (map_device_page, not
-	// map_page): same real-DMA-cache-incoherency reasoning as
-	// usbd_dma_paddr, this being the second driver (after usbd) doing
-	// genuine DMA against real Duo hardware.
-	uptr dma_paddr = alloc_pages(1);
-	map_device_page(proc.page_table, dma_paddr, dma_paddr, PAGE_U | PAGE_R | PAGE_W);
-	ethd_dma_paddr = dma_paddr;
-
-	// dwmac RX/TX-done interrupt: level, cleared by ethd writing the DMA
-	// status register. Registered now so interrupt-driven RX only needs
-	// board::plic_init to arm IRQ_ETH + ethd to unmask + wait on the
-	// notify — no kernel routing edit. Inert until then (source never
-	// fires).
-	irq_route_register(board::IRQ_ETH, proc.pid, true);
-}
-
-// Called once, right after create_process() spawns netd (see
-// kernel.c3), to give it access to virtio-net's own virtio-mmio
-// registers and two virtqueues (RX and TX — virtio-net's own spec
-// requires both configured before DRIVER_OK, even though Phase 1
-// doesn't push anything through them yet). Cacheable map_page(), same
-// as diskd's own virtqueue above and for the same reason: netd only
-// ever runs against QEMU's software-emulated virtio-mmio
-// (board::HAS_VIRTIO_NET is QEMU-only), which has no real
-// cache-incoherency to hit — see usbd_dma_paddr's own comment
-// (map_device_page, not map_page) for why that reasoning does NOT
-// carry over to a real-hardware DMA buffer.
-fn void setup_netd_mappings(Process* proc)
-{
-	map_device_page(proc.page_table, board::VIRTIO_NET_PADDR, board::VIRTIO_NET_PADDR, PAGE_U | PAGE_R | PAGE_W);
-
-	uint vq_pages = (uint)(mem::aligned_offset((sz)Virtio_virtq::size, PAGE_SIZE) / PAGE_SIZE);
-
-	uptr rxq_paddr = alloc_pages(vq_pages);
-	for (uint off = 0; off < vq_pages * PAGE_SIZE; off += PAGE_SIZE)
-	{
-		map_page(proc.page_table, rxq_paddr + off, rxq_paddr + off, PAGE_U | PAGE_R | PAGE_W);
-	}
-
-	uptr txq_paddr = alloc_pages(vq_pages);
-	for (uint off = 0; off < vq_pages * PAGE_SIZE; off += PAGE_SIZE)
-	{
-		map_page(proc.page_table, txq_paddr + off, txq_paddr + off, PAGE_U | PAGE_R | PAGE_W);
-	}
-
-	// Phase 2's own packet-buffer page — see netd_pktbuf_paddr's own
-	// comment above for the layout.
-	uptr pktbuf_paddr = alloc_pages(1);
-	map_page(proc.page_table, pktbuf_paddr, pktbuf_paddr, PAGE_U | PAGE_R | PAGE_W);
-
-	netd_rxq_paddr    = rxq_paddr;
-	netd_txq_paddr    = txq_paddr;
-	netd_pktbuf_paddr = pktbuf_paddr;
 }
 
 Process* current_proc; // Currently running process

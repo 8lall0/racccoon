@@ -13,8 +13,8 @@ module user;
 // The SDHCI Buffer Data Port register is read/written one 32-bit word
 // at a time directly into ordinary memory inside this process's own
 // image — no virtqueue, no kernel-allocated physically-contiguous
-// buffer, no SYS_DISKD_INFO-style syscall to learn a physical address
-// (see setup_sdd_mappings, process.c3). Also no PLIC/interrupt
+// buffer, no SYS_DEV_INFO-style syscall to learn a physical address
+// (see device_setup, src/device.c3). Also no PLIC/interrupt
 // involvement at all: SDHCI commands complete in microseconds to low
 // milliseconds, so busy-polling PRESENT_STATE/INT_STATUS directly is
 // simpler — see sdd_block_rw's own header comment for the real,
@@ -168,7 +168,7 @@ const uint SD_TRNS_READ       = 0x0010; // 1 = card-to-host (read)
 // falls back to PIO if the controller can't do SDMA.
 const bool SDD_USE_DMA = true;
 bool g_sdd_dma_ok = false;      // set by sdd_init once SD_CAPABILITIES is read
-uptr g_sdd_dma_paddr = 0;       // the DMA staging buffer (SYS_SDD_INFO), 0 until sdd.c3 sets it
+uptr g_sdd_dma_paddr = 0;       // the DMA staging buffer (SYS_DEV_INFO), 0 until sdd.c3 sets it
 uint g_sd_dma_addr_pending = 0; // sd_send_cmd writes this to SD_DMA_ADDRESS + sets SD_TRNS_DMA for the next data command, then clears it
 
 // mmio_read32 / mmio_write32: user/user.c3 (shared).
@@ -665,7 +665,7 @@ fn bool sdd_enumerate()
 
 // SDMA block transfer — the controller moves the 512 bytes to/from
 // g_sdd_dma_paddr itself (an identity-mapped, uncached staging page,
-// SYS_SDD_INFO). No PIO FIFO, so the shallow-FIFO timing discipline the
+// SYS_DEV_INFO). No PIO FIFO, so the shallow-FIFO timing discipline the
 // function above lives under doesn't apply here — syscalls / yield()
 // during the completion wait are fine. Completion is interrupt-driven
 // (PLIC source board::IRQ_SDHCI; SYS_DRIVER_IRQ_ARM re-arms it after

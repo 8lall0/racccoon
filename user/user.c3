@@ -20,7 +20,7 @@ const int SYS_EXIT      = 3;
 const int SYS_IPC_SEND  = 6;
 const int SYS_IPC_RECV  = 7;
 const int SYS_NS_RESOLVE = 8;
-const int SYS_DISKD_INFO = 9;
+// 9 was SYS_DISKD_INFO — subsumed by SYS_DEV_INFO (60).
 const int SYS_IPC_POLL   = 10;
 const int SYS_RFORK      = 11;
 const int SYS_NS_UNMOUNT = 12;
@@ -39,12 +39,12 @@ const int SYS_EXEC         = 24; // replaces the calling process's own image in 
 const int SYS_SETUID       = 25; // sets the caller's own uid, only while still root — see src/entry.c3's case
 const int SYS_NS_MOUNT_WAIT = 26; // SYS_NS_MOUNT, but blocks (bounded by a retry count) until the target actually posts — see src/entry.c3's case
 const int SYS_YIELD         = 27; // voluntarily gives up the rest of this process's timeslice once — see src/entry.c3's case
-const int SYS_USBD_INFO     = 28; // usbd-only: returns its DMA buffer physical address — see src/entry.c3's case
-const int SYS_NETD_INFO     = 29; // netd-only: returns its RX/TX virtqueue physical addresses, plus its packet-buffer page — see src/entry.c3's case
-const int SYS_ETHD_INFO     = 30; // ethd-only: returns its DMA region's physical address — see src/entry.c3's case
+// 28 was SYS_USBD_INFO — subsumed by SYS_DEV_INFO (60).
+// 29 was SYS_NETD_INFO — subsumed by SYS_DEV_INFO (60).
+// 30 was SYS_ETHD_INFO — subsumed by SYS_DEV_INFO (60).
 const int SYS_KBD_PUSH      = 31; // usbd-only: pushes one decoded USB-keyboard byte into the kernel keystroke queue SYS_GETCHAR drains — see src/entry.c3's case
 const int SYS_DRIVER_IRQ_ARM = 32; // usbd/sdd: re-enable this driver's PLIC source (handle_trap disables it on each fire — level-triggered); dispatched by caller pid — see src/entry.c3's case
-const int SYS_SDD_INFO      = 33; // sdd-only: returns its SDMA staging buffer's physical address — same shape as SYS_USBD_INFO
+// 33 was SYS_SDD_INFO — subsumed by SYS_DEV_INFO (60).
 const int SYS_IPC_CALL      = 34; // one-shot RPC: deliver a request and block for the reply, all in the kernel — reply can't be pre-empted by a stray sender, aborts -1 if the server dies at any point — see src/entry.c3's case
 const int SYS_GETUID        = 35; // the caller's own uid — see src/entry.c3's case
 const int SYS_BOOT_QUIET    = 36; // shell-only: silences boot-server console output once boot settles — see src/entry.c3's case
@@ -71,6 +71,7 @@ const int SYS_DISK_ARENA_INFO = 56; // diskd + primary fsd: base+size of the sha
 const int SYS_KLOG_READ     = 57; // kernel console log ring — /bin/dmesg — see src/entry.c3's case + klog_read() below
 const int SYS_PROC_STAT     = 58; // per-process state/uid/gen/pages/pid/name — /bin/ps + /bin/top — see src/entry.c3's case + proc_stat() below
 const int SYS_GETCHAR_NB    = 59; // non-blocking console read: a keystroke, or -1 if none waiting — see src/entry.c3's case + getchar_nb() below
+const int SYS_DEV_INFO   = 60; // a0 = out uptr[], a1 = capacity (<= 4): physical base of each DMA region the caller's board device declared (src/device.c3). Returns the region count, or -1 if the caller owns no device — see dev_info() below
 
 // rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
@@ -853,26 +854,40 @@ fn void yield() @export("yield") {
     syscall(SYS_YIELD, 0, 0, 0);
 }
 
-// usbd-only, called once at its own startup — see process.c3's
-// usbd_dma_paddr for why this address can't be known at compile time.
+// Hardware drivers only (sdd, diskd, usbd, ethd, netd), called once at
+// startup: the physical base of each DMA region the kernel allocated and
+// identity-mapped for this driver's board device (src/device.c3's
+// Dev_dma list, in declaration order). A driver can't learn these itself —
+// it can't call alloc_pages() and its own image pages have no guaranteed
+// physical contiguity, but the device's DMA engine needs real physical
+// addresses. Writes min(max, regions) entries into out[]; returns how many
+// regions the device HAS, or -1 if this process owns no device.
+// uptr (not uint): the kernel stores full pointer-sized physical
+// addresses — a uint[] would corrupt whatever follows on the caller's stack.
+fn int dev_info(uptr* out, int max) @export("dev_info") {
+    return syscall(SYS_DEV_INFO, (long)out, (long)max, 0);
+}
+
+// usbd: one region, its control-transfer DMA buffer.
 fn uptr usbd_info() @export("usbd_info") {
-    uptr dma_paddr;
-    syscall(SYS_USBD_INFO, (long)&dma_paddr, 0, 0);
+    uptr dma_paddr = 0;
+    dev_info(&dma_paddr, 1);
     return dma_paddr;
 }
 
-// netd-only, called once at its own startup — see process.c3's
-// netd_rxq_paddr/netd_txq_paddr/netd_pktbuf_paddr for why these
-// addresses can't be known at compile time.
+// netd: RX virtqueue, TX virtqueue, packet-buffer page — that order.
 fn void netd_info(uptr* rxq_paddr_out, uptr* txq_paddr_out, uptr* pktbuf_paddr_out) @export("netd_info") {
-    syscall(SYS_NETD_INFO, (long)rxq_paddr_out, (long)txq_paddr_out, (long)pktbuf_paddr_out);
+    uptr[3] r;
+    if (dev_info(&r[0], 3) < 3) { return; }
+    *rxq_paddr_out    = r[0];
+    *txq_paddr_out    = r[1];
+    *pktbuf_paddr_out = r[2];
 }
 
-// ethd-only, called once at its own startup — see process.c3's
-// ethd_dma_paddr for why this address can't be known at compile time.
+// ethd: one region, its descriptor ring + packet buffers.
 fn uptr ethd_info() @export("ethd_info") {
-    uptr dma_paddr;
-    syscall(SYS_ETHD_INFO, (long)&dma_paddr, 0, 0);
+    uptr dma_paddr = 0;
+    dev_info(&dma_paddr, 1);
     return dma_paddr;
 }
 
@@ -1171,15 +1186,16 @@ fn int p9_call_path(char* path, uint verb, char* data, int len, char* reply_buf,
 }
 
 // diskd-only: learns the physical addresses of its virtqueue and request
-// buffer, allocated (and identity-mapped into diskd's own page table) by
-// the kernel at process-creation time — see setup_diskd_mappings in
-// src/process.c3 for why diskd can't know or derive these itself.
-// uptr* (not uint*): the kernel writes full pointer-sized physical
-// addresses into these out-params (src/entry.c3's SYS_DISKD_INFO case) —
-// a uint* here would only reserve 4 bytes for what the kernel's 8-byte
-// store actually writes, corrupting whatever's next on diskd's stack.
+// buffer — its board device's two DMA regions (boards/qemu/board.c3),
+// allocated and identity-mapped into diskd's own page table by the kernel
+// at process-creation time; see dev_info() for why diskd can't derive
+// them itself. Returns 0, or -1 if the kernel didn't hand it both.
 fn int diskd_info(uptr* vq_paddr_out, uptr* req_paddr_out) @export("diskd_info") {
-    return syscall(SYS_DISKD_INFO, (long)vq_paddr_out, (long)req_paddr_out, 0);
+    uptr[2] r;
+    if (dev_info(&r[0], 2) < 2) { return -1; }
+    *vq_paddr_out  = r[0];
+    *req_paddr_out = r[1];
+    return 0;
 }
 
 // diskd + primary fsd only: the physical base + size of the shared
@@ -1187,7 +1203,7 @@ fn int diskd_info(uptr* vq_paddr_out, uptr* req_paddr_out) @export("diskd_info")
 // P1 step 2, src/entry.c3's SYS_DISK_ARENA_INFO). Sector data for the
 // DISKD_*_ARENA verbs lives here instead of in the IPC message.
 // Returns 0, or -1 for any other caller. uptr*/uint* sizing matches the
-// kernel's stores (see diskd_info's own comment).
+// kernel's stores (see dev_info's own comment).
 fn int disk_arena_info(uptr* paddr_out, uint* size_out) @export("disk_arena_info") {
     return syscall(SYS_DISK_ARENA_INFO, (long)paddr_out, (long)size_out, 0);
 }

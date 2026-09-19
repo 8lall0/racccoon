@@ -6,7 +6,7 @@ import std::nolibc::mem;
 // diskd: the virtio-blk driver, moved out of the trusted kernel into its
 // own user-mode process (microkernel plan phase 4 — see docs/devlog.md).
 // It's the only process with the device's MMIO mapped into its page
-// table (see setup_diskd_mappings, src/process.c3); every other client
+// table (see device_setup, src/device.c3); every other client
 // — today just the kernel's own fs.c3, via a kernel-internal IPC helper
 // — talks to it exclusively over the DISKD_READ/DISKD_WRITE messages
 // below.

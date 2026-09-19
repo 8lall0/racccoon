@@ -1,6 +1,7 @@
 module kernel;
 
 import board;
+import panic;
 
 // supervisor_tick() runs inside the timer trap handler, where std::io's
 // formatter isn't usable (it faulted with "No method 'write_byte'" —
@@ -15,21 +16,21 @@ fn void svc_puts(char* s) @noinline
 	}
 }
 
-// Boot-server supervision (docs/roadmap.md §5.2). kernel_main registers
-// each supervisable server here right after spawning it; supervisor_tick()
-// runs once per timer tick (~1/s, from handle_trap's SCAUSE_SUPERVISOR_TIMER
-// case) and re-spawns any that have exited.
+// Boot-server supervision (docs/roadmap.md §5.2). kernel_main starts every
+// boot server through service_boot() below, which spawns it AND registers
+// it here; supervisor_tick() runs once per timer tick (~1/s, from
+// handle_trap's SCAUSE_SUPERVISOR_TIMER case) and re-spawns any that have
+// exited. First boot and respawn share one code path (service_instantiate),
+// so a restarted server is set up exactly like the original.
 //
-// Supervised: the pure-IPC servers (fsd, fsd2, echod, procd, envd) plus
-// the block-storage driver (diskd on QEMU / sdd on the Duo) — the one
-// device driver everything else depends on. Its MMIO + DMA mappings are
-// re-established on respawn via Service.kind (setup_diskd_mappings /
-// setup_sdd_mappings) and its PLIC route self-heals (irq_route_register
-// overwrites in place). fsd re-resolves the storage pid on an IPC
-// failure (user/fs/fsd.c3's diskd_rw), so a respawn into a new slot is
-// transparent to it. usbd/ethd/netd/gpiod are still unsupervised — the
-// kind switch has slots for them, but each needs its bring-up verified
-// idempotent and a way to fault-test it (mostly Duo-only).
+// Supervised: the pure-IPC servers (fsd, fsd2, echod, procd, envd), the
+// block-storage driver (diskd on QEMU / sdd on the Duo), and the other
+// hardware drivers (usbd, ethd, netd, gpiod). A driver's hardware — MMIO
+// windows, PLIC route, DMA regions — comes from its board Device entry
+// (device.c3) and is re-established on every respawn by device_setup(); its
+// PLIC route self-heals (irq_route_register overwrites in place). fsd
+// re-resolves the storage pid on an IPC failure (user/fs/fsd.c3's
+// diskd_rw), so a respawn into a new slot is transparent to it.
 //
 // A respawned server lands in whatever slot is free, so its pid usually
 // changes. supervisor_spawn() therefore (a) updates the *_pid global the
@@ -51,25 +52,17 @@ const int SVC_RESTART_LIMIT = 5;
 // deadlock, not a slow request.
 const int SVC_STALL_LIMIT = 5;
 
-// Post-create setup each service needs, dispatched in supervisor_spawn().
-const int SVC_KIND_PLAIN = 0;  // echod / procd / envd — nothing
-const int SVC_KIND_FSD   = 1;  // setup_fsd_mappings(proc, partition, secondary)
-const int SVC_KIND_DISKD = 2;  // setup_diskd_mappings(proc) — QEMU virtio-blk
-const int SVC_KIND_SDD   = 3;  // setup_sdd_mappings(proc)   — Duo SD
-const int SVC_KIND_USBD  = 4;  // not registered yet
-const int SVC_KIND_ETHD  = 5;  // not registered yet
-const int SVC_KIND_NETD  = 6;  // not registered yet
-const int SVC_KIND_GPIOD = 7;  // not registered yet
-
 struct Service
 {
 	char* name;
 	char* bin_start;
 	char* bin_end;
 
-	int   kind;            // SVC_KIND_* — which setup_*_mappings to run on respawn
-	uint  fsd_partition;   // SVC_KIND_FSD only
-	bool  fsd_secondary;   // SVC_KIND_FSD only
+	int   device;          // index into board::DEVICES (device.c3) to hand this
+	                       // server on every (re)spawn, or -1: it owns no hardware
+	bool  is_fsd;          // an fsd instance: also run setup_fsd_mappings
+	uint  fsd_partition;   // is_fsd only
+	bool  fsd_secondary;   // is_fsd only
 
 	// Hang watchdog applies? Off for usbd/ethd/gpiod: their bring-up
 	// (a USB bus reset + 1s settle, an Ethernet PHY train, …) can
@@ -106,31 +99,41 @@ struct Service
 Service[SVC_MAX] services;
 int service_count;
 
-// Called from kernel_main right after a supervisable server is spawned.
-fn void supervisor_register(char* name, char* bin_start, char* bin_end,
-	int kind, uint fsd_partition, bool fsd_secondary, bool watch_hangs,
-	int* pid_global, Process* proc)
+// Start `name`'s embedded binary (`bin_start`/`bin_end`) as a boot server
+// and put it under supervision. Called from kernel_main for every boot
+// server; the returned Process is the freshly spawned instance.
+//   pid_global   the kernel global the default-namespace seeding reads for
+//                this server (fsd_pid / echod_pid / storage_pid / …), or null
+//   device       board::DEVICES index this server drives (device_find), -1 none
+//   is_fsd       an fsd instance, with its partition / secondary flag
+//   watch_hangs  hang watchdog applies (see the field's comment above)
+fn Process* service_boot(char* name, char* bin_start, char* bin_end,
+	int* pid_global = null, int device = -1, bool watch_hangs = true,
+	bool is_fsd = false, uint fsd_partition = 0, bool fsd_secondary = false)
 {
-	if (service_count >= SVC_MAX || proc == null) { return; }
-	proc_set_name(proc, name);
+	if (service_count >= SVC_MAX) { panic::panic("service table full"); }
 	Service* s = &services[service_count];
-	service_count++;
 	s.name           = name;
 	s.bin_start      = bin_start;
 	s.bin_end        = bin_end;
-	s.kind           = kind;
+	s.device         = device;
+	s.is_fsd         = is_fsd;
 	s.fsd_partition  = fsd_partition;
 	s.fsd_secondary  = fsd_secondary;
 	s.watch_hangs    = watch_hangs;
 	s.pid_global     = pid_global;
-	s.pid            = proc.pid;
-	s.generation     = proc.generation;
 	s.restarts       = 0;
 	s.given_up       = false;
-	s.used           = true;
-	s.ever_ready     = false;
-	s.stall_ticks    = 0;
-	s.last_progress  = proc.ipc_progress;
+
+	Process* p = service_instantiate(s);
+
+	// Published last: supervisor_tick() skips an entry until it is `used`,
+	// and must never see one whose pid/generation aren't set yet (a timer
+	// tick can land anywhere in kernel_main) — it would read as "dead" and
+	// respawn a duplicate.
+	s.used = true;
+	service_count++;
+	return p;
 }
 
 // Re-point every namespace mount that named (old_pid) at (new_pid,
@@ -155,11 +158,12 @@ fn void reseat_namespace_mounts(int old_pid, int new_pid, uint new_generation)
 	}
 }
 
-fn void supervisor_spawn(Service* s)
+// Create one instance of `s` and wire it up: name, hardware, fsd
+// parameters, and the bookkeeping the supervisor and the default-namespace
+// seeding read. Shared by first boot (service_boot) and respawn.
+fn Process* service_instantiate(Service* s)
 {
-	int old_pid = s.pid;
-
-	// Null the global first so the replacement's own create_process()
+	// Null the global first so the new instance's own create_process()
 	// namespace seeding treats this server as "not up yet" (server_pid
 	// 0 — SYS_NS_RESOLVE skips it), exactly like first boot, rather than
 	// inheriting a stale pid.
@@ -173,25 +177,23 @@ fn void supervisor_spawn(Service* s)
 
 	p.is_boot_server = true;
 	proc_set_name(p, s.name);
-	switch (s.kind)
-	{
-		case SVC_KIND_FSD:   setup_fsd_mappings(p, s.fsd_partition, s.fsd_secondary);
-		case SVC_KIND_DISKD: setup_diskd_mappings(p);
-		case SVC_KIND_SDD:   setup_sdd_mappings(p);
-		case SVC_KIND_USBD:  setup_usbd_mappings(p);
-		case SVC_KIND_ETHD:  setup_ethd_mappings(p);
-		case SVC_KIND_NETD:  setup_netd_mappings(p);
-		case SVC_KIND_GPIOD: setup_gpiod_mappings(p);
-		default: break;
-	}
+	if (s.device >= 0) { device_setup(p, s.device); }
+	if (s.is_fsd) { setup_fsd_mappings(p, s.fsd_partition, s.fsd_secondary); }
 
 	s.pid        = p.pid;
 	s.generation = p.generation;
-	s.restarts++;
 	s.ever_ready  = false;
 	s.stall_ticks = 0;
 	s.last_progress = p.ipc_progress;
 	if (s.pid_global != null) { *s.pid_global = p.pid; }
+	return p;
+}
+
+fn void supervisor_spawn(Service* s)
+{
+	int old_pid = s.pid;
+	Process* p = service_instantiate(s);
+	s.restarts++;
 
 	reseat_namespace_mounts(old_pid, p.pid, p.generation);
 

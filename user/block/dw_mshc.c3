@@ -10,8 +10,8 @@ module user;
 // blocked (docs/opi-rv-plan.md) and there is no QEMU model of the JH7110
 // SD controller, so nothing below is verified. It is written against
 // real driver source (see "Sourcing" below) and is meant to be
-// reviewable now and brought up once the board is unblocked. `board::
-// HAS_SD_BLOCK` stays false until then; this file is not yet wired into
+// reviewable now and brought up once the board is unblocked. the
+// board's "sd" DEVICES entry doesn't exist until then; this file is not yet wired into
 // any build (see "Build integration").
 //
 // ---------------------------------------------------------------------
@@ -41,7 +41,7 @@ module user;
 // ---------------------------------------------------------------------
 //  1. IDMAC / DMA. PIO only here (like sdhci.c3's fallback path). DMA on
 //     this IP is the internal DMA controller (IDMAC) with a physically-
-//     contiguous descriptor list — needs the uncached SYS_SDD_INFO page
+//     contiguous descriptor list — needs the uncached SYS_DEV_INFO page
 //     (see sdd.c3) plus a descriptor ring. Follow-up once PIO reads work.
 //  2. Clock/reset controller (JH7110 syscrg @ 0x13020000). The first cut
 //     ASSUMES U-Boot already left the SDIO0 biu+ciu clocks ungated and
@@ -64,9 +64,9 @@ module user;
 // scripts/build_user.sh builds `sdd` from `sdhci.c3 + sdd.c3`. To ship
 // this instead on the opi targets, have scripts/build_opi.sh and
 // scripts/build_opi_qemu.sh rebuild `sdd` from `dw_mshc.c3 + sdd.c3`
-// before the link step (a 1-line build_user_program override), and flip
-// board::HAS_SD_BLOCK / HAS_BLOCK_DEVICE in boards/opi-rv/board.c3 with
-// SD_MMIO_BASE = 0x16010000, IRQ_SDHCI = 74. sdd.c3 itself needs no
+// before the link step (a 1-line build_user_program override), and add an
+// "sd" entry to board::DEVICES in boards/opi-rv/board.c3 (MMIO page,
+// IRQ 74, DMA region — see docs/opi-rv-plan.md on which sdio is the SD slot). sdd.c3 itself needs no
 // change — it only calls the four names this file also exports
 // (dw-prefixed here vs sd-prefixed in sdhci.c3; see the shim aliases at
 // the bottom).

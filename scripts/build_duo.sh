@@ -17,8 +17,9 @@ LLC=${LLC:-llc}
   # target, and none of shell/echod/diskd/sdd/fsd touch PLIC/console
   # directly, only through kernel syscalls). diskd and sdd both still get
   # built and linked in on every target even though only one of them ever
-  # actually runs on a given board (board::HAS_SD_BLOCK/HAS_VIRTIO_BLOCK
-  # picks which — see src/kernel.c3) — kernel.c3 references both
+  # actually runs on a given board (whether the board's DEVICES table has
+  # an "sd" or a "virtio-blk" entry picks which — see src/kernel.c3) —
+  # kernel.c3 references both
   # embedded-binary symbols unconditionally, each inside an `if` that
   # only runs on one board, so the linker needs both present regardless.
   bash scripts/build_user.sh

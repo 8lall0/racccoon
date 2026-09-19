@@ -47,7 +47,7 @@ const SYS_EXIT      = 3;
 const SYS_IPC_SEND  = 6;
 const SYS_IPC_RECV  = 7;
 const SYS_NS_RESOLVE = 8;
-const SYS_DISKD_INFO = 9; // diskd-only: returns its vq/req physical addrs
+// 9 was SYS_DISKD_INFO — subsumed by SYS_DEV_INFO (60). Left unused, not renumbered.
 const SYS_IPC_POLL   = 10; // non-blocking SYS_IPC_RECV, see its case below
 const SYS_RFORK       = 11;
 const SYS_NS_UNMOUNT  = 12; // remove one of the caller's own namespace mounts by exact prefix
@@ -56,7 +56,7 @@ const SYS_FS_PARTITION_INFO = 14; // fsd-only: returns current_proc.fs_partition
                                     // board is a kernel-only module (see user/sdd.c3's own
                                     // header comment), so this is fsd.c3's only way to learn
                                     // a board-specific fact despite being one board-agnostic
-                                    // user binary, same shape as SYS_DISKD_INFO above. Reads
+                                    // user binary, same shape as SYS_DEV_INFO below. Reads
                                     // the CALLER's own per-process field, not a single shared
                                     // board constant directly — see process.c3's
                                     // setup_fsd_mappings()/fs_partition_start comments for why:
@@ -82,12 +82,12 @@ const SYS_EXEC         = 24; // replaces the calling process's own image in plac
 const SYS_SETUID       = 25; // sets the caller's own uid, only while still root — see its case below
 const SYS_NS_MOUNT_WAIT = 26; // SYS_NS_MOUNT, but blocks (bounded by a retry count) until the target actually posts — see its case below
 const SYS_YIELD         = 27; // voluntarily gives up the rest of this process's timeslice once — see its case below
-const SYS_USBD_INFO     = 28; // usbd-only: returns its DMA buffer's physical address — same shape/reasoning as SYS_DISKD_INFO above
-const SYS_NETD_INFO     = 29; // netd-only: returns its RX/TX virtqueue physical addresses, plus (Ethernet Phase 2) its packet-buffer page — see its case below
-const SYS_ETHD_INFO     = 30; // ethd-only: returns its DMA region's physical address (Ethernet Phase 2) — same shape/reasoning as SYS_USBD_INFO above
+// 28 was SYS_USBD_INFO — subsumed by SYS_DEV_INFO (60).
+// 29 was SYS_NETD_INFO — subsumed by SYS_DEV_INFO (60).
+// 30 was SYS_ETHD_INFO — subsumed by SYS_DEV_INFO (60).
 const SYS_KBD_PUSH      = 31; // usbd-only in practice: pushes one decoded USB-keyboard byte into the kernel keystroke queue SYS_GETCHAR drains (src/kbd.c3) — see its case below
 const SYS_DRIVER_IRQ_ARM = 32; // interrupt-driven driver: re-enable this driver's PLIC source, disabled by handle_trap on each fire (level source); the source is the one the caller registered in the Irq_route table (process.c3) — see its case below
-const SYS_SDD_INFO      = 33; // sdd-only: returns its SDMA staging buffer's physical address — see its case below
+// 33 was SYS_SDD_INFO — subsumed by SYS_DEV_INFO (60).
 const SYS_IPC_CALL      = 34; // one-shot RPC: deliver a request to a server and block for its reply, all in the kernel — the reply can't be pre-empted by a stray sender, and the whole thing aborts with -1 if the server dies at any point (see its case below); user-space p9_call is now just this
 const SYS_GETUID        = 35; // the caller's own uid — see its case below
 const SYS_BOOT_QUIET    = 36; // shell-only, called once after boot settles: silences boot servers' console output — see SYS_PUTCHAR
@@ -110,10 +110,11 @@ const SYS_NS_TRANSLATE  = 52; // a0 = path, a1 = union member index, a2 = out bu
 const SYS_PROF          = 53; // a0 = out buf (>= 32 bytes: 4 LE u64 — ipc_calls, ipc_ticks, yields, switches), a1 = reset flag — cheap on-device profiling odometer (gobuildtest)
 const SYS_PROF_HIST     = 54; // DIAGNOSTIC (temporary): a0 = out buf (512 bytes = 64 LE u64, indexed by syscall number), a1 = reset flag — the `synhist` builtin, chasing the go-build syscall storm
 const SYS_DRIVER_IRQ_WAIT = 55; // interrupt-driven driver: block until this driver's pending device-completion notify (driver_irq_pending) is set, hand-draining the PLIC each pass — one syscall per completion in place of diskd's per-sector SYS_IPC_POLL spin (docs/ipc-rings.md P1). Returns 0, or -1 if not a routed driver.
-const SYS_DISK_ARENA_INFO = 56; // diskd + primary fsd only: a0 -> arena paddr, a1 -> arena size (u32). The fsd<->diskd shared payload region (docs/ipc-rings.md P1 step 2) — identity-mapped into both by setup_diskd_mappings / setup_fsd_mappings. Returns 0, or -1 for any other caller / before it's allocated.
+const SYS_DISK_ARENA_INFO = 56; // diskd + primary fsd only: a0 -> arena paddr, a1 -> arena size (u32). The fsd<->diskd shared payload region (docs/ipc-rings.md P1 step 2) — identity-mapped into both by device_setup (device.c3) / setup_fsd_mappings. Returns 0, or -1 for any other caller / before it's allocated.
 const SYS_KLOG_READ  = 57; // a0 = out buf, a1 = max bytes, a2 = ulong* cursor (bytes-consumed counter; 0 = from the oldest byte still in the ring). Copies newer kernel-console bytes out, advances *cursor, returns the count. The kernel log ring (sbi.c3) — /bin/dmesg.
 const SYS_PROC_STAT  = 58; // a0 = slot (1..PROCS_MAX), a1 = out buf (>= 52 bytes): [0..3] state LE, [4..7] uid LE, [8..11] generation LE, [12..15] resident pages LE, [16..19] real pid LE, [20..51] name (NUL-padded). Returns 0, or -1 for an unused slot. /bin/ps + /bin/top.
 const SYS_GETCHAR_NB = 59; // non-blocking console read: one keystroke from the USB-kbd queue or serial console, or -1 immediately if none waiting. Console only (returns -1 when stdin is a pipe). Lets a follow/redraw loop (`dmesg -f`, `top`) bail on a keypress — racccoon has no ^C.
+const SYS_DEV_INFO   = 60; // a0 = out uptr[] , a1 = capacity (<= 4): the physical base of each DMA region the caller's board device (src/device.c3) declared, in declaration order. Returns how many regions the device has, or -1 for a process that owns no device. One syscall for every hardware driver — replaces SYS_DISKD/USBD/NETD/ETHD/SDD_INFO.
 
 // Per-process SYS_MAP ceiling: the bump pointer can't grow more than this
 // past USER_BASE. Board-specific (board::HEAP_MAX_BYTES): 16 MiB on the
@@ -823,6 +824,7 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		child.ipc_call_deadline = 0;
 		child.ipc_timed_out = false;
 		child.is_boot_server = false; // an rfork child is user work, not a boot server
+		child.device = -1;            // ...and owns no device (device.c3)
 		// a2 / a4 (optional, RFPROC only): wire the child's stdout / stdin
 		// to these pipe ids atomically, as part of the fork. Both the c3
 		// shell (`|`, `>`, `<`) and Go's os/exec use this. A follow-up
@@ -2730,28 +2732,39 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				for (int k = 0; k < 32; k++) { ps_out[20 + k] = ps_p.name[k]; }
 				f.a0 = 0;
 			}
-		case SYS_DISKD_INFO:
-			// diskd-only, called once at its own startup — see
-			// setup_diskd_mappings in process.c3 for why these addresses
-			// can't be known at compile time or derived by diskd itself.
-			// a0/a1 are out-pointers (same convention as SYS_IPC_RECV's
-			// optional type-out pointer): a0 -> vq paddr, a1 -> req paddr.
-			uptr* diskd_vq_out  = (uptr*)(uptr)f.a0;
-			uptr* diskd_req_out = (uptr*)(uptr)f.a1;
-			if (!user_range_valid(current_proc.page_table, (uptr)diskd_vq_out, 8, true)
-				|| !user_range_valid(current_proc.page_table, (uptr)diskd_req_out, 8, true))
+		case SYS_DEV_INFO:
+			// Hands the caller the physical base of each DMA region its
+			// board device declared (device.c3's Dev_dma list, allocated by
+			// device_setup at spawn) — the only way a driver can learn
+			// them: it can't call alloc_pages() and its own image pages
+			// have no guaranteed physical contiguity. Replaces the
+			// per-driver SYS_DISKD/USBD/NETD/ETHD/SDD_INFO syscalls.
+			// a0 = out array of uptr, a1 = its capacity (<= DEV_DMA_MAX).
+			// Writes min(capacity, regions) entries in declaration order and
+			// returns how many regions the device HAS (so a caller can check
+			// it got the count it needs), or -1 for a caller that owns no
+			// device / a bad buffer.
+			uptr* dev_out = (uptr*)(uptr)f.a0;
+			ulong dev_cap = f.a1;
+			int   dev_idx = current_proc.device;
+			if (dev_idx < 0 || dev_cap > (ulong)DEV_DMA_MAX
+				|| !user_range_valid(current_proc.page_table, (uptr)dev_out, dev_cap * 8, true))
 			{
 				f.a0 = (ulong)(-1);
 				break;
 			}
-			*diskd_vq_out  = diskd_vq_paddr;
-			*diskd_req_out = diskd_req_paddr;
+			int dev_nregions = device_dma_count(dev_idx);
+			for (int dr = 0; dr < dev_nregions && (ulong)dr < dev_cap; dr++)
+			{
+				dev_out[dr] = dev_dma_paddr[dev_idx * DEV_DMA_MAX + dr];
+			}
+			f.a0 = (ulong)dev_nregions;
 		case SYS_DISK_ARENA_INFO:
 			// diskd + the primary fsd only — the two processes
-			// setup_diskd_mappings / setup_fsd_mappings identity-mapped
+			// device_setup / setup_fsd_mappings identity-mapped
 			// the arena into (docs/ipc-rings.md P1 step 2). a0 -> paddr
 			// (uptr), a1 -> size (u32), same out-pointer convention as
-			// SYS_DISKD_INFO above.
+			// SYS_DEV_INFO above.
 			uptr* da_paddr_out = (uptr*)(uptr)f.a0;
 			uint* da_size_out  = (uint*)(uptr)f.a1;
 			if (disk_arena_paddr == 0
@@ -2767,7 +2780,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			f.a0 = 0;
 		case SYS_FS_PARTITION_INFO:
 			// fsd-only, called once at its own startup — a0 is an
-			// out-pointer, same convention as SYS_DISKD_INFO above.
+			// out-pointer, same convention as SYS_DEV_INFO above.
 			// Reads the CALLER's own current_proc.fs_partition_start
 			// (set by process.c3's setup_fsd_mappings() at spawn time),
 			// not board::FS_PARTITION_START_SECTOR directly — see that
@@ -3052,53 +3065,6 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// own scheduling would have.
 			yield();
 			f.a0 = 0;
-		case SYS_USBD_INFO:
-			// usbd-only, called once at its own startup — see
-			// setup_usbd_mappings in process.c3 for why this address
-			// can't be known at compile time or derived by usbd itself.
-			// a0 is an out-pointer, same convention as SYS_DISKD_INFO
-			// above.
-			uptr* usbd_dma_out = (uptr*)(uptr)f.a0;
-			if (!user_range_valid(current_proc.page_table, (uptr)usbd_dma_out, 8, true))
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			*usbd_dma_out = usbd_dma_paddr;
-		case SYS_NETD_INFO:
-			// netd-only, called once at its own startup — see
-			// setup_netd_mappings in process.c3 for why these addresses
-			// can't be known at compile time. a0/a1/a2 are out-pointers,
-			// same convention as SYS_DISKD_INFO above: a0 -> RX
-			// virtqueue paddr, a1 -> TX virtqueue paddr, a2 -> packet-
-			// buffer page paddr (Ethernet Phase 2 — see
-			// netd_pktbuf_paddr's own comment, process.c3).
-			uptr* netd_rxq_out = (uptr*)(uptr)f.a0;
-			uptr* netd_txq_out = (uptr*)(uptr)f.a1;
-			uptr* netd_pktbuf_out = (uptr*)(uptr)f.a2;
-			if (!user_range_valid(current_proc.page_table, (uptr)netd_rxq_out, 8, true)
-				|| !user_range_valid(current_proc.page_table, (uptr)netd_txq_out, 8, true)
-				|| !user_range_valid(current_proc.page_table, (uptr)netd_pktbuf_out, 8, true))
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			*netd_rxq_out = netd_rxq_paddr;
-			*netd_txq_out = netd_txq_paddr;
-			*netd_pktbuf_out = netd_pktbuf_paddr;
-		case SYS_ETHD_INFO:
-			// ethd-only, called once at its own startup — see
-			// setup_ethd_mappings in process.c3 for why this address
-			// can't be known at compile time or derived by ethd itself.
-			// a0 is an out-pointer, same convention as SYS_USBD_INFO
-			// above.
-			uptr* ethd_dma_out = (uptr*)(uptr)f.a0;
-			if (!user_range_valid(current_proc.page_table, (uptr)ethd_dma_out, 8, true))
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			*ethd_dma_out = ethd_dma_paddr;
 		case SYS_KBD_PUSH:
 			// usbd-only in practice (user/usb/kbd.c3's kbd_emit): one
 			// decoded keyboard byte in a0, appended to the kernel
@@ -3120,8 +3086,8 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// completion — handle_trap disabled it on the way in (the
 			// device line is level-high and can't be cleared from the
 			// trap handler). The source is whichever one the caller
-			// registered in the Irq_route table (setup_*_mappings,
-			// process.c3). A non-driver caller finds no route -> no-op.
+			// registered in the Irq_route table (device_setup,
+			// device.c3). A non-driver caller finds no route -> no-op.
 			// Idempotent (first transfer / timeout path harmlessly
 			// re-sets an already-set enable bit).
 			Irq_route* arm_route = irq_route_by_pid(current_proc.pid);
@@ -3130,17 +3096,6 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				board::plic_set_enabled(arm_route.irq, true);
 			}
 			f.a0 = 0;
-		case SYS_SDD_INFO:
-			// sdd-only, called once at startup — see setup_sdd_mappings
-			// in process.c3. a0 is an out-pointer, same convention as
-			// SYS_USBD_INFO.
-			uptr* sdd_dma_out = (uptr*)(uptr)f.a0;
-			if (!user_range_valid(current_proc.page_table, (uptr)sdd_dma_out, 8, true))
-			{
-				f.a0 = (ulong)(-1);
-				break;
-			}
-			*sdd_dma_out = sdd_dma_paddr;
 		case SYS_PARENT_INFO:
 			// Read-only, no permission check — same reasoning as
 			// SYS_PROC_INFO above. Returns the given pid's parent_pid

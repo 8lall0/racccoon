@@ -48,11 +48,11 @@ Two structural costs to attack:
   `RC_FS_MSG_MAX`, `fsMsgMax`).
 - **`SYS_MAP` (47)** — per-process anonymous zero-filled RW pages just
   past the image, demand-paged. *Not* shareable between processes.
-- **`setup_diskd_mappings` / `setup_usbd_mappings` / `setup_netd_...`**
-  — the kernel allocates one physically-contiguous run with
+- **`device_setup()` (`src/device.c3`, driven by the board's `DEVICES`
+  table)** — the kernel allocates one physically-contiguous run with
   `alloc_pages(n)`, identity-maps it (`vaddr == paddr`) into the
   driver's page table, and hands the base back via a driver-only
-  `SYS_*_INFO` syscall. This is the closest thing to shared memory the
+  `SYS_DEV_INFO` syscall. This is the closest thing to shared memory the
   system has, but each region has exactly one user-mode consumer and is
   shaped for device DMA, not for a second process.
 - **`irq_route_register(irq, pid, level)`** — routes a device IRQ to a
@@ -198,8 +198,8 @@ into a shared region.
   cacheable `map_page` — consistent with `diskd_req_paddr`, and
   virtio-blk is QEMU-only so no real DMA-coherency issue), identity-
   mapped into diskd (hands the paddr to a virtio descriptor) and into
-  the primary fsd (plain r/w). `setup_diskd_mappings` /
-  `setup_fsd_mappings` both map it (so a supervisor respawn re-maps it
+  the primary fsd (plain r/w). `device_setup` (virtio-blk's
+  `disk_arena` device) / `setup_fsd_mappings` both map it (so a supervisor respawn re-maps it
   for free); allocated once, on the first of those calls.
   `SYS_DISK_ARENA_INFO` (56) returns `(paddr, size)`, gated to the two
   recorded pids.
