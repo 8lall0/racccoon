@@ -4,6 +4,84 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-09-19 (later) — Orange Pi RV: the "flaky SD probe" was `mmc 0`, the Wi-Fi; the microSD (`mmc 1`) works fine
+
+**What the user's vendor-Debian boot log showed:** `mmc1 is current device` →
+`Try booting from MMC1 ...` → `Retrieving file: /extlinux/extlinux.conf`,
+`/uInitrd` (5.9 MB, 21.6 MiB/s), `/Image` (8.6 MB, 21.8 MiB/s), the dtb — all
+read from **MMC1** without a hiccup. The single `Card did not respond to voltage
+select! : -110` line is U-Boot's distro boot moving on to probe *another* MMC
+device. Cross-checked against the JH7110 devicetree: `mmc0` = sdio0
+`0x16010000` (IRQ 74), `mmc1` = sdio1 `0x16020000` (IRQ 75), and mainline
+`jh7110-orangepi-rv.dts` gives `&mmc0` the AP6256 Wi-Fi (mmc-pwrseq, `wifi@1`)
+and `&mmc1` the `cd-gpios` (the microSD).
+
+**Consequence: a whole sub-arc was chasing a misreading.** Since 2026-09-08 the
+port treated `mmc dev 0` as the SD slot ("device 1 has no partition, likely the
+Wi-Fi") — exactly inverted. The sdio0 probe *always* fails with -110 because it
+is not an SD card. So: the "known upstream U-Boot dw_mmc voltage-switch bug",
+the ground-loop theory, the serial-isolator experiment, the USB-mass-storage
+boot workaround, and (indirectly) the firmware-upgrade misadventure that
+followed were all built on `boot.cmd` saying `load mmc 0:1`. The
+"mmc dev 1 probes fine" observation recorded in the plan was the SD card the
+whole time. Natural boot needs no USB and no firmware surgery.
+
+**Changed (not yet run on the board):**
+- `boards/opi-rv/boot.cmd` (SUPERSEDED, see RESULT below — boot.scr never runs
+  on this U-Boot; replaced by `vf2_uEnv.txt`): `load mmc 1:1 0x40200000
+  kernel_opi.bin` + `go` (raw `.bin`, since `bootelf` on the ELF crashes this
+  U-Boot — that finding stands).
+- `user/block/dw_mshc.c3` (never-run draft): retargeted from sdio0 to sdio1 —
+  base `0x16020000`, IRQ 75, sysreg `<syscon 0x9c, shift 1, mask 0x3e>` (was
+  `0x14 / 26 / 0x7c000000`). Clock/reset args are SDIO1's.
+- `docs/opi-rv-plan.md`: correction block at the top + the wrong facts fixed
+  where they were stated as current; the historical narrative left as written.
+
+**To confirm on the board (10 seconds at the U-Boot prompt):** `mmc list`
+(expect `mmc@16010000: 0` and `mmc@16020000: 1`), `mmc dev 0` (-110, expected),
+`mmc dev 1` + `mmc info` (a working SD card), `part list mmc 1`. Then rename
+`extlinux.conf`, drop `kernel_opi.bin` + `vf2_uEnv.txt` on the boot partition
+(`scripts/flash_opi.sh`), and racccoon boots off the card unattended.
+
+**RESULT (same day, hardware): racccoon boots off the microSD, unattended, to a
+`root / #` shell on the real Orange Pi RV.** `boot.scr` turned out never to run
+(the vendor chain aborts on `"distro_boot_env_test" not defined` and drops to
+`StarFive #`), but the log showed `Failed to load 'vf2_uEnv.txt'` immediately
+followed by `## Error: "boot2" not defined` — the chain imports that file and
+runs `boot2`. So the hook is `boards/opi-rv/vf2_uEnv.txt`:
+`boot2=echo …; load mmc 1:1 0x40200000 kernel_opi.bin; go 0x40200000`
+(`boot.cmd` deleted). `scripts/flash_opi.sh` (`OPI_BOOT_PART=/dev/sdX1`) builds,
+refuses anything that isn't a vendor bootfs (needs `Image` + `extlinux/`, so it
+can't hit a Duo card), renames `extlinux.conf` → `.bak`, copies `kernel_opi.bin`
++ the env file (as `vf2_uEnv.txt` and `uEnv.txt`) and verifies by read-back. No
+SPI-flash write anywhere; delete the env file / restore `extlinux.conf.bak` and
+vendor Debian boots again. One failed attempt on the way was simply the card not
+seated in the slot (that boot never even tried `mmc1`). First real-hardware run
+of the c3c linker-symbol fix + the device-table kernel on this board. Boot log
+also confirms `MMC: sdio0@16010000: 0, sdio1@16020000: 1`.
+
+**Console input fixed in software (QEMU-verified, then CONFIRMED ON THE REAL
+BOARD — typed `echo "a"` → `a`; no more `Invalid error` spam):** typing `ls` produced `sbi_ecall_handler: Invalid error 108/115/13 for
+ext=0x2` — the characters (`l`, `s`, CR) reach OpenSBI v1.2 but its legacy
+`console_getchar` return check clamps them to "no key". DBCN's console read
+would be the clean answer but v1.2 predates it, so `boards/opi-rv/board.c3`
+now reads UART0 (DW-APB @ 0x10000000, reg-shift 2, 32-bit) directly:
+LSR(+0x14).DR, then RBR(+0). New per-board `CONSOLE_MMIO_PAGE` (0 = keep SBI:
+QEMU, Duo, sifive_u) is mapped kernel-only into every page table by
+`map_console_mmio()` (`process.c3` `create_process` + `entry.c3` `sys_rfork`,
+next to the PLIC pages) because the read runs under whichever process's satp is
+active. Output stays on SBI putchar. Verified on QEMU virt with a TEMPORARY
+raw-only variant (byte-wide, shift 0, no SBI fallback, so input working can only
+come from the new path) incl. across `rforktest`; committed QEMU/opi-qemu/Duo
+kernels are behaviourally unchanged (scripted logs identical bar one `sepc`).
+Disassembly of the Orange Pi `console_getchar` checked. On hardware, OpenSBI's
+PMP does let S-mode touch 0x10000000, as expected. `ls`/`cat` etc. report
+`command not found` on this board: those are programs on the filesystem and the
+board has no storage driver yet (only shell builtins exist) — the `"sd"` device
+entry + retargeted `dw_mshc.c3` (sdio1) is the next step.
+
+---
+
 ## 2026-09-19 — device table: the kernel stops knowing what each driver's hardware is (branch `device-table`), and c3c 0.8.4 broke every kernel boot
 
 **Prompted by:** "the services have some stuff related to them mapped

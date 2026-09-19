@@ -6,6 +6,27 @@ plan; it mirrors how the Milk-V Duo port was sequenced (a `board`
 module seam first, then one peripheral at a time, each verified before
 the next).
 
+> **CORRECTION 2026-09-19 — the "flaky SD probe" below was the wrong device.**
+> The microSD slot is **`mmc 1`** (sdio1, `0x16020000`, PLIC IRQ 75), not
+> `mmc 0`. `mmc 0` is sdio0 @ `0x16010000`, the AP6256 Wi-Fi's SDIO — not an SD
+> card, so U-Boot's `Card did not respond to voltage select! : -110` for it is
+> expected noise, not a bug. A vendor-Debian boot log shows the distro boot
+> reading `/extlinux/extlinux.conf`, `/uInitrd`, `/Image` and the dtb from
+> `MMC1` at ~21 MiB/s. Everything below that blames a "known upstream U-Boot
+> dw_mmc voltage-switch bug", the ground-loop/isolator experiments, and the
+> USB-mass-storage workaround was chasing that misreading (mainline
+> `jh7110-orangepi-rv.dts` had it right all along: `&mmc0` carries the Wi-Fi,
+> `&mmc1` has `cd-gpios`). The real fix for booting without USB is just
+> `load mmc 1:1 ...`. **It works, unattended (2026-09-19):** the vendor U-Boot
+> imports `/vf2_uEnv.txt` from the boot partition and runs its `boot2`
+> variable, so `boards/opi-rv/vf2_uEnv.txt` (`boot2=load mmc 1:1 ...
+> kernel_opi.bin; go 0x40200000`) starts racccoon before the Linux boot is
+> tried; `scripts/flash_opi.sh` installs it. (`boot.scr` is never run by this
+> chain — it dies on `"distro_boot_env_test" not defined` — so the old
+> `boot.cmd` was removed.) The historical text is left as written for the record. Still true: `bootelf` on the ELF
+> crashes in this U-Boot (use the raw `.bin` + `go`), and OpenSBI's legacy
+> `console_getchar` bug is separate and unaffected.
+
 ## The board
 
 Orange Pi RV = **StarFive JH7110** SoC (same as VisionFive 2, Star64,
@@ -20,7 +41,7 @@ apply):
 | Timebase | 4 MHz (`timebase-frequency = <4000000>`) |
 | Debug UART | UART0 (8250/DW-APB) @ `0x10000000` |
 | Firmware | U-Boot SPL → OpenSBI (fw_dynamic, M-mode) → U-Boot proper (S-mode) → distro |
-| Storage | Synopsys DW-MSHC (`snps,dw-mshc` / `starfive,jh7110-mmc`), sdio0 `0x16010000`, sdio1 `0x16020000` |
+| Storage | Synopsys DW-MSHC (`snps,dw-mshc` / `starfive,jh7110-mmc`): `mmc0`/sdio0 `0x16010000` = **Wi-Fi** SDIO (IRQ 74); `mmc1`/sdio1 `0x16020000` = **the microSD slot** (IRQ 75, cd-gpio 41) |
 | Ethernet | 2× `starfive,jh7110-dwmac` (Synopsys DWMAC 5.20), gmac0 `0x16030000`, gmac1 `0x16040000`, **external** PHY on the RJ45 |
 | USB | Cadence USBSS-DRD (`cdns,usb3`) @ `0x10100000` |
 | Pinctrl / GPIO | `starfive,jh7110-sys-pinctrl` @ `0x13040000` |
@@ -92,11 +113,11 @@ prompt. No filesystem (an empty `board::DEVICES` table), so this is purely:
 BSS clear → trap vector → `plic_init` → FPU enable → timer interrupts →
 idle + echod + shell processes → cooperative scheduler → prompt.
 
-- Get the ELF onto an SD card next to the vendor image, load + run from
-  U-Boot: `load mmc 0:1 0x40200000 kernel_opi.elf ; bootelf 0x40200000`
-  (device 0 = `sdio0@16010000`, confirmed the real SD slot on this
-  board — device 1 has no partition, likely the onboard AP6256 WiFi's
-  SDIO interface, not a second card slot).
+- Get the kernel onto the SD card's boot partition next to the vendor image,
+  load + run from U-Boot: `load mmc 1:1 0x40200000 kernel_opi.bin ; go
+  0x40200000` (**corrected 2026-09-19**: the microSD is `mmc 1` = sdio1
+  `0x16020000`; `mmc 0` is the Wi-Fi's SDIO. `bootelf` on the ELF crashes
+  this U-Boot, hence the raw `.bin` + `go`).
 - Verify against the four open questions above (console, hart/context,
   `rdtime`, and that the vendor U-Boot's `bootelf` really does jump in
   S-mode — it should; U-Boot proper on JH7110 runs S-mode under
@@ -434,9 +455,10 @@ does **not** have, in order of bring-up priority:
   4. `DWMCI_DATA` offset is VERID-gated (0x200 for ≥ 0x240A; StarFive is
      0x270A) — `dw_reg_verid_check()` asserts it at init.
 
-DT-sourced facts already in the file: base `0x16010000`, PLIC IRQ 74,
-`fifo-depth` 32, `fifo-watermark-aligned`, sys_syscon sample-phase field
-`<0x13030000 + 0x14, shift 26, mask 0x7c000000>`.
+DT-sourced facts already in the file (**corrected 2026-09-19 to mmc1 / sdio1,
+the microSD; the first draft used mmc0, the Wi-Fi**): base `0x16020000`, PLIC
+IRQ 75, `fifo-depth` 32, `fifo-watermark-aligned`, sys_syscon sample-phase
+field `<0x13030000 + 0x9c, shift 1, mask 0x3e>`.
 
 Build integration when ready: `scripts/build_opi{,_qemu}.sh` rebuild
 `sdd` from `dw_mshc.c3 + sdd.c3` (a 1-line `build_user_program`

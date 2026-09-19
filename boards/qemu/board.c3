@@ -180,6 +180,13 @@ const EXEC_MAX_IMAGE_SIZE = 33554432;
 // (boards/duo/board.c3) — 64 MiB DRAM total.
 const uptr HEAP_MAX_BYTES = 512 * 1024 * 1024;
 
+// Console input: 0 = read it through the SBI legacy getchar (sbi::__getchar),
+// which works on QEMU and the Duo. A board whose firmware mangles that call
+// sets this to the UART's page and does the read itself in console_getchar()
+// (see boards/opi-rv/board.c3); process.c3's map_console_mmio then maps it
+// kernel-only into every page table.
+const uptr CONSOLE_MMIO_PAGE = 0;
+
 fn void plic_init()
 {
 	// Runs from kernel_main *before* the first switch_context — i.e.

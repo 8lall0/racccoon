@@ -1,0 +1,18 @@
+# racccoon on the Orange Pi RV — boots the kernel straight off the microSD.
+#
+# The vendor U-Boot (2021.10-orangepi, StarFive VF2 base) tries mmc1 first,
+# loads /vf2_uEnv.txt from the boot partition, `env import`s it, then runs a
+# variable called `boot2` (it logs '"boot2" not defined' when this file is
+# absent). Defining boot2 here means racccoon starts before the vendor
+# distro/extlinux Linux boot is even attempted — nothing is written to the
+# board's SPI flash, and removing this file (or extlinux.conf.bak -> back)
+# restores the vendor Debian boot.
+#
+# mmc 1 = sdio1 @ 0x16020000 = the microSD slot. (mmc 0 is the Wi-Fi's SDIO —
+# its `Card did not respond to voltage select! : -110` is expected noise.)
+# 1:1 = the FAT `bootfs` partition (partition 1 of the GPT vendor image).
+# Raw .bin + `go`, NOT `bootelf` on the ELF: bootelf crashes this U-Boot.
+# 0x40200000 = kernel_opi.bin's link + load address (boards/opi-rv/kernel.ld).
+#
+# scripts/flash_opi.sh installs this file (as vf2_uEnv.txt and uEnv.txt).
+boot2=echo racccoon: loading kernel_opi.bin from mmc 1:1...; load mmc 1:1 0x40200000 kernel_opi.bin; go 0x40200000

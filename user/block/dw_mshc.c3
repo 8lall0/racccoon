@@ -22,16 +22,19 @@ module user;
 //   by Rockchip / Allwinner / Exynos / Hi3798, very well trodden).
 // JH7110 glue: Linux `drivers/mmc/host/dw_mmc-starfive.c` and the
 //   mainline devicetree `arch/riscv/boot/dts/starfive/jh7110.dtsi`
-//   `mmc@16010000` node:
-//     reg          = <0x16010000 0x10000>
-//     interrupts   = <74>                       (PLIC source -> IRQ_SDHCI)
+//   `mmc@16020000` (mmc1 / sdio1) node — THE MICROSD SLOT on the Orange Pi RV
+//   (mmc0 @ 0x16010000 is the AP6256 Wi-Fi's SDIO; corrected 2026-09-19 from
+//   the U-Boot boot log + the board devicetree, this draft originally
+//   targeted mmc0):
+//     reg          = <0x16020000 0x10000>
+//     interrupts   = <75>                       (PLIC source -> the "sd" entry's irq)
 //     fifo-depth   = <32>
 //     fifo-watermark-aligned;
-//     clocks       = SDIO0_AHB ("biu"), SDIO0_SDCARD ("ciu")
-//     resets       = SDIO0_AHB ("reset")
-//     starfive,sysreg = <&sys_syscon 0x14 0x1a 0x7c000000>
-//                        (sample-phase field: syscon off 0x14, shift 26,
-//                         mask 0x7c000000)
+//     clocks       = SDIO1_AHB ("biu"), SDIO1_SDCARD ("ciu")
+//     resets       = SDIO1_AHB ("reset")
+//     starfive,sysreg = <&sys_syscon 0x9c 0x1 0x3e>
+//                        (sample-phase field: syscon off 0x9c, shift 1,
+//                         mask 0x3e)
 // The SD Physical Layer command sequence in dw_enumerate() is
 // controller-agnostic and copied verb-for-verb from sdhci.c3's
 // sdd_enumerate() — only dw_send_cmd() differs from its SDHCI sibling.
@@ -66,7 +69,7 @@ module user;
 // scripts/build_opi_qemu.sh rebuild `sdd` from `dw_mshc.c3 + sdd.c3`
 // before the link step (a 1-line build_user_program override), and add an
 // "sd" entry to board::DEVICES in boards/opi-rv/board.c3 (MMIO page,
-// IRQ 74, DMA region — see docs/opi-rv-plan.md on which sdio is the SD slot). sdd.c3 itself needs no
+// IRQ 75, DMA region — sdio1 @ 0x16020000 is the SD slot, see docs/opi-rv-plan.md). sdd.c3 itself needs no
 // change — it only calls the four names this file also exports
 // (dw-prefixed here vs sd-prefixed in sdhci.c3; see the shim aliases at
 // the bottom).
@@ -212,11 +215,11 @@ const ulong DW_BUSY_US        = 1000000;  // post-write DAT0-busy release
 // --- MMIO helpers. board:: is kernel-only; the base is duplicated here
 // as a plain const with its devicetree sourcing, same convention as
 // sdhci.c3's SD_BASE and diskd.c3's VIRTIO_BLK_PADDR.
-const uptr DW_BASE       = 0x16010000; // jh7110.dtsi mmc@16010000 (sdio0)
+const uptr DW_BASE       = 0x16020000; // jh7110.dtsi mmc@16020000 (mmc1 / sdio1 — the microSD slot)
 const uptr DW_SYSCON_BASE = 0x13030000; // starfive,jh7110-sys-syscon
-const uint DW_SYSCON_PHASE_OFF   = 0x14;       // starfive,sysreg arg 0
-const uint DW_SYSCON_PHASE_MASK  = 0x7C000000; // starfive,sysreg arg 2 (shift 26)
-const uint DW_SYSCON_PHASE_SHIFT = 26;
+const uint DW_SYSCON_PHASE_OFF   = 0x9C;       // starfive,sysreg arg 0 (mmc1; mmc0 would be 0x14)
+const uint DW_SYSCON_PHASE_MASK  = 0x3E;       // starfive,sysreg arg 2 (mmc1; mmc0: 0x7C000000)
+const uint DW_SYSCON_PHASE_SHIFT = 1;          // starfive,sysreg arg 1 (mmc1; mmc0: 26)
 
 fn uint dw_read(uint off)  { return mmio_read32((uptr)(DW_BASE + off)); }
 fn void dw_write(uint off, uint v) { mmio_write32((uptr)(DW_BASE + off), v); }

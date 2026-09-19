@@ -8,13 +8,14 @@
 # bring-up path is to keep the vendor's SD image (SPL + OpenSBI + U-Boot)
 # and load racccoon from U-Boot:
 #
-#   load mmc 1:1 0x40200000 kernel_opi.elf
-#   bootelf 0x40200000
+#   load mmc 1:1 0x40200000 kernel_opi.bin
+#   go 0x40200000
 #
-# `bootelf` honours the ELF entry point and jumps in S-mode with
-# a0=hartid, a1=dtb — racccoon ignores both. `go 0x40200000` also works
-# against kernel_opi.bin since .text.boot is first and load addr ==
-# link addr.
+# (mmc 1 is the microSD; mmc 0 is the Wi-Fi's SDIO. Use the raw .bin + `go`:
+# `bootelf` on the ELF crashes this vendor U-Boot.) .text.boot is first and
+# load addr == link addr, so `go` on the .bin lands on boot(). scripts/
+# flash_opi.sh installs it on the card and wires it into the vendor boot
+# chain via vf2_uEnv.txt so the board starts it unattended.
 #
 # OPI_TEST_SHELL=1 embeds shell_test.c3 (the *killtest / wasmtest / etc.
 # dev builtins) instead of the production shell — same trick as
@@ -104,5 +105,5 @@ STUB
   $LLVM_OBJCOPY -O binary build/kernel_opi.elf build/kernel_opi.bin
 
   echo "==> Done: build/kernel_opi.elf + build/kernel_opi.bin"
-  echo "    Load from the vendor U-Boot: load mmc 1:1 0x40200000 kernel_opi.elf ; bootelf 0x40200000"
+  echo "    Install on the card: OPI_BOOT_PART=/dev/sdX1 bash scripts/flash_opi.sh"
 )

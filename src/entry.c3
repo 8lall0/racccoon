@@ -722,6 +722,7 @@ fn void sys_rfork(Trap_frame* f) @noinline
 			map_device_page(child_table, board::PLIC_PRIORITY_PAGE, board::PLIC_PRIORITY_PAGE, PAGE_R | PAGE_W);
 			map_device_page(child_table, board::PLIC_ENABLE_PAGE, board::PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
 			map_device_page(child_table, board::PLIC_CLAIM_PAGE, board::PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
+			map_console_mmio(child_table);
 
 			ulong* parent_table2 = current_proc.page_table;
 			for (uint vpn2 = 0; vpn2 < 512; vpn2++)

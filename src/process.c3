@@ -1160,6 +1160,7 @@ fn Process* create_process(void* image, uint image_size)
 	map_device_page(page_table, board::PLIC_PRIORITY_PAGE, board::PLIC_PRIORITY_PHYS_PAGE, PAGE_R | PAGE_W);
 	map_device_page(page_table, board::PLIC_ENABLE_PAGE, board::PLIC_ENABLE_PHYS_PAGE, PAGE_R | PAGE_W);
 	map_device_page(page_table, board::PLIC_CLAIM_PAGE, board::PLIC_CLAIM_PHYS_PAGE, PAGE_R | PAGE_W);
+	map_console_mmio(page_table);
 
 	// Copy the process image into freshly allocated user pages, page by page.
 	char* img = image;
@@ -1351,6 +1352,20 @@ fn void setup_fsd_mappings(Process* proc, uint partition_start, bool is_secondar
 	{
 		map_disk_arena(proc);
 		disk_arena_fsd_pid = proc.pid;
+	}
+}
+
+// The console UART page, for boards that read console input straight from
+// the UART's registers (board::CONSOLE_MMIO_PAGE != 0) instead of through
+// the SBI legacy getchar — see boards/opi-rv/board.c3 for why. Like the
+// PLIC pages it must be in EVERY page table: SYS_GETCHAR's console read runs
+// in S-mode under whichever process's satp is active. Kernel-only (no
+// PAGE_U), identity-mapped. A no-op when the board reads input via SBI.
+fn void map_console_mmio(ulong* table)
+{
+	if (board::CONSOLE_MMIO_PAGE != 0)
+	{
+		map_device_page(table, board::CONSOLE_MMIO_PAGE, board::CONSOLE_MMIO_PAGE, PAGE_R | PAGE_W);
 	}
 }
 

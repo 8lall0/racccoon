@@ -103,8 +103,8 @@ const uint SMP_MAX_HARTS = 1;
 // and nothing in the kernel changes. What the entries will describe:
 //
 //  "sd"   Synopsys DesignWare MSHC ("snps,dw-mshc" / "starfive,jh7110-mmc",
-//         sdio0 @ 0x16010000, sdio1 @ 0x16020000 — see docs/opi-rv-plan.md
-//         on which one the microSD slot really is) — a DIFFERENT controller
+//         mmc0/sdio0 @ 0x16010000 = the AP6256 Wi-Fi's SDIO; mmc1/sdio1 @
+//         0x16020000 = THE MICROSD SLOT, PLIC IRQ 75 — see docs/opi-rv-plan.md) — a DIFFERENT controller
 //         from the Duo's Cvitek SDHCI (user/block/sdhci.c3), so it needs its
 //         own driver (Milestone 3), plus the syscrg clock/reset, sysreg
 //         syscon and pinmux pages it depends on.
@@ -170,19 +170,23 @@ fn void plic_complete(uint irq)
 // 0x10000000 — the 3-pin debug header on VisionFive 2, and the debug
 // serial on the Orange Pi RV. Same ecall path as QEMU and the Duo.
 //
-// Raw-MMIO fallback if the SBI console turns out not to be wired: UART0
-// is a stock 8250/DW-APB (reg-shift 2, reg-io-width 4) at 0x10000000,
-// same shape a small 16550 driver would target — replace just these two
-// function bodies, nothing else in the kernel changes. Not written
-// until proven necessary (same stance as boards/duo/board.c3).
+// Console output goes through the SBI (sbi::__putchar — works fine here).
+// Console INPUT does not: see CONSOLE_MMIO_PAGE above and console_getchar()
+// below, which read UART0's registers directly.
 fn int console_putchar(int ch)
 {
 	return sbi::__putchar(ch);
 }
 
+// Non-blocking, like the legacy call it replaces: the next received byte, or
+// -1 if none is waiting. LSR (offset 0x14 = reg 5 << 2) bit 0 is "data
+// ready"; reading RBR (offset 0) pops it. 32-bit accesses (reg-io-width 4).
+// The firmware keeps using the same UART for TX (SBI putchar) — RX is ours.
 fn int console_getchar()
 {
-	return sbi::__getchar();
+	uint lsr = mem::load((uint*)(CONSOLE_MMIO_PAGE + 0x14), 4, true);
+	if ((lsr & 1) == 0) { return -1; }
+	return (int)(mem::load((uint*)CONSOLE_MMIO_PAGE, 4, true) & 0xFF);
 }
 
 // Largest image SYS_EXEC will install (src/entry.c3's EXEC_MAX_IMAGE_SIZE)
@@ -193,3 +197,14 @@ fn int console_getchar()
 // kernel.ld's window is widened (docs/opi-rv-plan.md open question #4).
 const EXEC_MAX_IMAGE_SIZE = 1048576;
 const uptr HEAP_MAX_BYTES = 16 * 1024 * 1024;
+
+// Console input is read straight from UART0's registers, NOT through the SBI
+// legacy getchar: this board's OpenSBI (v1.2) logs `sbi_ecall_handler: Invalid
+// error N for ext=0x2 func=0x0` for every real keystroke and returns "no
+// char" instead — the legacy call hands the character back in a0, which that
+// version's return-value check treats as an error and clamps (newer OpenSBI
+// exempts SBI_EXT_0_1_CONSOLE_GETCHAR). Output (SBI putchar) is unaffected.
+// UART0 is a Synopsys DW-APB 8250-compatible at 0x10000000, reg-shift 2,
+// reg-io-width 4 (jh7110.dtsi `serial@10000000`); process.c3's
+// map_console_mmio maps this page kernel-only into every page table.
+const uptr CONSOLE_MMIO_PAGE = 0x10000000;
