@@ -37,15 +37,29 @@ fn void main(String[] args) {
     }
     char* path = args[0].ptr;
 
+    // Read in 1 KiB chunks with fs_read_at() until EOF (a short/zero read),
+    // writing exactly the bytes read — so a file of any size prints in full
+    // (this used to be ONE fs_read capped at 1023 bytes and silently dropped
+    // the rest, found cat-ing a 1141-byte file on the Orange Pi) and NUL bytes
+    // no longer end the output early. A trailing newline is added only if
+    // the file didn't end with one.
     char[1024] buf @noinit;
-    int len = fs_read(path, &buf, 1023);
-    if (len < 0) {
-        io::print("cat: ");
-        io::print((ZString)path);
-        io::print(": not found\n");
-        return;
+    uint off = 0;
+    char last = '\n';
+    for (;;) {
+        int got = fs_read_at(path, &buf, 1024, off);
+        if (got < 0) {
+            if (off == 0) {
+                io::print("cat: ");
+                io::print((ZString)path);
+                io::print(": not found\n");
+            }
+            return;
+        }
+        if (got == 0) { break; }
+        for (int i = 0; i < got; i++) { io::putchar(buf[i]); }
+        last = buf[got - 1];
+        off += (uint)got;
     }
-    buf[len] = 0;
-    io::print((ZString)&buf);
-    io::print("\n");
+    if (last != '\n') { io::print("\n"); }
 }
