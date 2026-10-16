@@ -11,17 +11,11 @@ import sbi;
 // PLIC base confirmed from an upstream Linux devicetree patch for
 // cv1800b.dtsi (compatible "sophgo,cv1800b-plic", "thead,c900-plic",
 // reg = <0x70000000 0x4000000>, riscv,ndev = 101) — not inferred from a
-// sibling chip. UNVERIFIED: whether the register *offsets* below
-// (priority/enable/threshold/claim, and the context-numbering
-// convention) actually match QEMU virt's SiFive-style PLIC just as
-// closely as the base address alone suggests — "thead,c900-plic" is
-// documented as PLIC-compatible, but that's not the same as confirmed
-// identical register layout. Kept identical to boards/qemu/board.c3's
-// formulas for now, on the working assumption that they match; if
-// Stage 2's real hardware boot shows interrupts don't behave (IRQs
-// never firing, or firing on the wrong claim value), this is the first
-// place to look — the `board` contract exists specifically so fixing
-// this means editing this file, not restructuring the kernel.
+// sibling chip. "thead,c900-plic" is SiFive-PLIC-compatible: the shared
+// register formulas in src/plic.c3 hold here (hardware-verified — SD and
+// USB run interrupt-driven on the real Duo; the one T-Head extra, the
+// S-mode access-delegation bit, is set by OpenSBI —
+// scripts/opensbi-thead-plic-delegate.patch).
 const uptr PLIC_BASE = 0x70000000;
 
 // T-Head C906's MAEE (Memory Attribute Extended Encoding) quirk. FSBL
@@ -70,20 +64,10 @@ const uint IRQ_VIRTIO_BLK = 0;
 // hart0 S-mode) pending real confirmation. See PLIC_BASE's comment.
 const uptr PLIC_S_CONTEXT = 1;
 
-const uptr PLIC_PRIORITY_BASE = PLIC_BASE;
-const uptr PLIC_ENABLE_BASE   = PLIC_BASE + 0x2000 + PLIC_S_CONTEXT * 0x80;
-const uptr PLIC_THRESHOLD     = PLIC_BASE + 0x200000 + PLIC_S_CONTEXT * 0x1000;
-const uptr PLIC_CLAIM         = PLIC_BASE + 0x200004 + PLIC_S_CONTEXT * 0x1000;
-
-const uptr PLIC_PRIORITY_PAGE = PLIC_PRIORITY_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
-const uptr PLIC_ENABLE_PAGE   = PLIC_ENABLE_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
-const uptr PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uptr)~(kernel::PAGE_SIZE - 1);
-// The Duo identity-maps the PLIC (it's at 0x70000000, far above any
-// 16 MiB Duo heap) — _PHYS_PAGE == _PAGE. The QEMU board aliases them
-// apart; see boards/qemu/board.c3's PLIC_BASE comment.
-const uptr PLIC_PRIORITY_PHYS_PAGE = PLIC_PRIORITY_PAGE;
-const uptr PLIC_ENABLE_PHYS_PAGE   = PLIC_ENABLE_PAGE;
-const uptr PLIC_CLAIM_PHYS_PAGE    = PLIC_CLAIM_PAGE;
+// The Duo identity-maps the PLIC: 0x70000000 is far above any 16 MiB Duo
+// heap, so virtual == physical. (QEMU virt aliases them apart — see
+// boards/qemu/board.c3's PLIC_BASE comment.) The driver is src/plic.c3.
+const uptr PLIC_PHYS_BASE = PLIC_BASE;
 
 // SDHCI-compliant SD controller (cvitek,cv180x-sd), sourced from
 // duo-buildroot-sdk's own U-Boot driver (drivers/mmc/cvitek/sdhci-cv180x.c)
@@ -92,7 +76,7 @@ const uptr PLIC_CLAIM_PHYS_PAGE    = PLIC_CLAIM_PAGE;
 // that actually owns this (pad/power/clock bring-up, standard SD command
 // sequence, PIO block transfers — no DMA, no PLIC involvement in v1).
 const uptr SD_MMIO_BASE = 0x04310000;
-const uint IRQ_SDHCI    = 36; // CV1800B SD0 PLIC source (cv180x dtsi SOC_PERIPHERAL_IRQ(20)=36) — armed in plic_init when INTERRUPT_DRIVEN_SD, routed via handle_trap like IRQ_USB
+const uint IRQ_SDHCI    = 36; // CV1800B SD0 PLIC source (cv180x dtsi SOC_PERIPHERAL_IRQ(20)=36) — armed at boot (Device.irq_armed) when INTERRUPT_DRIVEN_SD, routed via handle_trap like IRQ_USB
 
 // Interrupt-driven SD block-transfer completion — only meaningful with
 // the SDMA path (sdhci.c3 SDD_USE_DMA), where the controller moves the
@@ -282,7 +266,7 @@ const uptr ETH_SD1_SELPHY_PAGE = 0x05027000;
 // Efuse trim values live on two more, genuinely new pages.
 const uptr ETH_EFUSE_PAGE_0 = 0x03050000; // EPHY_EFUSE_VALID_BIT_BASE @ +0x120
 const uptr ETH_EFUSE_PAGE_1 = 0x03051000; // trim values @ +0x020, +0x024
-const uint IRQ_ETH            = 31; // declared, not wired into plic_init() yet — Phase 1 polls PHY link status directly, same reasoning as IRQ_USB above
+const uint IRQ_ETH            = 31; // declared, routed but irq_armed = false — Phase 1 polls PHY link status directly, same reasoning as IRQ_USB above
 
 // GPIO: Synopsys DesignWare APB GPIO (5 independent single-port banks,
 // confirmed via u-boot-2021.10/arch/riscv/dts/cv180x_base.dtsi's own
@@ -330,7 +314,7 @@ const uptr GPIO_PINMUX_PAGE = 0x03001000;
 //   eth-mac: MAC, its DMA block, embedded PHY, clock controller, LED pinmux,
 //        SD1 PHY-select, two efuse trim pages (level IRQ, cleared by ethd
 //        writing the DMA status register — registered now so interrupt-driven
-//        RX needs no kernel routing edit; never fires until plic_init arms it)
+//        RX needs no kernel routing edit; never fires until its irq_armed is set)
 //   gpio: banks A and C + the shared pinmux page — a fixed set of
 //        compile-time-known registers, no DMA region, no IRQ
 const Device[*] DEVICES = {
@@ -384,57 +368,6 @@ const uint FS_PARTITION_START_SECTOR = 2099200;
 // own sake, but racccoon's own namespace has nothing bound to it.
 const bool HAS_SECOND_FS_PARTITION = false;
 const uint FS_PARTITION_2_START_SECTOR = 2048;
-
-// Same register formulas as boards/qemu/board.c3 — see this file's own
-// PLIC_BASE comment for why these are unverified rather than assumed
-// safe.
-fn void plic_init()
-{
-	// Which sources get armed is not decided here — see plic_arm() and the
-	// Device table's `irq_armed` (sd: INTERRUPT_DRIVEN_SD, usb:
-	// INTERRUPT_DRIVEN_USB; eth is routed but deliberately left masked).
-	uint* threshold = (uint*)PLIC_THRESHOLD;
-	mem::store(threshold, 0u, 4, true);
-}
-
-// Arm one PLIC source for the S-mode context at boot: priority 1 (0 means
-// "never interrupt") plus its enable bit (one word per 32 sources). Called by
-// kernel.c3's plic_arm_devices() for every board Device with `irq_armed` —
-// bare mode, satp still 0, so PHYSICAL addresses. Runtime enable/disable of an
-// already-routed source is plic_set_enabled() below (through the mapped alias).
-fn void plic_arm(uint irq)
-{
-	uint* priority = (uint*)(PLIC_PRIORITY_BASE + (uptr)(4 * irq));
-	mem::store(priority, 1u, 4, true);
-	uint* enable = (uint*)(PLIC_ENABLE_BASE + (uptr)((irq / 32) * 4));
-	uint cur = mem::load(enable, 4, true);
-	mem::store(enable, cur | (1u << (irq % 32)), 4, true); // e.g. IRQ_SDHCI 36 -> second word, bit 4
-}
-
-// Toggle a single S-context enable bit. handle_trap disables a
-// level-triggered source (USB) the instant it fires — the device line
-// stays asserted until the driver clears it and this SoC re-traps
-// before the returned-to context runs an instruction, so leaving it
-// enabled is a hard hang. The driver re-arms via SYS_USB_IRQ_ARM.
-fn void plic_set_enabled(uint irq, bool on)
-{
-	uint* word = (uint*)(PLIC_ENABLE_BASE + (uptr)((irq / 32) * 4));
-	uint cur = mem::load(word, 4, true);
-	uint bit = 1u << (irq % 32);
-	mem::store(word, on ? (cur | bit) : (cur & ~bit), 4, true);
-}
-
-fn uint plic_claim()
-{
-	uint* claim = (uint*)PLIC_CLAIM;
-	return mem::load(claim, 4, true);
-}
-
-fn void plic_complete(uint irq)
-{
-	uint* complete = (uint*)PLIC_CLAIM;
-	mem::store(complete, irq, 4, true);
-}
 
 // Primary console path: same SBI-ecall mechanism as QEMU, unchanged.
 // The boot chain research (BootROM -> FSBL -> OpenSBI -> payload,

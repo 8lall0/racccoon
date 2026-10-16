@@ -91,14 +91,14 @@ fn int device_dma_count(int dev)
 
 // Arm, at boot, every PLIC source a board device asks for (`irq_armed`) —
 // replaces the hand-written per-board lists that used to live in each
-// plic_init(). The register writes themselves are the board's (board::plic_arm:
-// its PLIC layout/aliasing); WHICH sources is now data. Called right after
-// board::plic_init() (threshold), still bare-mode with interrupts off.
+// board's plic_init(). WHICH sources is data; the register writes are
+// plic.c3's plic_arm. Called right after plic_init() (threshold), still
+// bare-mode with interrupts off.
 fn void plic_arm_devices()
 {
 	foreach (d : board::DEVICES)
 	{
-		if (d.irq != 0 && d.irq_armed) { board::plic_arm(d.irq); }
+		if (d.irq != 0 && d.irq_armed) { plic_arm(d.irq); }
 	}
 }
 

@@ -719,9 +719,7 @@ fn void sys_rfork(Trap_frame* f) @noinline
 			{
 				map_page(child_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
 			}
-			map_device_page(child_table, board::PLIC_PRIORITY_PAGE, board::PLIC_PRIORITY_PAGE, PAGE_R | PAGE_W);
-			map_device_page(child_table, board::PLIC_ENABLE_PAGE, board::PLIC_ENABLE_PAGE, PAGE_R | PAGE_W);
-			map_device_page(child_table, board::PLIC_CLAIM_PAGE, board::PLIC_CLAIM_PAGE, PAGE_R | PAGE_W);
+			map_plic(child_table);
 			map_console_mmio(child_table);
 
 			ulong* parent_table2 = current_proc.page_table;
@@ -3099,7 +3097,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			Irq_route* arm_route = irq_route_by_pid(current_proc.pid);
 			if (arm_route != null)
 			{
-				board::plic_set_enabled(arm_route.irq, true);
+				plic_set_enabled(arm_route.irq, true);
 			}
 			f.a0 = 0;
 		case SYS_PARENT_INFO:
@@ -3347,7 +3345,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 // driver hasn't consumed yet. See docs/devlog.md.
 fn void service_pending_external_irq() @noinline
 {
-	uint irq = board::plic_claim();
+	uint irq = plic_claim();
 
 	Irq_route* route = irq_route_by_irq(irq);
 	if (route != null)
@@ -3364,7 +3362,7 @@ fn void service_pending_external_irq() @noinline
 	}
 	if (irq != 0)
 	{
-		board::plic_complete(irq);
+		plic_complete(irq);
 	}
 	// A `level` source (DWC2, SDHCI, dwmac) keeps its device status line
 	// asserted until the driver clears it; on this SoC a still-pending
@@ -3378,7 +3376,7 @@ fn void service_pending_external_irq() @noinline
 	// level=false) is the only case left enabled.
 	if (irq != 0 && (route == null || route.level))
 	{
-		board::plic_set_enabled(irq, false);
+		plic_set_enabled(irq, false);
 	}
 }
 

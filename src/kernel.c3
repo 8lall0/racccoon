@@ -129,7 +129,7 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 	// it in BSS; fixing it defensively now costs nothing.
 	write_csr("sscratch", ((uptr)&boot_trap_stack + boot_trap_stack.len) & ~(uptr)15);
 
-	board::plic_init();
+	plic_init();
 	plic_arm_devices();
 
 	// Turn the FPU on (sstatus.FS = Initial) — the C906 and QEMU virt both

@@ -4,7 +4,7 @@ import kernel;
 import sbi;
 
 // The `board` module is the one seam the rest of the kernel is allowed
-// to reach through for anything platform-specific — memory map, PLIC,
+// to reach through for anything platform-specific — memory map, PLIC base,
 // console. Adding a new target means adding a new `boards/<name>/`
 // directory implementing this same contract, not re-touching
 // entry.c3/process.c3/kernel.c3 again. See docs/devlog.md for why this
@@ -17,21 +17,15 @@ import sbi;
 // this refactor; that's the regression check for the abstraction
 // itself.
 
-// QEMU's virt machine PLIC. Register layout matches the standard
-// SiFive-style PLIC used across RISC-V platforms (same one xv6-riscv
-// targets): a small handful of scattered pages, not one contiguous
-// block, which is why the PLIC_*_PAGE constants below are three
-// separate pages, not a range. Addresses are uptr (pointer-sized, not
-// a fixed 32-bit uint); the *registers themselves* stay 32-bit values
-// (irq numbers, priority, enable bitmask) — PLIC register width is
-// fixed by the hardware spec, independent of hart XLEN.
-// Physical base of QEMU virt's PLIC.
+// QEMU's virt machine PLIC — a standard SiFive-style PLIC; the driver
+// itself (register formulas, claim/complete, map_plic) is src/plic.c3.
+// A board states only these three facts. Physical base of QEMU virt's PLIC.
 const uptr PLIC_PHYS_BASE = 0x0c000000;
 
 // PLIC_BASE is the *virtual* base the kernel dereferences the PLIC
-// through (all the PLIC_* register constants below derive from it), and
-// the base of the three kernel-only pages create_process maps into
-// every process's page table.
+// through (src/plic.c3's register constants derive from it), and the
+// base of the three kernel-only pages map_plic maps into every
+// process's page table.
 //
 // NOT identity-mapped to PLIC_PHYS_BASE: 0x0c000000 is only ~192 MiB
 // up, right in the middle of the userspace virtual range (USER_BASE
@@ -65,24 +59,6 @@ const uint IRQ_VIRTIO_BLK = 1;
 // context 2*hart for M-mode and 2*hart+1 for S-mode; single-hart S-mode
 // kernel, so context 1.
 const uptr PLIC_S_CONTEXT = 1;
-
-const uptr PLIC_PRIORITY_BASE = PLIC_BASE;                                    // + 4*irq
-const uptr PLIC_ENABLE_BASE   = PLIC_BASE + 0x2000 + PLIC_S_CONTEXT * 0x80;    // + (irq/32)*4, bit irq%32
-const uptr PLIC_THRESHOLD     = PLIC_BASE + 0x200000 + PLIC_S_CONTEXT * 0x1000;
-const uptr PLIC_CLAIM         = PLIC_BASE + 0x200004 + PLIC_S_CONTEXT * 0x1000;
-
-// Page-aligned bases of the distinct pages the registers above fall in
-// (PLIC_ENABLE_BASE and PLIC_THRESHOLD/PLIC_CLAIM aren't page-aligned
-// themselves), for process.c3's create_process to map into every
-// process's page table — _PAGE is the virtual page it maps at,
-// _PHYS_PAGE the physical PLIC page it points to. (On the Duo the two
-// are equal; here they differ — see PLIC_BASE's comment.)
-const uptr PLIC_PRIORITY_PAGE = PLIC_PRIORITY_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
-const uptr PLIC_ENABLE_PAGE   = PLIC_ENABLE_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
-const uptr PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uptr)~(kernel::PAGE_SIZE - 1);
-const uptr PLIC_PRIORITY_PHYS_PAGE = (PLIC_PRIORITY_PAGE - PLIC_BASE) + PLIC_PHYS_BASE;
-const uptr PLIC_ENABLE_PHYS_PAGE   = (PLIC_ENABLE_PAGE - PLIC_BASE) + PLIC_PHYS_BASE;
-const uptr PLIC_CLAIM_PHYS_PAGE    = (PLIC_CLAIM_PAGE - PLIC_BASE) + PLIC_PHYS_BASE;
 
 // fsd.c3 (see its own header comment) adds this to every logical sector
 // number before touching the disk — see boards/duo/board.c3's matching
@@ -187,63 +163,6 @@ const uptr HEAP_MAX_BYTES = 512 * 1024 * 1024;
 // (see boards/opi-rv/board.c3); process.c3's map_console_mmio then maps it
 // kernel-only into every page table.
 const uptr CONSOLE_MMIO_PAGE = 0;
-
-fn void plic_init()
-{
-	// Runs from kernel_main *before* the first switch_context — bare-mode, satp
-	// still 0, so vaddr == paddr and the PLIC alias (PLIC_BASE, virtual, not
-	// mapped yet) would hit nothing: use the physical addresses. Which sources
-	// get armed is not decided here — see plic_arm() and the Device table.
-	uptr poff = PLIC_PHYS_BASE - PLIC_BASE;
-
-	// Threshold 0: forward any interrupt with priority > 0 (i.e. all of
-	// them, since we only ever set priority 1).
-	uint* threshold = (uint*)(PLIC_THRESHOLD + poff);
-	mem::store(threshold, 0u, 4, true);
-}
-
-// Arm one PLIC source for the S-mode context at boot: priority 1 (0 means
-// "never interrupt") plus its enable bit (one word per 32 sources). Called by
-// kernel.c3's plic_arm_devices() for every board Device with `irq_armed` —
-// bare mode, satp still 0, so PHYSICAL addresses. Runtime enable/disable of an
-// already-routed source is plic_set_enabled() below (through the mapped alias).
-fn void plic_arm(uint irq)
-{
-	uptr poff = PLIC_PHYS_BASE - PLIC_BASE;
-	uint* priority = (uint*)(PLIC_PRIORITY_BASE + poff + (uptr)(4 * irq));
-	mem::store(priority, 1u, 4, true);
-	uint* enable = (uint*)(PLIC_ENABLE_BASE + poff + (uptr)((irq / 32) * 4));
-	uint cur = mem::load(enable, 4, true);
-	mem::store(enable, cur | (1u << (irq % 32)), 4, true);
-}
-
-// Claiming an IRQ both tells us which one fired and acknowledges it to
-// the PLIC (clears it from pending) — returns 0 if nothing is actually
-// pending (spurious claim).
-fn uint plic_claim()
-{
-	uint* claim = (uint*)PLIC_CLAIM;
-	return mem::load(claim, 4, true);
-}
-
-// Must be called after handling an IRQ obtained via plic_claim(), or the
-// PLIC will never forward that source again.
-fn void plic_complete(uint irq)
-{
-	uint* complete = (uint*)PLIC_CLAIM;
-	mem::store(complete, irq, 4, true);
-}
-
-// See boards/duo/board.c3's plic_set_enabled — kept here for symbol
-// parity (shared kernel code calls it). Never exercised on QEMU
-// (no "usb" device, usbd never spawned).
-fn void plic_set_enabled(uint irq, bool on)
-{
-	uint* word = (uint*)(PLIC_ENABLE_BASE + (uptr)((irq / 32) * 4));
-	uint cur = mem::load(word, 4, true);
-	uint bit = 1u << (irq % 32);
-	mem::store(word, on ? (cur | bit) : (cur & ~bit), 4, true);
-}
 
 // QEMU's OpenSBI wires its console extension straight to the virt
 // board's UART — the ecall round trip already proven working since the

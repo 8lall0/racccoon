@@ -76,22 +76,10 @@ const uint IRQ_VIRTIO_BLK = 0;
 // it shows up.
 const uptr PLIC_S_CONTEXT = 2;
 
-const uptr PLIC_PRIORITY_BASE = PLIC_BASE;                                     // + 4*irq
-const uptr PLIC_ENABLE_BASE   = PLIC_BASE + 0x2000 + PLIC_S_CONTEXT * 0x80;     // + (irq/32)*4, bit irq%32
-const uptr PLIC_THRESHOLD     = PLIC_BASE + 0x200000 + PLIC_S_CONTEXT * 0x1000;
-const uptr PLIC_CLAIM         = PLIC_BASE + 0x200004 + PLIC_S_CONTEXT * 0x1000;
-
-const uptr PLIC_PRIORITY_PAGE = PLIC_PRIORITY_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
-const uptr PLIC_ENABLE_PAGE   = PLIC_ENABLE_BASE & (uptr)~(kernel::PAGE_SIZE - 1);
-const uptr PLIC_CLAIM_PAGE    = PLIC_CLAIM & (uptr)~(kernel::PAGE_SIZE - 1);
-
 // PLIC_BASE IS the physical address (0x0c000000, well below DRAM's
 // 0x80000000 base here, so no QEMU-`virt`-style aliasing is needed).
 // Identity-mapped, same stance as boards/opi-rv/board.c3.
 const uptr PLIC_PHYS_BASE = PLIC_BASE;
-const uptr PLIC_PRIORITY_PHYS_PAGE = PLIC_PRIORITY_PAGE;
-const uptr PLIC_ENABLE_PHYS_PAGE   = PLIC_ENABLE_PAGE;
-const uptr PLIC_CLAIM_PHYS_PAGE    = PLIC_CLAIM_PAGE;
 
 // Kept at 1 for the Stage-1 boot-to-shell harness: racccoon runs on
 // whichever single U54 OpenSBI hands it. Launch with `-smp 2` (the
@@ -120,48 +108,6 @@ const uint FS_PARTITION_2_START_SECTOR = 0;
 // forced-preemption tick just lands every real second here (arm_timer is
 // passed TIMEBASE_HZ = "one second of ticks").
 const ulong TIMEBASE_HZ = 1000000;
-
-// Only the block-device IRQ would ever be armed here, and this harness
-// has no block device — QEMU-shaped minimum: threshold 0, nothing else.
-fn void plic_init()
-{
-	uint* threshold = (uint*)PLIC_THRESHOLD;
-	mem::store(threshold, 0u, 4, true);
-}
-
-// Arm one PLIC source for the S-mode context at boot: priority 1 (0 means
-// "never interrupt") plus its enable bit (one word per 32 sources). Called by
-// kernel.c3's plic_arm_devices() for every board Device with `irq_armed` —
-// bare mode, satp still 0, so PHYSICAL addresses. Runtime enable/disable of an
-// already-routed source is plic_set_enabled() below (through the mapped alias).
-fn void plic_arm(uint irq)
-{
-	uint* priority = (uint*)(PLIC_PRIORITY_BASE + (uptr)(4 * irq));
-	mem::store(priority, 1u, 4, true);
-	uint* enable = (uint*)(PLIC_ENABLE_BASE + (uptr)((irq / 32) * 4));
-	uint cur = mem::load(enable, 4, true);
-	mem::store(enable, cur | (1u << (irq % 32)), 4, true);
-}
-
-fn void plic_set_enabled(uint irq, bool on)
-{
-	uint* word = (uint*)(PLIC_ENABLE_BASE + (uptr)((irq / 32) * 4));
-	uint cur = mem::load(word, 4, true);
-	uint bit = 1u << (irq % 32);
-	mem::store(word, on ? (cur | bit) : (cur & ~bit), 4, true);
-}
-
-fn uint plic_claim()
-{
-	uint* claim = (uint*)PLIC_CLAIM;
-	return mem::load(claim, 4, true);
-}
-
-fn void plic_complete(uint irq)
-{
-	uint* complete = (uint*)PLIC_CLAIM;
-	mem::store(complete, irq, 4, true);
-}
 
 // QEMU's OpenSBI for sifive_u wires the SBI console (DBCN + legacy
 // putchar/getchar) to the SiFive UART at 0x10010000. Same ecall path as

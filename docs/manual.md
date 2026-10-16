@@ -1031,16 +1031,20 @@ isn't listed.
 
 ## 12. Board abstraction & porting
 
-`module board` is the **only** platform seam. `boards/qemu/board.c3` and
-`boards/duo/board.c3` each export the same set of names; the kernel and
+`module board` is the **only** platform seam. Every `boards/<name>/board.c3`
+(`qemu`, `duo`, `opi-rv`, `opi-rv-qemu`) exports the same set of names; the kernel and
 servers `import board` and never `#ifdef`.
 
 What a board provides:
 
-- **PLIC** layout (`PLIC_*_BASE`, `plic_init/plic_arm/claim/complete/set_enabled`).
-  `plic_init` only sets the threshold; **which sources get armed at boot is data** —
-  a `Device` with `irq_armed` in `DEVICES` — and `plic_arm(irq)` is the board's
-  priority + enable write for one source (`plic_arm_devices()`, `device.c3`).
+- **PLIC** placement — three constants: `PLIC_PHYS_BASE` (physical),
+  `PLIC_BASE` (the virtual address the kernel uses once paging is on;
+  identity on real boards, aliased to `0x7a000000` on QEMU virt) and
+  `PLIC_S_CONTEXT` (1 on QEMU virt/Duo, 2 on the JH7110/sifive_u). The driver
+  itself — register formulas, `plic_init` (threshold only), `plic_arm`,
+  `plic_claim`/`plic_complete`/`plic_set_enabled`, and `map_plic(page_table)` —
+  is shared, in `src/plic.c3`. **Which sources get armed at boot is data**: a
+  `Device` with `irq_armed` in `DEVICES` (`plic_arm_devices()`, `device.c3`).
 - **PTE bits** — `PTE_DEVICE_BITS` (the Duo needs bit 63 set for
   strong-ordered MMIO; getting this wrong caused the "PLIC storm").
 - **`DEVICES`** — a `Device[]` table (type in `src/device.c3`), one entry
