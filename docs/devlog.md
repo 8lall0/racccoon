@@ -4,6 +4,66 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-17 — refactor: one shared PLIC driver, one shared kernel build path (branch `plic-buildlib`)
+
+A refactor survey after the device-table / Orange Pi work found the two
+multi-board copies worth removing (the 09-05 backlog items — split `entry.c3`'s
+syscall layer, split `shell_test.c3` — are still open).
+
+**`b371c55` — `src/plic.c3`.** `plic_init/arm/claim/complete/set_enabled` and
+the ENABLE/THRESHOLD/CLAIM/`*_PAGE` formulas were byte-identical in all four
+`boards/*/board.c3` (every target is a stock SiFive-layout PLIC). They now live
+once in `module kernel`; a board states only `PLIC_PHYS_BASE`, `PLIC_BASE`
+(virtual) and `PLIC_S_CONTEXT` (the Duo gained `PLIC_PHYS_BASE = PLIC_BASE`).
+The bare-mode boot writes go through `PLIC_PHYS_OFFSET` (0 except on QEMU
+virt). New `map_plic(page_table)` replaces the two hand-written triples of
+`map_device_page` calls — and **fixes a latent bug**: `SYS_RFORK`'s child table
+mapped the PLIC pages *virtual → virtual*, which is wrong on QEMU virt (alias
+0x7a000000, PLIC physically at 0x0c000000; a forked child's context would
+claim from empty PCIe window space). Never seen fail — real boards are
+identity-mapped, and on QEMU an unclaimed IRQ just gets claimed later from
+another context. Checked: the compiled addresses per board match the old
+values (QEMU threshold/arm at phys 0x0c201000/0x0c002080 and claim via
+0x7a201004; Duo 0x70201000/0x70002080/0x70201004; JH7110 + sifive_u context 2
+→ 0x0c202000/0x0c002100/0x0c202004), and `boot()` is still first in every
+image. QEMU virt (single image + dual image: runtest2/mounttest/p9fstest/
+bigreadtest/elftest2/argvtest2/pathtest2, `ns` byte-identical to master) and
+the sifive_u harness (faulttest, killtest, rforktest, threadtest,
+hungservertest, devinfotest, maptest, oomtest) all green.
+
+**`d4f376e` — `scripts/lib_kernel.sh`.** The four kernel build scripts each
+carried the toolchain defaults, the c3c `--emit-llvm` + `llc` medany loop, the
+`shell_test` re-embed stub and the 10-server `ld.lld` list (adding a server =
+edit four scripts). Now `kernel_compile` / `kernel_test_shell_obj` /
+`kernel_link` + one `KERNEL_SERVERS` list; board scripts keep only their own
+bits (opi's `SDD_SOC_SRC` and `.bin`). The build is deterministic, so this was
+checked by hash: kernel.elf + .map, kernel_duo.elf (production and
+`DUO_TEST_SHELL=1`), kernel_opi.elf + .bin, kernel_opi_qemu.elf
+(`OPI_TEST_SHELL=1`) are **byte-identical** to the old scripts' output. The
+manual's "servers embedded in the kernel" note was stale since the device table
+(`create_process` / `setup_*_mappings`); rewritten.
+
+**Pre-existing, found while testing, not chased:** on QEMU virt (default
+`disk.img`), `storagekilltest` followed by `wasmtest` hangs `wasmtest` — **on
+master too**, identical. `netdkilltest` / `hungservertest` before `wasmtest`
+are fine; `wasmtest` alone is fine. Likely the same storage-respawn family as
+the `fsdkilltest` memory corruption (the respawned diskd/fsd pair stops serving
+a larger read). Also seen, also pre-existing and expected: `runtest2`,
+`mounttest`, `p9fstest`, `bigreadtest` fail on the single `disk.img` — they
+need `disk_dual.img`, where they pass.
+
+Also: a transient host-side `Bus error` killed `c3c` and `ld.lld` once each
+mid-build (disk and /tmp fine); a straight re-run built clean.
+
+**Not on hardware yet.** The Duo and Orange Pi kernels build (and are
+byte-identical to what the old scripts produce from this source), but the PLIC
+change has not been booted on either board. Together with `412618a`/`5dc5557`
+(also unbooted), one flash per board covers all three: Duo — root prompt,
+`ls /`, `storagekilltest`, `usbdkilltest`, SD + USB still interrupt-driven;
+Orange Pi — boots to a shell, mounts the ext2 root, `cat` a file.
+
+---
+
 ## 2026-09-19 (late) — small cleanups: PLIC arming and the default namespace come from tables; master pushed
 
 **Pushed** the hardware-verified state to `origin/master` (`9a495cc..ff2646e`, plain
