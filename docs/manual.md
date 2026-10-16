@@ -911,9 +911,11 @@ build_user_program_stdio countdown $STDIO_COMMON user/bin/countdown.c3
 4. `scripts/build.sh`, then run — the shell finds `/bin/hello` via
    `exec_path`.
 
-Servers embedded in the kernel (not in `/bin`) additionally need a
-`create_process()` call in `src/kernel.c3` and, if they touch hardware,
-a `setup_*_mappings()`.
+Servers embedded in the kernel (not in `/bin`) instead need the name in
+`KERNEL_SERVERS` (`scripts/lib_kernel.sh`, which every board's link step
+uses), the `_binary_<name>_bin_*` externs + a `service_boot()` call in
+`src/kernel.c3`, and — if they own hardware — a `DEVICES` entry in each
+board that has it (see §12).
 
 ### 9.6 The build, end to end
 
@@ -922,13 +924,16 @@ a `setup_*_mappings()`.
 binary` to a flat image, then wraps it as a linkable `.bin.o` via
 `llvm-mc` + `.incbin` (an `objcopy -Ibinary` wrapper has the wrong
 soft-float `e_flags` and won't link against the hard-float kernel). The
-kernel build (`scripts/build.sh`) then:
+kernel steps are shared by every board script (`scripts/lib_kernel.sh`):
 
-1. `c3c build racccoon --emit-llvm` — LLVM IR, because c3c has no
-   `--mcmodel`.
-2. `llc -code-model=medium -relocation-model=static` per `.ll` — the
-   default `small` model can't reach the kernel's link address on RV64.
-3. `ld.lld` the medany objects + every `*.bin.o` + `-T src/kernel.ld`.
+1. `kernel_compile` — `c3c build <target> --emit-llvm` (LLVM IR, because
+   c3c has no `--mcmodel`), then `llc -code-model=medium
+   -relocation-model=static` per `.ll` — the default `small` model can't
+   reach the kernel's link address on RV64.
+2. `kernel_test_shell_obj` (QEMU always; boards with `DUO_TEST_SHELL=1` /
+   `OPI_TEST_SHELL=1`) — re-embeds `shell_test.bin` as the shell.
+3. `kernel_link` — `ld.lld` the medany objects + the shell + every
+   `KERNEL_SERVERS` `*.bin.o` + the board's linker script.
 
 ---
 
@@ -1214,6 +1219,9 @@ scripts/
   build.sh              kernel + user + QEMU disk images
   build_user.sh         the two build paths + every program's build line
   build_duo.sh          the Duo kernel (racccoon-duo target)
+  build_opi.sh          the Orange Pi RV kernel (+ raw .bin for U-Boot)
+  build_opi_qemu.sh     the QEMU sifive_u harness for the Orange Pi port
+  lib_kernel.sh         shared kernel compile / test-shell / link steps
   reflash_duo.sh        repackage fip.bin on the SD card + flash (no sudo)
   populate_duo_bin.sh   seed /bin + the tree onto the Duo's ext2 partition
   launch64*.sh          QEMU boot variants

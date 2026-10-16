@@ -23,13 +23,7 @@
 
 set -e
 
-if [ -x /opt/riscv/bin/ld.lld ]; then
-  LLVM_LLD=${LLVM_LLD:-/opt/riscv/bin/ld.lld}
-else
-  LLVM_LLD=${LLVM_LLD:-ld.lld}
-fi
-LLC=${LLC:-llc}
-LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
+. "$(dirname "$0")/lib_kernel.sh"
 
 (
   cd "$(dirname "$0")/.."
@@ -39,68 +33,15 @@ LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
   # real board facts reach user code by syscall).
   SDD_SOC_SRC=user/block/dw_mshc.c3 bash scripts/build_user.sh
 
-  echo "==> Compiling kernel to LLVM IR (racccoon-opi target)..."
-  rm -rf build/obj build/llvm build/obj_medany build/kernel_opi.*
-  c3c build racccoon-opi --no-entry --safe=no --riscv-cpu=rvimac --riscv-abi=double --emit-llvm
-
-  # Same medium (medany) code-model workaround as scripts/build.sh /
-  # build_duo.sh — c3c has no --mcmodel, so recompile the IR through llc.
-  # The JH7110 load address (0x40200000) is actually within medlow's
-  # +/-2GiB-of-zero reach, unlike QEMU/Duo — but the toolchain is set up
-  # for medany and reusing the exact same objects the other boards build
-  # keeps one pipeline, so do it anyway.
-  echo "==> Recompiling IR with the medium (medany) code model..."
-  mkdir -p build/obj_medany
-  for f in build/llvm/elf-riscv64/*.ll; do
-    name=$(basename "$f" .ll)
-    $LLC -mtriple=riscv64-unknown-elf -mattr=+m,+a,+c,+f,+d \
-      -code-model=medium -relocation-model=static \
-      -filetype=obj -o "build/obj_medany/$name.o" "$f"
-  done
+  kernel_compile racccoon-opi kernel_opi
 
   SHELL_OBJ=build/user/shell.bin.o
   if [ "${OPI_TEST_SHELL:-0}" = "1" ]; then
     echo "==> OPI_TEST_SHELL=1 — embedding shell_test.c3 as the shell"
-    mkdir -p build/user_opi_shell
-    cp build/user/shell_test.bin build/user_opi_shell/shell.bin
-    (
-      cd build/user_opi_shell
-      cat > shell.bin.s <<'STUB'
-	.section .rodata._binary_shell_bin, "a"
-	.balign 8
-	.globl _binary_shell_bin_start
-_binary_shell_bin_start:
-	.incbin "shell.bin"
-	.globl _binary_shell_bin_end
-_binary_shell_bin_end:
-STUB
-      "${LLVM_MC:-llvm-mc}" --triple=riscv64 --mattr=+m,+a,+c,+f,+d --target-abi=lp64d \
-        --filetype=obj -o shell.bin.o shell.bin.s
-    )
-    SHELL_OBJ=build/user_opi_shell/shell.bin.o
+    SHELL_OBJ=$(kernel_test_shell_obj user_opi_shell)
   fi
 
-  # diskd/sdd/usbd/ethd/netd/gpiod are all linked in on every target even
-  # though board::HAS_* gates most of them from ever spawning on this one
-  # — kernel.c3 references every embedded-binary symbol unconditionally.
-  # Same as build_duo.sh.
-  echo "==> Linking kernel_opi.elf (with embedded shell)..."
-  $LLVM_LLD \
-    build/obj_medany/*.o \
-    "$SHELL_OBJ" \
-    build/user/echod.bin.o \
-    build/user/diskd.bin.o \
-    build/user/sdd.bin.o \
-    build/user/fsd.bin.o \
-    build/user/procd.bin.o \
-    build/user/envd.bin.o \
-    build/user/usbd.bin.o \
-    build/user/ethd.bin.o \
-    build/user/netd.bin.o \
-    build/user/gpiod.bin.o \
-    -T boards/opi-rv/kernel.ld \
-    -Map=build/kernel_opi.map \
-    -o build/kernel_opi.elf
+  kernel_link "$SHELL_OBJ" boards/opi-rv/kernel.ld kernel_opi
 
   $LLVM_OBJCOPY -O binary build/kernel_opi.elf build/kernel_opi.bin
 

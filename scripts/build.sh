@@ -2,15 +2,8 @@
 
 set -e
 
-# Prefer the /opt/riscv LLVM if it's installed, else fall back to the
-# system tools on PATH (an Arch host with llvm/lld packages, say).
-if [ -x /opt/riscv/bin/ld.lld ]; then
-  LLVM_LLD=${LLVM_LLD:-/opt/riscv/bin/ld.lld}
-else
-  LLVM_LLD=${LLVM_LLD:-ld.lld}
-fi
-LLC=${LLC:-llc}
-LLVM_OBJCOPY=${LLVM_OBJCOPY:-llvm-objcopy}
+# Toolchain defaults + the shared kernel compile/link steps.
+. "$(dirname "$0")/lib_kernel.sh"
 
 # ext2_seed_tree <hostdir> <destdir-on-image> <image>
 # Recursively copy a host directory into an ext2 image via debugfs
@@ -446,90 +439,15 @@ GOEOF
   # entry.
   bash scripts/mk_exfat_image.sh || echo "    (skipped — see scripts/mk_exfat_image.sh; exFAT boot test unavailable on this host)"
 
-  echo "==> Compiling kernel to LLVM IR..."
-  rm -rf build/obj build/llvm build/obj_medany build/kernel.*
-  c3c build racccoon --no-entry --safe=no --riscv-cpu=rvimac --riscv-abi=double --emit-llvm
+  kernel_compile racccoon kernel
 
-  # RV64 port: c3c's own object-file codegen only knows RISC-V's default
-  # "small"/medlow code model, which requires every absolute address it
-  # emits (every global variable, every string literal, every rodata
-  # constant) to fit in the signed 32-bit range — i.e. below 2GiB. This
-  # kernel boots at 0x80200000 (OpenSBI's fixed RV64 payload address,
-  # just past the 2GiB line), so under medlow *every* such reference is
-  # out of range; ld.lld catches this at link time
-  # (R_RISCV_HI20 out of range). c3c has no --mcmodel flag to ask for
-  # "medany" (PC-relative auipc-based addressing, valid across the full
-  # 64-bit space) — the standard, correct code model for exactly this
-  # situation, and what every real RV64 kernel (Linux, OpenSBI itself)
-  # actually uses. So we take the one escape hatch --emit-llvm gives us:
-  # recompile c3c's own LLVM IR ourselves via llc, this time asking for
-  # -code-model=medium (LLVM's name for RISC-V's "medany"). See
-  # docs/devlog.md for the full debugging story — this took a while to
-  # pin down.
-  echo "==> Recompiling IR with the medium (medany) code model..."
-  mkdir -p build/obj_medany
-  for f in build/llvm/elf-riscv64/*.ll; do
-    name=$(basename "$f" .ll)
-    $LLC -mtriple=riscv64-unknown-elf -mattr=+m,+a,+c,+f,+d \
-      -code-model=medium -relocation-model=static \
-      -filetype=obj -o "build/obj_medany/$name.o" "$f"
-  done
-
-  # QEMU embeds the *test* shell (user/shell_test.c3 — every dev/
-  # regression-test builtin this project has accumulated), not the
-  # trimmed production shell.bin the real Duo build embeds
-  # (scripts/build_duo.sh) — see docs/devlog.md. src/kernel.c3's
-  # _binary_shell_bin_start/_end symbols are board-agnostic and fixed by
-  # name, and objcopy -Ibinary derives the embedded symbol name from the
-  # input file's own basename — so shell_test.bin.o's symbols would come
-  # out named _binary_shell_test_bin_*, not matching. Re-embedding
-  # shell_test.bin under the literal name "shell.bin" in its own
-  # directory (not build/user/, which already holds the real
-  # build/user/shell.bin.o for Duo) sidesteps that without changing
-  # build_user.sh's own one-name-per-binary convention or touching
-  # kernel.c3 at all.
+  # QEMU always embeds the *test* shell (user/shell_test.c3), not the
+  # trimmed production shell the real boards embed by default — see
+  # lib_kernel.sh's kernel_test_shell_obj and docs/devlog.md.
   echo "==> Re-embedding the test shell as this kernel's own shell..."
-  mkdir -p build/user_qemu_shell
-  cp build/user/shell_test.bin build/user_qemu_shell/shell.bin
-  # llvm-mc + .incbin (see build_user.sh's matching comment): -Ibinary
-  # wrappers carry soft-float e_flags, which ld.lld now rejects against
-  # the rv64imafdc kernel.
-  (
-    cd build/user_qemu_shell
-    cat > shell.bin.s <<'STUB'
-	.section .rodata._binary_shell_bin, "a"
-	.balign 8
-	.globl _binary_shell_bin_start
-_binary_shell_bin_start:
-	.incbin "shell.bin"
-	.globl _binary_shell_bin_end
-_binary_shell_bin_end:
-STUB
-    "${LLVM_MC:-llvm-mc}" --triple=riscv64 --mattr=+m,+a,+c,+f,+d --target-abi=lp64d \
-      --filetype=obj -o shell.bin.o shell.bin.s
-  )
+  SHELL_OBJ=$(kernel_test_shell_obj user_qemu_shell)
 
-  echo "==> Linking kernel.elf (with embedded shell)..."
-  # Built rv64imafdc/lp64d (--riscv-abi=double above + llc -mattr=+f,+d), so
-  # LLVM emits hardware FP inline — no compiler-rt soft-float builtins to
-  # resolve, hence no libclang_rt.builtins-riscv64 needed. (Pre-FPU this
-  # linked against src/kernel/softfloat_stubs.c3's panic stubs instead.)
-  $LLVM_LLD \
-    build/obj_medany/*.o \
-    build/user_qemu_shell/shell.bin.o \
-    build/user/echod.bin.o \
-    build/user/diskd.bin.o \
-    build/user/sdd.bin.o \
-    build/user/fsd.bin.o \
-    build/user/procd.bin.o \
-    build/user/envd.bin.o \
-    build/user/usbd.bin.o \
-    build/user/ethd.bin.o \
-    build/user/netd.bin.o \
-    build/user/gpiod.bin.o \
-    -T src/kernel.ld \
-    -Map=build/kernel.map \
-    -o build/kernel.elf
+  kernel_link "$SHELL_OBJ" src/kernel.ld kernel
 
   echo "==> Done: build/kernel.elf"
 
