@@ -1409,11 +1409,11 @@ fn void interp()
             case OP_I64_LOAD:     uint e = mem_ea(fr, 8); vpush(*(long*)&g_mem[e]);
             case OP_F32_LOAD:     uint e = mem_ea(fr, 4); vpush((long)(uint)*(uint*)&g_mem[e]);
             case OP_F64_LOAD:     uint e = mem_ea(fr, 8); vpush(*(long*)&g_mem[e]);
-            case OP_I32_LOAD8_S:  uint e = mem_ea(fr, 1); vpush((long)(int)*(char*)&g_mem[e]);
+            case OP_I32_LOAD8_S:  uint e = mem_ea(fr, 1); vpush((long)(int)*(ichar*)&g_mem[e]);   // ichar: C3's char is UNSIGNED
             case OP_I32_LOAD8_U:  uint e = mem_ea(fr, 1); vpush((long)((uint)g_mem[e] & 0xff));
             case OP_I32_LOAD16_S: uint e = mem_ea(fr, 2); vpush((long)(int)*(short*)&g_mem[e]);
             case OP_I32_LOAD16_U: uint e = mem_ea(fr, 2); vpush((long)(uint)*(ushort*)&g_mem[e]);
-            case OP_I64_LOAD8_S:  uint e = mem_ea(fr, 1); vpush((long)*(char*)&g_mem[e]);
+            case OP_I64_LOAD8_S:  uint e = mem_ea(fr, 1); vpush((long)*(ichar*)&g_mem[e]);
             case OP_I64_LOAD8_U:  uint e = mem_ea(fr, 1); vpush((long)((ulong)g_mem[e] & 0xff));
             case OP_I64_LOAD16_S: uint e = mem_ea(fr, 2); vpush((long)*(short*)&g_mem[e]);
             case OP_I64_LOAD16_U: uint e = mem_ea(fr, 2); vpush((long)(ulong)*(ushort*)&g_mem[e]);
@@ -1526,9 +1526,9 @@ fn void interp()
             case OP_I32_WRAP_I64:     vpush((long)(int)vpop());
             case OP_I64_EXTEND_I32_S: vpush((long)(int)vpop());
             case OP_I64_EXTEND_I32_U: vpush((long)((ulong)(uint)vpop()));
-            case OP_I32_EXTEND8_S:    vpush((long)(int)(char)(int)vpop());
+            case OP_I32_EXTEND8_S:    vpush((long)(int)(ichar)(int)vpop());   // ichar: C3's char is UNSIGNED
             case OP_I32_EXTEND16_S:   vpush((long)(int)(short)(int)vpop());
-            case OP_I64_EXTEND8_S:    vpush((long)(char)vpop());
+            case OP_I64_EXTEND8_S:    vpush((long)(ichar)vpop());
             case OP_I64_EXTEND16_S:   vpush((long)(short)vpop());
             case OP_I64_EXTEND32_S:   vpush((long)(int)vpop());
 
