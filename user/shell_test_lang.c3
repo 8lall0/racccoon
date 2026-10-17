@@ -79,6 +79,30 @@ fn bool shell_test_lang_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
             putchar('\n');
         }
         print(wi_ok ? "wasitest: ok\n" : "wasitest: FAILED\n");
+    } else if (strcmp(cmd, "luatest") == 0) {
+        // Lua 5.4 (third_party/lua via WASI, /lib/lua.wasm): one -e chunk of
+        // self-checks, os.exit(0) only if every one holds. Exercises the
+        // interpreter-assisted setjmp/longjmp (error/pcall), coroutines,
+        // string/table libs and WASI file I/O. Kept small: /bin/wasm is slow.
+        char* lt_code = "local n=0 local function c(ok) n=n+1 if not ok then print('luatest: check '..n..' failed') os.exit(n) end end "
+            "c(select('#',pcall(error,'x'))==2) c(not pcall(function() local t=nil return t.k end)) "
+            "local ok,e=pcall(error,{code=7}) c(not ok and e.code==7) "
+            "c(('a,b,c'):gsub(',',';')=='a;b;c') c(string.format('%05.1f',3.14159)=='003.1') "
+            "local t={5,3,9,1} table.sort(t) c(table.concat(t,' ')=='1 3 5 9') "
+            "local co=coroutine.wrap(function(a) local b=coroutine.yield(a+1) return b*2 end) c(co(1)==2 and co(5)==10) "
+            "local f=io.open('tmp/luat.txt','w') f:write('hi\\n',42) f:close() f=io.open('tmp/luat.txt') c(f:read('l')=='hi' and f:read('n')==42) f:close() os.remove('tmp/luat.txt') "
+            "c(math.maxinteger+1==math.mininteger and 7//2==3 and 2^10==1024.0) "
+            "print('luatest: '..n..' checks ok') os.exit(0)";
+        char*[3] lt_av;
+        lt_av[0] = "/lib/lua.wasm"; lt_av[1] = "-e"; lt_av[2] = lt_code;
+        uint lt_gen = 0;
+        int lt_c = rfork(RFPROC, &lt_gen);
+        if (lt_c == 0) {
+            exec("bin/wasm", exec_buf(), exec_buf_max(), 0, &lt_av[0], 3);
+            exitcode(127);
+        }
+        int lt_code_rc = join(lt_c, lt_gen);
+        print(lt_code_rc == 0 ? "luatest: ok\n" : "luatest: FAILED\n");
     } else if (strcmp(cmd, "stdiotest") == 0) {
         // /bin/stdiotest (docs/devlog.md, "std::io on racccoon") —
         // a program built against the REAL c3 stdlib (std::io)

@@ -1,0 +1,5 @@
+#!rc
+# /bin/lua — Lua 5.4 (third_party/lua, unmodified) compiled to WASI and run
+# by /bin/wasm. Built by scripts/build_lua.sh. `lua` alone is the REPL
+# (quit with os.exit()); `lua script.lua args...` runs a script.
+wasm /lib/lua.wasm $*

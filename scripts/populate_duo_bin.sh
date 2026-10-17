@@ -114,6 +114,11 @@ rm -f "$MNT/.tiny.$$"
 # wasm fixtures (wasmtest).
 if ls build/wasm/*.wasm >/dev/null 2>&1; then
   for w in build/wasm/*.wasm; do cp "$w" "$MNT/$(basename "$w")"; done
+  if [ -f build/lua/lua.wasm ]; then
+    echo "==> Copying Lua: build/lua/lua.wasm -> /lib/lua.wasm, lib/lua/lua -> /bin/lua..."
+    cp build/lua/lua.wasm "$MNT/lib/lua.wasm"
+    cp lib/lua/lua "$MNT/bin/lua"
+  fi
 fi
 
 # TinyCC payload (roadmap §7.7/§7.8) — same tree scripts/seed_tcc.sh puts

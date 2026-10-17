@@ -4,6 +4,123 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-19 — Lua on racccoon: sleep(), interpreter-assisted setjmp/longjmp, a 7× faster /bin/wasm, and a FAT32 directory bug
+
+Three items: `poll_oneoff`, a real program on WASI, and interpreter speed.
+Doing them in that order paid off. Lua needed the first, and gave the
+third a benchmark worth optimising for.
+
+### poll_oneoff → sleep() works
+wasi-libc compiles `sleep`/`usleep`/`nanosleep` to one relative clock
+subscription. The shim now waits until the earliest clock deadline,
+`yield()`ing so the rest of the system runs (fd subscriptions are reported
+ready at once, since racccoon has no readiness API). Fixture `wasi_sleep`:
+200 / 300 / 1000 ms requested, 201 / 301 / 1000 ms measured in QEMU.
+
+### Lua 5.4.7, unmodified
+`third_party/lua` is a submodule of github.com/lua/lua at tag v5.4.7. The
+tag's files are byte-identical to the lua.org release tarball (checked
+file-by-file), plus `ltests.c`/`onelua.c`, which are excluded.
+`scripts/build_lua.sh` builds it with zig cc to `/lib/lua.wasm` (254 KB,
+959 functions), and `/bin/lua` is a two-line `#!` script.
+
+**The obstacle was setjmp.** Lua's `error`/`pcall` need setjmp/longjmp, and
+on wasm32 wasi-libc only provides them with the exception-handling proposal.
+That proposal needs interpreter support, and zig's LLVM crashed on it anyway
+("undefined tag symbol cannot be weak"). But `/bin/wasm` keeps its call
+frames explicitly, so it can implement them itself: `racccoon.setjmp` /
+`racccoon.longjmp` host imports, plus a `lib/wasm/include/setjmp.h` shim
+that maps the C names onto them. setjmp records the frame depth, resume ip,
+stack heights and mutable globals (the C stack pointer); longjmp restores
+them and pushes setjmp's second result.
+
+**The bug that design had at first:** it restored only the operand stack's
+*height*. clang pushes operands *before* the call (here the frame pointer
+it then stores setjmp's result through) and pops them after, so after a
+longjmp those slots held stale values. The result went through a garbage
+address and `setjmp` "returned 0" again, forever. An instrumented copy
+showed `B r=0` repeating. The fix snapshots the setjmp frame's operand-stack
+values and locals as well, the wasm analogue of a jmp_buf's registers.
+Fixture `wasi_sjlj`: a 200-deep recursion with 512-byte frames unwound
+twice, nested and reused buffers, val 0 → 1.
+
+Two libc gaps were stubbed (`lib/lua/racccoon_stubs.c`: `tmpfile`,
+`system`), plus `LUA_USE_C89` and a stubbed `lua_tmpnam`. Then everything
+worked on the first run: pcall with error messages, coroutines, string/table/
+math, io files and `os.time`. `luatest` packs 9 self-checks into one `-e`
+chunk, validated against native Lua first.
+
+**And a shell bug:** `/bin/lua`'s first comment contained `; \`lua x\``.
+`shell_exec_block` split statements on `;` *before* recognising a `#`
+comment, so the rest of the comment ran: a backtick substitution that
+spawned `/bin/lua` as a flat binary (a user fault at USER_BASE), then a
+command called `runs`. A `#` statement now skips to the end of the line.
+
+### /bin/wasm 7× faster (Lua `fib(22)` in QEMU: 53.6 s → 7.6 s)
+Native Lua runs `fib(27)` in 0.02 s; under `/bin/wasm` in QEMU it took
+500 s. To find out why:
+
+1. **A sampling profiler over QEMU's gdbstub:** a 60-line client for the GDB
+   remote protocol that interrupts, reads the pc and resumes. It said "100%
+   `find_block`": the binary search mapping a block's pc to its sidetable
+   entry, run on every block entry. Replaced with an O(1) pc → index table
+   (`g_block_at`): **−14%**. The profile had overstated it. QEMU only
+   honours the stop at certain translation-block boundaries, and later
+   samples always landed on the dispatch loop's head. So the sampler can't
+   see inside the interpreter.
+2. **Userspace is built unoptimised.** `build_user.sh` passed no `-O`, and the
+   disassembly reloads every local from the stack. `build_user_program` now
+   takes `C3_OPT` per program, and only `wasm` uses `-O2`. Drivers stay at
+   the level they were tested at. -O2 made LLVM emit `strlen` calls
+   (nolibc has none), so wasm.c3 defines one. **−51%.**
+3. **`wasm -p`, an opcode histogram from the inside:** **67% of all executed
+   instructions were `block`.** A C `switch` compiles to one nested `block`
+   per case, and Lua's VM loop enters all of them on every dispatch. Runs of
+   directly nested blocks are consecutive sidetable entries, so they're now
+   entered in one step (labels pushed in a tight loop): dispatches went from
+   85.6 M to 29.3 M, **−39%**.
+4. **One-byte LEB128 fast path, and `nlocals` cached in the frame** (for
+   local.get/set/tee's bounds check): **−45%.**
+
+Further gains need restructuring (pre-decoded code, static branch targets
+instead of a runtime control stack). That's its own project. The longer
+benchmark, run alone (`fib(27)` / a 300k-iteration loop / 20k-string concat):
+500 / 168 / 58 s → **116 / 37 / 21 s** (4.3× / 4.6× / 2.8×). It gains less
+than `fib(22)`'s 7×; the 500 s baseline also predates the setjmp work, so the
+two numbers aren't strictly the same build. Native is 0.02 s total, so this
+is still ~1000× native, of which QEMU's emulation is maybe 10–20×.
+
+### FAT32: a directory could hide its own new entries
+The full regression turned up 5 new FAT32-only failures. An A/B of the image
+showed they depended only on how full the root was, not on any code
+change. An old kernel failed on the new image too. With fsd instrumented:
+at boot `/tmp` is created in the root, which left **one** free slot, a
+`0x00` "this and every later entry is unused" marker. A 2-slot LFN name
+then made `fat32_find_free_dirent_range` extend the directory into a new
+cluster, but the `0x00` before it made every lookup stop short. The file
+was created but never found again ("write failed"), and `mkdir` "succeeded"
+on a directory that didn't exist. Latent since the extension code was
+written; the new fixtures just pushed the root to that exact fill level.
+The fix: before extending, turn the last cluster's trailing `0x00` slots into
+`0xE5` (deleted, which readers skip past). Verified on the failing image:
+creates, mkdir and nested files work, the tests pass, and `fsck.vfat` is clean.
+
+### Verified
+QEMU FAT32 / ext2 / dual: `wasitest` (5 fixtures incl. sleep + sjlj),
+`luatest` and `wasmtest` all ok. The 54-builtin regression is identical to
+master on FAT32 and ext2 (FAT32 fully back after the directory fix), and on
+dual everything passes, including the storage/fsd kill tests. fsck clean.
+`/bin/lua -v`, script args (`lua args.lua one two`) and `-e` work from the shell.
+
+**Real Duo** (`populate_duo_bin.sh` + dev-shell kernel, driven over serial):
+`lua -v`, `luatest` 9/9, `wasitest` (sleeps measured 200 / 301 / 1000 ms on
+the C906), `wasmtest` ok. Lua `fib(22)` = **6.9 s** on the board, slightly
+faster than QEMU's 7.6 s. One limitation found there: `/bin/lua` forwards
+arguments with rc's `$*`, which re-splits on spaces, so a quoted multi-word
+`lua -e "…"` breaks. Documented; `wasm /lib/lua.wasm -e "…"` works.
+
+---
+
 ## 2026-10-18 (night) — /bin/wasm runs standard WASI programs; signed bytes were zero-extended
 
 Roadmap §4's "next: a WASI shim". Until now `/bin/wasm` only ran modules

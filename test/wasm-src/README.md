@@ -33,3 +33,8 @@ themselves were validated.
   readdir, rename, remove, rmdir, ENOENT/ENOTEMPTY. Needs a writable `tmp/`.
 - `wasi_exit.c` — `exit(7)` must reach the shell as 7.
 - `wasi_wc.c` — wc over stdin: `echo hi there | wasm wasi_wc.wasm` → `1 2 9`.
+- `wasi_sleep.c` — usleep / nanosleep / sleep (→ poll_oneoff), timed on
+  CLOCK_MONOTONIC.
+- `wasi_sjlj.c` — setjmp/longjmp out of deep recursion with big stack frames,
+  nested and reused buffers, val 0 → 1. Built with `-I lib/wasm/include`
+  (racccoon's interpreter-assisted setjmp); natively with the system one.

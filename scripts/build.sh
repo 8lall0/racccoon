@@ -36,6 +36,11 @@ ext2_seed_tree() {
   # build/tcc/tcc.bin + build/tcc/lib/ (the CONFIG_TCCDIR payload).
   bash scripts/build_tcc.sh
 
+  # Lua 5.4 (third_party/lua) as a WASI module for /bin/wasm — seeded
+  # below as /lib/lua.wasm + the /bin/lua script. Falls back to the
+  # committed lib/lua/lua.wasm without zig / the submodule.
+  bash scripts/build_lua.sh
+
   # Hand-built .wasm test fixtures for /bin/wasm (no wat2wasm on this
   # host — the bytes are assembled by the Python script). Seeded onto
   # every disk image below next to /bin. Cleaned first so a renamed or
@@ -189,6 +194,9 @@ ext2_seed_tree() {
   done
   mcopy -i build/disk.img build/user/test.bin "::bin/["   # /bin/[ is /bin/test
   for w in build/wasm/*.wasm; do mcopy -i build/disk.img "$w" "::$(basename "$w")"; done
+  mmd -i build/disk.img ::lib 2>/dev/null || true
+  mcopy -i build/disk.img build/lua/lua.wasm ::lib/lua.wasm
+  mcopy -i build/disk.img lib/lua/lua ::bin/lua
   # C test programs (roadmap §7), if the C libc build produced any.
   for c in build/libc/*.bin; do [ -e "$c" ] && mcopy -i build/disk.img "$c" "::bin/$(basename "$c" .bin)"; done
   bash scripts/seed_tcc.sh fat32 build/disk.img
@@ -332,6 +340,8 @@ GOEOF
   for c in build/libc/*.bin; do [ -e "$c" ] && debugfs -w -R "write $c bin/$(basename "$c" .bin)" build/disk_ext2.img > /dev/null; done
   bash scripts/seed_tcc.sh ext2 build/disk_ext2.img
   for w in build/wasm/*.wasm; do debugfs -w -R "write $w $(basename "$w")" build/disk_ext2.img > /dev/null; done
+  debugfs -w -R "write build/lua/lua.wasm lib/lua.wasm" build/disk_ext2.img > /dev/null
+  debugfs -w -R "write lib/lua/lua bin/lua" build/disk_ext2.img > /dev/null
   debugfs -w -R "write build/bigfile_fixture.bin bigfile.bin" build/disk_ext2.img > /dev/null
 
   # manyfiles/ — 60 entries in one directory, past FS_LIST's 31-per-reply
@@ -406,6 +416,8 @@ GOEOF
   done
   debugfs -w -R "write build/user/test.bin bin/[" build/disk_dual_root_part.img > /dev/null   # /bin/[ is /bin/test
   for w in build/wasm/*.wasm; do debugfs -w -R "write $w $(basename "$w")" build/disk_dual_root_part.img > /dev/null; done
+  debugfs -w -R "write build/lua/lua.wasm lib/lua.wasm" build/disk_dual_root_part.img > /dev/null
+  debugfs -w -R "write lib/lua/lua bin/lua" build/disk_dual_root_part.img > /dev/null
   for c in build/libc/*.bin; do [ -e "$c" ] && debugfs -w -R "write $c bin/$(basename "$c" .bin)" build/disk_dual_root_part.img > /dev/null; done
   dd if=build/disk_dual_root_part.img of=build/disk_dual.img bs=512 seek=0 conv=notrunc status=none
   rm -f build/disk_dual_root_part.img

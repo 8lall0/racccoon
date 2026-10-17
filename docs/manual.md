@@ -966,12 +966,36 @@ What the shim provides (`user/bin/wasm.c3`, "WASI preview1" block):
 | path_create_directory / remove_directory / unlink_file / rename | `fs_mkdir` / `fs_delete` / `fs_rename` |
 | clock_time_get | time since boot (no RTC yet, so `time()` ≈ 1970) |
 | random_get, sched_yield, proc_exit | xorshift64, `yield`, `exitcode` |
-| anything else (poll_oneoff, sockets, …) | returns `ENOSYS` (only if called) |
+| poll_oneoff | clock subscriptions wait (yielding), so `sleep`/`usleep`/`nanosleep` work; fd subscriptions report ready at once |
+| anything else (sockets, fd_renumber, …) | returns `ENOSYS` (only if called) |
 
-Limits: no `sleep()` (poll_oneoff), no sockets, no file holes (writing past
-EOF fails), paths under 100 bytes, `getcwd()` inside the program reports
-`/` (wasi-libc's own emulated cwd, though opens still use the real one).
-The dev shell's `wasitest` runs the fixtures in `test/wasm-src/*.c`.
+**setjmp/longjmp.** wasi-libc's `<setjmp.h>` needs the wasm
+exception-handling proposal, which `/bin/wasm` doesn't implement. Build with
+`-I lib/wasm/include` instead: that `setjmp.h` maps setjmp/longjmp onto
+`racccoon.setjmp` / `racccoon.longjmp`, which the interpreter implements
+itself. It keeps its call frames explicitly, so `longjmp` restores the
+setjmp frame's depth, operand stack, locals and the C stack pointer.
+Same C semantics as usual: non-volatile locals changed after setjmp are
+indeterminate.
+
+**Lua.** `/bin/lua` (a `#!` script) runs `/lib/lua.wasm`: Lua 5.4.7 from the
+`third_party/lua` submodule, unmodified, built by `scripts/build_lua.sh`
+with the flags above (LUA_USE_C89, the setjmp shim, `lib/lua/racccoon_stubs.c`
+for `tmpfile`/`system`). `lua` is the REPL (`os.exit()` quits), and
+`lua script.lua args` runs a script. error/pcall, coroutines, string/table/math
+libs and io all work. `os.execute`, `io.tmpfile` and `io.popen` don't.
+`luatest` checks it. One catch: the script forwards its arguments with rc's
+`$*`, which re-splits on spaces, so a quoted `lua -e "a b"` arrives as two
+words. For a multi-word `-e`, call `wasm /lib/lua.wasm -e "…"` directly.
+
+**Profiling.** `wasm -p mod.wasm …` counts every executed opcode and prints
+the top 25 at exit (about 20% slower while on).
+
+Limits: no sockets, no file holes (writing past EOF fails), paths under 100
+bytes, `getcwd()` inside the program reports `/` (wasi-libc's own emulated
+cwd, though opens still use the real one). It's an interpreter: in QEMU, Lua's
+recursive `fib(22)` takes ~8 s (~1000× native). The dev shell's `wasitest` runs
+the fixtures in `test/wasm-src/*.c`.
 
 ## 10. The shell
 
