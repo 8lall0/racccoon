@@ -2215,7 +2215,15 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// landing on the console after the prompt is up. The shell
 			// and everything it exec()s (is_boot_server == false) print
 			// normally.
-			else if (!(g_boot_quiet && current_proc.is_boot_server))
+			else if (g_boot_quiet && current_proc.is_boot_server)
+			{
+				// Silenced, not discarded: a respawned server's bring-up
+				// (or its dying panic() line) stays readable with `dmesg`
+				// without the serial-speed delay `loud` would add — that
+				// delay was enough to hide a timing bug (docs/devlog.md).
+				sbi::klog_put((int)f.a0);
+			}
+			else
 			{
 				// Boot-server chatter (fsd/sdd/usbd/ethd init lines) is
 				// worth keeping in the kernel log — tee it. A plain

@@ -38,7 +38,7 @@ fn Sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4, long a
 // Kernel log ring — every byte the kernel prints (io::print, the libc
 // puts/fwrite path, board::console_putchar, panic) funnels through
 // __putchar, so teeing here captures the whole console history for
-// `dmesg` (SYS_KLOG_READ, src/entry.c3). Lives in `module sbi` — a leaf
+// `dmesg` (SYS_KLOG_READ, src/syscalls.c3). Lives in `module sbi` — a leaf
 // module the kernel imports — because sbi can't import `kernel` back.
 // Plain non-atomic append: single-hart today, and a torn byte in a
 // debug log is harmless (see spinlock.c3's console note).
@@ -47,7 +47,7 @@ char[KLOG_SIZE] klog_buf;
 ulong klog_written = 0;          // total bytes ever, monotonic
 
 // Raw console write — one legacy-SBI putchar, NO klog tee. Used for a
-// plain userspace process's SYS_PUTCHAR (src/entry.c3): its stdout is
+// plain userspace process's SYS_PUTCHAR (src/syscalls.c3): its stdout is
 // terminal output, not kernel log, and — critically — teeing it would
 // let `dmesg` (which prints what it reads) chase its own tail forever.
 // Kernel-originated output (io::print, libc, panic) and boot-server
@@ -58,10 +58,18 @@ fn int console_emit(int ch)
 	return ch;
 }
 
-fn int __putchar(int ch)
+// Append to the kernel log ring only — no console write. For boot-server
+// output while SYS_BOOT_QUIET is on (src/syscalls.c3's SYS_PUTCHAR): off
+// the console, but still readable with `dmesg`, at no serial-speed cost.
+fn void klog_put(int ch)
 {
 	klog_buf[(uint)(klog_written % KLOG_SIZE)] = (char)ch;
 	klog_written++;
+}
+
+fn int __putchar(int ch)
+{
+	klog_put(ch);
 	return console_emit(ch);
 }
 
