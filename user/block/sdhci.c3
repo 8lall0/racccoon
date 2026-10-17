@@ -392,8 +392,7 @@ fn void sdd_pad_power_clock_init()
 	print(clk_stable ? "1\n" : "0\n");
 }
 
-uint sd_rca; // relative card address, learned from CMD3
-bool sd_high_capacity; // CCS bit from ACMD41's R3 response
+// sd_rca / sd_high_capacity: the card's state, in sd_card.c3.
 
 // Issues one SD command and busy-polls for completion. `resp_flags` is
 // one of the SD_CMD_RESP_* constants (ORed with SD_CMD_CRC_CHECK /
@@ -562,116 +561,28 @@ fn void sdd_raise_clock()
 	sd_reg_write(SD_CLOCK_SWRESET, w | SD_CLOCK_CARD_EN);
 }
 
-// Standard SD Physical Layer enumeration sequence — same command
-// sequence for any SDHCI controller (see this file's header comment).
-// Prints a marker after every stage: this exact function silently
-// stalled on real hardware the first time through (three real bugs in
-// sdd_pad_power_clock_init — see its own comments), and there was no way
-// to tell from the console alone which of CMD0/CMD8/ACMD41/CMD2/CMD3/
-// CMD9/CMD7 it had gotten stuck at without disassembling and reasoning
-// about it blind. Kept permanently, not stripped once this works — see
-// entry.c3's current_pid trap-print for the same reasoning elsewhere in
-// this codebase.
-fn bool sdd_enumerate()
+// sd_card.c3's controller hooks: the shared SD card protocol
+// (sdd_enumerate) drives this SDHCI through these three.
+fn bool sdc_cmd(uint index, uint arg, uint resp)
 {
-	// CMD0: GO_IDLE_STATE, no response — success here just means the
-	// command register accepted the write and CMD_INHIBIT cleared
-	// afterward (SD_CMD_RESP_NONE means sd_send_cmd's own SD_INT_RESPONSE
-	// check can never be satisfied by a real response, only by the
-	// command-complete interrupt SDHCI still raises for a no-response
-	// command). A false here means CMD_INHIBIT never cleared at all
-	// going in, or the command-complete interrupt itself never fired —
-	// i.e. the clock genuinely isn't toggling — the single most useful
-	// bit to know before spending any more time on ACMD41 below.
-	bool cmd0_ok = sd_send_cmd(0, 0, SD_CMD_RESP_NONE, false);
-	print("sdd: CMD0 ");
-	print(cmd0_ok ? "ok\n" : "TIMED OUT\n");
+	uint flags = SD_CMD_RESP_NONE;
+	if (resp == SDC_RESP_R1) { flags = SD_CMD_RESP_SHORT | SD_CMD_CRC_CHECK | SD_CMD_INDEX_CHECK; }
+	else if (resp == SDC_RESP_R2) { flags = SD_CMD_RESP_LONG | SD_CMD_CRC_CHECK; }
+	else if (resp == SDC_RESP_R3) { flags = SD_CMD_RESP_SHORT; }
+	// SD_CMD_RESP_NONE (CMD0): sd_send_cmd's SD_INT_RESPONSE check is then
+	// satisfied by the command-complete interrupt SDHCI still raises for
+	// a no-response command, so a false still means "never completed".
+	return sd_send_cmd(index, arg, flags, false);
+}
 
-	// CMD8: SEND_IF_COND — 0x1AA = check pattern 0xAA + 2.7-3.6V range.
-	// A v1.x (pre-SD2.0) card won't respond at all; treated as
-	// non-fatal (some cards, still handled by ACMD41 below), only a
-	// v2.0+-card assumption gets recorded.
-	bool cmd8_ok = sd_send_cmd(8, 0x1AA, SD_CMD_RESP_SHORT | SD_CMD_CRC_CHECK | SD_CMD_INDEX_CHECK, false);
-	print("sdd: CMD8 ");
-	print(cmd8_ok ? "responded: " : "no response: ");
-	print_hex32(sd_response0);
-	print("\n");
+fn uint sdc_resp0() { return sd_response0; }
 
-	// ACMD41 (CMD55 + CMD41): SD_SEND_OP_COND, polled until the card
-	// reports ready (bit 31 of the R3 response). HCS (bit 30 of the
-	// argument) requests high-capacity support.
-	//
-	// Bounded by wall-clock time, not a try count: the SD Physical Layer
-	// spec gives the card up to 1 s to finish initializing, and Linux's
-	// mmc_send_app_op_cond polls every 10 ms for that 1 s. This used to be
-	// "200 back-to-back tries", which only lasted long enough by accident:
-	// at boot the card is already initialized (BootROM read it), and with
-	// `loud` on each progress '.' costs serial time. A respawned sdd with
-	// its output silenced (CMD0 just reset an initialized card, which then
-	// needs a full init) burned all 200 before the card was ready, panicked,
-	// and only the supervisor's second respawn worked — the double
-	// "svc: respawned sdd" (docs/devlog.md 2026-10-18). 2 s = the spec's
-	// bound with margin; a '.' every 100 ms shows progress meanwhile.
-	const ulong ACMD41_TIMEOUT_US = 2000000;
-	const ulong ACMD41_POLL_US    = 10000;
-	ulong acmd41_start = rdtime();
-	ulong acmd41_next_dot = acmd41_start + sd_us_to_ticks(100000);
-	bool ready = false;
-	int tries = 0;
-	while (!ready && rdtime() - acmd41_start < sd_us_to_ticks(ACMD41_TIMEOUT_US))
-	{
-		if (tries > 0)
-		{
-			ulong poll_start = rdtime();
-			while (rdtime() - poll_start < sd_us_to_ticks(ACMD41_POLL_US)) { yield(); }
-		}
-		tries++;
-		if (rdtime() >= acmd41_next_dot) { putchar('.'); acmd41_next_dot += sd_us_to_ticks(100000); }
-		if (!sd_send_cmd(55, 0, SD_CMD_RESP_SHORT | SD_CMD_CRC_CHECK | SD_CMD_INDEX_CHECK, false)) continue;
-		if (!sd_send_cmd(41, 0x40FF8000, SD_CMD_RESP_SHORT, false)) continue;
-		if ((sd_response0 & 0x80000000) != 0)
-		{
-			ready = true;
-			sd_high_capacity = (sd_response0 & 0x40000000) != 0;
-		}
-	}
-	print("\n");
-	print("sdd: ACMD41 ");
-	print(ready ? "ready after " : "gave up after ");
-	print_hex32((uint)tries);
-	print(" tries, ocr=");
-	print_hex32(sd_response0);
-	print("\n");
-	if (!ready) return false;
-
-	// CMD2: ALL_SEND_CID, R2 (long) response — content unused in v1.
-	if (!sd_send_cmd(2, 0, SD_CMD_RESP_LONG | SD_CMD_CRC_CHECK, false)) return false;
-	print("sdd: CMD2 (CID) ok\n");
-
-	// CMD3: SEND_RELATIVE_ADDR, R6 — RCA in bits [31:16] of the response.
-	if (!sd_send_cmd(3, 0, SD_CMD_RESP_SHORT | SD_CMD_CRC_CHECK | SD_CMD_INDEX_CHECK, false)) return false;
-	sd_rca = sd_response0 & 0xFFFF0000;
-	print("sdd: CMD3 rca=");
-	print_hex32(sd_rca);
-	print("\n");
-
-	// CMD9: SEND_CSD, R2 — mostly informational for a first cut; not
-	// decoded further here.
-	sd_send_cmd(9, sd_rca, SD_CMD_RESP_LONG | SD_CMD_CRC_CHECK, false);
-
-	// CMD7: SELECT_CARD.
-	if (!sd_send_cmd(7, sd_rca, SD_CMD_RESP_SHORT | SD_CMD_CRC_CHECK | SD_CMD_INDEX_CHECK, false)) return false;
-	print("sdd: CMD7 (SELECT_CARD) ok\n");
-
+fn bool sdc_run_clock()
+{
 	sdd_raise_clock();
 	print("sdd: raised clock, clock_reg=");
 	print_hex32(sd_reg_read(SD_CLOCK_SWRESET));
 	print("\n");
-
-	// CMD16: SET_BLOCKLEN=512 — SDHC/SDXC cards are fixed at 512 by
-	// spec, but harmless (and required for SDSC cards) to send anyway.
-	sd_send_cmd(16, SECTOR_SIZE, SD_CMD_RESP_SHORT | SD_CMD_CRC_CHECK | SD_CMD_INDEX_CHECK, false);
-
 	return true;
 }
 

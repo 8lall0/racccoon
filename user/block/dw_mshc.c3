@@ -35,9 +35,8 @@ module user;
 //     starfive,sysreg = <&sys_syscon 0x9c 0x1 0x3e>
 //                        (sample-phase field: syscon off 0x9c, shift 1,
 //                         mask 0x3e)
-// The SD Physical Layer command sequence in dw_enumerate() is
-// controller-agnostic and copied verb-for-verb from sdhci.c3's
-// sdd_enumerate() — only dw_send_cmd() differs from its SDHCI sibling.
+// The SD card protocol itself (CMD0..CMD16 enumeration) is shared with
+// the Duo's SDHCI in sd_card.c3; this file supplies its sdc_* hooks.
 //
 // ---------------------------------------------------------------------
 // What is NOT done yet (the bring-up TODO list)
@@ -47,11 +46,11 @@ module user;
 //     contiguous descriptor list — needs the uncached SYS_DEV_INFO page
 //     (see sdd.c3) plus a descriptor ring. Follow-up once PIO reads work.
 //  2. Clock/reset controller (JH7110 syscrg @ 0x13020000). The first cut
-//     ASSUMES U-Boot already left the SDIO0 biu+ciu clocks ungated and
+//     ASSUMES U-Boot already left the SDIO1 biu+ciu clocks ungated and
 //     out of reset — it has to, it loads the kernel off this same card
 //     (same reasoning sdhci.c3 uses for not re-clocking the Duo's IP the
 //     BootROM already set up). dw_mshc_soc_init() is a near-no-op on that
-//     assumption; if it's wrong, the syscrg SDIO0 gate/deassert bits are
+//     assumption; if it's wrong, the syscrg SDIO1 gate/deassert bits are
 //     the thing to add, and DW_CIU_HZ below is the parent rate to pin.
 //  3. Card-detect (CDETECT @ 0x50) — ignored; the slot is assumed
 //     populated, same as sdhci.c3.
@@ -62,17 +61,12 @@ module user;
 //     dw_reg_verid_check().
 //
 // ---------------------------------------------------------------------
-// Build integration (when ready)
+// Build integration
 // ---------------------------------------------------------------------
-// scripts/build_user.sh builds `sdd` from `sdhci.c3 + sdd.c3`. To ship
-// this instead on the opi targets, have scripts/build_opi.sh and
-// scripts/build_opi_qemu.sh rebuild `sdd` from `dw_mshc.c3 + sdd.c3`
-// before the link step (a 1-line build_user_program override), and add an
-// "sd" entry to board::DEVICES in boards/opi-rv/board.c3 (MMIO page,
-// IRQ 75, DMA region — sdio1 @ 0x16020000 is the SD slot, see docs/opi-rv-plan.md). sdd.c3 itself needs no
-// change — it only calls the four names this file also exports
-// (dw-prefixed here vs sd-prefixed in sdhci.c3; see the shim aliases at
-// the bottom).
+// scripts/build_opi.sh builds `sdd` with SDD_SOC_SRC=user/block/dw_mshc.c3
+// (scripts/build_user.sh: controller file + sd_card.c3 + sdd.c3), and
+// boards/opi-rv/board.c3's "sd" DEVICES entry hands it sdio1 @ 0x16020000
+// (the microSD slot — mmc 0 is the Wi-Fi) plus the syscon page.
 
 const bool DWMSHC_VERBOSE = false; // per-sector trace; on it prints 2 lines/read and floods dmesg's 32K ring
 
@@ -234,8 +228,7 @@ fn void dw_write(uint off, uint v) { mmio_write32((uptr)(DW_BASE + off), v); }
 
 // print_hex32 / print_uint / rdtime / mmio_* / timebase_hz : user/user.c3
 
-uint dw_rca;              // relative card address from CMD3
-bool dw_high_capacity;    // CCS bit from ACMD41's R3
+// sd_rca / sd_high_capacity: the card's state, in sd_card.c3.
 uint dw_response0;
 uint dw_response1;
 uint dw_response2;
@@ -440,84 +433,33 @@ fn bool dw_send_cmd(uint index, uint arg, uint resp_flags, bool data, bool is_wr
 	return true;
 }
 
-// Response-flag shorthands mapping the SDHCI-style names used at the call
-// sites in dw_enumerate() onto DW-MSHC's CMD bits.
+// Response-flag shorthands onto DW-MSHC's CMD bits (sdc_cmd's mapping).
 const uint DW_R_NONE  = 0;
 const uint DW_R_SHORT = DWMCI_CMD_RESP_EXP;
 const uint DW_R_LONG  = DWMCI_CMD_RESP_EXP | DWMCI_CMD_RESP_LENGTH;
 const uint DW_R_CRC   = DWMCI_CMD_CHECK_CRC;
 
-// Standard SD Physical Layer enumeration — identical command order to
-// sdhci.c3's sdd_enumerate() (CMD0 / CMD8 / ACMD41 / CMD2 / CMD3 / CMD9 /
-// CMD7 / CMD16). Per-stage prints kept for the same reason sdhci.c3
-// keeps them: on a silent stall there is no other way to see how far it
-// got.
-fn bool dw_enumerate()
+// sd_card.c3's controller hooks: the shared SD card protocol
+// (sdd_enumerate) drives this DW-MSHC through these three.
+fn bool sdc_cmd(uint index, uint arg, uint resp)
 {
-	bool cmd0 = dw_send_cmd(0, 0, DW_R_NONE, false, false);
-	print("dw_mshc: CMD0 ");
-	print(cmd0 ? "ok\n" : "TIMED OUT\n");
+	uint flags = DW_R_NONE;
+	if (resp == SDC_RESP_R1) { flags = DW_R_SHORT | DW_R_CRC; }
+	else if (resp == SDC_RESP_R2) { flags = DW_R_LONG | DW_R_CRC; }
+	else if (resp == SDC_RESP_R3) { flags = DW_R_SHORT; }
+	return dw_send_cmd(index, arg, flags, false, false);
+}
 
-	bool cmd8 = dw_send_cmd(8, 0x1AA, DW_R_SHORT | DW_R_CRC, false, false);
-	print("dw_mshc: CMD8 ");
-	print(cmd8 ? "responded: " : "no response: ");
-	print_hex32(dw_response0);
-	print("\n");
+fn uint sdc_resp0() { return dw_response0; }
 
-	// Time-bounded, like sdhci.c3's ACMD41 loop (see its comment): the
-	// spec allows the card 1 s; poll every 10 ms for up to 2 s. A bare
-	// try count only lasted long enough when printing slowed it down.
-	ulong hz = timebase_hz();
-	ulong acmd41_start = rdtime();
-	ulong acmd41_next_dot = acmd41_start + hz / 10;
-	bool ready = false;
-	int tries = 0;
-	while (!ready && rdtime() - acmd41_start < hz * 2)
-	{
-		if (tries > 0)
-		{
-			ulong poll_start = rdtime();
-			while (rdtime() - poll_start < hz / 100) { yield(); }
-		}
-		tries++;
-		if (rdtime() >= acmd41_next_dot) { putchar('.'); acmd41_next_dot += hz / 10; }
-		if (!dw_send_cmd(55, 0, DW_R_SHORT | DW_R_CRC, false, false)) { continue; }
-		if (!dw_send_cmd(41, 0x40FF8000, DW_R_SHORT, false, false)) { continue; }
-		if ((dw_response0 & 0x80000000) != 0)
-		{
-			ready = true;
-			dw_high_capacity = (dw_response0 & 0x40000000) != 0;
-		}
-	}
-	print("\ndw_mshc: ACMD41 ");
-	print(ready ? "ready, ocr=" : "gave up, ocr=");
-	print_hex32(dw_response0);
-	print("\n");
-	if (!ready) { return false; }
-
-	if (!dw_send_cmd(2, 0, DW_R_LONG | DW_R_CRC, false, false)) { return false; }
-	print("dw_mshc: CMD2 (CID) ok\n");
-
-	if (!dw_send_cmd(3, 0, DW_R_SHORT | DW_R_CRC, false, false)) { return false; }
-	dw_rca = dw_response0 & 0xFFFF0000;
-	print("dw_mshc: CMD3 rca=");
-	print_hex32(dw_rca);
-	print("\n");
-
-	dw_send_cmd(9, dw_rca, DW_R_LONG | DW_R_CRC, false, false); // CSD, informational
-
-	if (!dw_send_cmd(7, dw_rca, DW_R_SHORT | DW_R_CRC, false, false)) { return false; }
-	print("dw_mshc: CMD7 (SELECT) ok\n");
-
+fn bool sdc_run_clock()
+{
 	if (!dw_set_clock(DW_CLKDIV_RUN))
 	{
 		print("dw_mshc: run clock setup failed\n");
 		return false;
 	}
 	print("dw_mshc: raised clock to run speed\n");
-
-	dw_send_cmd(16, SECTOR_SIZE, DW_R_SHORT | DW_R_CRC, false, false); // SET_BLOCKLEN
-
 	return true;
 }
 
@@ -542,7 +484,7 @@ fn bool dw_block_rw_once(char* data, uint sector, bool is_write)
 {
 	uint* words = (uint*)data;
 
-	uint arg = dw_high_capacity ? sector : (sector * SECTOR_SIZE);
+	uint arg = sd_high_capacity ? sector : (sector * SECTOR_SIZE);
 	uint cmd_index = is_write ? 24 : 17;
 
 	if (!dw_send_cmd(cmd_index, arg, DW_R_SHORT | DW_R_CRC, true, is_write))
@@ -708,7 +650,6 @@ fn void sdd_pad_power_clock_init()
 	}
 }
 
-fn bool sdd_enumerate() { return dw_enumerate(); }
 
 fn bool sdd_block_rw(char* data, uint sector, bool is_write)
 {

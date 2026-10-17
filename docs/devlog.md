@@ -4,6 +4,46 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-18 (evening) — one SD card protocol (`sd_card.c3`) for both SD controllers
+
+The ACMD41 fix (previous entry) had to be made twice because the SD card's
+bring-up sequence was written out twice: `sdhci.c3` (Duo, Cvitek SDHCI) and
+`dw_mshc.c3` (Orange Pi, DesignWare MSHC) each had their own copy of
+CMD0 → CMD8 → ACMD41 → CMD2 → CMD3 → CMD9 → CMD7 → CMD16. Those are the
+SD *card's* protocol, identical on both. Only the controller differs.
+
+Now `user/block/sd_card.c3` holds it once: `sdd_enumerate()` plus the card
+state `sd_rca` / `sd_high_capacity`. The controller file built into sdd
+(`SDD_SOC_SRC`) supplies three hooks:
+
+- `sdc_cmd(index, arg, resp)` with `resp` ∈ `SDC_RESP_NONE/R1/R2/R3` (the
+  spec's response kinds). SDHCI maps R1 to short+CRC+index check, DW-MSHC to
+  short+CRC (it has no index check).
+- `sdc_resp0()`
+- `sdc_run_clock()` (SDHCI's `sdd_raise_clock`; DW-MSHC's `dw_set_clock` to
+  run speed, which can fail).
+
+`dw_rca`/`dw_high_capacity` became the shared `sd_*` names. On the Orange Pi the
+enumeration lines now print with the `sdd:` prefix, as on the Duo.
+`build_user.sh` adds `sd_card.c3` to sdd's sources. Also refreshed
+`dw_mshc.c3`'s header: its "Build integration (when ready)" section described
+work done on 09-19, and it called the SD slot SDIO0 (it's SDIO1; mmc 0 is
+the Wi-Fi).
+
+**Verified on the Duo**, driven over its serial console: boot-time
+enumeration prints exactly what the old code did (same OCR, RCA,
+`clock_reg`, SDMA on); `storagekilltest` ×3 silenced (each respawn
+re-runs the whole shared sequence; `ACMD41 ready after 5 tries`); and
+`fswriteat`, `fsneg`, `p9fswritetest`, `chmodtest`, `cycletest`, `wasmtest` all
+ok. All four boards build. The Orange Pi build uses the same file and hasn't
+been run there yet.
+
+The klog-only console idea was considered and **declined**: the user wants
+all boot output on the console. (Silenced post-settle output still lands in
+`dmesg` since `3b91146`.)
+
+---
+
 ## 2026-10-18 (later) — the double "respawned sdd" was a count-bounded ACMD41 wait; device DMA now outlives its driver
 
 Two items from the open list, taken together because they meet in sdd's
