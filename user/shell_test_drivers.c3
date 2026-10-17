@@ -44,23 +44,83 @@ fn bool shell_test_drivers_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
         // supervisor re-inits it (device_setup re-runs the
         // MMIO+DMA setup) and fsd re-resolves its new pid on the
         // next read (user/fs/fsd.c3's diskd_rw). docs/roadmap.md §5.
+        //
+        // A read alone can't prove the *new* driver works: fsd's read
+        // cache answers a just-read file without touching the driver (on
+        // the Duo this passed before sdd had even been respawned). So it
+        // also writes a file and reads it back — the cache is read-only,
+        // writes always reach the driver. Then it waits 3 s, writes
+        // again (fsd re-resolves the driver if it died meanwhile) and
+        // requires the same driver instance (pid + generation — a
+        // respawn usually reuses the slot, so the pid alone repeats): a
+        // respawned driver that dies
+        // during its own bring-up (seen on the Duo as a second "svc:
+        // respawned sdd") fails here instead of passing unnoticed.
         uint sk_part = 0;
         int  sk_pid  = 0;
         int sk_info = fs_partition_info(&sk_part, null, &sk_pid);
+        uint sk_gen0 = 0;
+        if (sk_pid > 0) proc_info(sk_pid, null, &sk_gen0, null);
         char[64] sk_buf @noinit;
         char* sk_probe = "bin/echod";   // on every image (see fsdkilltest)
+        char* sk_tmp = "tmp/skt.txt";
+        char* sk_msg = "storagekill write-through\n";
+        int sk_msglen = 26;
         int sk_before = fs_read(sk_probe, &sk_buf, 64);
         int sk_killed = sk_pid > 0 ? kill(sk_pid, 0) : -1;
         ulong sk_deadline = rdtime() + timebase_hz() * 20; // 20s wall-clock, any board
         int sk_after = -1;
-        while (sk_after < 0 && rdtime() < sk_deadline) {
+        bool sk_rw_ok = false;
+        while (!sk_rw_ok && rdtime() < sk_deadline) {
             yield();
             sk_after = fs_read(sk_probe, &sk_buf, 64);
+            if (fs_write(sk_tmp, sk_msg, sk_msglen) != sk_msglen) continue;
+            char[32] sk_rb @noinit;
+            if (fs_read(sk_tmp, &sk_rb, 32) != sk_msglen) continue;
+            sk_rw_ok = true;
+            for (int sk_i = 0; sk_i < sk_msglen; sk_i++) {
+                if (sk_rb[sk_i] != sk_msg[sk_i]) { sk_rw_ok = false; break; }
+            }
         }
-        if (sk_info == 0 && sk_pid > 0 && sk_before >= 0 && sk_killed == 0 && sk_after == sk_before) {
-            print("storagekilltest: ok (storage driver killed, respawned, reads work)\n");
+        int sk_pid1 = 0;
+        uint sk_gen1 = 0;
+        fs_partition_info(&sk_part, null, &sk_pid1);
+        if (sk_pid1 > 0) proc_info(sk_pid1, null, &sk_gen1, null);
+        ulong sk_settle = rdtime() + timebase_hz() * 3;
+        while (rdtime() < sk_settle) { yield(); }
+        bool sk_rw2_ok = fs_write(sk_tmp, sk_msg, sk_msglen) == sk_msglen;
+        int sk_pid2 = 0;
+        uint sk_gen2 = 0;
+        fs_partition_info(&sk_part, null, &sk_pid2);
+        if (sk_pid2 > 0) proc_info(sk_pid2, null, &sk_gen2, null);
+        fs_delete(sk_tmp);
+        bool sk_stable = sk_pid1 > 0 && sk_pid1 == sk_pid2 && sk_gen1 == sk_gen2;
+        // The supervisor respawns into the freed slot, and each
+        // create_process bumps that slot's generation — so a respawn
+        // that died and was respawned again *before* the first write
+        // succeeded shows up as a jump of 2+, not 1. (Only judged when
+        // the slot was reused; nothing else spawns during the test.)
+        uint sk_respawns = (sk_pid1 == sk_pid && sk_gen1 >= sk_gen0) ? sk_gen1 - sk_gen0 : 1;
+        sk_stable = sk_stable && sk_respawns == 1;
+        if (sk_info == 0 && sk_pid > 0 && sk_before >= 0 && sk_killed == 0 && sk_after == sk_before
+            && sk_rw_ok && sk_rw2_ok && sk_stable) {
+            print("storagekilltest: ok (storage driver killed, respawned once, writes + reads work)\n");
         } else {
-            print("storagekilltest: FAILED\n");
+            print("storagekilltest: FAILED (read=");
+            print(sk_after == sk_before ? "ok" : "bad");
+            print(" write=");
+            print(sk_rw_ok ? "ok" : "bad");
+            print(" write2=");
+            print(sk_rw2_ok ? "ok" : "bad");
+            print(" respawns=");
+            print_uint(sk_respawns);
+            print(" driver pid/gen ");
+            print_uint((uint)sk_pid); putchar('/'); print_uint(sk_gen0);
+            print(" -> ");
+            print_uint((uint)sk_pid1); putchar('/'); print_uint(sk_gen1);
+            print(" -> ");
+            print_uint((uint)sk_pid2); putchar('/'); print_uint(sk_gen2);
+            print(")\n");
         }
     } else if (strcmp(cmd, "devinfotest") == 0) {
         // SYS_DEV_INFO (src/device.c3): only a process a board device
