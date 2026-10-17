@@ -30,8 +30,16 @@ import std::nolibc::mem;
 //
 // Milestone 3: real compiled programs — Zig against "racccoon", and
 // standard wasm32-wasi C programs through the WASI shim (fd table over
-// the path-based fs_* API, preopens "/" + "."). Limits raised for
-// mid-size programs (FUNCS_MAX 2048, BLOCKS_MAX 16384).
+// the path-based fs_* API, preopens "/" + "."), including Lua 5.4
+// (/bin/lua). Limits raised for mid-size programs (FUNCS_MAX 2048,
+// BLOCKS_MAX 16384); interpreter-assisted setjmp/longjmp ("racccoon"
+// setjmp/longjmp); `-p` opcode profile.
+//
+// Speed (2026-10-18, Lua fib(22) in QEMU 53.6 s -> 7.6 s): O(1) block
+// lookup (g_block_at), runs of nested blocks entered in one step (a C
+// switch = one block per case, entered on every dispatch), one-byte
+// LEB128 fast path, nlocals cached in the frame, and -O2 for this one
+// program (scripts/build_user.sh).
 //
 // All working memory (the module bytes, the value/locals/frame stacks,
 // the section tables) comes from map_pages() (SYS_MAP) — userspace has
@@ -209,6 +217,8 @@ const int HOST_READ_FILE  = 5;   // (path:i32, plen:i32, buf:i32, cap:i32) -> i3
 const int HOST_WRITE_FILE = 6;   // (path:i32, plen:i32, buf:i32, len:i32) -> i32
 const int HOST_TIME       = 7;   // () -> i64
 const int HOST_PRINT_I64  = 8;   // (i64)
+const int HOST_SETJMP     = 9;   // (buf:i32) -> i32   interpreter-assisted setjmp, see host_setjmp
+const int HOST_LONGJMP    = 10;  // (buf:i32, val:i32)
 
 // --- limits (grow as real modules need) -------------------------------
 const int TYPES_MAX    = 256;
@@ -221,7 +231,7 @@ const int VSTACK_MAX   = 8192;   // 64 KiB
 const int LOCALS_MAX   = 8192;   // 64 KiB
 const int FRAMES_MAX   = 512;
 const int MODULE_MAX   = 512 * 1024;
-const int BLOCKS_MAX   = 16384;   // block/loop/if opcodes across the whole module
+const int BLOCKS_MAX   = 16384;  // < 65535: g_block_at stores index + 1 in a ushort   // block/loop/if opcodes across the whole module
 const int CTL_MAX      = 1024;   // active control-stack entries
 const int SCAN_MAX     = 512;    // block nesting depth during the load-time scan
 const int DATA_MAX     = 128;    // data segments (active + passive)
@@ -263,6 +273,7 @@ struct WFrame
     int  locals_base;          // into g_locals
     int  vstack_base;          // value-stack height on entry (for RETURN unwind)
     int  ctl_base;             // control-stack height on entry
+    int  nlocals;              // the function's, cached for local.get/set/tee's bounds check
 }
 
 // one block/loop/if opcode, from the load-time scan. start_pc is the
@@ -274,6 +285,7 @@ struct WBlock
     uint else_pc;              // 0 if none
     uint end_pc;               // offset of the matching END byte
     char arity;                // 0 or 1 result value
+    ushort run;                // OP_BLOCK only: this + the blocks directly nested right after it ("block bt block bt …"), see OP_BLOCK
 }
 
 // an entered block, on the control stack
@@ -306,6 +318,7 @@ WType*  g_types;    int  g_ntypes;
 WFunc*  g_funcs;    int  g_nfuncs;
 WExport* g_exports; int  g_nexports;
 long*   g_globals;  int  g_nglobals;   // value only; mutability not enforced yet
+bool[GLOBALS_MAX] g_global_mut;       // recorded for longjmp, which restores the mutable ones (the C stack pointer)
 
 long*   g_vstack;   int  g_vtop;
 long*   g_locals;   int  g_ltop;
@@ -328,6 +341,43 @@ int*    g_elemvals; int  g_nelemvals;     // flat funcidx pool referenced by g_e
 
 // argv for the host `arg` import — set in main
 String[] g_args;
+
+// At -O2 (build_user.sh) LLVM turns byte-counting loops into strlen()
+// calls, and nolibc userspace has none. LLVM never rewrites the loop of a
+// function itself named strlen into a call to itself.
+fn usz strlen(char* s) @export("strlen")
+{
+    usz n = 0;
+    while (s[n] != 0) { n++; }
+    return n;
+}
+
+// `wasm -p file.wasm …`: count every executed opcode and print the top
+// ones at exit — the profile a sampling profiler can't give from outside
+// (QEMU's gdbstub only stops at the dispatch loop's head).
+bool g_prof;
+ulong[256] g_opcount;
+
+fn void wasm_exit(int code)
+{
+    if (g_prof)
+    {
+        ulong total = 0;
+        for (int i = 0; i < 256; i++) { total += g_opcount[i]; }
+        print("wasm -p: "); print_uint64(total); print(" instructions\n");
+        bool[256] shown;
+        for (int k = 0; k < 25; k++)
+        {
+            int best = -1;
+            for (int i = 0; i < 256; i++) { if (!shown[i] && g_opcount[i] > 0 && (best < 0 || g_opcount[i] > g_opcount[best])) { best = i; } }
+            if (best < 0) { break; }
+            shown[best] = true;
+            print("  0x"); print_hex32((uint)best); print("  "); print_uint64(g_opcount[best]);
+            print("  "); print_uint64(g_opcount[best] * 1000 / (total > 0 ? total : 1)); print("‰\n");
+        }
+    }
+    exitcode(code);
+}
 
 // --- fatal-exit helper ------------------------------------------------
 fn void die(char* msg)
@@ -485,6 +535,8 @@ fn int resolve_host(char* mod, char* fld)
     if (strcmp(fld, "read_file")  == 0) { return HOST_READ_FILE; }
     if (strcmp(fld, "write_file") == 0) { return HOST_WRITE_FILE; }
     if (strcmp(fld, "time")       == 0) { return HOST_TIME; }
+    if (strcmp(fld, "setjmp")     == 0) { return HOST_SETJMP; }
+    if (strcmp(fld, "longjmp")    == 0) { return HOST_LONGJMP; }
     return -1;
 }
 
@@ -517,6 +569,7 @@ fn int resolve_wasi(char* fld)
     if (strcmp(fld, "path_remove_directory") == 0) { return HOST_WASI_PATH_REMOVE_DIRECTORY; }
     if (strcmp(fld, "path_unlink_file") == 0)      { return HOST_WASI_PATH_UNLINK_FILE; }
     if (strcmp(fld, "path_rename") == 0)           { return HOST_WASI_PATH_RENAME; }
+    if (strcmp(fld, "poll_oneoff") == 0)           { return HOST_WASI_POLL_ONEOFF; }
     return HOST_WASI_NOSYS;
 }
 
@@ -553,7 +606,7 @@ fn void decode_globals(Cur* c)
     for (int i = 0; i < g_nglobals; i++)
     {
         cur_byte(c);               // valtype
-        cur_byte(c);               // mutability
+        g_global_mut[i] = cur_byte(c) == 1;
         g_globals[i] = read_const_expr(c);
     }
 }
@@ -783,8 +836,15 @@ fn void decode_data(Cur* c)
 }
 
 // --- immediate readers (advance fr.ip) --------------------------------
+// Immediates are decoded on every execution; nearly all of them (local
+// indices, small constants, offsets) are one LEB128 byte — fast-path that.
 fn uint imm_u32(WFrame* fr)
 {
+    if (fr.ip < g_mod_len)
+    {
+        char b0 = g_mod[fr.ip];
+        if (b0 < 0x80) { fr.ip++; return (uint)b0; }
+    }
     Cur c; c.p = fr.ip; c.end = g_mod_len;
     uint v = read_u32(&c);
     fr.ip = c.p;
@@ -793,6 +853,11 @@ fn uint imm_u32(WFrame* fr)
 
 fn int imm_i32(WFrame* fr)
 {
+    if (fr.ip < g_mod_len)
+    {
+        char b0 = g_mod[fr.ip];
+        if (b0 < 0x80) { fr.ip++; return (b0 & 0x40) != 0 ? (int)b0 - 0x80 : (int)b0; }   // signed 7-bit
+    }
     Cur c; c.p = fr.ip; c.end = g_mod_len;
     int v = read_i32(&c);
     fr.ip = c.p;
@@ -902,8 +967,14 @@ fn char next_instr(Cur* c)
 
 // Scan a function body once, recording every block/loop/if -> its
 // matching else/end into the global sidetable (ascending start_pc).
+fn bool blocktype_is_byte(char bt)
+{
+    return bt == BT_VOID || bt == VT_I32 || bt == VT_I64 || bt == VT_F32 || bt == VT_F64;
+}
+
 fn void scan_function(WFunc* f)
 {
+    int first_block = g_nblocks;
     uint[SCAN_MAX] open @noinit;      // start_pc of each open block
     int[SCAN_MAX]  slot @noinit;      // its g_blocks index
     int depth = 0;
@@ -920,6 +991,7 @@ fn void scan_function(WFunc* f)
             int idx = g_nblocks;
             g_nblocks++;
             g_blocks[idx].start_pc = pc;
+            g_block_at[pc] = (ushort)(idx + 1);
             g_blocks[idx].else_pc = 0;
             g_blocks[idx].end_pc = 0;
             // arity: re-read the blocktype byte at pc+1
@@ -942,22 +1014,37 @@ fn void scan_function(WFunc* f)
         }
     }
     if (depth != 0) { die("unbalanced blocks"); }
+
+    // Runs of directly nested blocks — a C switch compiles to one `block`
+    // per case, back to back, all entered on every dispatch (Lua's VM loop:
+    // 2/3 of all executed opcodes were `block`). Blocks are recorded in pc
+    // order, so a run is consecutive sidetable entries; OP_BLOCK enters a
+    // whole run in one step. Only single-byte blocktypes (2 bytes/block).
+    for (int bi = g_nblocks - 1; bi >= first_block; bi--)
+    {
+        WBlock* b = &g_blocks[bi];
+        b.run = 1;
+        uint bpc = b.start_pc;
+        if (g_mod[bpc] != OP_BLOCK || !blocktype_is_byte(g_mod[bpc + 1])) { continue; }
+        if (bi + 1 < g_nblocks && g_blocks[bi + 1].start_pc == bpc + 2
+            && g_mod[bpc + 2] == OP_BLOCK && blocktype_is_byte(g_mod[bpc + 3])
+            && g_blocks[bi + 1].run < 65000)
+        {
+            b.run = (ushort)(g_blocks[bi + 1].run + 1);
+        }
+    }
 }
 
 // binary search the sidetable by start_pc
+// O(1): g_block_at[pc] = block index + 1 for every block/loop/if opcode
+// (filled by scan_function), 0 elsewhere. Was a binary search over the
+// sidetable on every block entry — a sampling profile of Lua under
+// /bin/wasm put essentially all of its time there (docs/devlog.md).
 fn WBlock* find_block(uint start_pc)
 {
-    int lo = 0;
-    int hi = g_nblocks - 1;
-    while (lo <= hi)
-    {
-        int mid = (lo + hi) / 2;
-        if (g_blocks[mid].start_pc == start_pc) { return &g_blocks[mid]; }
-        if (g_blocks[mid].start_pc < start_pc) { lo = mid + 1; }
-        else { hi = mid - 1; }
-    }
-    die("block not in sidetable");
-    return null;
+    uint bi = start_pc < g_mod_len ? (uint)g_block_at[start_pc] : 0;
+    if (bi == 0) { die("block not in sidetable"); }
+    return &g_blocks[bi - 1];
 }
 
 // --- top-level decode --------------------------------------------------
@@ -1181,7 +1268,7 @@ fn void host_call(int host_id, int type_idx)
             else { print_uint64((ulong)lv); }
             putchar('\n');
         case HOST_PROC_EXIT:
-            exitcode((int)vpop());
+            wasm_exit((int)vpop());
         case HOST_PRINT_STR:
             uint slen = (uint)vpop();
             uint soff = (uint)vpop();
@@ -1226,9 +1313,101 @@ fn void host_call(int host_id, int type_idx)
             vpush((long)wput);
         case HOST_TIME:
             vpush((long)rdtime());
+        case HOST_SETJMP:
+            host_setjmp((uint)vpop());
+        case HOST_LONGJMP:
+            int lv = (int)vpop();
+            host_longjmp((uint)vpop(), lv);
         default:
             die("unresolved host import");
     }
+}
+
+// --- interpreter-assisted setjmp/longjmp ("racccoon" setjmp/longjmp) ---
+// wasm can't unwind a C stack without the exception-handling proposal
+// (and wasi-libc's setjmp.h refuses to work without it), but this
+// interpreter keeps its call frames explicitly, so it can do it itself:
+// setjmp records where the caller is — frame depth, resume ip, value /
+// control / locals heights, the mutable wasm globals (for clang-compiled
+// C that's __stack_pointer, i.e. what a native longjmp restores) — and
+// longjmp puts all of that back and makes setjmp "return" again. It also
+// snapshots the caller frame's own operand-stack values and locals — the
+// wasm analogue of the registers a native jmp_buf saves: clang pushes
+// operands *before* the call (e.g. the frame pointer it will store the
+// result through) and pops them after, so restoring only the stack
+// *height* leaves stale values in those slots (found the hard way:
+// setjmp's second return stored through a garbage address and read 0). A C
+// program opts in with the racccoon setjmp.h shim (test/wasm-src/include).
+// Semantics are C's: locals the caller changed after setjmp are
+// indeterminate unless they live in memory.
+const int JMP_SLOTS = 64;
+const int JMP_VALS_MAX = 64;   // operand-stack values of the setjmp frame
+const int JMP_LOCALS_MAX = 512;
+struct WJmp
+{
+    bool used;
+    uint buf;                  // the jmp_buf's address (one slot per buffer, reused)
+    int  fcount;
+    int  func_idx;
+    int  locals_base;
+    uint ip;                   // just past the call to setjmp
+    int  vtop;
+    int  ctop;
+    int  ltop;
+}
+WJmp[JMP_SLOTS] g_jmps;
+ushort* g_block_at;            // module byte offset -> block index + 1 (see find_block)
+long* g_jmp_globals;           // JMP_SLOTS x GLOBALS_MAX snapshot, SYS_MAP'd in main
+long* g_jmp_vals;              // JMP_SLOTS x JMP_VALS_MAX
+long* g_jmp_locals;            // JMP_SLOTS x JMP_LOCALS_MAX
+int   g_jmp_next;              // round-robin victim when all slots are taken
+
+fn void host_setjmp(uint buf)
+{
+    int slot = -1;
+    for (int i = 0; i < JMP_SLOTS; i++) { if (g_jmps[i].used && g_jmps[i].buf == buf) { slot = i; break; } }
+    if (slot < 0) { for (int i = 0; i < JMP_SLOTS; i++) { if (!g_jmps[i].used) { slot = i; break; } } }
+    if (slot < 0) { slot = g_jmp_next; g_jmp_next = (g_jmp_next + 1) % JMP_SLOTS; }
+    WFrame* fr = &g_frames[g_fcount - 1];
+    WJmp* j = &g_jmps[slot];
+    j.used = true;
+    j.buf = buf;
+    j.fcount = g_fcount;
+    j.func_idx = fr.func_idx;
+    j.locals_base = fr.locals_base;
+    j.ip = fr.ip;
+    j.vtop = g_vtop;
+    j.ctop = g_ctop;
+    j.ltop = g_ltop;
+    for (int g = 0; g < g_nglobals; g++) { if (g_global_mut[g]) { g_jmp_globals[slot * GLOBALS_MAX + g] = g_globals[g]; } }
+    int nv = g_vtop - fr.vstack_base;
+    int nl = g_ltop - fr.locals_base;
+    if (nv > JMP_VALS_MAX || nl > JMP_LOCALS_MAX) { die("setjmp: caller frame too large to snapshot"); }
+    for (int k = 0; k < nv; k++) { g_jmp_vals[slot * JMP_VALS_MAX + k] = g_vstack[fr.vstack_base + k]; }
+    for (int k = 0; k < nl; k++) { g_jmp_locals[slot * JMP_LOCALS_MAX + k] = g_locals[fr.locals_base + k]; }
+    wput32(buf, (uint)slot);
+    vpush(0);
+}
+
+fn void host_longjmp(uint buf, int val)
+{
+    uint slot = wget32(buf);
+    if (slot >= (uint)JMP_SLOTS || !g_jmps[slot].used || g_jmps[slot].buf != buf) { die("longjmp: buffer was never set"); }
+    WJmp* j = &g_jmps[slot];
+    // The frame that called setjmp must still be live (longjmp into a
+    // function that already returned is undefined in C; here it's fatal).
+    if (j.fcount > g_fcount || g_frames[j.fcount - 1].func_idx != j.func_idx
+        || g_frames[j.fcount - 1].locals_base != j.locals_base) { die("longjmp: target frame is gone"); }
+    g_fcount = j.fcount;
+    g_frames[g_fcount - 1].ip = j.ip;
+    g_vtop = j.vtop;
+    g_ctop = j.ctop;
+    g_ltop = j.ltop;
+    for (int g = 0; g < g_nglobals; g++) { if (g_global_mut[g]) { g_globals[g] = g_jmp_globals[(int)slot * GLOBALS_MAX + g]; } }
+    WFrame* fr = &g_frames[g_fcount - 1];
+    for (int k = 0; k < g_vtop - fr.vstack_base; k++) { g_vstack[fr.vstack_base + k] = g_jmp_vals[(int)slot * JMP_VALS_MAX + k]; }
+    for (int k = 0; k < g_ltop - fr.locals_base; k++) { g_locals[fr.locals_base + k] = g_jmp_locals[(int)slot * JMP_LOCALS_MAX + k]; }
+    vpush((long)(val == 0 ? 1 : val));                       // setjmp's second return
 }
 
 // --- WASI preview1 ("wasi_snapshot_preview1") ---------------------------
@@ -1269,6 +1448,7 @@ const int HOST_WASI_PATH_CREATE_DIRECTORY = 124;
 const int HOST_WASI_PATH_REMOVE_DIRECTORY = 125;
 const int HOST_WASI_PATH_UNLINK_FILE = 126;
 const int HOST_WASI_PATH_RENAME = 127;
+const int HOST_WASI_POLL_ONEOFF = 128;
 
 // errno (preview1 numbering)
 const int WASI_ESUCCESS = 0;  const int WASI_EBADF = 8;   const int WASI_EEXIST = 20;
@@ -1572,6 +1752,71 @@ fn int wasi_fd_readdir(uint fd, uint buf, uint buf_len, ulong cookie, uint used_
     return WASI_ESUCCESS;
 }
 
+fn ulong wasi_now_ns()
+{
+    ulong ticks = rdtime();
+    ulong hz = timebase_hz();
+    return (ticks / hz) * 1000000000 + (ticks % hz) * 1000000000 / hz;
+}
+
+fn ulong wget64(uint off) { return (ulong)wget32(off) | ((ulong)wget32(off + 4) << 32); }
+
+// poll_oneoff: subscriptions are 48 bytes {userdata u64, tag u8 @8, then
+// clock {id u32 @16, timeout u64 @24, precision u64 @32, flags u16 @40
+// (1 = absolute)} or fd {fd u32 @16}}; events are 32 bytes {userdata u64,
+// error u16 @8, type u8 @10, nbytes u64 @16, flags u16 @24}. This is what
+// wasi-libc's sleep/usleep/nanosleep compile to (one relative clock
+// subscription). Clocks: wait until the earliest deadline, yield()ing so
+// the rest of the system runs. fd subscriptions are reported ready at
+// once — racccoon has no readiness API; the read itself then blocks.
+fn int wasi_poll_oneoff(uint subs, uint events, uint nsubs, uint nevents_off)
+{
+    if (nsubs == 0) { return WASI_EINVAL; }
+    ulong now = wasi_now_ns();
+    bool any_fd = false;
+    ulong earliest = ~(ulong)0;
+    for (uint i = 0; i < nsubs; i++)
+    {
+        uint sb = subs + i * 48;
+        char tag = *mem_ptr(sb + 8, 1);
+        if (tag != 0) { any_fd = true; continue; }
+        ulong timeout = wget64(sb + 24);
+        uint flags = wget32(sb + 40) & 0xFFFF;
+        ulong deadline = (flags & 1) != 0 ? timeout : now + timeout;
+        if (deadline < earliest) { earliest = deadline; }
+    }
+    if (!any_fd && earliest != ~(ulong)0)
+    {
+        while (wasi_now_ns() < earliest) { yield(); }
+    }
+    now = wasi_now_ns();
+    uint nev = 0;
+    for (uint i = 0; i < nsubs; i++)
+    {
+        uint sb = subs + i * 48;
+        char tag = *mem_ptr(sb + 8, 1);
+        bool fire = tag != 0;
+        if (!fire)
+        {
+            ulong timeout = wget64(sb + 24);
+            uint flags = wget32(sb + 40) & 0xFFFF;
+            ulong deadline = (flags & 1) != 0 ? timeout : 0;   // relative ones were measured from entry
+            fire = (flags & 1) == 0 ? !any_fd : now >= deadline;
+        }
+        if (!fire) { continue; }
+        uint ev = events + nev * 32;
+        char* ep = mem_ptr(ev, 32);
+        for (int z = 0; z < 32; z++) { ep[z] = 0; }
+        char* sp = mem_ptr(sb, 8);
+        for (int z = 0; z < 8; z++) { ep[z] = sp[z]; }       // userdata
+        ep[10] = tag;                                          // eventtype = subscription tag
+        if (tag != 0) { wput64(ev + 16, 1); }                  // fd: "1 byte ready"
+        nev++;
+    }
+    wput32(nevents_off, nev);
+    return WASI_ESUCCESS;
+}
+
 fn void wasi_call(int id, int type_idx)
 {
     int r = WASI_ESUCCESS;
@@ -1617,15 +1862,13 @@ fn void wasi_call(int id, int type_idx)
             uint t_off = (uint)vpop();
             vpop();                                                  // precision
             vpop();                                                  // clock id: every clock = time since boot (no RTC)
-            ulong ticks = rdtime();
-            ulong hz = timebase_hz();
-            wput64(t_off, (ticks / hz) * 1000000000 + (ticks % hz) * 1000000000 / hz);
+            wput64(t_off, wasi_now_ns());
         case HOST_WASI_CLOCK_RES_GET:
             uint res_off = (uint)vpop();
             vpop();
             wput64(res_off, 1000000000 / timebase_hz() + 1);
         case HOST_WASI_PROC_EXIT:
-            exitcode((int)vpop());
+            wasm_exit((int)vpop());
         case HOST_WASI_SCHED_YIELD:
             yield();
         case HOST_WASI_RANDOM_GET:
@@ -1776,6 +2019,11 @@ fn void wasi_call(int id, int type_idx)
             char rft; uint rsz;
             if (wasi_stat(&oldp[0], &rft, &rsz) != WASI_ESUCCESS) { r = WASI_ENOENT; break; }
             if (fs_rename(&oldp[0], &newp[0]) != 0) { r = WASI_EIO; }
+        case HOST_WASI_POLL_ONEOFF:
+            uint pne = (uint)vpop();
+            uint pns = (uint)vpop();
+            uint pev = (uint)vpop();
+            r = wasi_poll_oneoff((uint)vpop(), pev, pns, pne);
         default:
             // HOST_WASI_NOSYS: an import this shim doesn't implement.
             // Consume its params per its type and report ENOSYS.
@@ -1826,6 +2074,7 @@ fn void push_frame(int func_idx)
     fr.locals_base = lbase;
     fr.vstack_base = g_vtop;
     fr.ctl_base = g_ctop;
+    fr.nlocals = f.nlocals;
 }
 
 fn void frame_return()
@@ -1881,6 +2130,7 @@ fn void interp()
         if (fr.ip >= g_mod_len) { die("ip past module"); }
         char op = g_mod[fr.ip];
         fr.ip++;
+        if (g_prof) { g_opcount[(uint)op]++; }
 
         switch (op)
         {
@@ -1902,8 +2152,26 @@ fn void interp()
 
             case OP_BLOCK:
                 uint bpc = fr.ip - 1;
-                char bar = read_blocktype(fr);
                 WBlock* bi = find_block(bpc);
+                int brun = (int)bi.run;
+                if (brun > 1)
+                {
+                    // a run of directly nested single-byte-blocktype blocks
+                    // (see scan_function): push all their labels at once
+                    if (g_ctop + brun > CTL_MAX) { die("control stack overflow"); }
+                    for (int k = 0; k < brun; k++)
+                    {
+                        WBlock* bk = bi + k;
+                        g_ctl[g_ctop].kind = OP_BLOCK;
+                        g_ctl[g_ctop].target_pc = bk.end_pc + 1;
+                        g_ctl[g_ctop].vstack_height = g_vtop;
+                        g_ctl[g_ctop].arity = bk.arity;
+                        g_ctop++;
+                    }
+                    fr.ip = bpc + 2 * (uint)brun;
+                    break;
+                }
+                char bar = read_blocktype(fr);
                 if (g_ctop >= CTL_MAX) { die("control stack overflow"); }
                 g_ctl[g_ctop].kind = OP_BLOCK;
                 g_ctl[g_ctop].target_pc = bi.end_pc + 1;   // past the END
@@ -1972,15 +2240,15 @@ fn void interp()
                 else { push_frame(ci_fn); }
             case OP_LOCAL_GET:
                 uint li = imm_u32(fr);
-                if ((int)li >= g_funcs[fr.func_idx].nlocals) { die("local idx"); }
+                if (li >= (uint)fr.nlocals) { die("local idx"); }
                 vpush(g_locals[fr.locals_base + (int)li]);
             case OP_LOCAL_SET:
                 uint si = imm_u32(fr);
-                if ((int)si >= g_funcs[fr.func_idx].nlocals) { die("local idx"); }
+                if (si >= (uint)fr.nlocals) { die("local idx"); }
                 g_locals[fr.locals_base + (int)si] = vpop();
             case OP_LOCAL_TEE:
                 uint tti = imm_u32(fr);
-                if ((int)tti >= g_funcs[fr.func_idx].nlocals) { die("local idx"); }
+                if (tti >= (uint)fr.nlocals) { die("local idx"); }
                 g_locals[fr.locals_base + (int)tti] = g_vstack[g_vtop - 1];
             case OP_GLOBAL_GET:
                 uint gi = imm_u32(fr);
@@ -2355,7 +2623,8 @@ fn int find_export_func(char* nm)
 
 fn void main(String[] args)
 {
-    if (args.len < 1) { die("usage: wasm <file.wasm> [args]"); }
+    if (args.len >= 1 && strcmp(args[0].ptr, "-p") == 0) { g_prof = true; args = args[1..]; }
+    if (args.len < 1) { die("usage: wasm [-p] <file.wasm> [args]"); }
     char* path = args[0].ptr;
 
     uint fsize = 0;
@@ -2367,6 +2636,7 @@ fn void main(String[] args)
     // one map_pages for the module + all the tables/stacks
     g_mod = wasm_alloc(fsize);
     g_mod_len = fsize;
+    g_block_at = (ushort*)wasm_alloc(fsize * 2);
     g_types    = (WType*)wasm_alloc((uint)(TYPES_MAX * WType::size));
     g_funcs    = (WFunc*)wasm_alloc((uint)(FUNCS_MAX * WFunc::size));
     g_exports  = (WExport*)wasm_alloc((uint)(EXPORTS_MAX * WExport::size));
@@ -2381,6 +2651,9 @@ fn void main(String[] args)
     g_elem     = (WElem*)wasm_alloc((uint)(ELEM_MAX * WElem::size));
     g_elemvals = (int*)wasm_alloc((uint)(ELEM_VALS_MAX * 4));
     g_dirbuf   = wasm_alloc((uint)(WDIR_MAX * FS_LIST_ENTRY_SIZE));
+    g_jmp_globals = (long*)wasm_alloc((uint)(JMP_SLOTS * GLOBALS_MAX * 8));
+    g_jmp_vals    = (long*)wasm_alloc((uint)(JMP_SLOTS * JMP_VALS_MAX * 8));
+    g_jmp_locals  = (long*)wasm_alloc((uint)(JMP_SLOTS * JMP_LOCALS_MAX * 8));
 
     // args after the .wasm path are the guest program's argv (host `arg`)
     g_args = args[1..];
@@ -2425,5 +2698,5 @@ fn void main(String[] args)
     // _start's result (if any) is the exit code
     int code = 0;
     if (g_vtop > 0) { code = (int)g_vstack[g_vtop - 1]; }
-    exitcode(code);
+    wasm_exit(code);
 }

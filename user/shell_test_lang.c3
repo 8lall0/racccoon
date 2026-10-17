@@ -54,13 +54,15 @@ fn bool shell_test_lang_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
         // exactly 7, via exit() -> proc_exit). wasi_hello also reads
         // WASITEST from the environment (environ_get over /env), set here.
         fs_write("/env/WASITEST", "hello", 5);
-        char*[3] wi_fx;
+        char*[5] wi_fx;
         wi_fx[0] = "wasi_hello.wasm";  // printf, argv, environ, signed bytes
         wi_fx[1] = "wasi_files.wasm";  // path_open/fd_* /readdir/rename/unlink/mkdir/rmdir
         wi_fx[2] = "wasi_exit.wasm";   // exit(7)
-        int[3] wi_want = { 0, 0, 7 };
+        wi_fx[3] = "wasi_sleep.wasm";  // usleep/nanosleep/sleep -> poll_oneoff, timed on CLOCK_MONOTONIC
+        wi_fx[4] = "wasi_sjlj.wasm";   // setjmp/longjmp out of deep recursion (racccoon.setjmp/longjmp)
+        int[5] wi_want = { 0, 0, 7, 0, 0 };
         bool wi_ok = true;
-        for (int wf = 0; wf < 3; wf++) {
+        for (int wf = 0; wf < 5; wf++) {
             char*[3] wi_av;
             wi_av[0] = wi_fx[wf]; wi_av[1] = "a"; wi_av[2] = "b";
             int wi_ac = wf == 0 ? 3 : 1;

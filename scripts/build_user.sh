@@ -45,6 +45,11 @@ cd "$ROOT"
 # file(s), producing build/user/<name>.bin.o ready to embed in the kernel
 # image. Every program links at the same USER_BASE (user/user.ld) — that's
 # fine, each one only ever exists in its own process's own page table.
+#
+# C3_OPT (e.g. C3_OPT=-O2 build_user_program …): an optimisation level for
+# that one program. Default is c3c's own (no -O = unoptimised), which every
+# other program — drivers included — is built and tested at; opt in per
+# program after testing it, not globally.
 build_user_program() {
   local name="$1"
   shift
@@ -53,7 +58,7 @@ build_user_program() {
   mkdir -p "build/user/$name/obj"
 
   echo "==> Compiling $name..."
-  c3c compile-only \
+  c3c compile-only ${C3_OPT:-} \
     --safe=no \
     --use-stdlib=no \
     --link-libc=no \
@@ -251,7 +256,9 @@ build_user_program_stdio gpio $STDIO_COMMON user/bin/gpio.c3
 build_user_program_stdio dmesg $STDIO_COMMON user/bin/dmesg.c3
 build_user_program_stdio ps $STDIO_COMMON user/bin/ps.c3
 build_user_program_stdio top $STDIO_COMMON user/bin/top.c3
-build_user_program wasm user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/wasm.c3
+# /bin/wasm at -O2: an interpreter's dispatch loop is all hot code, and
+# unoptimised c3c reloads every local from the stack (docs/devlog.md).
+C3_OPT=-O2 build_user_program wasm user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/wasm.c3
 build_user_program diskd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/virtio.c3 user/block/diskd.c3
 # sdd = the board-independent orchestration (sdd.c3) + ONE SD-controller layer:
 # the Duo's Cvitek SDHCI (sdhci.c3, default) or the Orange Pi's DesignWare MSHC
