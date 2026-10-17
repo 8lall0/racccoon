@@ -15,6 +15,21 @@ import std::nolibc::fmt;
 // The builtins themselves live in user/shell_test_{fs,ipc,proc,drivers,
 // lang}.c3, one shell_test_<cat>_dispatch() each; main() below only
 // reads + tokenizes a line and tries them in turn.
+// For the ext2-only builtins: true (after printing "<name>: skipped
+// (...)") when the root filesystem isn't ext2 — e.g. a FAT32-root QEMU
+// image — so a run there reports skipped, not a misleading FAILED. Uses
+// FS_STAT's backend byte (fs_type_of), not "the first call failed", so a
+// genuine ext2 regression still shows up as FAILED.
+fn bool test_skip_unless_ext2_root(char* name, char* why) {
+    int t = fs_type_of("/");
+    if (t == FS_TYPE_EXT2) return false;
+    print(name);
+    print(": skipped (root is not ext2 — ");
+    print(why);
+    print(")\n");
+    return true;
+}
+
 fn void main() {
     // ~3 s covers the (fast) virtio boot chatter; automated test runs
     // wait much longer than this before sending anything anyway.

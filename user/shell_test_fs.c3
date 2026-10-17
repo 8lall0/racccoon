@@ -502,6 +502,7 @@ fn bool shell_test_fs_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
             }
         }
     } else if (strcmp(cmd, "fspermtest") == 0) {
+        if (test_skip_unless_ext2_root("fspermtest", "FAT32/exFAT keep no uid/mode")) return true;
         // Real ext2 file permissions (i_uid + owner/other write
         // bits, user/fs/ext2.c3): root (this shell, uid 0) may
         // overwrite/delete anything; a non-root process may only
@@ -629,6 +630,7 @@ fn bool shell_test_fs_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
             }
         }
     } else if (strcmp(cmd, "chmodtest") == 0) {
+        if (test_skip_unless_ext2_root("chmodtest", "FAT32/exFAT keep no uid/mode")) return true;
         // FS_CHMOD / FS_CHOWN against the ext2 root (user/fs/ext2.c3
         // ext2_chmod/ext2_chown, docs/roadmap.md §2). Root creates a
         // file, hands it to uid 42 with chown, then tightens it with

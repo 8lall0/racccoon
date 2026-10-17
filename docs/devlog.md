@@ -4,6 +4,52 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-18 — the "FAT32-only failures" were ext2-only tests: `FS_STAT` now reports the backend, and the tests skip
+
+The four FAT32 failures carried along since the PLIC entry (`p9fswritetest`,
+`p9mkdirtest`, `fspermtest`, `chmodtest`), plus `p9fstest`, which the sweep had
+missed, are not bugs. They test features that exist only on ext2:
+
+- fsd's 9P fid server (attach/walk/open/read/create/write/remove) opens with
+  `if (fs_type != FS_TYPE_EXT2) reply -1`. `p9fstest`'s own comment already
+  said it "fails cleanly on a FAT32-only mount".
+- `FS_CHMOD`/`FS_CHOWN` and uid permissions are documented "ext2 only":
+  FAT32/exFAT keep no `i_mode`/`i_uid`.
+
+On a FAT32- or exFAT-root image they could only print FAILED, which buries
+real failures in known ones. ext2 is root on every real board (FAT32 is
+boot-partition only), so these images are test configurations. The tests
+should say **skipped**.
+
+Deciding *how* to skip mattered: "the first `p9_attach` returned -1 → skip"
+would also turn a genuine ext2 attach regression into a silent skip. So the
+tests ask for the backend explicitly:
+
+- **`FS_STAT` reply byte 9** = the serving mount's backend (`FS_TYPE_*`: 1
+  FAT32 / 2 ext2 / 3 exFAT). It was unused, so old clients (the C libc's
+  `__rc_fs_stat`, Go's `racccoon/fs.go`, already-installed `/bin` binaries)
+  just ignore it. The `FS_TYPE_*` constants moved from `fsd.c3` into
+  `user/user.c3` (same module), so server and clients share one definition.
+- **`fs_type_of(path)`** (`user.c3`): the backend serving `path`, or -1.
+  `fs_stat` became a wrapper over `fs_stat_ex`, which also fills it. (Also
+  re-attached `fs_stat`'s doc comment, which had drifted onto
+  `fs_cache_stats`.)
+- **`test_skip_unless_ext2_root(name, why)`** (`shell_test.c3`) guards the five
+  tests: `p9fstest: skipped (root is not ext2 — 9P fids are ext2-only)`.
+
+**Verified (QEMU):** FAT32 and exFAT roots → the five print `skipped`; ext2
+and dual → all five run and pass. The full 54-builtin regression against master:
+ext2 is identical, and FAT32 differs only in those five (FAILED → skipped).
+exFAT's `stdiotest`/`wasmtest` fail identically on master (`wasm: no such
+file`: this host's exFAT image lacks those fixtures, a known seeding gap).
+Manual's FS_STAT row and API list updated.
+
+On a single FAT32 image the only FAILED lines left in that sweep are
+`bigreadtest` and `mounttest`, which need the dual image (they pass there),
+as before.
+
+---
+
 ## 2026-10-17 (late night) — the fsd-respawn freeze, root-caused: `proc_destroy` freed the shared disk arena
 
 The QEMU-only freeze open since 09-06 (`fsdkilltest` hangs right after

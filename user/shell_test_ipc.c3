@@ -134,6 +134,7 @@ fn bool shell_test_ipc_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
             print("p9realtest: FAILED\n");
         }
     } else if (strcmp(cmd, "p9fstest") == 0) {
+        if (test_skip_unless_ext2_root("p9fstest", "9P fids are ext2-only")) return true;
         // Same real 9P verbs as p9realtest above, this time against
         // fsd — the real file server, backed by real ext2 data, not
         // a synthetic tree (see docs/devlog.md). No new client
@@ -180,6 +181,7 @@ fn bool shell_test_ipc_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
             print("p9fstest: FAILED\n");
         }
     } else if (strcmp(cmd, "p9fswritetest") == 0) {
+        if (test_skip_unless_ext2_root("p9fswritetest", "9P fids are ext2-only")) return true;
         // Follow-up to p9fstest above: real writes against fsd
         // (Tcreate, Tremove full, genuine offset-aware Twrite —
         // see docs/devlog.md). Exercises create-then-immediately-
@@ -260,6 +262,7 @@ fn bool shell_test_ipc_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
             print("p9fswritetest: FAILED\n");
         }
     } else if (strcmp(cmd, "p9mkdirtest") == 0) {
+        if (test_skip_unless_ext2_root("p9mkdirtest", "9P fids are ext2-only")) return true;
         // mkdir via real 9P (P9_CREATE's perm gaining P9_DMDIR —
         // see docs/devlog.md): creates a real directory through a
         // fid, walks into it independently (proving it's a real

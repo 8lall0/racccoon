@@ -569,6 +569,7 @@ fn int fs_read_at(char* path, char* buf, int len, uint offset);
 fn int fs_write(char* path, char* buf, int len);                     // create/truncate
 fn int fs_write_at(char* path, char* buf, int len, uint offset);     // offset FS_OFFSET_APPEND = append
 fn int fs_stat(char* path, uint* out_size, int* out_type);           // type 0 file / 1 dir
+fn int fs_type_of(char* path);   // backend serving path: FS_TYPE_FAT32/EXT2/EXFAT, or -1
 fn int fs_list(char* dir, char* out_buf, int max_entries);           // 36-byte records, paged
 fn int fs_mkdir(char* dir);
 fn int fs_delete(char* path);
@@ -790,7 +791,7 @@ Replies: byte `0..3` = an `int` result (`-1` = error). `FS_MSG_MAX` =
 | `FS_RENAME` | 25 | `0..99` old, `100..199` new | 0 / -1 (refuses to overwrite) |
 | `FS_READ_AT` | 26 | `100..103` max, `104..107` offset | as `FS_READ`; 0 = clean EOF |
 | `FS_WRITE_AT` | 27 | `100..103` len, `104..107` offset, `108..` data | written / -1; `offset = 0xFFFFFFFF` = append |
-| `FS_STAT` | 28 | — | `0..3` 0/-1, `4..7` size, `8` type (0 file / 1 dir) |
+| `FS_STAT` | 28 | — | `0..3` 0/-1, `4..7` size, `8` type (0 file / 1 dir), `9` backend (`FS_TYPE_*`: 1 FAT32 / 2 ext2 / 3 exFAT) |
 | `FS_CHMOD` | 29 | `100..103` mode (low 12 bits) | 0 / -1 (ext2 only; owner-or-root) |
 | `FS_CHOWN` | 30 | `100..103` uid | 0 / -1 (ext2 only; root only) |
 | `FS_CACHE_STATS` | 31 | — | `0..7` hits, `8..15` misses (u64) |

@@ -1450,8 +1450,15 @@ const uint FS_READ_AT = 26;
 const uint FS_WRITE_AT = 27;
 // FS_STAT: byte 0..99 = path ("" = the root). Reply: byte 0..3 = 0 or
 // -1 (nothing resolves there), byte 4..7 = uint size (0 for a
-// directory), byte 8 = type (0 = file, 1 = directory).
+// directory), byte 8 = type (0 = file, 1 = directory), byte 9 = the
+// serving mount's backend (FS_TYPE_* below).
 const uint FS_STAT = 28;
+// Filesystem backends, as fsd's FS_STAT reports them (byte 9) and as
+// fsd itself tracks its mount (user/fs/fsd.c3's fs_type).
+const int FS_TYPE_NONE  = 0;
+const int FS_TYPE_FAT32 = 1;
+const int FS_TYPE_EXT2  = 2;
+const int FS_TYPE_EXFAT = 3;
 // FS_CHMOD / FS_CHOWN: byte 0..99 = path, byte 100..103 = uint arg (the
 // new mode's low 12 bits for FS_CHMOD, the new owner uid for FS_CHOWN).
 // Reply: byte 0..3 = 0 or -1, same as FS_MKDIR/FS_DELETE. ext2 only —
@@ -1658,10 +1665,6 @@ fn int fs_write_at(char* filename, char* buf, int len, uint offset) @export("fs_
     return *result_field;
 }
 
-// Size + type of `filename` ("" = the root directory). On success
-// returns 0 and fills *out_size (0 for a directory) and *out_type
-// (0 = file, 1 = directory), either of which may be null. Returns -1 if
-// nothing resolves there. See FS_STAT's own wire-format comment.
 // Reads fsd's sector-read-cache hit/miss counters (FS_CACHE_STATS).
 // Resolves the fsd serving "/" (the primary/ext2 mount). Returns 0 on
 // success. Introspection only — see user/fs/fsd.c3's fs_cache_init.
@@ -1689,7 +1692,25 @@ fn int fs_opstats(ulong* out6) @export("fs_opstats") {
     return 0;
 }
 
+// Size + type of `filename` ("" = the root directory). On success
+// returns 0 and fills *out_size (0 for a directory) and *out_type
+// (0 = file, 1 = directory), either of which may be null. Returns -1 if
+// nothing resolves there. See FS_STAT's own wire-format comment.
 fn int fs_stat(char* filename, uint* out_size, int* out_type) @export("fs_stat") {
+    return fs_stat_ex(filename, out_size, out_type, null);
+}
+
+// The backend (FS_TYPE_*) of the mount serving `path` — e.g. "/" for the
+// root filesystem — or -1 if nothing resolves there. For callers whose
+// behaviour depends on the backend: 9P fids, chmod/chown and uid
+// permissions are ext2-only.
+fn int fs_type_of(char* path) @export("fs_type_of") {
+    int t = FS_TYPE_NONE;
+    if (fs_stat_ex(path, null, null, &t) < 0) return -1;
+    return t;
+}
+
+fn int fs_stat_ex(char* filename, uint* out_size, int* out_type, int* out_fstype) {
     char[100] _ap @noinit; fs_abspath(filename, &_ap[0]); filename = &_ap[0]; // cwd-relative -> absolute
     for (int mi = 0; ; mi++) {                       // union walk — first member with the file
         char[FS_XLATE_MAX] _sb @noinit;
@@ -1714,6 +1735,7 @@ fn int fs_stat(char* filename, uint* out_size, int* out_type) @export("fs_stat")
         uint* size_field = (uint*)&req[4];
         if (out_size != null) *out_size = *size_field;
         if (out_type != null) *out_type = (int)((uint)req[8] & 0xFF);
+        if (out_fstype != null) *out_fstype = (int)((uint)req[9] & 0xFF);
         return 0;
     }
 }

@@ -273,12 +273,8 @@ bool g_fsd_is_secondary = false;
 uint fs_partition_start;
 
 // Which backend is mounted — set once by fs_mount(), still handy for the
-// P9_* block below and a couple of log lines. Plain int constants, not
-// an enum: no enum usage anywhere else in this codebase.
-const int FS_TYPE_NONE  = 0;
-const int FS_TYPE_FAT32 = 1;
-const int FS_TYPE_EXT2  = 2;
-const int FS_TYPE_EXFAT = 3;
+// P9_* block below, FS_STAT's reply byte 9 and a couple of log lines.
+// The FS_TYPE_* values live in user/user.c3 (shared with clients).
 int fs_type = FS_TYPE_NONE;
 
 // --- FS_* verb dispatch table ----------------------------------------
@@ -1608,12 +1604,14 @@ fn void main(String[] args)
 			case FS_STAT:
 			{
 				// Reply: 0..3 = 0/-1, 4..7 = size (uint), 8 = type
-				// (0 file, 1 dir). The adapter fills r.out_size/out_type.
+				// (0 file, 1 dir), 9 = this mount's backend (FS_TYPE_*).
+				// The adapter fills r.out_size/out_type.
 				r.uid = fsd_requester_uid(from);
 				result = fs_ops.stat(&r);
 				uint* stat_size_field = (uint*)&buf[4];
 				*stat_size_field = r.out_size;
 				buf[8] = (char)r.out_type;
+				buf[9] = (char)fs_type;
 			}
 			case FS_WRITE:
 			{
