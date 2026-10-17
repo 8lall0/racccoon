@@ -54,7 +54,7 @@ func nsResolve(path *byte, prefixOut *uint32) int64
 // nsTranslate resolves an absolute path through the caller's namespace,
 // applying any `bind` path rewrite, and writes the server-relative path
 // for union member `member` into `out`. Returns the serving pid, -1 if
-// nothing matches / member past the end. See src/entry.c3.
+// nothing matches / member past the end. See src/syscalls.c3.
 //
 //go:noescape
 func nsTranslate(path *byte, member int64, out *byte, outMax int64) int64

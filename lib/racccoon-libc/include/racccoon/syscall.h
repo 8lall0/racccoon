@@ -4,7 +4,7 @@
  * syscall5(): a0..a2 (and a4, a5) carry arguments, a3 the syscall
  * number, the result comes back in a0. Keep the numbers in sync with
  * user/user.c3 (authoritative — shared by every c3 program and the
- * kernel switch in src/entry.c3). Wrappers are real functions in
+ * kernel switch in src/syscalls.c3). Wrappers are real functions in
  * src/syscall.c (not inline — some callers want a stable address). */
 #ifndef RACCCOON_SYSCALL_H
 #define RACCCOON_SYSCALL_H

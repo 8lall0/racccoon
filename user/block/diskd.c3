@@ -20,7 +20,7 @@ import std::nolibc::mem;
 // comments).
 
 // --- Shared with the kernel — kept in sync by hand, same convention as
-// the SYS_* numbers above (see src/entry.c3, src/process.c3).
+// the SYS_* numbers above (see src/syscalls.c3, src/entry.c3, src/process.c3).
 const uint DISKD_IRQ_NOTIFY = 0xFFFFFFFF;
 const uint DISKD_READ  = 210; // request: read one sector
 const uint DISKD_WRITE = 211; // request: write one sector
@@ -228,7 +228,7 @@ fn void main()
 		// one SYS_DRIVER_IRQ_WAIT: the same PLIC-hand-draining poll loop,
 		// but the passes happen inside the kernel where the yield()s aren't
 		// syscalls. Still not a true blocking wait — see that syscall's
-		// comment in src/entry.c3 for why (sscratch nested-trap hazard,
+		// comment in src/syscalls.c3 for why (sscratch nested-trap hazard,
 		// global SIE-off storms) and why the in-kernel loop is safe anyway.
 		driver_irq_wait();
 

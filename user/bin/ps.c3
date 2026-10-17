@@ -3,7 +3,7 @@ module user;
 import std::io;
 
 // ps — one-shot process list. Walks every process-table slot via
-// SYS_PROC_STAT (src/entry.c3) and prints pid / state / uid / resident
+// SYS_PROC_STAT (src/syscalls.c3) and prints pid / state / uid / resident
 // pages / name. No options; the kernel table caps at 16 slots (PROCS_MAX).
 
 const int MAXSLOT = 64; // generous ceiling over PROCS_MAX

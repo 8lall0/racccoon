@@ -6,7 +6,7 @@ import std::nolibc::mem;
 // /env: per-process environment variables, real Plan 9 idea (there
 // #e, a private per-process kernel device). Racccoon has no per-process
 // device concept and doesn't need one for this: every request reaches
-// this server via ipc_recv_type_gen() (src/entry.c3's SYS_IPC_RECV_GEN),
+// this server via ipc_recv_type_gen() (src/syscalls.c3's SYS_IPC_RECV_GEN),
 // carrying the sender's own kernel-verified (pid, generation) —
 // unforgeable by the requester. Keying env_table by (pid, generation,
 // name) and only ever matching a request's own (from, from_gen) gives
@@ -132,7 +132,7 @@ const char* ENV_INHERITED_MARKER = ".inherited";
 // send to a server from inside another process's syscall handling, and
 // building one would be a much bigger mechanism than this needs) — so
 // instead, the first time this process instance ever touches /env at
-// all, ask the kernel who its parent is (SYS_PARENT_INFO, src/entry.c3
+// all, ask the kernel who its parent is (SYS_PARENT_INFO, src/syscalls.c3
 // — built for exactly this) and copy that parent's *current* vars once.
 // A one-time snapshot, not a live link — matches real Plan 9's own
 // copy-on-fork semantics, not an ongoing connection: neither side's

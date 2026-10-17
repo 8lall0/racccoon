@@ -8,7 +8,7 @@ import std::nolibc::fmt;
 extern char[] __stack_top @cname("__stack_top");
 
 // Syscall numbers. Must be kept in sync by hand with the SYS_* consts in
-// src/entry.c3 — kernel and user are separate c3c compilations with no
+// src/syscalls.c3 — kernel and user are separate c3c compilations with no
 // shared header.
 const int SYS_PUTCHAR   = 1;
 const int SYS_GETCHAR   = 2;
@@ -26,54 +26,54 @@ const int SYS_RFORK      = 11;
 const int SYS_NS_UNMOUNT = 12;
 const int SYS_JOIN       = 13;
 const int SYS_FS_PARTITION_INFO = 14;
-const int SYS_FUTEX_WAIT = 15; // block while *addr == expected — see src/entry.c3's case
+const int SYS_FUTEX_WAIT = 15; // block while *addr == expected — see src/syscalls.c3's case
 const int SYS_FUTEX_WAKE = 16; // wake every waiter blocked on addr in this address space
-const int SYS_PROC_INFO  = 17; // returns another process's state/generation — see src/entry.c3's case
-const int SYS_KILL       = 18; // kills another process by pid (+ optional generation check) — see src/entry.c3's case
-const int SYS_IPC_RECV_GEN = 19; // same as SYS_IPC_RECV, plus the sender's generation — see src/entry.c3's case
-const int SYS_IPC_REPLY    = 20; // same as SYS_IPC_SEND, plus an optional target-generation check — see src/entry.c3's case
-const int SYS_SRV_POST     = 21; // posts current_proc under a short name in the global srv_table — see src/entry.c3's case
-const int SYS_NS_MOUNT     = 22; // binds a posted srv_table name at a path prefix in the caller's own namespace — see src/entry.c3's case
-const int SYS_PARENT_INFO  = 23; // returns a process's parent pid/generation, if it has one — see src/entry.c3's case
-const int SYS_EXEC         = 24; // replaces the calling process's own image in place — see src/entry.c3's case
-const int SYS_SETUID       = 25; // sets the caller's own uid, only while still root — see src/entry.c3's case
-const int SYS_NS_MOUNT_WAIT = 26; // SYS_NS_MOUNT, but blocks (bounded by a retry count) until the target actually posts — see src/entry.c3's case
-const int SYS_YIELD         = 27; // voluntarily gives up the rest of this process's timeslice once — see src/entry.c3's case
+const int SYS_PROC_INFO  = 17; // returns another process's state/generation — see src/syscalls.c3's case
+const int SYS_KILL       = 18; // kills another process by pid (+ optional generation check) — see src/syscalls.c3's case
+const int SYS_IPC_RECV_GEN = 19; // same as SYS_IPC_RECV, plus the sender's generation — see src/syscalls.c3's case
+const int SYS_IPC_REPLY    = 20; // same as SYS_IPC_SEND, plus an optional target-generation check — see src/syscalls.c3's case
+const int SYS_SRV_POST     = 21; // posts current_proc under a short name in the global srv_table — see src/syscalls.c3's case
+const int SYS_NS_MOUNT     = 22; // binds a posted srv_table name at a path prefix in the caller's own namespace — see src/syscalls.c3's case
+const int SYS_PARENT_INFO  = 23; // returns a process's parent pid/generation, if it has one — see src/syscalls.c3's case
+const int SYS_EXEC         = 24; // replaces the calling process's own image in place — see src/syscalls.c3's case
+const int SYS_SETUID       = 25; // sets the caller's own uid, only while still root — see src/syscalls.c3's case
+const int SYS_NS_MOUNT_WAIT = 26; // SYS_NS_MOUNT, but blocks (bounded by a retry count) until the target actually posts — see src/syscalls.c3's case
+const int SYS_YIELD         = 27; // voluntarily gives up the rest of this process's timeslice once — see src/syscalls.c3's case
 // 28 was SYS_USBD_INFO — subsumed by SYS_DEV_INFO (60).
 // 29 was SYS_NETD_INFO — subsumed by SYS_DEV_INFO (60).
 // 30 was SYS_ETHD_INFO — subsumed by SYS_DEV_INFO (60).
-const int SYS_KBD_PUSH      = 31; // usbd-only: pushes one decoded USB-keyboard byte into the kernel keystroke queue SYS_GETCHAR drains — see src/entry.c3's case
-const int SYS_DRIVER_IRQ_ARM = 32; // usbd/sdd: re-enable this driver's PLIC source (handle_trap disables it on each fire — level-triggered); dispatched by caller pid — see src/entry.c3's case
+const int SYS_KBD_PUSH      = 31; // usbd-only: pushes one decoded USB-keyboard byte into the kernel keystroke queue SYS_GETCHAR drains — see src/syscalls.c3's case
+const int SYS_DRIVER_IRQ_ARM = 32; // usbd/sdd: re-enable this driver's PLIC source (handle_trap disables it on each fire — level-triggered); dispatched by caller pid — see src/syscalls.c3's case
 // 33 was SYS_SDD_INFO — subsumed by SYS_DEV_INFO (60).
-const int SYS_IPC_CALL      = 34; // one-shot RPC: deliver a request and block for the reply, all in the kernel — reply can't be pre-empted by a stray sender, aborts -1 if the server dies at any point — see src/entry.c3's case
-const int SYS_GETUID        = 35; // the caller's own uid — see src/entry.c3's case
-const int SYS_BOOT_QUIET    = 36; // shell-only: silences boot-server console output once boot settles — see src/entry.c3's case
-const int SYS_CHDIR         = 37; // set the caller's cwd (absolute, normalised) — see src/entry.c3's case
-const int SYS_GETCWD        = 38; // copy the caller's cwd out — see src/entry.c3's case
+const int SYS_IPC_CALL      = 34; // one-shot RPC: deliver a request and block for the reply, all in the kernel — reply can't be pre-empted by a stray sender, aborts -1 if the server dies at any point — see src/syscalls.c3's case
+const int SYS_GETUID        = 35; // the caller's own uid — see src/syscalls.c3's case
+const int SYS_BOOT_QUIET    = 36; // shell-only: silences boot-server console output once boot settles — see src/syscalls.c3's case
+const int SYS_CHDIR         = 37; // set the caller's cwd (absolute, normalised) — see src/syscalls.c3's case
+const int SYS_GETCWD        = 38; // copy the caller's cwd out — see src/syscalls.c3's case
 const int SYS_PIPE          = 39;
 const int SYS_PIPE_SETOUT   = 40;
 const int SYS_PIPE_SETIN    = 41;
 const int SYS_PIPE_READ     = 42;
 const int SYS_PIPE_WRITE    = 43;
 const int SYS_PIPE_HOLD     = 44;
-const int SYS_NS_LIST       = 45; // copy the caller's namespace out — see src/entry.c3's case
-const int SYS_NS_BIND       = 46; // Plan 9 `bind` — see src/entry.c3's case
-const int SYS_MAP           = 47; // map fresh zero-filled RW pages, returns base vaddr or -1 — see src/entry.c3's case
-const int SYS_STDIN_ISATTY  = 48; // 1 = console, 0 = pipe — see src/entry.c3's case
-const int SYS_TIMEBASE      = 49; // the `time` CSR tick rate (Hz) — see src/entry.c3's case
-const int SYS_GETPID        = 50; // the caller's own pid — see src/entry.c3's case
-const int SYS_EXEC_MAX      = 51; // board::EXEC_MAX_IMAGE_SIZE — the largest image SYS_EXEC will install (varies by board: 1 MiB Duo, 4 MiB QEMU/JH7110) — see src/entry.c3's case
-const int SYS_NS_TRANSLATE  = 52; // union-aware path resolution — see src/entry.c3's case
-const int SYS_PROF          = 53; // on-device profiling odometer — see src/entry.c3's case
-const int SYS_PROF_HIST     = 54; // DIAGNOSTIC per-syscall histogram — see src/entry.c3's case + ns_translate() below
-const int SYS_DRIVER_IRQ_WAIT = 55; // interrupt-driven driver completion-wait, in-kernel — see src/entry.c3's case + driver_irq_wait() below
-const int SYS_DISK_ARENA_INFO = 56; // diskd + primary fsd: base+size of the shared payload arena — see src/entry.c3's case + disk_arena_info() below
-const int SYS_KLOG_READ     = 57; // kernel console log ring — /bin/dmesg — see src/entry.c3's case + klog_read() below
-const int SYS_PROC_STAT     = 58; // per-process state/uid/gen/pages/pid/name — /bin/ps + /bin/top — see src/entry.c3's case + proc_stat() below
-const int SYS_GETCHAR_NB    = 59; // non-blocking console read: a keystroke, or -1 if none waiting — see src/entry.c3's case + getchar_nb() below
+const int SYS_NS_LIST       = 45; // copy the caller's namespace out — see src/syscalls.c3's case
+const int SYS_NS_BIND       = 46; // Plan 9 `bind` — see src/syscalls.c3's case
+const int SYS_MAP           = 47; // map fresh zero-filled RW pages, returns base vaddr or -1 — see src/syscalls.c3's case
+const int SYS_STDIN_ISATTY  = 48; // 1 = console, 0 = pipe — see src/syscalls.c3's case
+const int SYS_TIMEBASE      = 49; // the `time` CSR tick rate (Hz) — see src/syscalls.c3's case
+const int SYS_GETPID        = 50; // the caller's own pid — see src/syscalls.c3's case
+const int SYS_EXEC_MAX      = 51; // board::EXEC_MAX_IMAGE_SIZE — the largest image SYS_EXEC will install (varies by board: 1 MiB Duo, 4 MiB QEMU/JH7110) — see src/syscalls.c3's case
+const int SYS_NS_TRANSLATE  = 52; // union-aware path resolution — see src/syscalls.c3's case
+const int SYS_PROF          = 53; // on-device profiling odometer — see src/syscalls.c3's case
+const int SYS_PROF_HIST     = 54; // DIAGNOSTIC per-syscall histogram — see src/syscalls.c3's case + ns_translate() below
+const int SYS_DRIVER_IRQ_WAIT = 55; // interrupt-driven driver completion-wait, in-kernel — see src/syscalls.c3's case + driver_irq_wait() below
+const int SYS_DISK_ARENA_INFO = 56; // diskd + primary fsd: base+size of the shared payload arena — see src/syscalls.c3's case + disk_arena_info() below
+const int SYS_KLOG_READ     = 57; // kernel console log ring — /bin/dmesg — see src/syscalls.c3's case + klog_read() below
+const int SYS_PROC_STAT     = 58; // per-process state/uid/gen/pages/pid/name — /bin/ps + /bin/top — see src/syscalls.c3's case + proc_stat() below
+const int SYS_GETCHAR_NB    = 59; // non-blocking console read: a keystroke, or -1 if none waiting — see src/syscalls.c3's case + getchar_nb() below
 const int SYS_DEV_INFO   = 60; // a0 = out uptr[], a1 = capacity (<= 4): physical base of each DMA region the caller's board device declared (src/device.c3). Returns the region count, or -1 if the caller owns no device — see dev_info() below
 
-// rfork flags — see src/entry.c3's SYS_RFORK case for the full design.
+// rfork flags — see src/syscalls.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
 const int RFMEM  = 1 << 1; // share the parent's address space instead of copying it
 
@@ -96,7 +96,7 @@ fn void exitcode(int code) @noreturn @export("exitcode") {
 
 // Returns the child's pid (>0) to the parent, 0 to the child, or -1 on
 // failure (no free process slot, or RFPROC not set) — same convention
-// as Plan 9's rfork(2). See src/entry.c3's SYS_RFORK case and
+// as Plan 9's rfork(2). See src/syscalls.c3's SYS_RFORK case and
 // process.c3's fork_entry() for the actual mechanism: both halves
 // resume from this exact call site, not a fresh entry point.
 //
@@ -104,7 +104,7 @@ fn void exitcode(int code) @noreturn @export("exitcode") {
 // generation counter at creation time — capture this if you intend to
 // join() the child later, so join can tell "it exited" apart from "its
 // pid got reused by something unrelated" (see src/process.c3's
-// Process.generation and SYS_JOIN's case in src/entry.c3).
+// Process.generation and SYS_JOIN's case in src/syscalls.c3).
 fn int rfork(int flags, uint* generation_out) @export("rfork") {
     return rfork_io(flags, generation_out, -1, -1);
 }
@@ -115,7 +115,7 @@ fn int rfork(int flags, uint* generation_out) @export("rfork") {
 // open (the child can be scheduled — timer preemption, or a forking
 // runtime that yields — before the caller gets to the second call).
 // -1 for either = leave that stream on the console. The shell's `|` /
-// `>` / `<` path uses this; see src/entry.c3's SYS_RFORK case.
+// `>` / `<` path uses this; see src/syscalls.c3's SYS_RFORK case.
 fn int rfork_io(int flags, uint* generation_out, int stdout_pipe, int stdin_pipe) @export("rfork_io") {
     return syscall4(SYS_RFORK, flags, (long)generation_out, stdout_pipe, stdin_pipe);
 }
@@ -160,7 +160,7 @@ fn int rfork_io(int flags, uint* generation_out, int stdout_pipe, int stdin_pipe
 // right after the image content as NUL-separated strings ("foo\0bar\0"
 // for argc=2) — the simplest encoding that survives being copied as a
 // flat byte blob into the new process's own address space; real
-// pointers wouldn't survive that copy. SYS_EXEC (src/entry.c3) stages
+// pointers wouldn't survive that copy. SYS_EXEC (src/syscalls.c3) stages
 // this blob as its own pages, mapped right after the image's own last
 // page, and hands the new process argc/its base address via a0/a1 at
 // entry — start() below passes them straight through as real
@@ -479,7 +479,7 @@ fn int ipc_call(int dest_pid, uint verb, char* buf, int req_len, int buf_cap, ui
 // half of the stale-pid protection: pair with ipc_recv_type_gen()'s own
 // out_from_generation to close the window where the original requester
 // exits (or gets killed) and its pid gets reused before this reply
-// arrives. See SYS_IPC_REPLY's case in src/entry.c3 for the full
+// arrives. See SYS_IPC_REPLY's case in src/syscalls.c3 for the full
 // reasoning.
 fn int ipc_reply(int dest_pid, uint type, char* data, int len, uint expected_generation) @export("ipc_reply") {
     return syscall5(SYS_IPC_REPLY, dest_pid, (long)type, (long)data, len, (long)expected_generation);
@@ -493,7 +493,7 @@ fn int ipc_recv_type(char* buf, int len, uint* out_type) @export("ipc_recv_type"
 // captured at delivery time (out_from_generation) — feed this straight
 // back into ipc_reply()'s own expected_generation to reply safely. A
 // distinct syscall (SYS_IPC_RECV_GEN) rather than a widened
-// SYS_IPC_RECV — see that case's own comment, src/entry.c3, for why.
+// SYS_IPC_RECV — see that case's own comment, src/syscalls.c3, for why.
 fn int ipc_recv_type_gen(char* buf, int len, uint* out_type, uint* out_from_generation) @export("ipc_recv_type_gen") {
     return syscall4(SYS_IPC_RECV_GEN, (long)buf, len, (long)out_type, (long)out_from_generation);
 }
@@ -503,7 +503,7 @@ fn int ipc_recv(char* buf, int len) @export("ipc_recv") {
 }
 
 // Non-blocking: returns -1 immediately if nothing's waiting, instead of
-// parking this process until a message arrives. See src/entry.c3's
+// parking this process until a message arrives. See src/syscalls.c3's
 // SYS_IPC_POLL case for why this exists (diskd's completion-wait needs
 // it specifically — a blocking recv there is unsafe).
 fn int ipc_poll_type(char* buf, int len, uint* out_type) @export("ipc_poll_type") {
@@ -512,7 +512,7 @@ fn int ipc_poll_type(char* buf, int len, uint* out_type) @export("ipc_poll_type"
 
 // Interrupt-driven driver completion-wait: block until this driver's
 // pending device-completion notify fires, hand-draining the PLIC each
-// pass inside the one syscall (see src/entry.c3's SYS_DRIVER_IRQ_WAIT).
+// pass inside the one syscall (see src/syscalls.c3's SYS_DRIVER_IRQ_WAIT).
 // diskd's old `for(;;){ ipc_poll_type(...) }` spin was one syscall per
 // pass, ~330M/run over a `go build`; this is one syscall per completion.
 // Returns 0, or -1 if the caller doesn't own a routed IRQ.
@@ -736,7 +736,7 @@ fn int ns_resolve(char* path, uint* out_prefix_len) @export("ns_resolve") {
 // exact prefix (not the longest-prefix match ns_resolve/SYS_NS_RESOLVE
 // use). Returns 0 if found and removed, -1 if no mount had that exact
 // prefix. A process that rfork(RFPROC)'d (a real, independent copy of
-// the namespace — see src/entry.c3's SYS_RFORK case) can use this to
+// the namespace — see src/syscalls.c3's SYS_RFORK case) can use this to
 // sandbox itself without affecting its parent or siblings.
 fn int ns_unmount(char* prefix) @export("ns_unmount") {
     return syscall(SYS_NS_UNMOUNT, (long)prefix, 0, 0);
@@ -768,7 +768,7 @@ fn int ns_mount(char* prefix, char* srv_name) @export("ns_mount") {
 // itself yet but is expected to soon (a dynamically-spawned driver
 // still finishing its own hardware init, for instance). A plain retry
 // count, not a wall-clock timeout — see SYS_NS_MOUNT_WAIT's own case
-// (src/entry.c3) for why: a real time-CSR deadline crashed here,
+// (src/syscalls.c3) for why: a real time-CSR deadline crashed here,
 // combining read_reg("time") with other locals surviving across
 // repeated calls inside a loop. Returns 0 once bound, -1 if every
 // attempt failed — same convention every other ns_*/srv_* wrapper
@@ -845,7 +845,7 @@ fn void* map_pages(uint nbytes) @export("map_pages") {
 // For a process busy-waiting on something with no syscall of its own
 // (a hardware register poll, a real-time delay via rdtime()) so it
 // stays cooperatively preemptible instead of a syscall-free spin —
-// see SYS_YIELD's own case (src/entry.c3) for why that matters: this
+// see SYS_YIELD's own case (src/syscalls.c3) for why that matters: this
 // kernel's own design means a genuinely syscall-free loop can never be
 // preempted once some other process is idling in SYS_GETCHAR (the
 // shell's own normal resting state), a real deadlock, not just an
@@ -903,7 +903,7 @@ fn uptr ethd_info() @export("ethd_info") {
 // can't tell "this process exited" apart from "this pid got reused by
 // an unrelated process" (pids are slot-indexed and do get reused; see
 // src/process.c3's Process.generation and SYS_JOIN's case in
-// src/entry.c3 for the full reasoning).
+// src/syscalls.c3 for the full reasoning).
 fn int join(int pid, uint generation) @export("join") {
     return syscall(SYS_JOIN, pid, (long)generation, 0);
 }
@@ -914,7 +914,7 @@ fn int join(int pid, uint generation) @export("join") {
 // is src/process.c3's PROC_RUNNABLE (1) or PROC_BLOCKED (2) — never
 // PROC_UNUSED (0), since the kernel's own proc_by_pid() already filters
 // that case out before this can return success. uid_out (new, syscall4
-// for the extra argument — see src/entry.c3's SYS_PROC_INFO case for
+// for the extra argument — see src/syscalls.c3's SYS_PROC_INFO case for
 // why widening the wrapper directly is safe here) is what lets a
 // server like procd (user/procd.c3) look up the real requester's uid
 // before acting on their behalf with its own, always-root privilege.
@@ -930,7 +930,7 @@ fn int proc_info(int pid, uint* state_out, uint* generation_out, int* uid_out) @
 // level" — the standard fork() + child-calls-setuid() idiom. Gates
 // kill() (root or same-uid target only) and srv_post()'s
 // reclaim-an-existing-name case (root or same-uid as the live holder)
-// — see both their own comments, src/entry.c3.
+// — see both their own comments, src/syscalls.c3.
 fn int setuid(int new_uid) @export("setuid") {
     return syscall(SYS_SETUID, new_uid, 0, 0);
 }
@@ -1109,7 +1109,7 @@ fn int parent_info(int pid, uint* parent_generation_out) @export("parent_info") 
 // at this pid right now"); any other value must match that pid's live
 // Process.generation exactly or this fails, the same stale-pid
 // protection join()'s own generation argument gives — see SYS_KILL's
-// case in src/entry.c3 for the full reasoning. Returns 0 on success, -1
+// case in src/syscalls.c3 for the full reasoning. Returns 0 on success, -1
 // if the pid doesn't exist, is the caller itself, or the generation
 // didn't match.
 fn int kill(int pid, uint expected_generation) @export("kill") {
@@ -1117,7 +1117,7 @@ fn int kill(int pid, uint expected_generation) @export("kill") {
 }
 
 // Blocks while *addr == expected, atomically with respect to any
-// concurrent futex_wake on the same address (see src/entry.c3's
+// concurrent futex_wake on the same address (see src/syscalls.c3's
 // SYS_FUTEX_WAIT case — the check-then-block sequence happens inside a
 // single, non-preemptible trap, so no wake can be lost between the
 // value check and actually parking this process). Returns immediately,
@@ -1130,7 +1130,7 @@ fn int futex_wait(int* addr, int expected) @export("futex_wait") {
 
 // Wakes every process currently blocked (via futex_wait) on addr
 // within this same address space (kernel matches by page_table, not
-// just the numeric address — see src/entry.c3). Never fails, doesn't
+// just the numeric address — see src/syscalls.c3). Never fails, doesn't
 // report how many were woken: callers don't need to know, same as a
 // condition-variable broadcast.
 fn int futex_wake(int* addr) @export("futex_wake") {
@@ -1159,7 +1159,7 @@ fn void Mutex.lock(&self) @export("mutex_lock") {
         // means the compare_exchange below just failed to CAS 0->1,
         // which is only possible if the current value is the other
         // state, 1. futex_wait itself re-checks *addr == expected
-        // right before blocking (see src/entry.c3), so a concurrent
+        // right before blocking (see src/syscalls.c3), so a concurrent
         // unlock() between that failed compare_exchange and
         // futex_wait's own check can't be missed — it just makes
         // futex_wait return immediately instead of actually parking
@@ -1200,7 +1200,7 @@ fn int diskd_info(uptr* vq_paddr_out, uptr* req_paddr_out) @export("diskd_info")
 
 // diskd + primary fsd only: the physical base + size of the shared
 // payload arena the kernel identity-mapped into both (docs/ipc-rings.md
-// P1 step 2, src/entry.c3's SYS_DISK_ARENA_INFO). Sector data for the
+// P1 step 2, src/syscalls.c3's SYS_DISK_ARENA_INFO). Sector data for the
 // DISKD_*_ARENA verbs lives here instead of in the IPC message.
 // Returns 0, or -1 for any other caller. uptr*/uint* sizing matches the
 // kernel's stores (see dev_info's own comment).
@@ -1434,7 +1434,7 @@ const uint FS_RENAME = 25;
 // 104..107 as a live offset on the *same* verb would mean reading
 // uninitialized stack garbage as an offset for every caller not
 // updated to know about it — same reasoning SYS_IPC_RECV_GEN
-// (src/entry.c3) used over widening SYS_IPC_RECV.
+// (src/syscalls.c3) used over widening SYS_IPC_RECV.
 const uint FS_READ_AT = 26;
 // FS_WRITE_AT: byte 0..99 = path, 100..103 = uint length, 104..107 =
 // uint offset, 108.. = data (so <= FS_MSG_MAX-108 = 1020 bytes/call —

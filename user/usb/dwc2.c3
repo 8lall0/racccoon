@@ -458,7 +458,7 @@ fn bool usb_core_reset()
 
     // Defensive settle delay — see this function's own header comment.
     // yield()-paced, not a bare spin — see SYS_YIELD's own comment
-    // (src/entry.c3) for why a genuinely syscall-free wait here is a
+    // (src/syscalls.c3) for why a genuinely syscall-free wait here is a
     // real deadlock risk, not just wasted CPU.
     ulong settle_start = rdtime();
     ulong settle_budget = usb_us_to_ticks(100000);
@@ -893,7 +893,7 @@ fn uint usb_hfnum_microframe() { return usb_reg_read(USB_HFNUM) & 0x7; }
 //
 // This is a deliberate, narrow exception to the yield()-everywhere
 // convention elsewhere in this driver (see SYS_YIELD's own comment,
-// src/entry.c3, for the real deadlock it exists to avoid: SIE stays
+// src/syscalls.c3, for the real deadlock it exists to avoid: SIE stays
 // globally disabled while the shell idles in SYS_GETCHAR, so a
 // genuinely unbounded syscall-free spin elsewhere can wedge the whole
 // system). That risk doesn't apply here in the same way: this loop is

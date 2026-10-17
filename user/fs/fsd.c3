@@ -60,7 +60,7 @@ import std::nolibc::mem;
 // Unlike diskd, fsd is an ordinary IPC participant: nothing it waits for
 // depends on a hardware interrupt firing while it's parked mid-trap, so
 // plain blocking ipc_send/ipc_recv (via p9_call) is safe here — the
-// sscratch/nested-trap hazard documented in src/entry.c3's SYS_IPC_POLL
+// sscratch/nested-trap hazard documented in src/syscalls.c3's SYS_IPC_POLL
 // comment was specific to diskd's *interrupt* wait, not to IPC in
 // general.
 

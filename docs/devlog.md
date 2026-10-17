@@ -4,6 +4,96 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-18 (later) — the double "respawned sdd" was a count-bounded ACMD41 wait; device DMA now outlives its driver
+
+Two items from the open list, taken together because they meet in sdd's
+respawn path. Both verified on the real Duo, driven directly through the
+attached `screen` session on its serial console.
+
+### 1. Device DMA regions are kept across a driver respawn
+
+Same use-after-free class as the disk arena (previous entry), narrower
+window. `device_setup` allocated a fresh DMA region on every spawn and
+`proc_destroy` freed the old one. But a killed driver leaves its *device*
+still programmed with those addresses until the replacement resets it:
+virtio rings (diskd, netd), DWC2's interrupt-IN channel that keeps polling
+the keyboard (usbd), an SDMA block in flight (sdd). Any late DMA landed in
+whatever the allocator had handed out next.
+
+Now `dev_dma_paddr[]` is allocated on a device's first spawn and owned by the
+*device*. A respawn reuses the same region (zeroed with `mem::set`, the same
+way `alloc_pages` zeroes a fresh one, so there's no new cache-coherency
+question on the Duo's uncached mappings), and it's mapped `PAGE_SHARED` so
+`proc_destroy` no longer frees it. Both virtio drivers write
+`DEVICE_STATUS = 0` (reset) before touching ring memory, so reuse is safe
+there. Verified:
+
+- QEMU: respawned netd runs DHCP, ARP and a gateway ping through the reused
+  rings (×2); diskd ×3 per boot on all three images.
+- Duo: usbd's respawn fully re-enumerates the hub through its reused page;
+  sdd's SDMA comes back on.
+
+### 2. `storagekilltest` couldn't see the bug it was meant to catch
+
+On the Duo it printed `ok` *before* sdd had even been respawned: its
+post-kill read of `bin/echod` was served by fsd's read cache. Now it also
+writes a file through the respawned driver and reads it back (the cache is
+read-only), then waits 3 s and writes again. It counts respawns from the
+slot's generation, since a respawn reuses the slot and the pid alone repeats.
+It prints `ok … respawned once …` or, e.g., `FAILED (… respawns=2 driver
+pid/gen 3/1 -> 3/3 …)`.
+
+### 3. Silenced boot-server output goes to the `dmesg` ring
+
+`SYS_BOOT_QUIET` used to *drop* a boot server's output. Now
+`sbi::klog_put()` keeps it in the kernel log ring, off the console. That's
+what made the next step visible: with `loud` (output on the console), sdd's
+respawn was fine 4/4; silenced, it was double 3/3, and the third run hit the
+supervisor's restart limit (5), leaving sdd down. Printing at 115200 baud was
+slowing sdd down enough to hide the bug. With the ring, `dmesg` showed the
+first respawned sdd's last words without that slowdown:
+
+```
+sdd: ACMD41 gave up after 000000c8 tries, ocr=40ff8000
+sdd: card enumeration failed
+```
+
+### 4. Root cause: ACMD41 was bounded by a try count, not time
+
+`sdd_enumerate`'s ACMD41 loop (wait for the card to report "powered up",
+OCR bit 31) was `for (tries < 200)` with no delay. At boot the card is
+already initialized (BootROM read it), so it's ready in a few tries. A
+respawned sdd's CMD0 resets an initialized card, which then needs a real
+init. The spec allows up to 1 s, and 200 back-to-back tries took less than
+the ~40 ms this card needs. With `loud` on, the '.' every 20 tries cost serial
+time, which is why it worked there. The supervisor's second respawn found a
+card that had meanwhile finished initializing.
+
+Fix: a **2 s wall-clock bound, polled every 10 ms** (Linux's
+`mmc_send_app_op_cond` pace), '.' every 100 ms. On the Duo, silenced:
+`storagekilltest` ×4 → one respawn each, `ACMD41 ready after 5 tries` every
+time (≈40 ms). `dw_mshc.c3` (Orange Pi) had the identical count-only loop and
+got the same fix. It builds, but hasn't been run on that board.
+
+Also on this kernel, on the Duo: `usbdkilltest`, `gpiodkilltest`,
+`devinfotest`, `wasmtest`, `stdiotest`, and the five ext2-only tests (which
+really run there, the root being ext2; `fs_type_of` works on hardware).
+
+### Also: finished the `entry.c3` → `syscalls.c3` repointing
+
+The syscall-split commit had missed ~60 comments in `user.c3` (every `SYS_*`
+line's "see src/entry.c3's case"), `process.c3`, `sbi.c3`, the C libc header,
+Go's `racccoon_fs.go`, and several drivers. Each was checked by hand: syscall
+references now say `syscalls.c3`, while genuine trap-path ones (timer,
+`read_reg`, `enable_user_timer_access`, the lazy-fault path, IRQ handling)
+stay `entry.c3`.
+
+QEMU regression on the final source: per-test status identical to master on
+FAT32 and ext2 (54 builtins); dual image all ok, including fsdkill +
+storagekill ×2 + netdkill followed by the 300 KB `bigreadtest`; fsck clean.
+
+---
+
 ## 2026-10-18 — the "FAT32-only failures" were ext2-only tests: `FS_STAT` now reports the backend, and the tests skip
 
 The four FAT32 failures carried along since the PLIC entry (`p9fswritetest`,

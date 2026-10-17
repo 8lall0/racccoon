@@ -3,7 +3,7 @@ module user;
 import std::io;
 
 // top — live process view. Redraws every ~2 s via SYS_PROC_STAT
-// (src/entry.c3). racccoon has no ^C, so it runs a fixed number of frames
+// (src/syscalls.c3). racccoon has no ^C, so it runs a fixed number of frames
 // (default 30, ~1 min) then exits; `top N` sets the frame count, `top 0`
 // runs until the board resets.
 

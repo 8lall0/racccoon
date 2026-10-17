@@ -189,8 +189,8 @@ const NS_TARGET_MAX = 64;  // Longest rewrite target (Mount.target) — deeper
 
 // A small, kernel-global (not per-process — discoverable *by name*,
 // unlike Mount below) registry of servers that have posted themselves via
-// SYS_SRV_POST (src/entry.c3) — the "srv" half of the real Plan 9
-// post+mount two-step SYS_NS_MOUNT (also src/entry.c3) is the other half
+// SYS_SRV_POST (src/syscalls.c3) — the "srv" half of the real Plan 9
+// post+mount two-step SYS_NS_MOUNT (also src/syscalls.c3) is the other half
 // of. Deliberately separate from Mount/namespace: posting is global and
 // name-keyed ("any process, anywhere, that knows the name can find it"),
 // mounting is per-process and path-keyed (today's existing namespace
@@ -228,7 +228,7 @@ Srv_entry[SRV_MAX] srv_table;
 // start silently matching whatever unrelated process now occupies that
 // slot — worst case, the resolving process's own pid, which deadlocks
 // SYS_IPC_SEND. server_generation records the target's Process.generation
-// at the moment this entry was bound; SYS_NS_RESOLVE (entry.c3) requires
+// at the moment this entry was bound; SYS_NS_RESOLVE (syscalls.c3) requires
 // a live match on both pid and generation before handing server_pid
 // back, the same "this exact instance, not a reused slot" distinction
 // SYS_JOIN already relies on for its own, different purpose.
@@ -280,7 +280,7 @@ struct Process
 	// the moment that stopped being true. See docs/devlog.md.
 	ulong saved_sepc;
 
-	// Next free user virtual address for SYS_MAP (entry.c3) — a bump
+	// Next free user virtual address for SYS_MAP (syscalls.c3) — a bump
 	// pointer just past this process's mapped image (+ argv for an
 	// exec()'d one). Grows upward, never shrinks; every page it hands
 	// out is PAGE_U so proc_destroy's page walk frees it on exit. Set by
@@ -308,7 +308,7 @@ struct Process
 
 	// Set (to the user-space futex word's address) while this process is
 	// PROC_BLOCKED inside SYS_FUTEX_WAIT, cleared back to 0 the instant
-	// SYS_FUTEX_WAKE wakes it — see src/entry.c3's own cases for both.
+	// SYS_FUTEX_WAKE wakes it — see src/syscalls.c3's own cases for both.
 	// 0 the rest of the time (every other PROC_BLOCKED reason, e.g.
 	// SYS_IPC_RECV, leaves this untouched at its reset value).
 	uptr futex_addr;
@@ -330,7 +330,7 @@ struct Process
 	// the forking process's own (pid, generation) only by SYS_RFORK
 	// (src/entry.c3), right alongside where it already populates
 	// everything else about the child. Exists for user/envd.c3's own
-	// lazy env-inheritance (SYS_PARENT_INFO, entry.c3) — parent_generation
+	// lazy env-inheritance (SYS_PARENT_INFO, syscalls.c3) — parent_generation
 	// is what lets a caller confirm the named parent is still the exact
 	// instance it forked from, same staleness guard as
 	// Mount.server_generation/Srv_entry.generation elsewhere.
@@ -340,7 +340,7 @@ struct Process
 	// This process's owner — 0 (root) for every create_process()'d
 	// boot-time server, explicitly set there for the same "explicit, not
 	// relied-on zero-init" reason as parent_pid above. SYS_RFORK
-	// (entry.c3) inherits this into the child unchanged; SYS_EXEC doesn't
+	// (syscalls.c3) inherits this into the child unchanged; SYS_EXEC doesn't
 	// touch it at all, same as pid/namespace. The only way it ever
 	// changes after that is SYS_SETUID, and only while still 0 — see its
 	// own comment. Gates SYS_KILL (root or same-uid only) and
@@ -405,7 +405,7 @@ struct Process
 
 	uint msg_from_generation; // sender's own Process.generation, captured at delivery — lets
 	                          // a receiver that intends to reply later (SYS_IPC_RECV_GEN/
-	                          // SYS_IPC_REPLY, src/entry.c3) confirm msg_from still names the
+	                          // SYS_IPC_REPLY, src/syscalls.c3) confirm msg_from still names the
 	                          // same process instance it received this message from, closing
 	                          // the reply-side counterpart of the stale-pid hazard
 	                          // Mount.server_generation/SYS_JOIN already close elsewhere.
@@ -416,7 +416,7 @@ struct Process
 	// An interrupt-driven driver's pending device-completion notify —
 	// SEPARATE from the inbox above, so routing an IRQ can never clobber
 	// (or be clobbered by) a real client request. service_pending_external_irq()
-	// (entry.c3) sets it; the driver's SYS_IPC_POLL wait reports it as a
+	// (syscalls.c3) sets it; the driver's SYS_IPC_POLL wait reports it as a
 	// DISKD_IRQ_NOTIFY and clears it. Was routed through has_message /
 	// msg_type; that collided once SYS_IPC_POLL started draining the PLIC
 	// itself (see docs/devlog.md).
@@ -446,7 +446,7 @@ struct Process
 	int stdout_pipe;
 	int stdin_pipe;
 
-	// fsd-only: which partition SYS_FS_PARTITION_INFO (entry.c3) hands
+	// fsd-only: which partition SYS_FS_PARTITION_INFO (syscalls.c3) hands
 	// back to *this specific* process. Per-process, not a plain kernel
 	// global the way a driver's DMA addresses are (dev_dma_paddr,
 	// device.c3) — those are per-device and there's only ever one owner;
@@ -480,7 +480,7 @@ struct Process
 
 	// True while this process is inside one of the handful of blocking,
 	// multi-yield() syscalls (SYS_JOIN/SYS_GETCHAR/SYS_IPC_RECV[_GEN]/
-	// SYS_FUTEX_WAIT/SYS_NS_MOUNT_WAIT, entry.c3) — set right before that
+	// SYS_FUTEX_WAIT/SYS_NS_MOUNT_WAIT, syscalls.c3) — set right before that
 	// syscall's own poll loop, cleared right after. Not derived from
 	// `state`: SYS_JOIN/SYS_GETCHAR/SYS_NS_MOUNT_WAIT deliberately stay
 	// PROC_RUNNABLE throughout their own loops (see SYS_JOIN's own
@@ -493,7 +493,7 @@ struct Process
 	// blocking_depth's own comment for the real bug this closes.
 	bool in_blocking_wait;
 
-	// Short human-readable name for `ps` / `top` (SYS_PROC_STAT, entry.c3).
+	// Short human-readable name for `ps` / `top` (SYS_PROC_STAT, syscalls.c3).
 	// Set for kernel-spawned boot servers right after create_process()
 	// (kernel.c3 / supervisor_spawn), from argv[0]'s basename on every
 	// SYS_EXEC, and inherited by an rfork child until it exec()s. NUL-
@@ -566,7 +566,7 @@ int blocking_depth @export("blocking_depth") = 0;
 // Moved here from the now-deleted src/fs.c3 (its tar-parsing logic moved
 // to user/fsd.c3, phase 5 of the microkernel plan) — these two are still
 // needed kernel-side: str_copy by create_process's default namespace
-// population above, str_starts_with by entry.c3's SYS_NS_RESOLVE.
+// population above, str_starts_with by syscalls.c3's SYS_NS_RESOLVE.
 fn void str_copy(char* dst, char* src, uint max)
 {
 	uint i = 0;
@@ -590,7 +590,7 @@ fn bool str_starts_with(char* s, char* prefix)
 }
 
 // Also moved from the deleted src/fs.c3 — needed again by
-// SYS_NS_UNMOUNT (entry.c3), which unmounts by exact prefix match, not
+// SYS_NS_UNMOUNT (syscalls.c3), which unmounts by exact prefix match, not
 // the longest-prefix match SYS_NS_RESOLVE uses.
 fn bool str_eq(char* a, char* b)
 {
@@ -672,8 +672,8 @@ fn int proc_take_exit(int pid, uint generation)
 
 // One attempt at "look srv_name up in srv_table and, if it names a
 // still-live server, bind it at prefix in current_proc's own
-// namespace" — the shared logic SYS_NS_MOUNT (entry.c3) and
-// SYS_NS_MOUNT_WAIT (entry.c3, a retry loop around this exact same
+// namespace" — the shared logic SYS_NS_MOUNT (syscalls.c3) and
+// SYS_NS_MOUNT_WAIT (syscalls.c3, a retry loop around this exact same
 // attempt) both need. A stale/dead post (the poster's own generation
 // no longer matches — same check SYS_NS_RESOLVE already uses for
 // existing mounts) is treated as "not found," never bound. Idempotent
@@ -769,7 +769,7 @@ fn void switch_context(uptr* prev_sp, uptr* next_sp, ulong satp, uptr sscratch) 
     `);
 }
 
-// SYS_EXEC (entry.c3) remaps this process's own USER_BASE pages in place —
+// SYS_EXEC (syscalls.c3) remaps this process's own USER_BASE pages in place —
 // no satp write happens (same process, same page table physical address),
 // so switch_context's own sfence.vma (above) never fires for it. Without
 // this, the CPU can keep serving the *old* image's translations out of the
@@ -964,7 +964,7 @@ fn void user_entry() @naked @noinline @noreturn
 	//
 	// a0/a1 explicitly zeroed: user/user.c3's start() (this process's
 	// very first instruction after sret) passes a0/a1 straight through
-	// as main()'s own argc/argv parameters — SYS_EXEC (entry.c3) sets
+	// as main()'s own argc/argv parameters — SYS_EXEC (syscalls.c3) sets
 	// both deliberately for an exec()'d process, but this path is for a
 	// brand new process create_process() is booting for the first time,
 	// where a0/a1 would otherwise still hold whatever the kernel's own
@@ -992,7 +992,7 @@ fn void user_entry() @naked @noinline @noreturn
     `);
 }
 
-// rfork's child resume point — see SYS_RFORK in entry.c3, which builds
+// rfork's child resume point — see SYS_RFORK in syscalls.c3, which builds
 // the 32-word block this expects at the top of the child's kernel stack
 // before its first switch_context: a 31-word copy of the parent's own
 // Trap_frame at the moment of the rfork ecall (word 30 is the saved

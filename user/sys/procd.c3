@@ -25,7 +25,7 @@ import std::nolibc::fmt;
 //                     before calling kill() with it, closing the same
 //                     stale-pid window Mount.server_generation/SYS_JOIN
 //                     already close elsewhere (see kill()'s own comment,
-//                     user.c3, and SYS_KILL's case, src/entry.c3).
+//                     user.c3, and SYS_KILL's case, src/syscalls.c3).
 
 // Generous, hardcoded scan bound for listing "/proc" itself — not
 // required to track the kernel's own PROCS_MAX (src/process.c3), a
@@ -188,7 +188,7 @@ fn void main() {
                 // *this* process's own uid when procd is the one
                 // calling it, never the real requester's, so the
                 // kernel's own SYS_KILL check (root-or-same-uid,
-                // src/entry.c3) can't enforce anything on this indirect
+                // src/syscalls.c3) can't enforce anything on this indirect
                 // path unless checked here first. from (the real
                 // requester's pid, captured by ipc_recv_type_gen at the
                 // top of main()) is who this request is actually from,

@@ -21,7 +21,7 @@
 
 extern char **environ;
 
-/* kernel limits — keep in sync with src/entry.c3 (EXEC_MAX_IMAGE_SIZE /
+/* kernel limits — keep in sync with src/syscalls.c3 (EXEC_MAX_IMAGE_SIZE /
  * EXEC_MAX_ARGV_SIZE) */
 #define RC_EXEC_IMAGE_MAX 1048576
 #define RC_EXEC_BLOB_MAX  16384

@@ -972,7 +972,7 @@ fn void main()
     // or baked into a namespace default — usbd's own pid isn't fixed
     // (it's spawned last, after the shell itself, see kernel.c3's own
     // comment) and rfork() copies the PARENT's namespace verbatim
-    // (src/entry.c3's SYS_RFORK case), so a static default-namespace
+    // (src/syscalls.c3's SYS_RFORK case), so a static default-namespace
     // entry set before usbd existed would stay permanently stale for
     // every shell-spawned command — the dynamic srv_post/ns_mount_wait
     // path sidesteps that entirely.

@@ -48,7 +48,7 @@ const int MOUNTUSB_WAIT_ATTEMPTS = 2000000;
 //
 // matched_len == 9 (strlen("/mnt/usb/")) is the real safety check
 // here, not just a sanity assertion: ns_resolve()'s own longest-prefix
-// match (src/entry.c3's SYS_NS_RESOLVE) falls through to the ""
+// match (src/syscalls.c3's SYS_NS_RESOLVE) falls through to the ""
 // catch-all (root fsd, matched_len 0) for ANY path when nothing more
 // specific is bound — including "/mnt/usb/" itself, whenever it isn't
 // currently mounted. Without this check, calling usbfs_teardown() with
@@ -468,7 +468,7 @@ fn int shell_readline(char* buf, int cap)
 // unmount builtins.
 const int SH_NS_PREFIX_MAX = 32; // must match src/process.c3's NS_PREFIX_MAX
 const int NS_LIST_RECS     = 16; // must match src/process.c3's NS_MOUNTS_MAX
-const int NS_LIST_REC      = 100; // SYS_NS_LIST record size — must match entry.c3's NS_LIST_REC_SIZE
+const int NS_LIST_REC      = 100; // SYS_NS_LIST record size — must match syscalls.c3's NS_LIST_REC_SIZE
                                   // (32 prefix + 4 pid LE + 1 flags + 63 target)
 
 fn void shell_ns_prefix(char* in, char* out)
