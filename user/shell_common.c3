@@ -1821,6 +1821,14 @@ fn int shell_exec_block(char* text)
     while (text[i] != 0) {
         while (text[i] == '\n' || text[i] == ';' || text[i] == ' ' || text[i] == '\t') { i++; }
         if (text[i] == 0) { break; }
+        // A `#` comment runs to the end of the line. Skipped here, before
+        // statement splitting: otherwise a `;` inside it ended the
+        // comment and the rest ran as a command (a `#!` script's
+        // "...os.exit()); `lua x` runs..." comment executed `lua x`).
+        if (text[i] == '#') {
+            while (text[i] != 0 && text[i] != '\n') { i++; }
+            continue;
+        }
         int start = i;
         int end = sh_stmt_end(text, start);
 
