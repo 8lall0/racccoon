@@ -260,7 +260,7 @@ fn void main()
         }
 
         // ipc_poll_type() (SYS_IPC_POLL) explicitly never yields — see
-        // its own case comment, src/entry.c3 — so without this, this
+        // its own case comment, src/syscalls.c3 — so without this, this
         // loop is exactly the "syscall-free spin that nothing can ever
         // switch away from" SYS_YIELD exists to prevent (that comment's
         // own words). This kernel's timer preemption only fires once

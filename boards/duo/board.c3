@@ -102,14 +102,14 @@ const ulong TIMEBASE_HZ = 25000000;
 // smp_start_secondaries() is a no-op at this value.
 const uint SMP_MAX_HARTS = 1;
 
-// Largest image SYS_EXEC will install (src/entry.c3's EXEC_MAX_IMAGE_SIZE
+// Largest image SYS_EXEC will install (src/syscalls.c3's EXEC_MAX_IMAGE_SIZE
 // and the staging arrays it sizes). 1 MiB on the Duo — racccoon's own
 // binaries are 70-105 KiB and a native TinyCC (roadmap §7) is ~640 KiB,
 // so 1 MiB covers everything this 64 MiB board runs. QEMU/JH7110 raise
 // it to 4 MiB for the Go port (boards/qemu/board.c3).
 const EXEC_MAX_IMAGE_SIZE = 1048576;
 
-// Per-process SYS_MAP ceiling (src/entry.c3's HEAP_MAX_BYTES). 16 MiB on
+// Per-process SYS_MAP ceiling (src/syscalls.c3's HEAP_MAX_BYTES). 16 MiB on
 // the Duo — generous for a wasm linear memory and keeps PROCS_MAX
 // processes all maxing out under the 64 MiB DRAM pool. QEMU/JH7110 raise
 // it (boards/qemu/board.c3) for the Go port.

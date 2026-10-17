@@ -142,7 +142,7 @@ const ulong TIMEBASE_HZ = 10000000;
 // secondaries only announce themselves and park (no SMP scheduler yet).
 const uint SMP_MAX_HARTS = 8;
 
-// Largest image SYS_EXEC will install (src/entry.c3's EXEC_MAX_IMAGE_SIZE
+// Largest image SYS_EXEC will install (src/syscalls.c3's EXEC_MAX_IMAGE_SIZE
 // and the ~96 KiB staging arrays it sizes at this value). 32 MiB on QEMU
 // — RAM is plentiful (1792 MiB free_ram) and Stage 4 of the Go port runs
 // `go tool compile`, a ~23 MiB GOOS=tamago binary (docs/go-port-plan.md).
@@ -150,7 +150,7 @@ const uint SMP_MAX_HARTS = 8;
 // keeps 1 MiB (boards/duo/board.c3) — 64 MiB DRAM, no Go.
 const EXEC_MAX_IMAGE_SIZE = 33554432;
 
-// Per-process SYS_MAP ceiling (src/entry.c3's HEAP_MAX_BYTES). 512 MiB
+// Per-process SYS_MAP ceiling (src/syscalls.c3's HEAP_MAX_BYTES). 512 MiB
 // on QEMU — the free_ram window is 1792 MiB (src/kernel.ld, -m 2G), and
 // a Go process reserves a 64/448 MiB heap arena (lazy since 2026-09-02,
 // docs/devlog.md) with room for the GC to cycle. The Duo keeps 16 MiB

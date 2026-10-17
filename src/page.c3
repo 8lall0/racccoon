@@ -35,7 +35,7 @@ const ulong PPN_MASK = (1UL << 44) - 1;
 // back — encoding (paddr_to_ppn_field) and decoding (pte_to_paddr) both
 // used to be repeated inline at every call site instead (three copies
 // of the encode shape in this file alone; the decode shape duplicated
-// again in entry.c3's exit free-loop and its SYS_RFORK copy-on-write
+// again in syscalls.c3's exit free-loop and its SYS_RFORK copy-on-write
 // walk). That duplication is exactly how the PPN_MASK bug above shipped
 // in three different places before it was fixed in all of them — see
 // docs/devlog.md. Every table pointer recovery and every PTE
@@ -127,7 +127,7 @@ fn ulong* walk_to_leaf_table(ulong* table2, uptr vaddr)
 // or write it on the process's behalf.
 //
 // One exception to "non-allocating": a page inside the caller's own
-// lazy SYS_MAP reservation ([map_floor, heap_top), entry.c3) that hasn't
+// lazy SYS_MAP reservation ([map_floor, heap_top), syscalls.c3) that hasn't
 // been touched yet has no leaf PTE, but it IS validly reserved — so
 // demand-map it here, the same as a real page fault would. A syscall
 // handed a freshly make()'d Go slice the runtime hasn't written to yet

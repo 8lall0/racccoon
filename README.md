@@ -106,7 +106,7 @@ link address on RV64.
 ## Layout
 
 ```
-src/          kernel — traps & syscalls (entry.c3), scheduling & processes
+src/          kernel — traps (entry.c3) & syscalls (syscalls.c3), scheduling & processes
               (process.c3), paging (page.c3), allocator, supervisor, console/SBI
 boards/       the only platform seam — per-board constants & PLIC setup (qemu/, duo/)
 user/         everything that runs in user mode:

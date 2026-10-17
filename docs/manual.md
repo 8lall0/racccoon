@@ -16,7 +16,7 @@ protocol, servers reached by name.
 > syscall numbers, wire formats and helper signatures change whenever it
 > is convenient. This manual describes the tree as of commit `ce1aec4`
 > (2026-09-06). When in doubt, the source is authoritative:
-> `src/entry.c3` for syscalls, `user/user.c3` for the userspace API.
+> `src/syscalls.c3` for syscalls, `user/user.c3` for the userspace API.
 
 Contents:
 
@@ -49,7 +49,7 @@ Contents:
                     └───────────────▲─────────────────────────────┘
                                     │  ecall  (the only entry)
                     ┌───────────────┴─────────────────────────────┐
-   kernel (S)       │ traps & syscalls (entry.c3)                  │
+   kernel (S)       │ traps (entry.c3) & syscalls (syscalls.c3)    │
                     │ scheduler & processes (process.c3)           │
                     │ Sv39 paging (page.c3)   page allocator       │
                     │ IPC   namespaces   pipes   PLIC   console    │
@@ -68,7 +68,8 @@ OpenSBI for the T-HEAD PLIC S-mode delegate.
 
 The kernel is deliberately small. It owns:
 
-- **Trap entry / syscall dispatch** — `src/entry.c3`, one big `switch`.
+- **Trap entry / syscall dispatch** — `src/entry.c3` (trap path) and
+  `src/syscalls.c3` (`handle_syscall`, one big `switch`).
 - **The scheduler** — round-robin over `PROCS_MAX` (16) slots, preemptive
   via the S-mode timer interrupt, cooperative `yield()` inside blocking
   syscalls. Single run queue, single hart.
@@ -298,8 +299,8 @@ S-mode (kernel), trap cause `SCAUSE_ECALL` (8).
 
 `a3` holds the syscall number (not `a7`, which the SBI convention uses),
 so a "4th argument" spills to `a4` and a "5th" to `a5`. The trap handler
-saves the full `Trap_frame` (`src/entry.c3`), runs `handle_syscall()`,
-writes the result into the frame's `a0`, and `sret`s.
+saves the full `Trap_frame` (`src/entry.c3`), runs `handle_syscall()`
+(`src/syscalls.c3`), writes the result into the frame's `a0`, and `sret`s.
 
 The C3 wrappers in `user/user.c3`:
 
@@ -1171,7 +1172,10 @@ Deliberate or just not done — the honest list:
 
 ```
 src/
-  entry.c3          trap entry, the syscall switch, SYS_* consts, exec/rfork
+  entry.c3          trap entry, Trap_frame, timer, external IRQs, lazy faults,
+                    handle_trap
+  syscalls.c3       SYS_* consts, handle_syscall + the sys_* layer (exec/rfork,
+                    IPC, namespaces, futex, ...)
   process.c3        Process struct, scheduler, create_process, context switch,
                     fork_entry, setup_fsd_mappings
   device.c3         Device / Dev_dma types, device_setup(): a board device

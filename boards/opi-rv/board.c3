@@ -162,8 +162,8 @@ fn int console_getchar()
 	return (int)(mem::load((uint*)CONSOLE_MMIO_PAGE, 4, true) & 0xFF);
 }
 
-// Largest image SYS_EXEC will install (src/entry.c3's EXEC_MAX_IMAGE_SIZE)
-// and the per-process SYS_MAP ceiling (src/entry.c3's HEAP_MAX_BYTES).
+// Largest image SYS_EXEC will install (src/syscalls.c3's EXEC_MAX_IMAGE_SIZE)
+// and the per-process SYS_MAP ceiling (src/syscalls.c3's HEAP_MAX_BYTES).
 // Sized like boards/duo/board.c3, not boards/qemu/board.c3: the Stage 0
 // kernel.ld window here is a flat 64 MiB free_ram pool (same scale as
 // the Duo's 64 MiB total DRAM), not QEMU's 1792 MiB. Raise both once

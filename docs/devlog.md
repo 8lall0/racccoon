@@ -4,6 +4,61 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-17 (evening) — refactor: the syscall layer moves out of `entry.c3` into `src/syscalls.c3` (branch `entry-syscall-split`)
+
+Backlog item #2 from the 09-05 survey. `entry.c3` was 3636 lines: the trap
+path plus every syscall. It is now two files in the same `module kernel`:
+
+- `src/entry.c3` (670 lines): CSR macros, timer, `kernel_entry`,
+  `Trap_frame`, `service_pending_external_irq`, `try_lazy_fault`,
+  housekeeping/`ipc_timeout_sweep`, `handle_trap`, `DISKD_IRQ_NOTIFY`.
+- `src/syscalls.c3` (2976 lines): the `SYS_*` numbers and syscall-side
+  consts (`HEAP_MAX_BYTES`, `EXEC_MAX_*`, `RF*`, `IPC_CALL_DEADLINE_TICKS`,
+  `g_boot_quiet`), `proc_destroy`, every `sys_*`, the IPC/namespace helpers,
+  `handle_syscall`.
+
+It is a cut-and-paste, done by a script that asserts the exact boundary lines.
+Comments elsewhere that pointed at "`entry.c3`'s SYS_…" now point at
+`syscalls.c3` (board headers, allocation/page, shell_test, gpiod, tcc crt1,
+manual, README). Nothing else changed.
+
+**How "zero behaviour change" was checked.** Unlike `lib_kernel.sh`, the ELFs
+are *not* byte-identical: c3c emits a module's functions in source order, so
+moving code reorders `.text`. They are the same size (`llvm-size` equal on all
+four kernels), have the same symbol set and per-symbol sizes (apart from
+renumbered local labels), and `boot()` / `secondary_entry` / `kernel_entry` are
+still at `0x80200020` / `…2c` / `…34` on the Duo. Then a function-by-function
+diff of `kernel.ll` (opi-rv-qemu build, old vs new, ignoring debug metadata, attribute-group
+numbering and `.N` suffixes) gives exactly **one** difference across all 122
+functions: `handle_trap`'s `io::printfn` of `$$FILE`/`$$LINE`, which moved from
+line 3606 to 640. That is also the only thing behind `handle_trap` being 2 bytes
+smaller (a `lui`+`addi` for 3606 became one `li` for 640). (Watch out: `llvm-objdump
+--disassemble-symbols` stops at the first local label, which first made the
+function look "identical" after 6 instructions. Use `--start/--stop-address` from
+`llvm-nm -S`.)
+
+QEMU regression (the dev-shell `kernel.elf`, run by a small pty driver rather
+than by hand):
+
+- **ext2**: 37 tests (cycle/lfn/p9*/harden/ns/ps/kill/srv/env/run/elf/argv/
+  path/perm/fsperm/chmod/hotplug/stdio/map/oom/fault/devinfo/fpu/netdkill/
+  hungserver/ipcdeath/rfork/sandbox/thread/threadjoin/race/mutex/wasm/tcc), all pass.
+- **dual image**: runtest2, mounttest, p9fstest, bigreadtest, elftest2,
+  argvtest2, pathtest2, all pass.
+- **FAT32**: the same 37 tests. All pass except `p9fswritetest`, `p9mkdirtest`,
+  `fspermtest` and `chmodtest`. A master-built kernel on the same image prints
+  **identical** failure output for all four, so they are pre-existing, not from
+  this split. Two of them are expected (FAT has no owner/mode bits; both pass
+  on ext2). Why the two p9fs write tests fail only on the FAT image has not been
+  looked into. `fsdkilltest`/`storagekilltest` skipped (the known QEMU-TCG respawn hang,
+  see the 2026-09-06 entries).
+
+No hardware boot. The IR diff was run on the opi-rv-qemu build; the other three
+kernels match it by section and per-symbol sizes, and `boot()` is still pinned first
+on all of them.
+
+---
+
 ## 2026-10-17 (later) — `plic-buildlib` confirmed on real Milk-V Duo hardware
 
 One dev-shell flash (`DUO_TEST_SHELL=1 DUO_SD_PART=/dev/sda1 bash

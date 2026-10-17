@@ -76,7 +76,7 @@ fn void clear_bit(uint page_idx)
 	bitmap[page_idx / BITS_PER_WORD] &= ~(1u << (page_idx % BITS_PER_WORD));
 }
 
-// How many pages are currently free. SYS_MAP (entry.c3) pre-checks this
+// How many pages are currently free. SYS_MAP (syscalls.c3) pre-checks this
 // before its per-page map loop so an alloc_pages(1) inside it can never
 // hit the panic path — kernel code isn't preempted, so the count stays
 // valid between the check and the allocs.
@@ -186,7 +186,7 @@ fn void free_pages(uptr paddr, uint n)
 	// MMIO identity-mapping like diskd's VIRTIO_BLK_PADDR or sdd's
 	// SD_MMIO_BASE/SD_TOP_PAGE/etc (see device_setup,
 	// device.c3), both flagged PAGE_U for the same
-	// reason any other private mapping is. entry.c3's SYS_EXIT free loop
+	// reason any other private mapping is. syscalls.c3's SYS_EXIT free loop
 	// walks every PAGE_U leaf and frees it unconditionally, so without
 	// this check, a real MMIO physical address (numerically far below
 	// __free_ram on both boards) underflows `paddr - __free_ram` into a

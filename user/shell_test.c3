@@ -944,7 +944,7 @@ fn void main() {
             }
         } else if (strcmp(cmd, "hardentest") == 0) {
             // Regression guard for src/page.c3's user_range_valid() and
-            // its call sites in src/entry.c3: proves a syscall given a
+            // its call sites in src/syscalls.c3: proves a syscall given a
             // deliberately bad user pointer, or a syscall number the
             // kernel doesn't recognize, denies cleanly (this process
             // gets -1 back) instead of the whole kernel panicking —
@@ -1261,7 +1261,7 @@ fn void main() {
             // (the FS_READ_AT calls to fsd, loading the new image)
             // before it ever reaches echod's real loop, and this
             // process's single inbox slot has no per-sender filtering
-            // (src/entry.c3's SYS_IPC_RECV) — a ping sent too early can
+            // (src/syscalls.c3's SYS_IPC_RECV) — a ping sent too early can
             // land mid-round-trip and get bounced back as P9_STRAY
             // (user.c3's p9_call). A retry-with-backoff version of this
             // test tried exactly that and failed outright: fsd's own
@@ -1370,7 +1370,7 @@ fn void main() {
             // this execs bin/echod.elf — a real ELF64/RISC-V executable
             // (build/user/echod.elf, racccoon's own toolchain output,
             // before objcopy strips it to the flat bin/echod runtest
-            // uses), exercising SYS_EXEC's own ELF loader (src/entry.c3)
+            // uses), exercising SYS_EXEC's own ELF loader (src/syscalls.c3)
             // instead of the flat-binary path. Same "hi echod" echo
             // check as runtest — proving the loaded process is
             // genuinely executing (its code segment ran, its
@@ -1739,7 +1739,7 @@ fn void main() {
             // needed one: fs_write()/fs_delete() are already
             // synchronous blocking round trips, and join() (below,
             // real Plan-9-style: blocks until the joined process is
-            // actually gone, src/entry.c3's SYS_JOIN) is exactly the
+            // actually gone, src/syscalls.c3's SYS_JOIN) is exactly the
             // "wait for the child to be genuinely, fully done" this
             // needs.
             //
@@ -1974,7 +1974,7 @@ fn void main() {
                 print(")\n");
             }
         } else if (strcmp(cmd, "mounttest") == 0) {
-            // Proves srv_post()/ns_mount()/ns_unmount() (src/entry.c3)
+            // Proves srv_post()/ns_mount()/ns_unmount() (src/syscalls.c3)
             // genuinely work at runtime, not just as the boot-time
             // plumbing create_process() already uses once, statically,
             // for the default "/mnt/fs2/" binding (src/process.c3).
@@ -2003,7 +2003,7 @@ fn void main() {
                 print("mounttest: FAILED\n");
             }
         } else if (strcmp(cmd, "hotplugtest") == 0) {
-            // Proves ns_mount_wait() (src/entry.c3) genuinely closes the
+            // Proves ns_mount_wait() (src/syscalls.c3) genuinely closes the
             // gap mounttest above deliberately avoids: mounttest only
             // ever mounts something *already* posted well before the
             // command runs — this spawns a "late driver" child that
@@ -2017,7 +2017,7 @@ fn void main() {
             //
             // ns_mount_wait's own third argument is a plain retry count,
             // not a wall-clock timeout — see its own comment
-            // (src/entry.c3's SYS_NS_MOUNT_WAIT case) for the real bug
+            // (src/syscalls.c3's SYS_NS_MOUNT_WAIT case) for the real bug
             // that drove that choice: a wall-clock version crashed here,
             // combining read_reg("time") with other locals surviving
             // across repeated calls inside a loop.
@@ -2040,7 +2040,7 @@ fn void main() {
                 // wait in this kernel already uses. A syscall-free spin
                 // loop turned out to be a real design bug in this test,
                 // not just an inconvenience: once blocking_depth's own
-                // fix (src/entry.c3 / process.c3) correctly stops timer
+                // fix (src/entry.c3 / syscalls.c3 / process.c3) correctly stops timer
                 // interrupts from firing while any process is mid a
                 // blocking wait, nothing would ever forcibly preempt a
                 // child that never yields on its own — a genuine
@@ -2804,7 +2804,7 @@ fn void main() {
             }
         } else if (strcmp(cmd, "ipcdeathtest") == 0) {
             // Proves the IPC rendezvous no longer hangs forever when the
-            // peer dies mid-transfer (src/entry.c3 sys_exit /
+            // peer dies mid-transfer (src/syscalls.c3 sys_exit /
             // ipc_wake_waiters_on, docs/roadmap.md §5). A child is
             // spawned that never calls ipc_recv and just exit()s after a
             // short busy delay; the parent ipc_send()s to it and would
@@ -2921,7 +2921,7 @@ fn void main() {
             }
         } else if (strcmp(cmd, "rforktest") == 0) {
             // Plain rfork(RFPROC): the child gets an independent copy of
-            // this process's address space (src/entry.c3's SYS_RFORK,
+            // this process's address space (src/syscalls.c3's SYS_RFORK,
             // non-RFMEM branch). Both branches below are the *same*
             // rfork() call returning twice — proof that the child really
             // resumed from here, not a fresh entry point. Passing null

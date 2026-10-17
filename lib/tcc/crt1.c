@@ -3,7 +3,7 @@
  * Unlike our own flat /bin programs (lib/racccoon-libc/src/start.c),
  * tcc controls this binary's section layout, so there's no linker-script
  * __stack_top to load sp from. racccoon's SYS_EXEC doesn't hand a fresh
- * program a usable stack either (see src/entry.c3's exec comment). So
+ * program a usable stack either (see src/syscalls.c3's exec comment). So
  * _start SYS_MAPs its own stack first thing — an ecall needs no stack —
  * then hands off to __libc_start (in libc.a / libracccoon.a) with the
  * kernel's a0 = argc, a1 = argv-blob preserved. */
