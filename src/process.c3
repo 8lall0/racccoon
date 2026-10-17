@@ -80,7 +80,7 @@ fn void map_disk_arena(Process* proc)
 	}
 	for (uint off = 0; off < disk_arena_size; off += PAGE_SIZE)
 	{
-		map_page(proc.page_table, disk_arena_paddr + off, disk_arena_paddr + off, PAGE_U | PAGE_R | PAGE_W);
+		map_page(proc.page_table, disk_arena_paddr + off, disk_arena_paddr + off, PAGE_U | PAGE_R | PAGE_W | PAGE_SHARED);
 	}
 }
 

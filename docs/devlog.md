@@ -4,6 +4,69 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-17 (late night) — the fsd-respawn freeze, root-caused: `proc_destroy` freed the shared disk arena
+
+The QEMU-only freeze open since 09-06 (`fsdkilltest` hangs right after
+`svc: respawned fsd`; `storagekilltest` then `wasmtest` hangs) turned out to be a
+use-after-free of the fsd↔diskd **disk arena**.
+
+`map_disk_arena` (`process.c3`) allocates the arena **once**
+(`disk_arena_paddr`) and identity-maps it into both diskd and the primary fsd as
+`PAGE_U`. `proc_destroy`'s teardown walk frees **every** valid `PAGE_U` leaf.
+So killing fsd (or diskd) handed the still-in-use arena pages back to the
+allocator. The supervisor then respawned fsd, `create_process` →
+`alloc_pages(1)` returned one of those pages as the **new fsd's page-table
+root**, and `map_disk_arena` mapped the same stale `disk_arena_paddr` back in.
+diskd's next sector read through the arena overwrote the root page (zeros from
+a zero-filled sector), and the first switch to fsd faulted on `kernel_entry`
+forever.
+
+That matches the 09-06 gdb evidence exactly: `satp`'s root `0x81009000`
+"reads back all zeros" and "was a PAGE_U leaf of the old fsd moments ago,
+freed by `proc_destroy`". It was an arena page. It also explains why
+**the real Duo never froze**: the arena only exists on boards with a
+virtio-blk disk (`device_board_has_disk_arena`), and the Duo's sdd has none. And
+it explains why `hungservertest`'s echod respawn was always fine: echod maps
+no arena. The earlier suspects (stack depth, the supervisor's dead-vs-wedged
+asymmetry, TLB staleness) were symptoms or red herrings. The respawn path was
+never at fault, only the page it was given.
+
+**Fix (`PAGE_SHARED`):** RSW bit 8 (reserved for supervisor software, ignored
+by the MMU; the Duo's T-HEAD attributes are bits 59–63) marks a `PAGE_U` leaf
+the process maps but **does not own**. `map_disk_arena` sets it, and
+`pte_owned_user_leaf()` (`page.c3`) = V && U && !SHARED is what all three
+`PAGE_U` walkers now test:
+
+- `proc_destroy`: frees only owned leaves;
+- `SYS_EXEC`: still drops every user mapping, frees only owned ones;
+- `SYS_RFORK`: copies owned leaves as before, **shares** a `PAGE_SHARED`
+  leaf (same physical page, flag kept), and the pre-flight OOM count only
+  counts leaves it will actually allocate.
+
+`user_range_valid` (an access check) correctly still accepts shared pages. Not
+changed: per-driver DMA regions (`device_setup`) are owned by the driver and
+re-allocated fresh on every spawn, so freeing them on death is right.
+
+**Verified (QEMU virt):**
+
+- Both repros, confirmed hanging on master first, now pass: `fsdkilltest`
+  (the first time it has ever passed under QEMU) and `storagekilltest` →
+  `wasmtest` → `fsdkilltest` → `wasmtest`.
+- Stress: 6 boots (3 FAT32 + 3 ext2, each on a private image copy), each
+  running fsdkill/storagekill ×4/×3 interleaved with wasm/run/tcc tests:
+  66/66 ok.
+- Full regression (54 builtins on FAT32 + ext2, the dual-image set +
+  fsdkill/storagekill/bigread on the dual image): per-test status is identical
+  to master on FAT32/ext2 (the same four FAT32-only failures as before). On
+  dual, everything passes, including a 300 KB `bigreadtest` *after* both
+  respawns. `fsck.vfat -n` / `e2fsck -n -f` are clean on the images afterwards.
+
+All four kernels build, and `boot()` is still at `0x80200020`. The Duo has no
+arena, so its runtime behaviour is unchanged (no `PAGE_SHARED` leaf ever exists
+there). A Duo boot would only re-confirm that.
+
+---
+
 ## 2026-10-17 (night) — refactor: `shell_test.c3` split by category, and a QEMU benchmark that moved for layout reasons only
 
 Backlog item #1 from the 09-05 survey. The dev shell's `main()` was 3000

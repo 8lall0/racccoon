@@ -195,7 +195,7 @@ fn void proc_destroy(Process* target, int exit_code) @noinline
 				for (uint vpn0 = 0; vpn0 < 512; vpn0++)
 				{
 					if ((t0[vpn0] & PAGE_V) == 0) continue;
-					if (t0[vpn0] & PAGE_U) { free_pages(pte_to_paddr(t0[vpn0]), 1); }
+					if (pte_owned_user_leaf(t0[vpn0])) { free_pages(pte_to_paddr(t0[vpn0]), 1); }
 				}
 				free_pages((uptr)t0, 1);
 			}
@@ -351,7 +351,7 @@ fn void sys_rfork(Trap_frame* f) @noinline
 					ulong* rf_pt0 = (ulong*)pte_to_paddr(rf_pt1[rv1]);
 					for (uint rv0 = 0; rv0 < 512; rv0++)
 					{
-						if ((rf_pt0[rv0] & PAGE_V) != 0 && (rf_pt0[rv0] & PAGE_U) != 0) rf_leaves++;
+						if (pte_owned_user_leaf(rf_pt0[rv0])) rf_leaves++;
 					}
 				}
 			}
@@ -387,11 +387,19 @@ fn void sys_rfork(Trap_frame* f) @noinline
 						if ((parent_table0[vpn0] & PAGE_U) == 0) continue;
 
 						uptr parent_leaf_paddr = pte_to_paddr(parent_table0[vpn0]);
-						uptr child_leaf_paddr  = alloc_pages(1);
-						mem::copy((void*)child_leaf_paddr, (void*)parent_leaf_paddr, (sz)PAGE_SIZE);
-
 						uptr child_vaddr  = ((uptr)vpn2 << 30) | ((uptr)vpn1 << 21) | ((uptr)vpn0 << 12);
 						uint parent_flags = (uint)(parent_table0[vpn0] & 0x1f); // V|R|W|X|U — see page.c3's map_page encoding
+
+						// Not the parent's own page (PAGE_SHARED): the child
+						// maps the same one, it doesn't get a private copy.
+						if (!pte_owned_user_leaf(parent_table0[vpn0]))
+						{
+							map_page(child_table, child_vaddr, parent_leaf_paddr, parent_flags | PAGE_SHARED);
+							continue;
+						}
+
+						uptr child_leaf_paddr  = alloc_pages(1);
+						mem::copy((void*)child_leaf_paddr, (void*)parent_leaf_paddr, (sz)PAGE_SIZE);
 						map_page(child_table, child_vaddr, child_leaf_paddr, parent_flags);
 					}
 				}
@@ -926,8 +934,7 @@ fn void sys_exec(Trap_frame* f) @noinline
 					if ((exec_table0[evpn0] & PAGE_V) == 0) continue;
 					if (exec_table0[evpn0] & PAGE_U)
 					{
-						uptr exec_leaf_paddr = pte_to_paddr(exec_table0[evpn0]);
-						free_pages(exec_leaf_paddr, 1);
+						if (pte_owned_user_leaf(exec_table0[evpn0])) { free_pages(pte_to_paddr(exec_table0[evpn0]), 1); }
 						exec_table0[evpn0] = 0;
 					}
 				}

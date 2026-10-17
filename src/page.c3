@@ -21,6 +21,15 @@ const PAGE_D    = (1 << 7); // Dirty — cores without hardware A/D auto-set
                              // _PAGE_ACCESSED|_PAGE_DIRTY) and we never
                              // have — see the devlog entry for the hang
                              // this was found chasing.
+// RSW (bit 8, reserved for supervisor software — the MMU ignores it): a
+// PAGE_U leaf this process maps but does NOT own — the fsd<->diskd disk
+// arena (map_disk_arena, process.c3), allocated once and mapped into
+// both. The PAGE_U walkers that free (proc_destroy, SYS_EXEC) or copy
+// (SYS_RFORK) a process's own pages must skip it: freeing it on one
+// side's death handed the still-live arena back to the allocator — the
+// respawned fsd's page-table root landed in it and diskd's next sector
+// read zeroed it (fsdkilltest/storagekilltest freeze, docs/devlog.md).
+const PAGE_SHARED = (1 << 8);
 
 // Sv39's PPN field is 44 bits (entry bits 53:10). Needed to mask entries
 // back down before recovering a physical address from one — without it,
@@ -49,6 +58,13 @@ fn ulong paddr_to_ppn_field(uptr paddr)
 fn uptr pte_to_paddr(ulong entry)
 {
 	return (uptr)(((entry >> 10) & PPN_MASK) * PAGE_SIZE);
+}
+
+// A valid PAGE_U leaf whose physical page belongs to this process alone
+// — what an exit/exec frees and an rfork copies. See PAGE_SHARED.
+fn bool pte_owned_user_leaf(ulong entry)
+{
+	return (entry & (PAGE_V | PAGE_U | PAGE_SHARED)) == (PAGE_V | PAGE_U);
 }
 
 // Regression guard for the PPN-masking bug itself (docs/devlog.md):
