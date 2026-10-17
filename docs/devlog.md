@@ -4,6 +4,27 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-17 (later) — `plic-buildlib` confirmed on real Milk-V Duo hardware
+
+One dev-shell flash (`DUO_TEST_SHELL=1 DUO_SD_PART=/dev/sda1 bash
+scripts/reflash_duo.sh`, kernel from `a560b16`) covered all three
+not-yet-booted changes: the table-driven PLIC arming (`412618a`), the default
+namespace seeded from the service table (`5dc5557`), and the shared
+`src/plic.c3`. On the real Duo:
+
+- boots to the root prompt; sdd brings the card up (ACMD41 → CMD7, SDMA
+  enabled), fsd mounts the ext2 root, `ls /` lists it in full;
+- usbd enumerates the 4-port GL850 hub (`05e3:0610`) and switches it to multi-TT,
+  so the USB completion path still works through the shared PLIC;
+- `devinfotest`, `storagekilltest`, `usbdkilltest`, `gpiodkilltest` all `ok`:
+  each driver's IRQ source is re-armed correctly after a respawn.
+
+`storagekilltest` still prints `svc: respawned sdd` **twice**, the same as on
+09-19, so this is not a regression. It's still unexplained and non-fatal. The
+Orange Pi kernel from this branch is still unbooted (board not available today).
+
+---
+
 ## 2026-10-17 — refactor: one shared PLIC driver, one shared kernel build path (branch `plic-buildlib`)
 
 A refactor survey after the device-table / Orange Pi work found the two
