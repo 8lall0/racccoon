@@ -597,24 +597,36 @@ fn bool sdd_enumerate()
 	print_hex32(sd_response0);
 	print("\n");
 
-	// ACMD41 (CMD55 + CMD41): SD_SEND_OP_COND, busy-polled until the card
+	// ACMD41 (CMD55 + CMD41): SD_SEND_OP_COND, polled until the card
 	// reports ready (bit 31 of the R3 response). HCS (bit 30 of the
-	// argument) requests high-capacity support. 200 tries, not the
-	// original 2000 (itself already cut down from 100000) — SD Physical
-	// Layer spec's own recommended ACMD41 polling timeout is ~1 second,
-	// and each try costs up to two commands' worth of SD_CMD_INHIBIT_US/
-	// SD_CMD_COMPLETE_US-bounded busy-waits, so even 2000 tries of a
-	// genuinely non-responding card
-	// took long enough on real hardware to be indistinguishable from a
-	// hang from the console alone (confirmed: sat with no new output for
-	// a long time on the first real attempt). A '.' printed every 20
-	// tries means the console shows visible progress the whole time
-	// instead of only at the very end.
+	// argument) requests high-capacity support.
+	//
+	// Bounded by wall-clock time, not a try count: the SD Physical Layer
+	// spec gives the card up to 1 s to finish initializing, and Linux's
+	// mmc_send_app_op_cond polls every 10 ms for that 1 s. This used to be
+	// "200 back-to-back tries", which only lasted long enough by accident:
+	// at boot the card is already initialized (BootROM read it), and with
+	// `loud` on each progress '.' costs serial time. A respawned sdd with
+	// its output silenced (CMD0 just reset an initialized card, which then
+	// needs a full init) burned all 200 before the card was ready, panicked,
+	// and only the supervisor's second respawn worked — the double
+	// "svc: respawned sdd" (docs/devlog.md 2026-10-18). 2 s = the spec's
+	// bound with margin; a '.' every 100 ms shows progress meanwhile.
+	const ulong ACMD41_TIMEOUT_US = 2000000;
+	const ulong ACMD41_POLL_US    = 10000;
+	ulong acmd41_start = rdtime();
+	ulong acmd41_next_dot = acmd41_start + sd_us_to_ticks(100000);
 	bool ready = false;
-	int tries;
-	for (tries = 0; tries < 200 && !ready; tries++)
+	int tries = 0;
+	while (!ready && rdtime() - acmd41_start < sd_us_to_ticks(ACMD41_TIMEOUT_US))
 	{
-		if (tries > 0 && tries % 20 == 0) putchar('.');
+		if (tries > 0)
+		{
+			ulong poll_start = rdtime();
+			while (rdtime() - poll_start < sd_us_to_ticks(ACMD41_POLL_US)) { yield(); }
+		}
+		tries++;
+		if (rdtime() >= acmd41_next_dot) { putchar('.'); acmd41_next_dot += sd_us_to_ticks(100000); }
 		if (!sd_send_cmd(55, 0, SD_CMD_RESP_SHORT | SD_CMD_CRC_CHECK | SD_CMD_INDEX_CHECK, false)) continue;
 		if (!sd_send_cmd(41, 0x40FF8000, SD_CMD_RESP_SHORT, false)) continue;
 		if ((sd_response0 & 0x80000000) != 0)

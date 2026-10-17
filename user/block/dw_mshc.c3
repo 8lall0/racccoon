@@ -464,11 +464,23 @@ fn bool dw_enumerate()
 	print_hex32(dw_response0);
 	print("\n");
 
+	// Time-bounded, like sdhci.c3's ACMD41 loop (see its comment): the
+	// spec allows the card 1 s; poll every 10 ms for up to 2 s. A bare
+	// try count only lasted long enough when printing slowed it down.
+	ulong hz = timebase_hz();
+	ulong acmd41_start = rdtime();
+	ulong acmd41_next_dot = acmd41_start + hz / 10;
 	bool ready = false;
-	int tries;
-	for (tries = 0; tries < 200 && !ready; tries++)
+	int tries = 0;
+	while (!ready && rdtime() - acmd41_start < hz * 2)
 	{
-		if (tries > 0 && tries % 20 == 0) { putchar('.'); }
+		if (tries > 0)
+		{
+			ulong poll_start = rdtime();
+			while (rdtime() - poll_start < hz / 100) { yield(); }
+		}
+		tries++;
+		if (rdtime() >= acmd41_next_dot) { putchar('.'); acmd41_next_dot += hz / 10; }
 		if (!dw_send_cmd(55, 0, DW_R_SHORT | DW_R_CRC, false, false)) { continue; }
 		if (!dw_send_cmd(41, 0x40FF8000, DW_R_SHORT, false, false)) { continue; }
 		if ((dw_response0 & 0x80000000) != 0)
