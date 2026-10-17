@@ -4,6 +4,66 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-17 (night) — refactor: `shell_test.c3` split by category, and a QEMU benchmark that moved for layout reasons only
+
+Backlog item #1 from the 09-05 survey. The dev shell's `main()` was 3000
+lines: one `if/else if (strcmp(cmd, …))` chain of 65 builtins. Now
+`user/shell_test.c3` (71 lines) only reads and tokenizes a line, then tries five
+dispatchers in turn:
+
+| file | builtins |
+|---|---|
+| `shell_test_fs.c3` | cycle/lfn/perm/fsperm/chmod/bigread/mount/hotplug tests, exfatgrow(keep), fswriteat(frag), fsneg, fscachestat |
+| `shell_test_ipc.c3` | ping, p9*, ringbench, ns/srv/env, hungserver, ipcdeath |
+| `shell_test_proc.c3` | harden, ps/lsproc, kill, run/elf/argv/path(2), map/oom/fault, fpu, rfork, sandbox, thread*, race, mutex, synhist |
+| `shell_test_drivers.c3` | fsd/storage/netd/gpiod/usbd kill tests, devinfo, `loud`, `kbdpush` |
+| `shell_test_lang.c3` | wasm, stdio, go* (incl. gostage*), tcc |
+
+Each is `fn bool shell_test_<cat>_dispatch(cmd, cmd_argv, cmd_argc)`, true if
+it handled the command. The file-scope globals and helper fns moved with their
+tests (thread/race/mutex stacks → proc, bigread/exfatgrow/fsneg buffers → fs,
+ringbench → ipc). A script did the cut (asserting 65 branches and that every
+name maps to exactly one category); a line-multiset check confirms that every
+original line is still present and nothing beyond scaffolding was added. No
+branch used `break`/`continue` at its own level, so `main`'s loop semantics
+carry over unchanged (the compiler would have rejected any that did).
+
+**Verified** by running 54 builtins (every one except
+`fsdkilltest`/`storagekilltest` [the known TCG hang], `gobuildtest`/`gotoolchaintest`
+[slow], `exfatgrowkeep`, `gpiodkilltest`/`usbdkilltest` [no device on QEMU]) on
+master and on the split, on FAT32, ext2 and the dual image. Per-test status
+is identical everywhere. The output text, with numbers masked, is also identical
+except for two timing benchmarks.
+
+**The benchmark that moved.** `ringbench` (4 KiB `fs_read_at` ×20000) was
+consistently ~13% slower: ~405 µs/op vs ~360 µs/op, run alone and alternating.
+The per-op counters were the same (1 ipc_call, 3 switches, 3 yields), so it was
+the same work running slower. Checked in order:
+
+- *ringbench_buf alignment*: page-aligning it changed nothing.
+- *`fs_read_at`'s 8 KiB stack `req` page offset* (the caller frames changed
+  0x3f70 → 0xed0): padding the dispatcher's frame toward the old offset barely
+  moved it.
+- *user hot-path code placement* (TCG only chains TBs within a guest page):
+  `fs_read_at` and the rest of `user.c3` are at identical addresses in both.
+- *kernel image layout*: `.text` identical, but the split made `shell_test.bin`
+  10 KB smaller, so the embedded blob shrank and the kernel's `.data`/`.bss`
+  (`procs`, …) and `__free_ram` moved down 0x2000. That shifts every process's
+  physical pages. **Padding the new `shell_test.bin` back to the old size**
+  (kernel layout byte-for-byte that of master, new code inside) gave
+  **340–349 µs/op**, matching or beating master's 362–368.
+
+So the gap is QEMU-TCG's sensitivity to where kernel data and process pages land
+(its software TLB is direct-mapped), not the split. Worth remembering for any
+future `ringbench`/`gobuildtest` A/B: **a ±15% swing can come from an unrelated
+change to an embedded binary's size**. Compare at equal layout, or treat
+differences that small as noise.
+
+No hardware boot: the production shell (`shell.c3`) and every non-test binary are
+unchanged, and only `DUO_TEST_SHELL=1` kernels embed this shell.
+
+---
+
 ## 2026-10-17 (evening) — refactor: the syscall layer moves out of `entry.c3` into `src/syscalls.c3` (branch `entry-syscall-split`)
 
 Backlog item #2 from the 09-05 survey. `entry.c3` was 3636 lines: the trap

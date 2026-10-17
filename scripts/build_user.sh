@@ -196,7 +196,7 @@ STUB
 }
 
 build_user_program shell user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/shell_words.c3 user/shell_jobs.c3 user/shell_common.c3 user/shell.c3
-build_user_program shell_test user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/shell_words.c3 user/shell_jobs.c3 user/shell_common.c3 user/shell_test.c3
+build_user_program shell_test user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/shell_words.c3 user/shell_jobs.c3 user/shell_common.c3 user/shell_test.c3 user/shell_test_fs.c3 user/shell_test_ipc.c3 user/shell_test_proc.c3 user/shell_test_drivers.c3 user/shell_test_lang.c3
 build_user_program echod user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/sys/echod.c3
 # true/false do zero I/O (just exitcode(0)/(1)) — no benefit from the
 # real stdlib's ~180 KiB, kept on the lightweight std::nolibc path.

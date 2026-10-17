@@ -133,7 +133,8 @@ Everything else is a user process that reaches the kernel only through
   …), `/bin` execution. This is what `scripts/build_duo.sh` embeds.
 - **`user/shell_test.c3`** — the same, plus every regression-test
   builtin the project has accumulated (`runtest`, `wasmtest`,
-  `killtest`, `rforktest`, `oomtest`, …). `scripts/build.sh` embeds
+  `killtest`, `rforktest`, `oomtest`, …), split by category into
+  `shell_test_{fs,ipc,proc,drivers,lang}.c3`. `scripts/build.sh` embeds
   this in the QEMU kernel. It skips login (automated runs want a root
   shell immediately).
 
@@ -952,7 +953,7 @@ globbing.
 `namespace` (alias `ns`), `mount <srv> <prefix>`,
 `bind [-a] [-c] <src> <dst>`, `unmount` / `umount`.
 
-`shell_test.c3` adds ~50 `*test` builtins plus `loud` (echo boot-server
+`shell_test.c3` (+ `shell_test_*.c3`) adds ~50 `*test` builtins plus `loud` (echo boot-server
 output to the console), `kbdpush`, `synhist`, and profiling helpers.
 
 ### 10.2 Control flow
@@ -1209,6 +1210,7 @@ user/
   shell_common.c3   builtins, line editing, block parser, login
   shell_words.c3    $var, globbing, quoting, shell-locals
   shell_jobs.c3     jobs / wait
+  shell_test_*.c3   dev-shell builtins by category: fs, ipc, proc, drivers, lang
   virtio.c3         userspace virtio-mmio (diskd, netd)
   std_racccoon/     the real-stdlib shims (heap over SYS_MAP, _start, libc, io_native)
   sys/              echod, procd, envd
