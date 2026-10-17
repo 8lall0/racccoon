@@ -5,8 +5,10 @@ import std::nolibc::mem;
 
 // /bin/wasm — a WebAssembly interpreter (roadmap §4). Reads a .wasm file
 // through fsd, decodes + structurally validates it, and interprets it on
-// an operand stack, bridging a small racccoon-native host module
-// ("racccoon", NOT WASI) to racccoon syscalls.
+// an operand stack, bridging two host modules to racccoon syscalls: a
+// small racccoon-native one ("racccoon") and WASI preview1
+// ("wasi_snapshot_preview1" — standard C/Rust/Zig output, see the WASI
+// block below).
 //
 //   wasm foo.wasm [args...]
 //
@@ -26,8 +28,10 @@ import std::nolibc::mem;
 // table.init/elem.drop/table.copy for passive data/element segments,
 // and table.grow/size/fill.
 //
-// Next: milestone 3 — real compiled programs (raise limits, decide
-// AssemblyScript / `env` import compat).
+// Milestone 3: real compiled programs — Zig against "racccoon", and
+// standard wasm32-wasi C programs through the WASI shim (fd table over
+// the path-based fs_* API, preopens "/" + "."). Limits raised for
+// mid-size programs (FUNCS_MAX 2048, BLOCKS_MAX 16384).
 //
 // All working memory (the module bytes, the value/locals/frame stacks,
 // the section tables) comes from map_pages() (SYS_MAP) — userspace has
@@ -207,17 +211,17 @@ const int HOST_TIME       = 7;   // () -> i64
 const int HOST_PRINT_I64  = 8;   // (i64)
 
 // --- limits (grow as real modules need) -------------------------------
-const int TYPES_MAX    = 128;
-const int FUNCS_MAX    = 512;
+const int TYPES_MAX    = 256;
+const int FUNCS_MAX    = 2048;
 const int EXPORTS_MAX  = 128;
-const int GLOBALS_MAX  = 128;
+const int GLOBALS_MAX  = 256;
 const int TABLE_MAX    = 4096;   // funcref table slots
 const int PARAMS_MAX   = 16;
 const int VSTACK_MAX   = 8192;   // 64 KiB
 const int LOCALS_MAX   = 8192;   // 64 KiB
 const int FRAMES_MAX   = 512;
 const int MODULE_MAX   = 512 * 1024;
-const int BLOCKS_MAX   = 4096;   // block/loop/if opcodes across the whole module
+const int BLOCKS_MAX   = 16384;   // block/loop/if opcodes across the whole module
 const int CTL_MAX      = 1024;   // active control-stack entries
 const int SCAN_MAX     = 512;    // block nesting depth during the load-time scan
 const int DATA_MAX     = 128;    // data segments (active + passive)
@@ -470,6 +474,7 @@ fn void read_limits(Cur* c)
 
 fn int resolve_host(char* mod, char* fld)
 {
+    if (strcmp(mod, "wasi_snapshot_preview1") == 0) { return resolve_wasi(fld); }
     if (strcmp(mod, "racccoon") != 0) { return -1; }
     if (strcmp(fld, "print_i32")  == 0) { return HOST_PRINT_I32; }
     if (strcmp(fld, "print_i64")  == 0) { return HOST_PRINT_I64; }
@@ -481,6 +486,38 @@ fn int resolve_host(char* mod, char* fld)
     if (strcmp(fld, "write_file") == 0) { return HOST_WRITE_FILE; }
     if (strcmp(fld, "time")       == 0) { return HOST_TIME; }
     return -1;
+}
+
+fn int resolve_wasi(char* fld)
+{
+    if (strcmp(fld, "args_sizes_get") == 0)        { return HOST_WASI_ARGS_SIZES_GET; }
+    if (strcmp(fld, "args_get") == 0)              { return HOST_WASI_ARGS_GET; }
+    if (strcmp(fld, "environ_sizes_get") == 0)     { return HOST_WASI_ENVIRON_SIZES_GET; }
+    if (strcmp(fld, "environ_get") == 0)           { return HOST_WASI_ENVIRON_GET; }
+    if (strcmp(fld, "clock_time_get") == 0)        { return HOST_WASI_CLOCK_TIME_GET; }
+    if (strcmp(fld, "clock_res_get") == 0)         { return HOST_WASI_CLOCK_RES_GET; }
+    if (strcmp(fld, "proc_exit") == 0)             { return HOST_WASI_PROC_EXIT; }
+    if (strcmp(fld, "sched_yield") == 0)           { return HOST_WASI_SCHED_YIELD; }
+    if (strcmp(fld, "random_get") == 0)            { return HOST_WASI_RANDOM_GET; }
+    if (strcmp(fld, "fd_write") == 0)              { return HOST_WASI_FD_WRITE; }
+    if (strcmp(fld, "fd_read") == 0)               { return HOST_WASI_FD_READ; }
+    if (strcmp(fld, "fd_seek") == 0)               { return HOST_WASI_FD_SEEK; }
+    if (strcmp(fld, "fd_tell") == 0)               { return HOST_WASI_FD_TELL; }
+    if (strcmp(fld, "fd_close") == 0)              { return HOST_WASI_FD_CLOSE; }
+    if (strcmp(fld, "fd_sync") == 0 || strcmp(fld, "fd_datasync") == 0) { return HOST_WASI_FD_SYNC; }
+    if (strcmp(fld, "fd_fdstat_get") == 0)         { return HOST_WASI_FD_FDSTAT_GET; }
+    if (strcmp(fld, "fd_fdstat_set_flags") == 0)   { return HOST_WASI_FD_FDSTAT_SET_FLAGS; }
+    if (strcmp(fld, "fd_filestat_get") == 0)       { return HOST_WASI_FD_FILESTAT_GET; }
+    if (strcmp(fld, "fd_prestat_get") == 0)        { return HOST_WASI_FD_PRESTAT_GET; }
+    if (strcmp(fld, "fd_prestat_dir_name") == 0)   { return HOST_WASI_FD_PRESTAT_DIR_NAME; }
+    if (strcmp(fld, "fd_readdir") == 0)            { return HOST_WASI_FD_READDIR; }
+    if (strcmp(fld, "path_open") == 0)             { return HOST_WASI_PATH_OPEN; }
+    if (strcmp(fld, "path_filestat_get") == 0)     { return HOST_WASI_PATH_FILESTAT_GET; }
+    if (strcmp(fld, "path_create_directory") == 0) { return HOST_WASI_PATH_CREATE_DIRECTORY; }
+    if (strcmp(fld, "path_remove_directory") == 0) { return HOST_WASI_PATH_REMOVE_DIRECTORY; }
+    if (strcmp(fld, "path_unlink_file") == 0)      { return HOST_WASI_PATH_UNLINK_FILE; }
+    if (strcmp(fld, "path_rename") == 0)           { return HOST_WASI_PATH_RENAME; }
+    return HOST_WASI_NOSYS;
 }
 
 // bounds-checked linear-memory region -> returns a real pointer or dies
@@ -685,7 +722,10 @@ fn void decode_mem(Cur* c)
     char flag = cur_byte(c);
     uint minp = read_u32(c);
     uint maxp = (flag & 1) != 0 ? read_u32(c) : 0;
-    if ((int)minp > MEM_HARD_CAP_PAGES) { die("initial memory too large"); }
+    // zig cc's wasm32-wasi default stack is 16 MiB (257 pages) — over the
+    // Duo's whole per-process heap. clang/wasm-ld default to 64 KiB, Rust
+    // to 1 MiB; zig users link with -Wl,-z,stack-size=262144 (manual).
+    if ((int)minp > MEM_HARD_CAP_PAGES) { die("initial memory too large (over 240 x 64 KiB pages — relink with a smaller stack, e.g. -Wl,-z,stack-size=262144)"); }
     int cap = (int)minp;
     if ((flag & 1) != 0 && (int)maxp <= 64 && (int)maxp > cap) { cap = (int)maxp; }
     if (cap < 1) { cap = 1; }
@@ -1126,8 +1166,9 @@ fn void mem_cstr(uint off, uint len, char* out, int cap)
     out[k] = 0;
 }
 
-fn void host_call(int host_id)
+fn void host_call(int host_id, int type_idx)
 {
+    if (host_id >= HOST_WASI_FIRST) { wasi_call(host_id, type_idx); return; }
     switch (host_id)
     {
         case HOST_PRINT_I32:
@@ -1188,6 +1229,562 @@ fn void host_call(int host_id)
         default:
             die("unresolved host import");
     }
+}
+
+// --- WASI preview1 ("wasi_snapshot_preview1") ---------------------------
+// The standard import module real toolchains emit (zig cc / clang
+// -target wasm32-wasi, Rust wasm32-wasip1): with it, /bin/wasm runs
+// ordinary C programs built anywhere, not just ones written against the
+// "racccoon" host module above. Each call pops its params (last first)
+// and pushes an i32 errno. racccoon has no fds, so the shim keeps its own
+// table and maps every operation onto the path-based fs_* API: an open
+// file is a path + an offset.
+
+const int HOST_WASI_FIRST = 100;
+const int HOST_WASI_NOSYS = 100;            // any WASI import not implemented: pops its args, returns ENOSYS
+const int HOST_WASI_ARGS_SIZES_GET = 101;
+const int HOST_WASI_ARGS_GET = 102;
+const int HOST_WASI_ENVIRON_SIZES_GET = 103;
+const int HOST_WASI_ENVIRON_GET = 104;
+const int HOST_WASI_CLOCK_TIME_GET = 105;
+const int HOST_WASI_CLOCK_RES_GET = 106;
+const int HOST_WASI_PROC_EXIT = 107;
+const int HOST_WASI_SCHED_YIELD = 108;
+const int HOST_WASI_RANDOM_GET = 109;
+const int HOST_WASI_FD_WRITE = 110;
+const int HOST_WASI_FD_READ = 111;
+const int HOST_WASI_FD_SEEK = 112;
+const int HOST_WASI_FD_TELL = 113;
+const int HOST_WASI_FD_CLOSE = 114;
+const int HOST_WASI_FD_SYNC = 115;          // fd_sync / fd_datasync: writes are already synchronous
+const int HOST_WASI_FD_FDSTAT_GET = 116;
+const int HOST_WASI_FD_FDSTAT_SET_FLAGS = 117;
+const int HOST_WASI_FD_FILESTAT_GET = 118;
+const int HOST_WASI_FD_PRESTAT_GET = 119;
+const int HOST_WASI_FD_PRESTAT_DIR_NAME = 120;
+const int HOST_WASI_FD_READDIR = 121;
+const int HOST_WASI_PATH_OPEN = 122;
+const int HOST_WASI_PATH_FILESTAT_GET = 123;
+const int HOST_WASI_PATH_CREATE_DIRECTORY = 124;
+const int HOST_WASI_PATH_REMOVE_DIRECTORY = 125;
+const int HOST_WASI_PATH_UNLINK_FILE = 126;
+const int HOST_WASI_PATH_RENAME = 127;
+
+// errno (preview1 numbering)
+const int WASI_ESUCCESS = 0;  const int WASI_EBADF = 8;   const int WASI_EEXIST = 20;
+const int WASI_EINVAL = 28;   const int WASI_EIO = 29;    const int WASI_EISDIR = 31;
+const int WASI_ENAMETOOLONG = 37; const int WASI_ENOENT = 44; const int WASI_ENOSYS = 52;
+const int WASI_ENOTDIR = 54;  const int WASI_ENOTEMPTY = 55; const int WASI_ESPIPE = 70;
+
+// filetype, oflags, fdflags, whence
+const char WASI_FT_CHARDEV = 2; const char WASI_FT_DIR = 3; const char WASI_FT_FILE = 4;
+const uint WASI_O_CREAT = 1; const uint WASI_O_DIRECTORY = 2; const uint WASI_O_EXCL = 4; const uint WASI_O_TRUNC = 8;
+const uint WASI_FDFLAG_APPEND = 1;
+const ulong WASI_RIGHTS_ALL = 0x1FFFFFFF;
+
+const int FD_MAX = 32;
+const int FDK_FREE = 0; const int FDK_STDIO = 1; const int FDK_PREOPEN = 2;
+const int FDK_FILE = 3; const int FDK_DIR = 4;
+const int WPATH_MAX = 100;                  // racccoon's fs path field (FS wire format)
+
+struct WFd
+{
+    int   kind;
+    bool  append;
+    ulong offset;
+    char[WPATH_MAX] path;                   // absolute; "" for stdio
+}
+WFd[FD_MAX] g_fds;
+String[] g_wasi_argv;                       // argv as WASI sees it: argv[0] = the module path
+ulong g_wasi_rng;                           // random_get's xorshift64 state (seeded from rdtime)
+
+// fs_list scratch for fd_readdir / environ_* — SYS_MAP'd in main
+const int WDIR_MAX = 256;
+char* g_dirbuf;
+
+fn void wasi_init_fds()
+{
+    for (int i = 0; i < FD_MAX; i++) { g_fds[i].kind = FDK_FREE; }
+    for (int i = 0; i < 3; i++) { g_fds[i].kind = FDK_STDIO; g_fds[i].path[0] = 0; }
+    // Preopens: fd 3 = "/" (absolute paths), fd 4 = "." (the shell's cwd,
+    // for relative ones). wasi-libc enumerates them with fd_prestat_get.
+    g_fds[3].kind = FDK_PREOPEN; g_fds[3].path[0] = '/'; g_fds[3].path[1] = 0;
+    g_fds[4].kind = FDK_PREOPEN;
+    if (getcwd(&g_fds[4].path[0], WPATH_MAX) < 0) { g_fds[4].path[0] = '/'; g_fds[4].path[1] = 0; }
+}
+
+fn bool wasi_fd_ok(uint fd) { return fd < (uint)FD_MAX && g_fds[fd].kind != FDK_FREE; }
+
+fn void wput8(uint off, char v)   { *mem_ptr(off, 1) = v; }
+fn void wput16(uint off, ushort v) { char* p = mem_ptr(off, 2); p[0] = (char)v; p[1] = (char)(v >> 8); }
+fn void wput32(uint off, uint v)
+{
+    char* p = mem_ptr(off, 4);
+    for (int i = 0; i < 4; i++) { p[i] = (char)(v >> (8 * i)); }
+}
+fn void wput64(uint off, ulong v)
+{
+    char* p = mem_ptr(off, 8);
+    for (int i = 0; i < 8; i++) { p[i] = (char)(v >> (8 * i)); }
+}
+fn uint wget32(uint off)
+{
+    char* p = mem_ptr(off, 4);
+    return (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);
+}
+
+// dirfd's directory + the module's relative path -> an absolute racccoon
+// path in out (fs_abspath collapses "." / ".."). WASI paths are relative to
+// dirfd; wasi-libc already stripped the preopen prefix.
+fn int wasi_path(uint dirfd, uint poff, uint plen, char* out)
+{
+    if (!wasi_fd_ok(dirfd)) { return WASI_EBADF; }
+    int k = g_fds[dirfd].kind;
+    if (k != FDK_PREOPEN && k != FDK_DIR) { return WASI_ENOTDIR; }
+    char[2 * WPATH_MAX] joined @noinit;
+    int j = 0;
+    char* base = &g_fds[dirfd].path[0];
+    while (base[j] != 0) { joined[j] = base[j]; j++; }
+    if (j == 0 || joined[j - 1] != '/') { joined[j] = '/'; j++; }
+    char* p = mem_ptr(poff, plen);
+    for (uint i = 0; i < plen; i++)
+    {
+        if (j >= 2 * WPATH_MAX - 1) { return WASI_ENAMETOOLONG; }
+        joined[j] = p[i]; j++;
+    }
+    joined[j] = 0;
+    if (j >= WPATH_MAX) { return WASI_ENAMETOOLONG; }        // fs_abspath's output is WPATH_MAX bytes
+    char[WPATH_MAX] norm @noinit;
+    fs_abspath(&joined[0], &norm[0]);
+    int n = 0;
+    while (norm[n] != 0) { n++; }
+    if (n >= WPATH_MAX) { return WASI_ENAMETOOLONG; }
+    for (int i = 0; i <= n; i++) { out[i] = norm[i]; }
+    return WASI_ESUCCESS;
+}
+
+// WASI filestat (64 bytes): dev, ino, filetype@16, nlink@24, size@32, times
+fn void wasi_put_filestat(uint off, char ftype, ulong size)
+{
+    char* p = mem_ptr(off, 64);
+    for (int i = 0; i < 64; i++) { p[i] = 0; }
+    wput8(off + 16, ftype);
+    wput64(off + 24, 1);
+    wput64(off + 32, size);
+}
+
+// fs_stat with racccoon types -> 0 / WASI_ENOENT, *ftype = WASI filetype
+fn int wasi_stat(char* path, char* ftype, uint* size)
+{
+    uint size_b = 0;
+    int ty = 0;
+    if (fs_stat(path, &size_b, &ty) != 0) { return WASI_ENOENT; }
+    *ftype = ty == 1 ? WASI_FT_DIR : WASI_FT_FILE;
+    *size = size_b;
+    return WASI_ESUCCESS;
+}
+
+fn int wasi_fd_alloc()
+{
+    for (int i = 5; i < FD_MAX; i++) { if (g_fds[i].kind == FDK_FREE) { return i; } }
+    return -1;
+}
+
+// "NAME=value\0" for each /env entry, into out (count/size only if out == null)
+fn uint wasi_env_walk(uint ptrs_off, uint buf_off, uint* count_out, bool write)
+{
+    int n = fs_list("/env", g_dirbuf, WDIR_MAX);
+    uint size = 0;
+    uint count = 0;
+    for (int i = 0; i < n; i++)
+    {
+        char* rec = &g_dirbuf[(uint)i * FS_LIST_ENTRY_SIZE];
+        if (rec[FS_LIST_NAME_MAX] != 0) { continue; }          // a directory, not a variable
+        char[FS_LIST_NAME_MAX + 72] kv @noinit;
+        int k = 0;
+        while (rec[k] != 0 && k < (int)FS_LIST_NAME_MAX) { kv[k] = rec[k]; k++; }
+        kv[k] = '='; k++;
+        char[FS_LIST_NAME_MAX + 8] vpath @noinit;
+        char* pre = "/env/";
+        int q = 0;
+        while (pre[q] != 0) { vpath[q] = pre[q]; q++; }
+        for (int r = 0; rec[r] != 0 && r < (int)FS_LIST_NAME_MAX; r++) { vpath[q] = rec[r]; q++; }
+        vpath[q] = 0;
+        int got = fs_read(&vpath[0], &kv[k], 64);
+        if (got < 0) { got = 0; }
+        k += got;
+        while (k > 0 && (kv[k - 1] == '\n' || kv[k - 1] == 0)) { k--; }   // values are stored with no NUL; trim a stray newline
+        kv[k] = 0; k++;
+        if (write)
+        {
+            wput32(ptrs_off + count * 4, buf_off + size);
+            char* dst = mem_ptr(buf_off + size, (uint)k);
+            for (int b = 0; b < k; b++) { dst[b] = kv[b]; }
+        }
+        size += (uint)k;
+        count++;
+    }
+    *count_out = count;
+    return size;
+}
+
+fn int wasi_fd_write(uint fd, uint iovs, uint iovs_len, uint nwritten_off)
+{
+    if (!wasi_fd_ok(fd)) { return WASI_EBADF; }
+    WFd* f = &g_fds[fd];
+    uint total = 0;
+    for (uint i = 0; i < iovs_len; i++)
+    {
+        uint b = wget32(iovs + i * 8);
+        uint len = wget32(iovs + i * 8 + 4);
+        char* src = mem_ptr(b, len);
+        if (f.kind == FDK_STDIO)
+        {
+            if (fd == 0) { return WASI_EBADF; }
+            for (uint k = 0; k < len; k++) { putchar(src[k]); }
+            total += len;
+            continue;
+        }
+        if (f.kind != FDK_FILE) { return WASI_EBADF; }
+        if (f.append)
+        {
+            char ft; uint size_b;
+            if (wasi_stat(&f.path[0], &ft, &size_b) == WASI_ESUCCESS) { f.offset = size_b; }
+        }
+        uint done = 0;
+        while (done < len)
+        {
+            uint chunk = len - done;
+            if (chunk > 4096) { chunk = 4096; }
+            int w = fs_write_at(&f.path[0], src + done, (int)chunk, (uint)f.offset);
+            if (w <= 0) { if (total + done == 0) { return WASI_EIO; } break; }
+            done += (uint)w;
+            f.offset += (ulong)w;
+        }
+        total += done;
+    }
+    wput32(nwritten_off, total);
+    return WASI_ESUCCESS;
+}
+
+fn int wasi_fd_read(uint fd, uint iovs, uint iovs_len, uint nread_off)
+{
+    if (!wasi_fd_ok(fd)) { return WASI_EBADF; }
+    WFd* f = &g_fds[fd];
+    uint total = 0;
+    for (uint i = 0; i < iovs_len; i++)
+    {
+        uint b = wget32(iovs + i * 8);
+        uint len = wget32(iovs + i * 8 + 4);
+        char* dst = mem_ptr(b, len);
+        if (f.kind == FDK_STDIO)
+        {
+            if (fd != 0) { return WASI_EBADF; }
+            // Like a tty/pipe read: return what's there, a line at a time,
+            // 0 at EOF (getchar() == -1 once the pipe's writer is gone).
+            uint k = 0;
+            while (k < len)
+            {
+                int c = getchar();
+                if (c < 0) { break; }
+                dst[k] = (char)c; k++;
+                if (c == '\n') { break; }
+            }
+            wput32(nread_off, total + k);
+            return WASI_ESUCCESS;
+        }
+        if (f.kind != FDK_FILE) { return f.kind == FDK_DIR ? WASI_EISDIR : WASI_EBADF; }
+        uint done = 0;
+        while (done < len)
+        {
+            uint chunk = len - done;
+            if (chunk > 4096) { chunk = 4096; }
+            int r = fs_read_at(&f.path[0], dst + done, (int)chunk, (uint)f.offset);
+            if (r < 0) { if (total + done == 0) { return WASI_EIO; } break; }
+            if (r == 0) { break; }
+            done += (uint)r;
+            f.offset += (ulong)r;
+            if ((uint)r < chunk) { break; }
+        }
+        total += done;
+        if (done < len) { break; }                               // short read = EOF
+    }
+    wput32(nread_off, total);
+    return WASI_ESUCCESS;
+}
+
+fn int wasi_path_open(uint dirfd, uint poff, uint plen, uint oflags, uint fdflags, uint fd_out)
+{
+    char[WPATH_MAX] path @noinit;
+    int e = wasi_path(dirfd, poff, plen, &path[0]);
+    if (e != WASI_ESUCCESS) { return e; }
+    char ft = 0; uint size_b = 0;
+    bool exists = wasi_stat(&path[0], &ft, &size_b) == WASI_ESUCCESS;
+    if (exists && (oflags & WASI_O_EXCL) != 0 && (oflags & WASI_O_CREAT) != 0) { return WASI_EEXIST; }
+    if (!exists && (oflags & WASI_O_CREAT) == 0) { return WASI_ENOENT; }
+    if (exists && ft == WASI_FT_DIR)
+    {
+        if ((oflags & (WASI_O_CREAT | WASI_O_TRUNC)) != 0) { return WASI_EISDIR; }
+    }
+    else if ((oflags & WASI_O_DIRECTORY) != 0) { return exists ? WASI_ENOTDIR : WASI_ENOENT; }
+    if (!exists || (oflags & WASI_O_TRUNC) != 0)
+    {
+        if (fs_write(&path[0], "", 0) < 0) { return WASI_EIO; }      // create / truncate to empty
+        ft = WASI_FT_FILE;
+    }
+    int fd = wasi_fd_alloc();
+    if (fd < 0) { return 76; }                                       // EMFILE
+    WFd* f = &g_fds[fd];
+    f.kind = ft == WASI_FT_DIR ? FDK_DIR : FDK_FILE;
+    f.append = (fdflags & WASI_FDFLAG_APPEND) != 0;
+    f.offset = 0;
+    for (int i = 0; i < WPATH_MAX; i++) { f.path[i] = path[i]; if (path[i] == 0) { break; } }
+    wput32(fd_out, (uint)fd);
+    return WASI_ESUCCESS;
+}
+
+// fd_readdir: dirents (d_next u64, d_ino u64, d_namlen u32, d_type u8 =
+// 24 bytes, then the name) from entry `cookie` on; a full buffer
+// (bufused == buf_len) tells libc to call again from the last d_next.
+fn int wasi_fd_readdir(uint fd, uint buf, uint buf_len, ulong cookie, uint used_off)
+{
+    if (!wasi_fd_ok(fd)) { return WASI_EBADF; }
+    if (g_fds[fd].kind != FDK_DIR && g_fds[fd].kind != FDK_PREOPEN) { return WASI_ENOTDIR; }
+    int n = fs_list(&g_fds[fd].path[0], g_dirbuf, WDIR_MAX);
+    if (n < 0) { return WASI_EIO; }
+    char* out = mem_ptr(buf, buf_len);
+    uint used = 0;
+    for (int i = (int)cookie; i < n && used < buf_len; i++)
+    {
+        char* rec = &g_dirbuf[(uint)i * FS_LIST_ENTRY_SIZE];
+        uint namlen = 0;
+        while (namlen < FS_LIST_NAME_MAX && rec[namlen] != 0) { namlen++; }
+        char[24] hdr;
+        for (int z = 0; z < 24; z++) { hdr[z] = 0; }
+        ulong next = (ulong)i + 1;
+        for (int z = 0; z < 8; z++) { hdr[z] = (char)(next >> (8 * z)); hdr[8 + z] = (char)(next >> (8 * z)); }
+        for (int z = 0; z < 4; z++) { hdr[16 + z] = (char)(namlen >> (8 * z)); }
+        hdr[20] = rec[FS_LIST_NAME_MAX] == 1 ? WASI_FT_DIR : WASI_FT_FILE;
+        for (int z = 0; z < 24 && used < buf_len; z++) { out[used] = hdr[z]; used++; }
+        for (uint z = 0; z < namlen && used < buf_len; z++) { out[used] = rec[z]; used++; }
+    }
+    wput32(used_off, used);
+    return WASI_ESUCCESS;
+}
+
+fn void wasi_call(int id, int type_idx)
+{
+    int r = WASI_ESUCCESS;
+    switch (id)
+    {
+        case HOST_WASI_ARGS_SIZES_GET:
+            uint bsz_off = (uint)vpop();
+            uint cnt_off = (uint)vpop();
+            uint bsz = 0;
+            for (int i = 0; i < (int)g_wasi_argv.len; i++)
+            {
+                char* a = g_wasi_argv[i].ptr;
+                uint l = 0; while (a[l] != 0) { l++; }
+                bsz += l + 1;
+            }
+            wput32(cnt_off, (uint)g_wasi_argv.len);
+            wput32(bsz_off, bsz);
+        case HOST_WASI_ARGS_GET:
+            uint abuf = (uint)vpop();
+            uint aptrs = (uint)vpop();
+            for (int i = 0; i < (int)g_wasi_argv.len; i++)
+            {
+                char* a = g_wasi_argv[i].ptr;
+                uint l = 0; while (a[l] != 0) { l++; }
+                wput32(aptrs + (uint)i * 4, abuf);
+                char* dst = mem_ptr(abuf, l + 1);
+                for (uint k = 0; k <= l; k++) { dst[k] = a[k]; }
+                abuf += l + 1;
+            }
+        case HOST_WASI_ENVIRON_SIZES_GET:
+            uint esz_off = (uint)vpop();
+            uint ecnt_off = (uint)vpop();
+            uint ecount = 0;
+            uint esize = wasi_env_walk(0, 0, &ecount, false);
+            wput32(ecnt_off, ecount);
+            wput32(esz_off, esize);
+        case HOST_WASI_ENVIRON_GET:
+            uint ebuf = (uint)vpop();
+            uint eptrs = (uint)vpop();
+            uint ec = 0;
+            wasi_env_walk(eptrs, ebuf, &ec, true);
+        case HOST_WASI_CLOCK_TIME_GET:
+            uint t_off = (uint)vpop();
+            vpop();                                                  // precision
+            vpop();                                                  // clock id: every clock = time since boot (no RTC)
+            ulong ticks = rdtime();
+            ulong hz = timebase_hz();
+            wput64(t_off, (ticks / hz) * 1000000000 + (ticks % hz) * 1000000000 / hz);
+        case HOST_WASI_CLOCK_RES_GET:
+            uint res_off = (uint)vpop();
+            vpop();
+            wput64(res_off, 1000000000 / timebase_hz() + 1);
+        case HOST_WASI_PROC_EXIT:
+            exitcode((int)vpop());
+        case HOST_WASI_SCHED_YIELD:
+            yield();
+        case HOST_WASI_RANDOM_GET:
+            uint rlen = (uint)vpop();
+            uint rbuf = (uint)vpop();
+            char* rdst = mem_ptr(rbuf, rlen);
+            for (uint i = 0; i < rlen; i++)
+            {
+                g_wasi_rng ^= g_wasi_rng << 13; g_wasi_rng ^= g_wasi_rng >> 7; g_wasi_rng ^= g_wasi_rng << 17;
+                rdst[i] = (char)g_wasi_rng;
+            }
+        case HOST_WASI_FD_WRITE:
+            uint nw = (uint)vpop(); uint wl = (uint)vpop(); uint wi = (uint)vpop();
+            r = wasi_fd_write((uint)vpop(), wi, wl, nw);
+        case HOST_WASI_FD_READ:
+            uint nr = (uint)vpop(); uint rl = (uint)vpop(); uint ri = (uint)vpop();
+            r = wasi_fd_read((uint)vpop(), ri, rl, nr);
+        case HOST_WASI_FD_SEEK:
+            uint so = (uint)vpop();
+            int whence = (int)vpop();
+            long delta = vpop();
+            uint sfd = (uint)vpop();
+            if (!wasi_fd_ok(sfd)) { r = WASI_EBADF; break; }
+            if (g_fds[sfd].kind != FDK_FILE) { r = WASI_ESPIPE; break; }
+            long base = 0;
+            if (whence == 1) { base = (long)g_fds[sfd].offset; }
+            else if (whence == 2)
+            {
+                char sft; uint ssz;
+                if (wasi_stat(&g_fds[sfd].path[0], &sft, &ssz) != WASI_ESUCCESS) { r = WASI_EIO; break; }
+                base = (long)ssz;
+            }
+            else if (whence != 0) { r = WASI_EINVAL; break; }
+            if (base + delta < 0) { r = WASI_EINVAL; break; }
+            g_fds[sfd].offset = (ulong)(base + delta);
+            wput64(so, g_fds[sfd].offset);
+        case HOST_WASI_FD_TELL:
+            uint to = (uint)vpop();
+            uint tfd = (uint)vpop();
+            if (!wasi_fd_ok(tfd)) { r = WASI_EBADF; break; }
+            if (g_fds[tfd].kind != FDK_FILE) { r = WASI_ESPIPE; break; }
+            wput64(to, g_fds[tfd].offset);
+        case HOST_WASI_FD_CLOSE:
+            uint cfd = (uint)vpop();
+            if (!wasi_fd_ok(cfd) || cfd < 5) { r = cfd < 5 && wasi_fd_ok(cfd) ? WASI_ESUCCESS : WASI_EBADF; break; }
+            g_fds[cfd].kind = FDK_FREE;
+        case HOST_WASI_FD_SYNC:
+            if (!wasi_fd_ok((uint)vpop())) { r = WASI_EBADF; }
+        case HOST_WASI_FD_FDSTAT_GET:
+            uint fso = (uint)vpop();
+            uint ffd = (uint)vpop();
+            if (!wasi_fd_ok(ffd)) { r = WASI_EBADF; break; }
+            char* fsp = mem_ptr(fso, 24);
+            for (int i = 0; i < 24; i++) { fsp[i] = 0; }
+            int fk = g_fds[ffd].kind;
+            wput8(fso, fk == FDK_STDIO ? WASI_FT_CHARDEV : (fk == FDK_FILE ? WASI_FT_FILE : WASI_FT_DIR));
+            wput16(fso + 2, g_fds[ffd].append ? (ushort)WASI_FDFLAG_APPEND : (ushort)0);
+            wput64(fso + 8, WASI_RIGHTS_ALL);
+            wput64(fso + 16, WASI_RIGHTS_ALL);
+        case HOST_WASI_FD_FDSTAT_SET_FLAGS:
+            uint sflags = (uint)vpop();
+            uint sffd = (uint)vpop();
+            if (!wasi_fd_ok(sffd)) { r = WASI_EBADF; break; }
+            g_fds[sffd].append = (sflags & WASI_FDFLAG_APPEND) != 0;
+        case HOST_WASI_FD_FILESTAT_GET:
+            uint fto = (uint)vpop();
+            uint ftfd = (uint)vpop();
+            if (!wasi_fd_ok(ftfd)) { r = WASI_EBADF; break; }
+            if (g_fds[ftfd].kind == FDK_STDIO) { wasi_put_filestat(fto, WASI_FT_CHARDEV, 0); break; }
+            char fft; uint fsz;
+            r = wasi_stat(&g_fds[ftfd].path[0], &fft, &fsz);
+            if (r == WASI_ESUCCESS) { wasi_put_filestat(fto, fft, fsz); }
+        case HOST_WASI_FD_PRESTAT_GET:
+            uint po = (uint)vpop();
+            uint pfd = (uint)vpop();
+            if (pfd >= (uint)FD_MAX || g_fds[pfd].kind != FDK_PREOPEN) { r = WASI_EBADF; break; }
+            wput32(po, 0);                                            // tag 0 = dir (+ padding)
+            wput32(po + 4, pfd == 3 ? 1 : 1);                        // "/" or "."
+        case HOST_WASI_FD_PRESTAT_DIR_NAME:
+            uint pnl = (uint)vpop();
+            uint pnp = (uint)vpop();
+            uint pnfd = (uint)vpop();
+            if (pnfd >= (uint)FD_MAX || g_fds[pnfd].kind != FDK_PREOPEN) { r = WASI_EBADF; break; }
+            if (pnl < 1) { r = WASI_EINVAL; break; }
+            wput8(pnp, pnfd == 3 ? '/' : '.');
+        case HOST_WASI_FD_READDIR:
+            uint rdu = (uint)vpop();
+            ulong rdc = (ulong)vpop();
+            uint rdl = (uint)vpop();
+            uint rdb = (uint)vpop();
+            r = wasi_fd_readdir((uint)vpop(), rdb, rdl, rdc, rdu);
+        case HOST_WASI_PATH_OPEN:
+            uint fdo = (uint)vpop();
+            uint fdflags = (uint)vpop();
+            vpop(); vpop();                                           // rights (fsd's uid checks still apply)
+            uint oflags = (uint)vpop();
+            uint opl = (uint)vpop();
+            uint opp = (uint)vpop();
+            vpop();                                                   // lookupflags
+            r = wasi_path_open((uint)vpop(), opp, opl, oflags, fdflags, fdo);
+        case HOST_WASI_PATH_FILESTAT_GET:
+            uint pso = (uint)vpop();
+            uint psl = (uint)vpop();
+            uint psp = (uint)vpop();
+            vpop();                                                   // lookupflags
+            char[WPATH_MAX] sp @noinit;
+            r = wasi_path((uint)vpop(), psp, psl, &sp[0]);
+            if (r != WASI_ESUCCESS) { break; }
+            char pft; uint psz;
+            r = wasi_stat(&sp[0], &pft, &psz);
+            if (r == WASI_ESUCCESS) { wasi_put_filestat(pso, pft, psz); }
+        case HOST_WASI_PATH_CREATE_DIRECTORY:
+            uint mdl = (uint)vpop();
+            uint mdp = (uint)vpop();
+            char[WPATH_MAX] mp @noinit;
+            r = wasi_path((uint)vpop(), mdp, mdl, &mp[0]);
+            if (r != WASI_ESUCCESS) { break; }
+            char mft; uint msz;
+            if (wasi_stat(&mp[0], &mft, &msz) == WASI_ESUCCESS) { r = WASI_EEXIST; break; }
+            if (fs_mkdir(&mp[0]) != 0) { r = WASI_EIO; }
+        case HOST_WASI_PATH_REMOVE_DIRECTORY:
+        case HOST_WASI_PATH_UNLINK_FILE:
+            uint ul = (uint)vpop();
+            uint up = (uint)vpop();
+            char[WPATH_MAX] upath @noinit;
+            r = wasi_path((uint)vpop(), up, ul, &upath[0]);
+            if (r != WASI_ESUCCESS) { break; }
+            char uft; uint u_size;
+            r = wasi_stat(&upath[0], &uft, &u_size);
+            if (r != WASI_ESUCCESS) { break; }
+            bool want_dir = id == HOST_WASI_PATH_REMOVE_DIRECTORY;
+            if (want_dir && uft != WASI_FT_DIR) { r = WASI_ENOTDIR; break; }
+            if (!want_dir && uft == WASI_FT_DIR) { r = WASI_EISDIR; break; }
+            if (want_dir && fs_list(&upath[0], g_dirbuf, WDIR_MAX) > 0) { r = WASI_ENOTEMPTY; break; }
+            if (fs_delete(&upath[0]) != 0) { r = WASI_EIO; }
+        case HOST_WASI_PATH_RENAME:
+            uint nl = (uint)vpop();
+            uint np = (uint)vpop();
+            uint nfd = (uint)vpop();
+            uint ol = (uint)vpop();
+            uint op = (uint)vpop();
+            uint ofd = (uint)vpop();
+            char[WPATH_MAX] oldp @noinit;
+            char[WPATH_MAX] newp @noinit;
+            r = wasi_path(ofd, op, ol, &oldp[0]);
+            if (r == WASI_ESUCCESS) { r = wasi_path(nfd, np, nl, &newp[0]); }
+            if (r != WASI_ESUCCESS) { break; }
+            char rft; uint rsz;
+            if (wasi_stat(&oldp[0], &rft, &rsz) != WASI_ESUCCESS) { r = WASI_ENOENT; break; }
+            if (fs_rename(&oldp[0], &newp[0]) != 0) { r = WASI_EIO; }
+        default:
+            // HOST_WASI_NOSYS: an import this shim doesn't implement.
+            // Consume its params per its type and report ENOSYS.
+            WType* t = &g_types[type_idx];
+            for (int i = 0; i < t.nparams; i++) { vpop(); }
+            if (t.nresults == 0) { return; }
+            r = WASI_ENOSYS;
+    }
+    vpush((long)r);
 }
 
 fn void print_uint64(ulong n)
@@ -1361,7 +1958,7 @@ fn void interp()
             case OP_CALL:
                 uint callee = imm_u32(fr);
                 if ((int)callee >= g_nfuncs) { die("call idx"); }
-                if (g_funcs[callee].is_import) { host_call(g_funcs[callee].host_id); }
+                if (g_funcs[callee].is_import) { host_call(g_funcs[callee].host_id, g_funcs[callee].type_idx); }
                 else { push_frame((int)callee); }
             case OP_CALL_INDIRECT:
                 uint ci_type = imm_u32(fr);
@@ -1371,7 +1968,7 @@ fn void interp()
                 int ci_fn = g_table[ci_slot];
                 if (ci_fn < 0 || ci_fn >= g_nfuncs) { die("call_indirect: null/invalid table entry"); }
                 if ((int)ci_type >= g_ntypes || g_funcs[ci_fn].type_idx != (int)ci_type) { die("call_indirect: signature mismatch"); }
-                if (g_funcs[ci_fn].is_import) { host_call(g_funcs[ci_fn].host_id); }
+                if (g_funcs[ci_fn].is_import) { host_call(g_funcs[ci_fn].host_id, g_funcs[ci_fn].type_idx); }
                 else { push_frame(ci_fn); }
             case OP_LOCAL_GET:
                 uint li = imm_u32(fr);
@@ -1783,9 +2380,13 @@ fn void main(String[] args)
     g_data     = (WData*)wasm_alloc((uint)(DATA_MAX * WData::size));
     g_elem     = (WElem*)wasm_alloc((uint)(ELEM_MAX * WElem::size));
     g_elemvals = (int*)wasm_alloc((uint)(ELEM_VALS_MAX * 4));
+    g_dirbuf   = wasm_alloc((uint)(WDIR_MAX * FS_LIST_ENTRY_SIZE));
 
     // args after the .wasm path are the guest program's argv (host `arg`)
     g_args = args[1..];
+    g_wasi_argv = args;
+    g_wasi_rng = rdtime() | 1;
+    wasi_init_fds();
 
     // read the whole file
     uint total = 0;

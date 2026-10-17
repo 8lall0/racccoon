@@ -60,6 +60,21 @@ ext2_seed_tree() {
     rm -f "$name.wasm.o" "build/wasm/$name.wasm.o" 2>/dev/null
   done
 
+  # Standard WASI programs (test/wasm-src/*.c, `zig cc -target wasm32-wasi`,
+  # wasi-libc bundled with zig) — /bin/wasm's wasi_snapshot_preview1 shim.
+  # Same fallback: the committed .wasm when zig isn't on PATH. 256 KiB stack:
+  # zig's 16 MiB default is over /bin/wasm's linear-memory cap (wasm.c3).
+  for cs in test/wasm-src/*.c; do
+    [ -e "$cs" ] || continue
+    name=$(basename "$cs" .c)
+    if command -v zig >/dev/null 2>&1 && \
+       zig cc -target wasm32-wasi -Os -Wl,-z,stack-size=262144 "$cs" -o "build/wasm/$name.wasm" 2>/dev/null; then
+      cp "build/wasm/$name.wasm" "test/wasm-src/$name.wasm"
+    else
+      cp "test/wasm-src/$name.wasm" "build/wasm/$name.wasm"
+    fi
+  done
+
   # Go programs for racccoon (go/cmd/*, via the GOOS=tamago toolchain).
   # No-op unless TAMAGO points at a tamago-go/bin/go — build_go.sh says
   # so and exits 0. Seeded as /bin/go-<name> onto the images below;

@@ -940,6 +940,39 @@ kernel steps are shared by every board script (`scripts/lib_kernel.sh`):
 
 ---
 
+### 9.7 Path C — WebAssembly (WASI)
+
+`/bin/wasm` runs standard **WASI preview1** modules, so a program written
+for any POSIX-ish libc runs unchanged:
+
+```
+zig cc -target wasm32-wasi -Os -Wl,-z,stack-size=262144 prog.c -o prog.wasm
+wasm prog.wasm args...          # exit status = the program's exit code
+```
+
+(`zig` bundles wasi-libc. The stack flag matters: zig's 16 MiB default is
+over `/bin/wasm`'s linear-memory cap of 240 × 64 KiB pages, which keeps it
+under the Duo's per-process heap. clang/wasm-ld default to 64 KiB, Rust to
+1 MiB, so they're fine as is.)
+
+What the shim provides (`user/bin/wasm.c3`, "WASI preview1" block):
+
+| WASI | racccoon |
+|---|---|
+| args, environ | argv (argv[0] = the module path); `/env/*` as `NAME=value` |
+| fd 0/1/2 | console or pipe (`getchar`/`putchar`): `echo x \| wasm prog.wasm` works |
+| preopens | fd 3 = `/`, fd 4 = `.` (the shell's cwd), so relative paths honour `cd` |
+| path_open, fd_read/write/seek/tell/close, fd_readdir, *filestat_get | an fd table over `fs_read_at` / `fs_write_at` / `fs_stat` / `fs_list` |
+| path_create_directory / remove_directory / unlink_file / rename | `fs_mkdir` / `fs_delete` / `fs_rename` |
+| clock_time_get | time since boot (no RTC yet, so `time()` ≈ 1970) |
+| random_get, sched_yield, proc_exit | xorshift64, `yield`, `exitcode` |
+| anything else (poll_oneoff, sockets, …) | returns `ENOSYS` (only if called) |
+
+Limits: no `sleep()` (poll_oneoff), no sockets, no file holes (writing past
+EOF fails), paths under 100 bytes, `getcwd()` inside the program reports
+`/` (wasi-libc's own emulated cwd, though opens still use the real one).
+The dev shell's `wasitest` runs the fixtures in `test/wasm-src/*.c`.
+
 ## 10. The shell
 
 `rc`-flavoured. `shell_exec_block()` splits input into statements;

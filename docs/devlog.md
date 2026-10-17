@@ -4,6 +4,86 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-18 (night) — /bin/wasm runs standard WASI programs; signed bytes were zero-extended
+
+Roadmap §4's "next: a WASI shim". Until now `/bin/wasm` only ran modules
+importing racccoon's own `"racccoon"` host module: hand-assembled fixtures
+and two Zig programs. Real toolchains emit **WASI preview1**
+(`wasi_snapshot_preview1`), and with it plain C programs built by
+`zig cc -target wasm32-wasi` (wasi-libc ships with zig) now run unchanged.
+
+**Probe first.** A C program using printf, argv, getenv, stdio files, stat,
+readdir and time compiled to 32 KB with 19 WASI imports. Opcode-wise, the
+only family it needed beyond what the interpreter had was sign extension,
+and that turned up a real bug (below).
+
+**The shim** (one "WASI preview1" block in `user/bin/wasm.c3`):
+
+- **Imports:** `resolve_host` routes the `wasi_snapshot_preview1` module to 27
+  `HOST_WASI_*` ids. Any other WASI name becomes `HOST_WASI_NOSYS`: it
+  pops its params per the import's type and returns `ENOSYS`, so a module
+  that merely *imports* `poll_oneoff` still loads. `host_call` now takes the
+  callee's type for that.
+- **fd table:** racccoon has no file descriptors, so the shim keeps 32
+  entries of {kind, path, offset, append}. fds 0–2 are stdio
+  (`getchar`/`putchar`, so pipes work); fd 3 = preopen `/`, fd 4 = preopen
+  `.` = racccoon's cwd. Every fd op maps onto the path-based API:
+  `fs_read_at` / `fs_write_at` (chunked ≤ 4 KiB), `fs_stat`, `fs_list` →
+  WASI dirents, `fs_mkdir` / `fs_delete` / `fs_rename`. `path_open` handles
+  CREAT/EXCL/TRUNC/DIRECTORY and APPEND.
+- **Environment:** `/env/*` (envd) is listed and read as `NAME=value`.
+- **Clocks and the rest:** clocks are time since boot (no RTC);
+  `random_get` is xorshift64.
+- **Limits raised:** FUNCS 512 → 2048, BLOCKS 4096 → 16384, TYPES/GLOBALS
+  ×2. All of it is demand-paged `SYS_MAP`.
+
+**The bug the fixtures caught: `i32/i64.load8_s` and `i32/i64.extend8_s`
+zero-extended.** In C3 `char` is *unsigned* (`ichar` is the signed byte),
+and those four ops cast through `char`, so a byte 0x80 read as 128, not
+−128. The 14 older fixtures never had a negative byte; any real C program
+handling `signed char` data would have got wrong results silently. Fixed
+with `ichar`, and `wasi_hello.c` now checks it (`-128 + -1 == -129`,
+`(signed char)0x1234F0 == -16`).
+
+**zig's 16 MiB wasm stack.** Every module was first rejected with "initial
+memory too large": `zig cc` gives wasm32-wasi programs a 16 MiB stack (257
+pages), over `MEM_HARD_CAP_PAGES` (240), which keeps `/bin/wasm` under the
+Duo's 16 MiB per-process heap. clang/wasm-ld (64 KiB) and Rust (1 MiB) are
+fine. The fixtures link with `-Wl,-z,stack-size=262144`, and the error now
+says to do that. This is documented in the manual's new §9.7.
+
+**Fixtures** (`test/wasm-src/*.c`, built by `build.sh`, with the committed
+`.wasm` as fallback) are standard C that **self-check** (exit 0, or the
+number of the failed check), so the new dev-shell builtin `wasitest` only
+reads exit codes:
+
+- `wasi_hello`: argv, `WASITEST` via environ (wasitest writes
+  `/env/WASITEST`), signed bytes.
+- `wasi_files`: 26 file/dir checks.
+- `wasi_exit`: `exit(7)` → 7.
+- `wasi_wc`: stdin.
+
+There's no wasm runtime on this host, so the checks were validated by
+building the same `.c` **natively** and running them on Linux: all exit
+0 / 7 / `1 2 9`.
+
+**Cwd:** a relative path honours the shell's `cd` (wasi-libc resolves it
+via the `.` preopen; a throwaway probe from `/tmp` wrote `/tmp/rel.txt`).
+`getcwd()` inside the program still says `/`, because wasi-libc emulates its
+own cwd. Documented.
+
+**Verified.** QEMU FAT32 / ext2 / dual: `wasitest` ok,
+`echo hi there | wasm wasi_wc.wasm` → `1 2 9`, all 14 `wasmtest` fixtures
+still ok, the 54-builtin regression identical to master, fsck clean. On the
+**real Duo** (fixtures installed with `populate_duo_bin.sh`, driven over
+serial): `wasitest` ok, including all 26 file checks on the real ext2 root;
+the wc pipe gives `1 2 9`; `wasmtest` ok.
+
+Not done (manual §9.7): `poll_oneoff` (so no `sleep()`), sockets, real
+wall-clock time, file holes, reference-types/SIMD opcodes.
+
+---
+
 ## 2026-10-18 (evening) — one SD card protocol (`sd_card.c3`) for both SD controllers
 
 The ACMD41 fix (previous entry) had to be made twice because the SD card's

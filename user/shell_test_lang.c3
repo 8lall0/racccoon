@@ -46,6 +46,37 @@ fn bool shell_test_lang_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
             if (wt_code != 0) { wt_ok = -1; }
         }
         print(wt_ok == 0 ? "wasmtest: ok\n" : "wasmtest: FAILED\n");
+    } else if (strcmp(cmd, "wasitest") == 0) {
+        // /bin/wasm's WASI preview1 shim: standard C programs built with
+        // `zig cc -target wasm32-wasi` (test/wasm-src/*.c, wasi-libc) —
+        // no racccoon-specific code in them. Each fixture checks itself
+        // and exits 0, or the number of the check that failed (wasi_exit:
+        // exactly 7, via exit() -> proc_exit). wasi_hello also reads
+        // WASITEST from the environment (environ_get over /env), set here.
+        fs_write("/env/WASITEST", "hello", 5);
+        char*[3] wi_fx;
+        wi_fx[0] = "wasi_hello.wasm";  // printf, argv, environ, signed bytes
+        wi_fx[1] = "wasi_files.wasm";  // path_open/fd_* /readdir/rename/unlink/mkdir/rmdir
+        wi_fx[2] = "wasi_exit.wasm";   // exit(7)
+        int[3] wi_want = { 0, 0, 7 };
+        bool wi_ok = true;
+        for (int wf = 0; wf < 3; wf++) {
+            char*[3] wi_av;
+            wi_av[0] = wi_fx[wf]; wi_av[1] = "a"; wi_av[2] = "b";
+            int wi_ac = wf == 0 ? 3 : 1;
+            uint wi_gen = 0;
+            int wi_c = rfork(RFPROC, &wi_gen);
+            if (wi_c == 0) {
+                exec("bin/wasm", exec_buf(), exec_buf_max(), 0, &wi_av[0], wi_ac);
+                exitcode(127);
+            }
+            int wi_code = join(wi_c, wi_gen);
+            print("wasm "); print(wi_fx[wf]); print(" -> exit ");
+            print_uint((uint)wi_code);
+            if (wi_code != wi_want[wf]) { print("  (expected "); print_uint((uint)wi_want[wf]); print(")"); wi_ok = false; }
+            putchar('\n');
+        }
+        print(wi_ok ? "wasitest: ok\n" : "wasitest: FAILED\n");
     } else if (strcmp(cmd, "stdiotest") == 0) {
         // /bin/stdiotest (docs/devlog.md, "std::io on racccoon") —
         // a program built against the REAL c3 stdlib (std::io)
