@@ -57,8 +57,15 @@ struct Device
 }
 
 // Physical base of each device's DMA regions, filled by device_setup and
-// handed to the driver by SYS_DEV_INFO. Flat [device * DEV_DMA_MAX + region]:
-// a respawned driver gets fresh regions and simply overwrites its slots.
+// handed to the driver by SYS_DEV_INFO. Flat [device * DEV_DMA_MAX + region].
+// Allocated on the device's first spawn and then owned by the *device*, not
+// the process: a respawned driver gets the same regions back (zeroed). A
+// killed driver leaves its device programmed with these addresses — virtio
+// rings, a DWC2 channel still polling, an SDMA block in flight — until the
+// replacement resets it; freeing them on death let that late DMA land in
+// whatever the allocator handed out next (the same use-after-free class as
+// the disk arena, see PAGE_SHARED in page.c3). Mapped PAGE_SHARED so
+// proc_destroy leaves them alone.
 uptr[DEV_MAX * DEV_DMA_MAX] dev_dma_paddr;
 
 // Index of the board device named `name` in board::DEVICES, or -1 if this
@@ -125,19 +132,29 @@ fn void device_setup(Process* proc, int dev)
 	for (int r = 0; r < (int)d.dma.len; r++)
 	{
 		uint pages = d.dma[r].pages;
-		uptr paddr = alloc_pages(pages);
+		uptr paddr = dev_dma_paddr[dev * DEV_DMA_MAX + r];
+		if (paddr == 0)
+		{
+			paddr = alloc_pages(pages);
+			dev_dma_paddr[dev * DEV_DMA_MAX + r] = paddr;
+		}
+		else
+		{
+			// Respawn: same region, fresh contents — exactly what a new
+			// alloc_pages() would have handed over (it zeroes the same way).
+			mem::set((void*)paddr, 0, (sz)(pages * PAGE_SIZE));
+		}
 		for (uint off = 0; off < pages * PAGE_SIZE; off += PAGE_SIZE)
 		{
 			if (d.dma[r].cached)
 			{
-				map_page(proc.page_table, paddr + off, paddr + off, PAGE_U | PAGE_R | PAGE_W);
+				map_page(proc.page_table, paddr + off, paddr + off, PAGE_U | PAGE_R | PAGE_W | PAGE_SHARED);
 			}
 			else
 			{
-				map_device_page(proc.page_table, paddr + off, paddr + off, PAGE_U | PAGE_R | PAGE_W);
+				map_device_page(proc.page_table, paddr + off, paddr + off, PAGE_U | PAGE_R | PAGE_W | PAGE_SHARED);
 			}
 		}
-		dev_dma_paddr[dev * DEV_DMA_MAX + r] = paddr;
 	}
 
 	// No-op for irq == 0. A repeat register for the same IRQ (driver

@@ -24,7 +24,8 @@ const PAGE_D    = (1 << 7); // Dirty — cores without hardware A/D auto-set
 // RSW (bit 8, reserved for supervisor software — the MMU ignores it): a
 // PAGE_U leaf this process maps but does NOT own — the fsd<->diskd disk
 // arena (map_disk_arena, process.c3), allocated once and mapped into
-// both. The PAGE_U walkers that free (proc_destroy, SYS_EXEC) or copy
+// both, and every device DMA region (device_setup, device.c3), which
+// outlives the driver process. The PAGE_U walkers that free (proc_destroy, SYS_EXEC) or copy
 // (SYS_RFORK) a process's own pages must skip it: freeing it on one
 // side's death handed the still-live arena back to the allocator — the
 // respawned fsd's page-table root landed in it and diskd's next sector
