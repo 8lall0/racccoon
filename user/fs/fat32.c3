@@ -1187,6 +1187,30 @@ fn bool fat32_find_free_dirent_range(uint dir_cluster, int count, uint* out_entr
 		cluster = fat32_next_cluster(cluster);
 	}
 
+	// About to put entries *after* the current last cluster. Any 0x00
+	// ("this and every later entry is unused") slots still at the end of
+	// it would hide them: a reader stops at the first 0x00, by spec. Turn
+	// them into 0xE5 (deleted — skipped, scanning continues) first. Found
+	// when the root had exactly one free 0x00 slot left and a 2-slot LFN
+	// name went into a new cluster: created, then never found again
+	// ("write failed"; mkdir "succeeded" but the directory was missing).
+	uint tail_sector = fat32_cluster_to_sector(last_cluster);
+	for (uint s = 0; s < fat32_sectors_per_cluster; s++)
+	{
+		char[SECTOR_SIZE] tail_buf @noinit;
+		if (!fs_read_sector(tail_sector + s, &tail_buf)) return false;
+		bool changed = false;
+		for (uint e = 0; e < SECTOR_SIZE / FAT32_DIRENT_SIZE; e++)
+		{
+			if (tail_buf[e * FAT32_DIRENT_SIZE] == FAT32_DIRENT_FREE_REST)
+			{
+				tail_buf[e * FAT32_DIRENT_SIZE] = FAT32_DIRENT_DELETED;
+				changed = true;
+			}
+		}
+		if (changed && !fs_write_sector(tail_sector + s, &tail_buf)) return false;
+	}
+
 	uint new_cluster = fat32_alloc_cluster();
 	if (new_cluster == 0) return false;
 	char[SECTOR_SIZE] zero_buf @noinit;
