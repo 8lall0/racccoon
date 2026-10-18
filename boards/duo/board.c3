@@ -364,6 +364,19 @@ const uptr CIF_WRAP_PAGE = 0x0a0d0000;
 // power-on-reset default (clock gated off) this entire arc.
 const uptr CIF_VIP_SYS_PAGE = 0x0a0c8000;
 
+// The `vi` block (ISP, 0x0A000000) — the only path from the CSI MAC to
+// DRAM. Register map: duo-buildroot-sdk middleware/v2/include/linux/
+// isp_reg.h; driver source: github.com/sophgo/osdrv interdrv/vi/chip/
+// cv180x (a symlink to cv181x). cifd's raw capture uses pre_raw_fe0 +
+// its CSI bridge + that bridge's write DMA (all in the first page),
+// ISPTOP, and the write-DMA core behind it.
+const uptr VI_FE0_PAGE    = 0x0a000000; // PRE_RAW_FE0 +0x000, CSIBDG0 +0x800, DMA_CTL6 +0xb00
+const uptr VI_ISPTOP_PAGE = 0x0a070000;
+const uptr VI_WDMA0_PAGE  = 0x0a072000;
+// One raw frame crop: 2 pixels per 3 bytes (12-bit packed), so 128 pages
+// = 512 KiB holds a 640x480 window (960 B/line) with room to spare.
+const uint VI_FRAME_PAGES = 128;
+
 // The devices the kernel hands to boot drivers (src/device.c3) — the MMIO
 // pages each driver needs, its PLIC source, and the DMA regions the kernel
 // allocates for it. This board has an SD controller (sdd), a DWC2 USB core
@@ -430,7 +443,9 @@ const Device[*] DEVICES = {
 	},
 	{
 		.name = "cif",
-		.mmio = { CIF_MAC_PAGE, CIF_WRAP_PAGE, I2C_CLOCK_PAGE, I2C_RESET_PAGE, CIF_VIP_SYS_PAGE },
+		.mmio = { CIF_MAC_PAGE, CIF_WRAP_PAGE, I2C_CLOCK_PAGE, I2C_RESET_PAGE, CIF_VIP_SYS_PAGE,
+		          VI_FE0_PAGE, VI_ISPTOP_PAGE, VI_WDMA0_PAGE },
+		.dma = { { .pages = VI_FRAME_PAGES, .cached = false } },
 	},
 };
 

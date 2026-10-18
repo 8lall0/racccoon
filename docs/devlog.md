@@ -4,6 +4,65 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-18 (evening) — camera Stage 4: the first real GC2083 picture
+
+The `vi` block wasn't closed after all. Sophgo's github.com/sophgo/osdrv
+has the full vi driver source: `interdrv/vi/chip/cv180x` is a symlink to
+`cv181x`, with `__CV180X__` branches. The v1 SDK already carried the cv180x
+register map with every field (`middleware/v2/include/linux/isp_reg.h`,
+`vi_reg_blocks.h`, `vi_reg_fields.h`).
+
+`cifd` now follows the driver's raw-dump path: pre_raw_fe0 → CSI bridge
+(CSIBDG0, +0x800) → its write DMA (DMA_CTL6, +0xb00) → DRAM. The pixels are
+12-bit packed, 2 per 3 bytes. Pieces:
+- a 512 KiB uncached DMA region and the vi pages on the `"cif"` device;
+- the vi clock gates (from the devicetree plus `clk-cv180x.c`), and the
+  Linux VIP_SYS words (+0x10/+0x20/+0x28, plus the CSI MAC0 clock ratio,
+  divider 10);
+- new verbs `CAPTURE` and `FRAME_READ`;
+- the new tool `/bin/camcap [-p] [x y w h]`, which writes `/frame.raw`;
+- `scripts/raw_to_png.py`, which unpacks it, demosaics it at half
+  resolution and applies grey-world white balance.
+
+Found on the board:
+- **The scenario control matters.** The reset default of ISPTOP
+  SCENARIOS_CTRL streams FE0 online into the (unconfigured) back end. The
+  bridge then hits a FIFO overflow after line 1 (INTERRUPT_STATUS_1 bit 0).
+  FE → DRAM needs only `FE_DMA_SHARE_ENABLE`.
+- **The ISP's own soft reset is required** (`isp_reset`: SW_RST 0x40, then
+  0x37f, 0x40, 0, internal to ISPTOP and not the VIP_SYS reset that once
+  faulted the MAC). Without it, a bridge left mid-frame stays wedged.
+- **racccoon passes no argv[0]**: `args[0]` is the first argument.
+  camcap's first loop skipped `-p`.
+
+The first frame showed a real scene: the window, the roller shutter and the
+tiled wall the camera faced. Colours are natural with **RGGB** (BGGR turns
+the walls cyan). The pattern generator gives alternating 0x000/0xFFF
+pixels, which fixes the nibble order of the packing.
+
+Verified on the real Duo from a fresh boot:
+- `cifinit` PASS;
+- `camcap` 640×480 PASS twice in a row, with PXL_CNT = 1920×1080;
+- `camcap -p` PASS;
+- switching between patgen and sensor works both ways;
+- `storagekilltest` ok.
+
+QEMU: FAT32 (wasitest, luatest, wasmtest, storagekilltest) and dual
+(mounttest, fsdkilltest, wasmtest) all ok; `camcap` degrades to "cifd not
+available".
+
+One boot, between two populates, came up without the root filesystem
+(`ls: command not found`; storagekilltest writes failed). It wasn't logged.
+After a reflash and reboot it was fine. Possibly the SD-init timing race;
+worth an `e2fsck -fn` of the card after racccoon's large `/frame.raw` writes.
+
+Not done:
+- a full 1920×1080 frame (needs a ~3.1 MB contiguous region);
+- exposure/gain control (the sensor runs on its defaults);
+- anything past the front end: BE, the ISP colour pipeline, YUV.
+
+---
+
 ## 2026-10-18 (latest) — the GC2083 camera link locks: CSI-2 packets decoding on the real Duo
 
 Stage 3 of docs/camera-plan.md, open since 2026-09-13 and parked as "needs a

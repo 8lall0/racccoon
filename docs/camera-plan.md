@@ -52,6 +52,14 @@ mode 1920x1080p30 RAW10, 2-lane MIPI CSI-2, no sub-resolution mode.
 This is still the go/no-go gate for stages 4-5 below — nothing here
 resolves it, only the pin/register map underneath stages 0-3.
 
+**Corrected 2026-10-18: the `vi` block is not closed.** Sophgo's
+github.com/sophgo/osdrv carries the full vi driver source,
+`interdrv/vi/chip/cv180x` (a symlink to `cv181x`, with explicit
+`__CV180X__` branches), and the v1 SDK already had the cv180x register map
+with every field (`middleware/v2/include/linux/{isp_reg.h,
+vi_reg_blocks.h, vi_reg_fields.h}`). The `.ko` blobs were only the v1
+SDK's packaging. Stage 4 below was built from that source.
+
 ## Staged plan
 
 0. ~~Sourcing spike~~ (done, see above) + **i2cd** (`user/i2c/i2cd.c3`,
@@ -291,9 +299,20 @@ resolves it, only the pin/register map underneath stages 0-3.
    that order, with Linux's receiver settings in cifd and no pn-swap, and
    locks from a fresh boot (`CSI_STATUS` 0x00080001, PHY in HS, ~40 ms).
    Full story in docs/devlog.md 2026-10-18.
-4. `vi` raw dump — one RAW10 frame to a file, host-side debayer. The
-   risky stage; gated on actually being able to drive the closed `vi`
-   block correctly (see sourcing split above).
+4. **DONE 2026-10-18 — `vi` raw dump, one frame to a file, debayered on
+   the PC.** `cifd` drives the driver's raw-dump path: pre_raw_fe0 → its
+   CSI bridge (CSIBDG0) → the bridge's write DMA (DMA_CTL6) → a 512 KiB
+   uncached DMA region from the device table, 12-bit packed (2 pixels per
+   3 bytes). `camcap [-p] [x y w h]` captures a window (default 640×480
+   from the middle) to `/frame.raw`. `scripts/raw_to_png.py` unpacks it,
+   demosaics it at half resolution (RGGB, confirmed by eye) with grey-world
+   white balance, and writes a PNG. The first real frame showed the window,
+   roller shutter and tiled wall the camera was pointing at. `camcap -p`
+   uses the bridge's pattern generator instead of the sensor: alternating
+   0x000/0xFFF pixels, which pins the packing. Not done: a full 1920×1080
+   frame (needs a ~3.1 MB contiguous region), exposure/gain control (the
+   sensor's defaults, no AE), and anything past the front end (BE, ISP
+   colour pipeline, YUV). Full story in docs/devlog.md 2026-10-18.
 5. `camd` service + `capture` tool + double-buffered continuous
    capture.
 

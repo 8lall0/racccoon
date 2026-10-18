@@ -1,6 +1,7 @@
 module user;
 
 import std::nolibc::main_stub;
+import std::nolibc::mem;
 
 // cifd: driver for the CV1800B's MIPI CSI-2 receiver — "csi_mac0"
 // (0x0A0C2000) + "csi_wrap0" (0x0A0D0000) in cv180x_base.dtsi's own
@@ -269,7 +270,7 @@ const uint VIP_CLK_ISP_TOP_EN   = 1u << 18;
 const uint VIP_CLK_AXI_ISP_EN   = 1u << 19;
 const uint VIP_CLK_CSI_MAC0_EN  = 1u << 20;
 const uint VIP_CLK_CSI_MAC1_EN  = 1u << 21;
-const uint VIP_ENABLE_RST_CSI_MAC0 = 1u << 0; // REG_04, 1 = held in reset
+const uint VIP_ENABLE_RST_CSI_MAC0 = 1u << 0; // REG_04 bit 0 — actually clk_axi_isp_top_en (riscv64 reg_vip_sys.h; the vi driver's _vi_clk_ctrl sets it), not a reset: Linux runs with it 1
 const uint VIP_ENABLE_RST_CSI_MAC1 = 1u << 1;
 
 // First attempt here faithfully replayed the vendor's own full
@@ -530,6 +531,267 @@ fn void cif_stream_enable(uint pnswap_bits)
     print("cifd: [diag] WRAP REG_04 (sel_clk_channel)=0x"); print_hex32(wrap_reg_read(WRAP_REG_04)); print("\n");
 }
 
+// --- Stage 4: raw capture through the `vi` block (0x0A000000) -----------
+//
+// The only route from the CSI MAC to DRAM. The register map is
+// duo-buildroot-sdk's middleware/v2/include/linux/{isp_reg.h,
+// vi_reg_blocks.h, vi_reg_fields.h} (cv180x); the sequence below follows
+// the open vi driver, github.com/sophgo/osdrv interdrv/vi/chip/cv180x (a
+// symlink to cv181x, with explicit __CV180X__ branches), on its raw-dump
+// path (vi_raw_dump.c): CSI MAC -> pre_raw_fe0 -> its CSI bridge
+// (CSIBDG0) -> the bridge's write DMA (DMA_CTL6, "fe0_csibdg_le") ->
+// DRAM, 12-bit packed, 2 pixels per 3 bytes. Nothing past the front end
+// (BE, raw/rgb/yuv tops) is involved. Function names in the comments are
+// the driver's.
+const uint VI_BASE        = 0x0a000000;
+const uint VI_PRE_RAW_FE0 = VI_BASE + 0x00000;
+const uint VI_CSIBDG0     = VI_BASE + 0x00800;
+const uint VI_DMA_CTL6    = VI_BASE + 0x00b00;
+const uint VI_ISPTOP      = VI_BASE + 0x70000;
+
+// PRE_RAW_FE (REG_PRE_RAW_FE_T)
+const uint FE_PRE_RAW_CTRL       = 0x000;
+const uint FE_PRE_RAW_FRAME_SIZE = 0x004; // FRAME_WIDTHM1[12:0] FRAME_HEIGHTM1[28:16]
+const uint FE_PRE_RAW_FRAME_VLD  = 0x028; // FE_FRAME_VLD_CH0[0] FE_PQ_VLD_CH0[4]
+
+// CSI bridge (REG_ISP_CSI_BDG_T)
+const uint BDG_TOP_CTRL       = 0x000;
+const uint BDG_INTERRUPT_CTRL = 0x004; // CHn_VS_INT_EN at bit 4n
+const uint BDG_DMA_DPCM_MODE  = 0x008;
+const uint BDG_CH0_SIZE       = 0x010; // CH1..3 at +4 each: WIDTHM1[12:0] HEIGHTM1[28:16]
+const uint BDG_PAT_GEN_CTRL   = 0x060; // PAT_EN[0]
+const uint BDG_PAT_IDX_CTRL   = 0x064; // PAT_PRD[7:0] PAT_IDX[12:8]
+const uint BDG_PAT_COLOR_0    = 0x068; // R[11:0] G[27:16]
+const uint BDG_PAT_COLOR_1    = 0x06c; // B[11:0]
+const uint BDG_BG_COLOR_0     = 0x070;
+const uint BDG_BG_COLOR_1     = 0x074;
+const uint BDG_FIX_COLOR_0    = 0x078;
+const uint BDG_FIX_COLOR_1    = 0x07c;
+const uint BDG_MDE_V_SIZE     = 0x080; // STR[12:0] STP[28:16], same layout for the next five
+const uint BDG_MDE_H_SIZE     = 0x084;
+const uint BDG_FDE_V_SIZE     = 0x088;
+const uint BDG_FDE_H_SIZE     = 0x08c;
+const uint BDG_HSYNC_CTRL     = 0x090;
+const uint BDG_VSYNC_CTRL     = 0x094;
+const uint BDG_TGEN_TT_SIZE   = 0x098; // HTT[12:0] VTT[28:16]
+const uint BDG_CH0_DEBUG_0    = 0x0a0; // CH0_PXL_CNT
+const uint BDG_INT_STATUS_0   = 0x0e0; // write-1-to-clear
+const uint BDG_INT_STATUS_1   = 0x0e4; // FIFO_OVERFLOW[0] RESOLUTION_OVER_MAX[1] DMA_ERROR[4]
+const uint BDG_WDMA_CH0_CROP_EN   = 0x110;
+const uint BDG_WDMA_CH0_HORZ_CROP = 0x114; // START[12:0] END[28:16]
+const uint BDG_WDMA_CH0_VERT_CROP = 0x118;
+
+const uint BDG_TOP_CSI_MODE_SENSOR = 1;       // CSI_MODE[1:0]: 1 = from the CSI MAC, 3 = pattern generator
+const uint BDG_TOP_CSI_MODE_PATGEN = 3;
+const uint BDG_TOP_CH0_DMA_WR_EN   = 1u << 6;
+const uint BDG_TOP_PXL_DATA_SEL    = 1u << 10; // 1 = pixels from the pattern generator
+const uint BDG_TOP_CSI_ENABLE      = 1u << 24;
+const uint BDG_TOP_TGEN_ENABLE     = 1u << 25;
+const uint BDG_TOP_CSI_UP_REG      = 1u << 31; // latch the shadowed config
+
+// Write DMA channel (REG_ISP_DMA_CTL_T)
+const uint DMA_SYS_CONTROL = 0x000; // BASEH[15:8] BASE_SEL[16] STRIDE_SEL[17] SEGLEN_SEL[18] SEGNUM_SEL[19]
+const uint DMA_BASE_ADDR   = 0x004;
+const uint DMA_SEGLEN      = 0x008;
+const uint DMA_STRIDE      = 0x00c;
+const uint DMA_SEGNUM      = 0x010;
+const uint DMA_STATUS      = 0x014;
+const uint DMA_SW_MODE     = (1u << 16) | (1u << 17) | (1u << 18) | (1u << 19);
+
+// ISPTOP (REG_ISP_TOP_T)
+const uint TOP_INT_EVENT0    = 0x000; // FRAME_DONE_FE0[3:0], write-1-to-clear
+const uint TOP_INT_EVENT2    = 0x008; // FRAME_START_FE0[3:0] FRAME_ERR[8] INT_DMA_ERR[16]
+const uint TOP_INT_EVENT0_EN = 0x010;
+const uint TOP_INT_EVENT2_EN = 0x018;
+const uint TOP_SW_CTRL_0     = 0x020; // SHAW_UP_FE0[19:16]
+const uint TOP_SW_CTRL_1     = 0x024; // PQ_UP_FE0[3:0]
+const uint TOP_CTRL_MODE_SEL0 = 0x028; // TRIG_STR_SEL_FE0[3:0] SHAW_UP_SEL_FE0[19:16]
+const uint TOP_CTRL_MODE_SEL1 = 0x02c; // PQ_UP_SEL_FE0[3:0]
+const uint TOP_SCENARIOS_CTRL = 0x030;
+const uint TOP_SW_RST        = 0x034; // ISP_RST[0] CSI0_RST[1] ... AXI_RST[6] ... RAW_RST[9]
+const uint TOP_INT_EVENT1    = 0x004;
+// FE -> DRAM only: FE_DMA_SHARE_ENABLE alone. The reset default has
+// PRE2BE_L_ENABLE (FE0 streams online into the back end) and the online
+// RGB map set; with no back end running that back-pressures the bridge
+// into a FIFO overflow after its first line (seen on the board).
+const uint TOP_SCENARIO_FE_TO_DRAM = 1u << 22;
+
+// The GC2083's full frame — CSIBDG's channel sizes describe what arrives,
+// the WDMA crop picks the window written to DRAM.
+const uint VI_SENSOR_W = 1920;
+const uint VI_SENSOR_H = 1080;
+
+// Clock gates of the vi node's clock list (cv180x_base.dtsi: clk_src_vip_
+// sys_0..3, clk_axi_vip, clk_csi_be_vip, clk_raw_vip, clk_isp_top_vip,
+// clk_csi_mac0_vip), mapped to bits by linux_5.10/drivers/clk/cvitek/
+// clk-cv180x.c. Milk-V's Linux has all of them on while streaming.
+const uint REG_CLK_EN_4 = 0x010;
+const uint VI_CLK_EN_2_BITS = (1u << 4) | (1u << 5) | (1u << 6) | (1u << 18) | (1u << 20);
+const uint VI_CLK_EN_3_BITS = 1u << 29;
+const uint VI_CLK_EN_4_BITS = (1u << 8) | (1u << 15) | (1u << 18);
+
+// VIP_SYS words the link didn't need but the ISP does, as Linux has them
+// (docs/camera-linux-regs-2026-10-18.txt; names from freertos/cvitek/
+// common/include/interdrv/chip/riscv64/reg_vip_sys.h). +0x38's divider
+// 10 (ratio (10+1)/32: 594 MHz -> ~204 MHz) is the vi driver's own
+// cv180x value — clk_mac must stay <= 2x the back end's clock.
+const uint VIP_SYS_AXI_SW            = 0x010;
+const uint VIP_SYS_LP_CTRL_AXI_RT    = 0x020;
+const uint VIP_SYS_LP_CTRL_X2P       = 0x028;
+const uint VIP_SYS_CLK_RATIO_CSI_MAC0 = 0x038; // NORM_DIV_EN[0] UPDATE_SEL[2] NORM_DIV_VAL[20:16]
+
+const uint VI_FRAME_BYTES = 128 * 4096; // must match boards/duo/board.c3 VI_FRAME_PAGES
+uptr g_vi_frame_paddr;  // cifd's DMA region (boards/duo/board.c3 VI_FRAME_PAGES), identity-mapped, uncached
+uint g_vi_frame_bytes;  // what the last capture wrote
+
+fn uint vi_rd(uint a) { return mmio_read32((uptr)a); }
+fn void vi_wr(uint a, uint v) { mmio_write32((uptr)a, v); }
+
+fn uint vi_stride(uint w) { return (3 * ((w + 1) / 2) + 0xf) & ~(uint)0xf; } // VI_ALIGN(3 * UPPER(w, 1))
+
+// Everything the ISP needs powered that the link alone didn't. ORs gates
+// in, never pulses a reset: toggling VIP_SYS's axi/isp_top resets once
+// left the CSI MAC's registers faulting (see vip_sys_bring_up).
+fn void vi_power_up()
+{
+    clock_reg_write(REG_CLK_EN_2, clock_reg_read(REG_CLK_EN_2) | VI_CLK_EN_2_BITS);
+    clock_reg_write(REG_CLK_EN_3, clock_reg_read(REG_CLK_EN_3) | VI_CLK_EN_3_BITS);
+    clock_reg_write(REG_CLK_EN_4, clock_reg_read(REG_CLK_EN_4) | VI_CLK_EN_4_BITS);
+    vipsys_reg_write(VIP_SYS_AXI_SW, 0x0000000f);
+    vipsys_reg_write(VIP_SYS_LP_CTRL_AXI_RT, 0x00000c01);
+    vipsys_reg_write(VIP_SYS_LP_CTRL_X2P, 0x00000c01);
+    uint ratio = vipsys_reg_read(VIP_SYS_CLK_RATIO_CSI_MAC0);
+    ratio = (ratio & ~(uint)0x001f0000) | (10u << 16) | 1u | 4u;
+    vipsys_reg_write(VIP_SYS_CLK_RATIO_CSI_MAC0, ratio);
+    vipsys_reg_write(VIP_SYS_REG_04, vipsys_reg_read(VIP_SYS_REG_04) | 1u); // clk_axi_isp_top_en (the driver's _vi_clk_ctrl)
+}
+
+// Pattern generator timing (_patgen_config_timing, cv180x values: htt*vtt
+// *fps must fit the ~204 MHz clk_mac).
+fn void vi_patgen_setup()
+{
+    uint b = VI_CSIBDG0;
+    uint hm1 = VI_SENSOR_H - 1;
+    vi_wr(b + BDG_MDE_V_SIZE, (hm1 << 16) | 0);
+    vi_wr(b + BDG_MDE_H_SIZE, ((VI_SENSOR_W - 1) << 16) | 0);
+    vi_wr(b + BDG_FDE_V_SIZE, ((0x10 + hm1) << 16) | 0x10);
+    vi_wr(b + BDG_FDE_H_SIZE, ((0x10 + VI_SENSOR_W - 1) << 16) | 0x10);
+    vi_wr(b + BDG_HSYNC_CTRL, (5u << 16) | 4);
+    vi_wr(b + BDG_VSYNC_CTRL, (5u << 16) | 4);
+    vi_wr(b + BDG_TGEN_TT_SIZE, (0x7d0u << 16) | 0x1000);
+    // _patgen_config_pat: PAT_IDX 7 with fixed MDE colours, so a correct
+    // capture has known pixel values (R 0x457, G 0x8ae, B 0xd05).
+    vi_wr(b + BDG_PAT_GEN_CTRL, 1);              // PAT_EN, everything else off, BAYER_ID 0
+    vi_wr(b + BDG_PAT_IDX_CTRL, 7u << 8);
+    vi_wr(b + BDG_PAT_COLOR_0, (0xfffu << 16) | 0xfff);
+    vi_wr(b + BDG_PAT_COLOR_1, 0xfff);
+    vi_wr(b + BDG_BG_COLOR_0, (1u << 16) | 0);
+    vi_wr(b + BDG_BG_COLOR_1, 2);
+    vi_wr(b + BDG_FIX_COLOR_0, (0x8aeu << 16) | 0x457);
+    vi_wr(b + BDG_FIX_COLOR_1, 0xd05);
+}
+
+// Result of one capture, in the CAPTURE reply.
+struct Vi_result
+{
+    uint int_event0;   // ISPTOP INT_EVENT0 when done (or at the timeout)
+    uint int_event2;
+    uint bdg_status;   // CSIBDG0 INTERRUPT_STATUS_0
+    uint bdg_status1;  // CSIBDG0 INTERRUPT_STATUS_1
+    uint pxl_cnt;      // CSIBDG0 CH0_PXL_CNT
+    uint dma_status;   // DMA_CTL6 DMA_STATUS
+    uint bytes;        // stride * h
+    bool done;         // FRAME_DONE_FE0 seen
+}
+
+// One frame of the (cx, cy, cw, ch) window into the DMA region. patgen =
+// the bridge's own pattern generator instead of the sensor (cifinit must
+// have locked the link first for the sensor path).
+fn void vi_capture(bool patgen, uint cx, uint cy, uint cw, uint ch, Vi_result* r)
+{
+    *r = {};
+    uint stride = vi_stride(cw);
+    if (g_vi_frame_paddr == 0 || cw == 0 || ch == 0 || cx + cw > VI_SENSOR_W || cy + ch > VI_SENSOR_H
+        || (ulong)stride * ch > (ulong)VI_FRAME_BYTES) { return; }
+
+    vi_power_up();
+
+    // The ISP's own soft reset (isp_reset, run first by vi_start_streaming):
+    // hardware triggers back on, AXI first, then every block. Internal to
+    // ISPTOP — not VIP_SYS's isp_top reset. Without it a bridge left mid-
+    // frame by an earlier capture stays wedged at line 1.
+    vi_wr(VI_ISPTOP + TOP_CTRL_MODE_SEL0, vi_rd(VI_ISPTOP + TOP_CTRL_MODE_SEL0) | 0xf);
+    vi_wr(VI_ISPTOP + TOP_SW_RST, 0x040);
+    vi_wr(VI_ISPTOP + TOP_SW_RST, 0x37f);
+    vi_wr(VI_ISPTOP + TOP_SW_RST, 0x040);
+    vi_wr(VI_ISPTOP + TOP_SW_RST, 0);
+
+    // ISPTOP (ispblk_isptop_config): FE0 triggered and shadow-updated by
+    // hardware (sensor online), frame-done/frame-start events on, and the
+    // FE -> DRAM scenario.
+    vi_wr(VI_ISPTOP + TOP_INT_EVENT0, 0xffffffff);
+    vi_wr(VI_ISPTOP + TOP_INT_EVENT1, 0xffffffff);
+    vi_wr(VI_ISPTOP + TOP_INT_EVENT2, 0xffffffff);
+    vi_wr(VI_ISPTOP + TOP_INT_EVENT0_EN, 0xf);
+    vi_wr(VI_ISPTOP + TOP_INT_EVENT2_EN, 0xf);
+    vi_wr(VI_ISPTOP + TOP_CTRL_MODE_SEL0, (1u << 16) | 1u);
+    vi_wr(VI_ISPTOP + TOP_CTRL_MODE_SEL1, 1u);
+    vi_wr(VI_ISPTOP + TOP_SCENARIOS_CTRL, TOP_SCENARIO_FE_TO_DRAM);
+
+    // pre_raw_fe0 (ispblk_preraw_fe_config): frame size, Bayer type left 0.
+    vi_wr(VI_PRE_RAW_FE0 + FE_PRE_RAW_FRAME_SIZE, ((VI_SENSOR_H - 1) << 16) | (VI_SENSOR_W - 1));
+
+    // CSI bridge (ispblk_csibdg_config + _wdma_crop_config + _dma_wr_en).
+    uint b = VI_CSIBDG0;
+    uint top = BDG_TOP_CH0_DMA_WR_EN | (patgen ? (BDG_TOP_CSI_MODE_PATGEN | BDG_TOP_PXL_DATA_SEL) : BDG_TOP_CSI_MODE_SENSOR);
+    vi_wr(b + BDG_TOP_CTRL, top);
+    for (uint c = 0; c < 4; c++) { vi_wr(b + BDG_CH0_SIZE + 4 * c, ((VI_SENSOR_H - 1) << 16) | (VI_SENSOR_W - 1)); }
+    vi_wr(b + BDG_DMA_DPCM_MODE, 0);
+    vi_wr(b + BDG_INTERRUPT_CTRL, (1u << 0) | (1u << 4) | (1u << 8) | (1u << 12));
+    vi_wr(b + BDG_INT_STATUS_0, vi_rd(b + BDG_INT_STATUS_0));
+    vi_wr(b + BDG_INT_STATUS_1, vi_rd(b + BDG_INT_STATUS_1));
+    if (patgen) { vi_patgen_setup(); } else { vi_wr(b + BDG_PAT_GEN_CTRL, 0); }
+    vi_wr(b + BDG_WDMA_CH0_HORZ_CROP, ((cx + cw - 1) << 16) | cx);
+    vi_wr(b + BDG_WDMA_CH0_VERT_CROP, ((cy + ch - 1) << 16) | cy);
+    vi_wr(b + BDG_WDMA_CH0_CROP_EN, 1);
+
+    // Its write DMA (ispblk_dma_set_sw_mode + ispblk_dma_config).
+    mem::set((void*)g_vi_frame_paddr, 0, (usz)VI_FRAME_BYTES);
+    uint d = VI_DMA_CTL6;
+    uint sys = vi_rd(d + DMA_SYS_CONTROL);
+    sys = (sys & ~(uint)0xff00) | DMA_SW_MODE | (uint)(((ulong)g_vi_frame_paddr >> 32) & 0xff) << 8;
+    vi_wr(d + DMA_SYS_CONTROL, sys);
+    vi_wr(d + DMA_SEGLEN, stride);
+    vi_wr(d + DMA_STRIDE, stride);
+    vi_wr(d + DMA_SEGNUM, ch);
+    vi_wr(d + DMA_BASE_ADDR, (uint)g_vi_frame_paddr);
+
+    // Stream on (isp_streaming), then the first-frame trigger (isp_pre_trig).
+    vi_wr(VI_ISPTOP + TOP_SW_CTRL_1, 1u);
+    vi_wr(VI_ISPTOP + TOP_SW_CTRL_0, 1u << 16);
+    vi_wr(b + BDG_TOP_CTRL, top | BDG_TOP_CSI_UP_REG | BDG_TOP_CSI_ENABLE | (patgen ? BDG_TOP_TGEN_ENABLE : 0));
+    vi_wr(VI_PRE_RAW_FE0 + FE_PRE_RAW_FRAME_VLD, vi_rd(VI_PRE_RAW_FE0 + FE_PRE_RAW_FRAME_VLD) | (1u << 4) | 1u);
+
+    ulong hz = timebase_hz();
+    ulong deadline = rdtime() + hz / 2;
+    while (rdtime() < deadline)
+    {
+        if ((vi_rd(VI_ISPTOP + TOP_INT_EVENT0) & 0x1) != 0) { r.done = true; break; }
+        yield();
+    }
+    r.int_event0 = vi_rd(VI_ISPTOP + TOP_INT_EVENT0);
+    r.int_event2 = vi_rd(VI_ISPTOP + TOP_INT_EVENT2);
+    r.bdg_status = vi_rd(b + BDG_INT_STATUS_0);
+    r.bdg_status1 = vi_rd(b + BDG_INT_STATUS_1);
+    r.pxl_cnt    = vi_rd(b + BDG_CH0_DEBUG_0);
+    r.dma_status = vi_rd(d + DMA_STATUS);
+
+    // Stream off, so the next frame can't overwrite this one.
+    vi_wr(b + BDG_TOP_CTRL, top & ~BDG_TOP_CH0_DMA_WR_EN);
+    r.bytes = stride * ch;
+    g_vi_frame_bytes = r.done ? r.bytes : 0;
+}
+
 // Wire protocol: request is a single verb byte, plus for CIF_IPC_
 // STREAM_ENABLE one payload byte (byte0 = pnswap_bits, see cif_stream_
 // enable()'s own comment; ignored/unused for CIF_IPC_GET_STATUS). Reply
@@ -555,6 +817,17 @@ const uint CIF_IPC_STREAM_ENABLE = 2; // no payload either way; reply mirrors GE
 const uint CIF_IPC_PEEK = 3;
 const uint CIF_IPC_POKE = 4;
 const uint CIF_IPC_MSG_MAX    = 8;
+// Stage 4 raw capture. CAPTURE: req[0] = 1 patgen / 0 sensor, then
+// x, y, w, h as little-endian u16 at req[1..8]; reply = 0 ok / 1 no
+// frame-done / 2 bad request, then INT_EVENT0, INT_EVENT2, CSIBDG
+// INTERRUPT_STATUS_0, CH0_PXL_CNT, DMA_STATUS, the byte count and CSIBDG
+// INTERRUPT_STATUS_1, all u32 LE (29 bytes). FRAME_READ: req[0..3] = offset; reply = up to
+// CIF_FRAME_CHUNK bytes of the last capture from there (0 past its end).
+const uint CIF_IPC_CAPTURE    = 5;
+const uint CIF_IPC_FRAME_READ = 6;
+const uint CIF_IPC_REQ_MAX    = 16;
+const uint CIF_CAPTURE_REPLY  = 29;
+const uint CIF_FRAME_CHUNK    = 4096;
 
 const int CIF_STATUS_LOCKED     = 0; // a valid packet header has been decoded, no errors
 const int CIF_STATUS_NOT_LOCKED = 1; // no errors seen, but no packet decoded yet either
@@ -572,16 +845,38 @@ fn bool cif_addr_mapped(uint a)
     if ((a & 3) != 0) { return false; }
     uint page = a & ~(uint)0xfff;
     return page == CIF_MAC_BASE || page == CIF_WRAP_BASE || page == VIP_SYS_BASE
-        || page == CLOCK_BASE || page == RESET_BASE;
+        || page == CLOCK_BASE || page == RESET_BASE
+        || page == VI_PRE_RAW_FE0 || page == VI_ISPTOP || page == VI_ISPTOP + 0x2000; // + WDMA_CORE0
 }
 
 fn void cifd_ipc_serve()
 {
-    char[CIF_IPC_MSG_MAX] buf @noinit;
+    char[CIF_IPC_REQ_MAX] buf @noinit;
     uint verb = 0;
     uint from_gen = 0;
-    int from = ipc_recv_type_gen(&buf[0], (int)CIF_IPC_MSG_MAX, &verb, &from_gen);
+    int from = ipc_recv_type_gen(&buf[0], (int)CIF_IPC_REQ_MAX, &verb, &from_gen);
     if (from <= 0) { return; }
+    if (verb == CIF_IPC_CAPTURE)
+    {
+        uint[4] win;
+        for (int i = 0; i < 4; i++) { win[i] = (uint)buf[1 + 2 * i] | ((uint)buf[2 + 2 * i] << 8); }
+        Vi_result r;
+        vi_capture(buf[0] != 0, win[0], win[1], win[2], win[3], &r);
+        char[CIF_CAPTURE_REPLY] cr;
+        cr[0] = r.bytes == 0 ? (char)2 : (r.done ? (char)0 : (char)1);
+        uint[7] f = { r.int_event0, r.int_event2, r.bdg_status, r.pxl_cnt, r.dma_status, r.bytes, r.bdg_status1 };
+        for (int i = 0; i < 7; i++) { for (int k = 0; k < 4; k++) { cr[1 + 4 * i + k] = (char)(f[i] >> (8 * k)); } }
+        ipc_reply(from, verb, &cr[0], (int)CIF_CAPTURE_REPLY, from_gen);
+        return;
+    }
+    if (verb == CIF_IPC_FRAME_READ)
+    {
+        uint off = (uint)buf[0] | ((uint)buf[1] << 8) | ((uint)buf[2] << 16) | ((uint)buf[3] << 24);
+        uint n = 0;
+        if (off < g_vi_frame_bytes) { n = g_vi_frame_bytes - off; if (n > CIF_FRAME_CHUNK) { n = CIF_FRAME_CHUNK; } }
+        ipc_reply(from, verb, (char*)(g_vi_frame_paddr + off), (int)n, from_gen);
+        return;
+    }
     if (verb == CIF_IPC_PEEK || verb == CIF_IPC_POKE)
     {
         uint addr = (uint)buf[0] | ((uint)buf[1] << 8) | ((uint)buf[2] << 16) | ((uint)buf[3] << 24);
@@ -637,6 +932,9 @@ fn void cifd_ipc_serve()
 fn void main()
 {
     cif_init();
+    uptr frame = 0;
+    if (dev_info(&frame, 1) >= 1) { g_vi_frame_paddr = frame; }
+    print("cifd: raw frame buffer at 0x"); print_hex32((uint)g_vi_frame_paddr); print("\n");
 
     srv_post("cifd");
     print("cifd: init done\n");

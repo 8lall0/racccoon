@@ -251,12 +251,13 @@ C3_OPT=-O2 build_user_program_stdio test $STDIO_COMMON user/bin/test.c3
 C3_OPT=-O2 build_user_program_stdio expr $STDIO_COMMON user/bin/expr.c3
 build_user_program_stdio usbrw $STDIO_COMMON user/bin/usbrw.c3
 build_user_program_stdio gpio $STDIO_COMMON user/bin/gpio.c3
-# camtest / caminit / cifinit — the CAM-GC2083 bring-up tools
-# (docs/camera-plan.md Stages 1-3): chip-ID read, mode-init script,
-# CSI-2 receiver bring-up + link check. Duo only.
+# camtest / caminit / cifinit / camcap — the CAM-GC2083 bring-up tools
+# (docs/camera-plan.md Stages 1-4): chip-ID read, mode-init script,
+# CSI-2 receiver bring-up + link check, one raw frame to a file. Duo only.
 build_user_program_stdio camtest $STDIO_COMMON user/bin/camtest.c3
 build_user_program_stdio caminit $STDIO_COMMON user/bin/caminit.c3
 build_user_program_stdio cifinit $STDIO_COMMON user/bin/cifinit.c3
+build_user_program_stdio camcap $STDIO_COMMON user/bin/camcap.c3
 # introspection — dmesg (kernel console log ring, SYS_KLOG_READ) and
 # ps / top (per-process view, SYS_PROC_STAT). Real stdlib for io::printfn's
 # column formatting.
