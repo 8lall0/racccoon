@@ -4,6 +4,37 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-19 (later) — camera-gc2083 ported onto current master (branch `camera-port`)
+
+`camera-gc2083` (Stages 1-2 done, Stage 3 paused on a physical-layer
+question, see the 2026-09-13 entries below) had forked before the
+device-table refactor and was 35 commits behind. Ported rather than
+rebased, because its kernel half was exactly what that refactor replaced:
+
+- **Kernel side, now declarative.** The branch's `HAS_CAMERA` flag,
+  hand-written `create_process` + `setup_i2cd_mappings` /
+  `setup_cifd_mappings` and `SVC_KIND_I2CD/CIFD` are gone. The Duo's
+  `DEVICES` gains `"i2c"` (I2C1 + pinmux/clock/reset pages) and `"cif"`
+  (csi_mac0 + csi_wrap0 + clock/reset + VIP_SYS), and `kernel_main` gets two
+  `service_boot` rows found via `device_find`. QEMU and the Orange Pi have
+  neither device, so the services never spawn there. `i2cd`/`cifd` join
+  `KERNEL_SERVERS` (`lib_kernel.sh`).
+- **Unchanged from the branch:** `user/i2c/i2cd.c3`, `user/cif/cifd.c3`,
+  `camtest` / `caminit` / `cifinit`, `docs/camera-plan.md`, the camera board
+  constants, gpiod's GPIOC8 (SENSOR_RSTN) allowlist entry, and the devlog
+  entries for rounds 1-4 (inserted below at their dates). The drivers
+  hardcode their physical addresses and use none of the per-driver INFO
+  syscalls the device table removed, so they needed no change.
+
+Verified so far: all four boards build (`boot()` still first on the Duo),
+and a QEMU boot behaves as before (no camera services, tests pass, the
+tools are in `/bin`). Not yet on the Duo, so not yet re-checked that
+`camtest` still reads chip ID `0x2083` under the device-table mappings.
+The physical-layer question from round 4 is unchanged (continuity /
+scope / a known-good module).
+
+---
+
 ## 2026-10-19 (later) — /bin/wasm runs pre-decoded code: Lua fib(22) 7.6 s → 3.8 s (14× the original) (branch `wasm-predecode`)
 
 The next step after the 7× round: stop interpreting raw wasm bytes.
@@ -104,7 +135,6 @@ including wasitest/luatest/wasmtest; fsck clean. Duo: pending (and the
 Duo-only drivers stay unoptimised regardless).
 
 ---
-
 ## 2026-10-19 — Lua on racccoon: sleep(), interpreter-assisted setjmp/longjmp, a 7× faster /bin/wasm, and a FAT32 directory bug
 
 Three items: `poll_oneoff`, a real program on WASI, and interpreter speed.
@@ -1146,6 +1176,485 @@ made it obvious.
 sites), `src/entry.c3` (the 3rd call site), `src/kernel.c3` (defensive
 hardening), `docs/opi-rv-plan.md`, this entry. No lasting changes to
 the board's own firmware — it's back to exactly its original state.
+
+---
+
+## 2026-09-13 — camera Stage 3: cif_config/cif_stream_enable reordering, analog clk-channel select, exhaustive pn-swap sweep, MIPIMPLL verified — every register-level and empirical lead now exhausted
+
+Continuation of Stage 3 (CIF/D-PHY bring-up), re-opened on explicit
+instruction not to stop at a "needs hardware measurement" conclusion:
+"no go on please, search the datasheet better, it's impossible that
+this does not work." Found and tested four more concrete things this
+round, none of which moved `CSI_STATUS` off `0x00000000`.
+
+**1. Config/enable ordering fix.** Re-read the reference driver's real
+`cif_streaming(on)` (`freertos/cvitek/hal/cv1835/cif/src/cif_drv.c`):
+`cif_config()` (MAC_TOP mode, MAC_CSI lane/intr/vs_gen, WRAP sensor-
+mode/lane-select/ck-select) runs *every time*, immediately before
+`cif_stream_enable()`'s analog PD_IBIAS/RXLP/deskew dance — one atomic
+"turn streaming on" operation, not config-once-at-boot. `cifd.c3`'s
+first pass (previous session) had only split the analog dance out to
+on-demand, leaving the MAC/WRAP config at boot time, well before the
+sensor is even reset. Restructured `cif_init()` to keep only the one-
+time clock-gate/reset-deassert (`CLK_EN_2_CAM0_BIT`,
+`CLK_EN_3_VIP_SYS_2_BIT`, `SOFT_RST_2_CSIPHY0{,RST_APB}_BIT`), moving
+all MAC_TOP/MAC_CSI/WRAP config into `cif_stream_enable()`, immediately
+before the analog dance, matching the vendor's exact order. No change
+in hardware behavior after rebuild/reflash/retest — the reordering
+alone wasn't it, but needed to be right before ruling out anything
+downstream of it.
+
+**2. Analog clock-channel select — a genuinely new register.** Found
+`WRAP`'s global `REG_04` (`0x0A0D0004`): `reg_mipirx_sel_clk_channel`
+at `[21:16]`, reset `0x0`, never touched by any previous pass. Distinct
+from the per-link *digital* `WRAP_L0_CK_SEL` (`0x0A0D0308`) already
+set — this one sits alongside `REG_34`-`REG_48`'s "analog lane 0-5
+calibration result" and `REG_80`'s "AD clock lane0-5 inverse", strong
+circumstantial evidence it's a one-hot *analog* mux selecting which
+physical D-PHY lane feeds the clock-recovery PLL, separate from the
+link-level digital routing. Set to `1u << 3` (physical lane 3, matching
+the schematic + `WRAP_L0_CK_SEL`'s own value). No hardware behavior
+change.
+
+**3. Exhaustive pn-swap sweep.** `WRAP_L0_CK_SEL`'s own register also
+carries `reg_csi_lane_{ck,d0,d1}_pnswap` bits (4/8/9), datasheet-
+confirmed, never touched before. Reversed differential pairs are a
+common real-world MIPI wiring defect, especially plausible on this
+third-party GC2083 breakout (not Milk-V's own official camera FPC).
+Extended cifd's `CIF_IPC_STREAM_ENABLE` wire protocol to carry a
+pnswap-bits payload byte, and rewrote `cifinit.c3`'s `main()` to sweep
+all 8 clock/data0/data1 combinations, re-enabling the stream and
+polling `CSI_STATUS` fresh after each one. **All 8 came back byte-for-
+byte identical: `0x00000000`, no variation whatsoever** — real
+hardware, real test, not a guess accepted on faith.
+
+**4. Sensor restart() re-tried, MIPIMPLL verified.** Re-applied
+`gc2083_restart()`'s own register writes (`0x03f9=0x42`, `0x03f7=0x11`,
+`0x03fc=0x8e`, `0x003e=0x91` — the GC2083's own undocumented-in-the-
+main-table "streaming trigger", ruled out in an earlier pass but before
+the CIF side was fully corrected) with the now-fully-restructured CIF
+driver: no change. Then, rather than assume the D-PHY's own HS sampling
+clock (MIPIMPLL) was fine, read it back directly:
+`CLOCK_BASE+0x808` (`REG_MIPIMPLL_CSR`) = `0x05488101`, exactly matching
+FSBL's own unconditional boot-time programming
+(`fsbl/plat/cv180x/platform.c`'s `sys_pll_od()`/`sys_pll_nd()`, on the
+same FSBL binary this project's `reflash_duo.sh` reuses unchanged from
+the card's existing image) — confirmed correct via hardware, not
+assumed from "FSBL should have done this".
+
+**Where this leaves it.** Nine total hardware configurations tested
+this round (8 pn-swap combinations + sensor-restart), every one
+producing the identical `CSI_STATUS = 0x00000000`. That total
+invariance is itself informative: a polarity or protocol-config
+mismatch would be expected to at least flip an ECC/CRC/WC error bit on
+*some* combination, since garbled-but-present HS transitions still
+usually trip the header-ECC checker. Getting literally nothing, on
+every combination, points at the MAC's decoder never seeing lane
+activity at all — a physical-layer problem this project's remaining
+tool (a real, working CV1800B register-level TRM) cannot diagnose
+further. Every identifiable register in that datasheet is now
+hardware-verified correct; the datasheet mining arc is genuinely done,
+not abandoned early. Next step needs actual hardware measurement
+(continuity check against the schematic, oscilloscope/logic analyzer on
+the physical MIPI lines) or a known-good module to swap in for
+comparison — not more documentation review.
+
+**Files changed:** `user/cif/cifd.c3` (config/enable reordering, WRAP
+REG_04 clk-channel select, pnswap_bits parameter + wire protocol),
+`user/bin/cifinit.c3` (pnswap sweep loop, restart() re-test),
+`docs/camera-plan.md`, this entry.
+
+---
+
+## 2026-09-13 (2) — camera Stage 3 round 3: real Linux/U-Boot driver mining finds 3 more genuine clock/reset gates, still zero effect
+
+Direct response to "commit this checkpoint, analyze the datasheet VERY
+GOOD and try a fix yourself, i can't understand why you have a working
+driver for linux and you're not getting it" — took the "use the real
+driver, not just the datasheet" push seriously and searched the SDK's
+actual production driver sources (u-boot-2021.10, linux_5.10) rather
+than re-reading the same TRM pages again.
+
+**Found 1: VIP_SYS, a whole register block missing from the CV1800B
+TRM entirely.** `u-boot-2021.10/drivers/video/cvitek/vip_sys.c` (the
+real display driver's own clock/reset bring-up, `vip_isp_clk_reset()`)
+references a `reg_vip_sys` block never mentioned anywhere in the
+692-page TRM. `cv180x_base.dtsi`'s own `base` node (`compatible =
+"cvitek,base"`, `reg-names = "vip_sys"`) gives the real address:
+`0x0A0C8000`. Its `REG_00`/`REG_04` gate `csi_mac0`'s own clock+reset —
+a THIRD tier of gating, below the SoC-level `CLK_EN_2/3` bits and below
+`MIPIMPLL`, that nothing in this board's boot chain (including the
+reused FSBL, which only programs top-level PLLs) had ever touched,
+since the Duo has no display wired up to trigger U-Boot's own call to
+this function.
+
+First attempt faithfully replayed the *whole* vendor sequence (axi +
+isp_top + csi_mac0/1, each with an assert/pulse/deassert reset dance)
+— this crashed cifd on real hardware (`scause=5`, load access fault, on
+its own subsequent access to `CIF_MAC_BASE`, a register already
+accessed successfully dozens of times earlier the same session).
+Diagnosed as the axi/isp_top domains (shared with the ISP/display
+pipeline this driver never uses) destabilizing the bus bridge
+`csi_mac0`'s own register block sits behind. Narrowed to a plain
+set/clear of exactly `csi_mac0`'s own clock-enable + reset bits, no
+reset-pulse dance, no touching axi/isp_top/mac1 — fixed the crash,
+confirmed via readback (`REG_00=0x00100000`, `REG_04=0x0000fffe`).
+**No change to `CSI_STATUS`.**
+
+**Found 2 & 3: two more SoC-level `REG_CLK_EN_2` bits, same register
+already in use.** `linux_5.10/drivers/clk/cvitek/clk-cv180x.c` (the
+real Linux clock driver) names `CV180X_CLK_CSI_MAC0_VIP`
+("clk_csi_mac0_vip", bit 18) and its own parent `CV180X_CLK_AXI_VIP`
+("clk_axi_vip", bit 4) — both in `REG_CLK_EN_2` (the very register
+`cif_init()` already writes for `clk_cam0`'s own bit 16), both never
+set before. Neither is in `cv180x_base.dtsi`'s "mipi_rx: cif" node's
+own clock list — only visible by reading the Linux driver source
+directly. Set both. **Also no change to `CSI_STATUS`.**
+
+Before writing to `clk_axi_vip`'s own divider/mux register
+(`REG_DIV_CLK_AXI_VIP`, `0x0C8`) — real risk of misrouting a fast PLL
+into a domain with unknown max-frequency limits — read it back first:
+`0x00030009`. Its divider field already matches Linux's own intended
+`initval` (3) exactly; its mux is on the raw 25MHz oscillator, not a
+PLL. Almost certainly harmless: `csi_mac0`'s actual CSI-2 decode
+datapath is expected to run off the D-PHY's own recovered byte clock
+(itself derived from `MIPIMPLL`, already independently confirmed
+running), not this SoC-level APB/config-bus clock tree — this tree
+governs register *access* speed, not decode-logic timing. Left
+unwritten, on that reasoning, not on a guess.
+
+**Where this leaves it.** Every clock/reset gate any of the three
+independent sources this SDK offers (the real CV1800B TRM, the real
+U-Boot display driver, the real Linux clock driver) name as relevant
+to this datapath is now enabled and hardware-verified via readback:
+`clk_cam0`, `clk_src_vip_sys_2`, `MIPIMPLL`, `VIP_SYS`'s own internal
+`csi_mac0` gate, and now `clk_csi_mac0_vip` + its parent `clk_axi_vip`.
+12 total hardware configurations tested across this arc (8 pn-swap +
+sensor restart + 3 new clock-gate fixes), all producing the exact same
+`CSI_STATUS = 0x00000000`. This is a materially stronger result than
+before: it isn't just "every datasheet register checks out" any more,
+it's "every clock in the tree, from three independently-sourced real
+production drivers, is confirmed on" — which makes a clocking
+explanation very unlikely at this point, sharpening the case for a
+genuine physical-layer problem on this specific module.
+
+**Files changed:** `user/cif/cifd.c3` (VIP_SYS block + narrowed
+bring-up, two new `REG_CLK_EN_2` bits, `REG_DIV_CLK_AXI_VIP` diagnostic
+read), `boards/duo/board.c3` + `boards/qemu/board.c3`
+(`CIF_VIP_SYS_PAGE`), `src/process.c3` (`setup_cifd_mappings` 5th
+page), this entry.
+
+---
+
+## 2026-09-13 (3) — camera Stage 3 round 4: disassembled the real compiled kernel module (source is genuinely closed), confirmed clk_axi_vip was 0Hz not just slow, ruled out hs_settle for this sensor
+
+Direct continuation of "check if it has also a binary blob we can use"
+— `linux_5.10/drivers/media/platform/cvitek/` ships only a `Kconfig`
+naming the module `mipi_rx` (`VIDEO_CVITEK_CIF`); no `.c`/Makefile
+anywhere in the SDK, confirming the real capture driver's source really
+is closed, as already suspected. But the **compiled** module ships:
+`middleware/v2/cv180x/ko/cvi_mipi_rx.ko`, a real RISC-V ELF `.ko`,
+**not stripped** — real function names (`cif_config`, `cif_streaming`,
+`cif_set_hs_settle`, `cif_set_lane_id`, `cif_set_clk_dir`, `cif_set_
+clk_edge`, `cif_set_lane_deskew`, `_cif_set_mac_clk`, ...) all present.
+Disassembled with `riscv64-unknown-elf-objdump -dr` (this host already
+had the toolchain).
+
+**Correction to round 3's own "6-8MHz" framing.** Round 3 assumed the
+divider-mux field's value `0` meant "raw oscillator" and concluded
+`clk_axi_vip` (parent of the MAC's own `clk_csi_mac0_vip` gate) was
+running at roughly 6-8MHz instead of the vendor-required 200MHz.
+Read the actual Linux `clk_ops` implementation this time
+(`cv180x_clk_mux_get_parent`'s own documented index table) instead of
+guessing at the mapping: mux value `0` is actually `clk_mipimpll`
+(900MHz, independently confirmed running), not oscillator — meaning
+`clk_axi_vip`'s divider/mux (already at mux=0, div=3 before any of this
+session's writes) was selecting 900MHz/4 = **225MHz all along**, close
+to the vendor's 200MHz target. What round 3 actually fixed wasn't a
+slow clock — it was `REG_CLK_EN_2` bits 4 and 18 (the axi_vip and
+csi_mac0_vip *enable gates* themselves), which were genuinely off:
+before round 3, `clk_axi_vip`/`clk_csi_mac0_vip` were fully gated at
+**0Hz**, not merely slow. After round 3's fix, the MAC's clock domain
+is confirmed both gated on AND running near the correct frequency —
+this closes out clocking as an explanation with real confidence, not
+just "every register checks out."
+
+**`gcore_gc2083_cmos_param.h`'s own real struct confirms `mac_clk =
+RX_MAC_CLK_200M`** (an `enum rx_mac_clk_e` with 200M/300M/400M/500M/
+600M values) — genuine confirmation the 200MHz target from round 3 is
+correct and sensor-specific, not a guess.
+
+**`cif_set_hs_settle` — the long-flagged-as-unfindable T_HS_SETTLE
+register, finally located.** Disassembly shows it writes a single byte
+to an address at `WRAP_LINK0_BASE + 0x10` (i.e. `0x0A0D0310`) — exactly
+the gap the real datasheet's own Table 9-25 skips silently (`REG_0C`
+jumps straight to `REG_20`, no `REG_10`/`14`/`18`/`1C` documented at
+all): a genuinely undocumented, silicon-real register, confirmed only
+by reading the compiled driver directly. **But**: the call is gated on
+a `struct dphy_s { enable; hs_settle; }` field embedded in `mipi_dev_
+attr_s`, and GC2083's own real `gc2083_rx_attr` struct
+(`gc2083_cmos_param.h`) never sets `.mipi_attr.dphy` at all — C's
+static-initializer zero-fill leaves `.dphy.enable = 0`, and the
+disassembly's own `beqz` check on that exact byte skips the call
+entirely when it's zero. **The real vendor driver does not configure a
+custom HS-settle time for this specific sensor** — confirmed from the
+sensor's own real attribute struct, not inferred. Ruled out with
+unusually high confidence for an undocumented register.
+
+Also spotted `cif_set_clk_dir`/`cif_set_clk_edge` (per-lane clock-edge/
+direction bits at other WRAP offsets) called only from what nm/objdump
+address ranges strongly suggest is an ioctl-triggered attribute-set
+path, not `cif_config`'s own automatic bring-up — and no sensor driver
+in this SDK's `gcore_*` tree calls anything that would trigger them.
+Not chased further: relocatable-object address disambiguation without
+a proper decompiler is reaching the edge of what's practical here, and
+every concrete signal so far points to these being optional/TTL-mode
+knobs, not something a plain CSI sensor needs.
+
+**Where this leaves it.** The clock-gating fix this round closes a
+real, previously-invisible gap (a fully unclocked, not just slow, MAC
+domain) with unusually strong confidence, and — critically — did not
+change `CSI_STATUS`, still `0x00000000` across every configuration
+tested (13 now, across rounds 2-4). Every avenue any of 4 independent
+real sources (the CV1800B TRM, the FreeRTOS cv1835 HAL, the real
+U-Boot display driver, the real Linux clock driver) plus the actual
+compiled production kernel module's own disassembly offers has now
+been checked. This is the point where static analysis of available
+sources is genuinely exhausted, not merely paused.
+
+**Files changed:** `docs/devlog.md`, `docs/camera-plan.md`, this entry.
+No code changes this round — findings-only (hs_settle ruled out, no
+clk_dir/edge write attempted, clock-frequency framing corrected).
+
+---
+
+## 2026-09-12 — camera: i2cd (DesignWare I2C1) + gpiod SENSOR_RSTN + camtest, re-derived pin map
+
+Set the opi-rv-port branch aside (committed as a checkpoint,
+`d256afb`) to focus on the CAM-GC2083: the module physically arrived.
+New branch `camera-gc2083` off master.
+
+`docs/camera-plan.md` never actually existed on disk despite the
+2026-08-28 devlog entry describing it as written — recreated it here,
+and corrected a real mistake in that first survey: "SENSOR_RSTN =
+GPIOA2" was CV181X's own pin map (Duo256M/DuoS's chip), not this
+board's actual CV1800B, which has no such dedicated `CAM_RST0` pad at
+all. Re-derived straight from Milk-V's own published schematics
+(fetched this session: the module's `DUO_CAM_GC2083.pdf` and the
+mainboard's `duo-schematic-v1.2.pdf`, rendered to PNG and read
+visually since the PDF's text extraction interleaves unrelated
+columns) cross-checked against the real CV1800B pinctrl driver's own
+alt-function table. All 4 non-MIPI-lane camera signals land on 4
+consecutive QFN68 balls: SENSOR_RSTN = XGPIOC[8] (funcsel +0xec val 3),
+I2C_SDA/SCL = IIC1_SDA/SCL (funcsel +0xf0/+0xf4 val 4, I2C1 @
+0x04010000), SENSOR_CLK = CAM_MCLK0 (funcsel +0xf8 val 4, not driven by
+anything yet).
+
+Implemented Stage 0/1: `user/i2c/i2cd.c3` (new), a poll-only DesignWare
+I2C1 master driver — same one-owner-per-real-device IPC-server
+convention as gpiod/sdd/ethd/usbd, same defensive clock-gate OR-in
+ethd's own ETH_CLK_EN comment already established (`clk_i2c`,
+REG_CLK_EN_3 bit 7, isn't `CLK_IS_CRITICAL` in the vendor's own
+`clk-cv180x.c`, unlike the always-on `clk_apb_i2c1`). SS_SCL_HCNT/LCNT
+computed for 100kHz assuming `clk_i2c` = 25MHz (this project's already-
+established real-timebase constant, and `clk_i2c`'s own devicetree
+parent is "osc" = the board's 25MHz crystal at reset) — flagged in the
+driver's own comment as the first thing to revisit if chip-ID reads
+never ACK. gpiod.c3 gained a 4th allowlisted pin (GPIOC8, SENSOR_RSTN).
+`user/bin/camtest.c3` (new) is the Stage-1 milestone tool: reset-pulse
+over gpiod, then read the GC2083's chip-ID (0x2083 expected, register
+0x03f0/0x03f1, addr 0x37) over i2cd, PASS/FAIL. Wired into
+kernel.c3/supervisor.c3/process.c3 (SVC_KIND_I2CD, spawned like gpiod,
+gated on new `board::HAS_CAMERA`) and every build script
+(build_user.sh, build.sh/build_duo.sh's link lists, populate_duo_bin.sh's
+BINARIES list).
+
+Builds clean (QEMU + Duo, no new warnings). Reflashed the Duo's kernel
+(fip.bin, same no-sudo `reflash_duo.sh` flow as the isolator-testing
+session earlier today).
+
+**Real-hardware verification, same session, 3 reflash/reboot rounds:**
+
+1. First boot: `i2cd`/`gpiod` both came up clean with the new 4th
+   allowlisted pin and the new driver — no crash, no hang. `camtest`
+   (already copied onto the card's `/bin` by the user via
+   `populate_duo_bin.sh`, root needed — no sudo TTY in this session,
+   see [[racccoon_duo_flash_no_sudo]]) ran and reported an I2C
+   **timeout**, not a NAK — the actual transfer state machine was dead.
+2. Added register-readback diagnostics (`REG_CLK_EN_3`, `IC_ENABLE_
+   STATUS`, `IC_STATUS`) and found the real cause: **RST_I2C1**
+   (reset-controller index 28, `0x03003000` bit 28) was never
+   deasserted. Unlike SD/USB/ETH — each already in use by some earlier
+   boot stage, so already out of reset by the time racccoon's kernel
+   runs — nothing before this project's own `i2cd` had ever touched
+   I2C1 at all. Added the deassert (same OR-in-the-bit pattern as the
+   clock gate). Reflashed, rebooted — `i2cd`'s own init diagnostics now
+   show `IC_ENABLE_STATUS=1`, `IC_STATUS=0x6` (TFNF+TFE both set, FIFO
+   healthy) — but `camtest` still reported a timeout, now during the
+   actual transfer.
+3. Root-caused that one by reading the fix's own reasoning back
+   critically: `i2c_xfer`'s abort (NAK) check ran exactly once,
+   *immediately* after writing each `IC_DATA_CMD` byte — before the
+   byte's own ACK/NAK bit had even been clocked onto the bus, so a real
+   NAK was read as "no abort yet" and the code went on to wait forever
+   for read data that would never arrive. Moved the `IC_RAW_INTR_STAT`
+   TX_ABRT check inside both poll loops (the TFNF wait for the next
+   byte and the RFNE wait for read data) instead of a one-shot check,
+   plus a final check after the loop (a pure-write transfer never
+   entered either loop again after its last byte, so it could report a
+   false OK). Reflashed, rebooted a third time — `camtest` now reports
+   the *correct* result: **I2C NAK from address 0x37, no ACK at all**
+   — confirmed the camera module is physically seated on the FPC
+   connector, so this is a real signal, not "nothing's plugged in".
+
+Net: **i2cd itself is proven working** — three real, distinguishable
+outcomes (timeout / abort / (eventually) success) all reproduced
+correctly on real hardware, not just "it compiled". The GC2083 not
+ACKing is the actual open question the plan already flagged: does it
+need SENSOR_CLK/CAM_MCLK0 running before its I2C slave logic responds
+at all? MCLK generation is unimplemented — next real step, a fresh
+register-sourcing pass (the SoC's own camera-clock-generator PLL/
+divider, not touched by anything in this project yet).
+
+**Continued same day (2026-09-13): chip-ID PASS, two more real bugs.**
+Web research turned up two things worth having found: the actual GC2083
+datasheet (confirms XSHUTDOWN polarity/timing racccoon already matched,
+and that MCLK's 6-36MHz range comfortably covers the ~18.5MHz FSBL
+already leaves clk_cam0 at) and, much more directly useful, the real
+vendor U-Boot board-init table for this exact board
+(`cv1800b_milkv_duo_sd/u-boot/cvi_board_init.c`) — independent,
+bit-for-bit confirmation of every pin choice made this session
+(`PAD_MIPIRX1N`→`XGPIOC_8` literally commented `// Camera Reset` in
+their own source). Useful confirmation, but not new information — the
+NAK persisted through cable swaps, MCLK gating, RST_VIPSYS, and closing
+gpiod's floating-SENSOR_RSTN window.
+
+A fresh line-by-line re-read of `i2cd.c3` (at the user's request, after
+exhausting every sourced lead) found the actual bug: **`IC_TAR` was
+being written while the I2C controller was already enabled** — the
+DesignWare databook (and u-boot's own `i2c_setaddress()`, right there
+in the same reference driver already being read this session) says
+that register may only be programmed while disabled. Every transfer
+all session had very likely still been addressing whatever `IC_TAR`
+held at reset, never actually 0x37 — a NAK indistinguishable from "no
+sensor" no matter what else got fixed. First fix attempt (bare
+disable/write/enable, no polling) changed the symptom to a timeout —
+informative in itself (real behavior actually changed) but revealed a
+second instance of the same bug class: disabling isn't instant either,
+and u-boot's own `dw_i2c_enable()` polls `IC_ENABLE_STATUS` for *both*
+directions, not just enabling. Added `i2c_set_enable()` (polled both
+ways) around the `IC_TAR` write — first call after that still timed
+out, second call succeeded: `chip-ID = 0x2020`.
+
+That value diagnosed itself: `0x20` is exactly 0x2083's real high byte
+— the low-byte read simply never advanced. The GC2083 datasheet's own
+"Single Register Reading" protocol diagram is one byte per transaction
+(write 2-byte address, restart, read 1 byte); only "Incremental
+Register Writing" gets auto-increment, not reads. `camtest` was doing
+one combined write-2/read-2 call, silently re-reading the same register
+twice. Split into two separate single-byte-read transactions —
+**chip-ID now reads 0x2083, PASS, twice in a row.**
+
+Stage 1 of docs/camera-plan.md is genuinely done: the GC2083 is
+powered, clocked, reset, and answering I2C correctly and repeatably on
+real hardware. Cleaned up the temporary CAM0-clock-register diagnostic
+dump before committing.
+
+**Stage 2 same session: full mode-init script, PASS first try.** New
+`user/bin/caminit.c3` writes all 135 registers of the vendor's own
+`gc2083_linear_1080p30_init()` (1920x1080p30 RAW10, 2-lane MIPI) —
+transcribed from `gc2083_sensor_ctl.c` and diffed programmatically
+against the source (135/135 exact match, not eyeballed) rather than
+retyped by hand. Real hardware: all 135 writes succeeded, chip-ID still
+reads 0x2083 afterward, and the last register (0x023e) reads back
+exactly 0x99 — the value written, confirming the writes actually land
+rather than merely "every transfer returned OK". Streaming blind — no
+MIPI receiver up yet. Next: Stage 3 (D-PHY/CSI-2 RX bring-up).
+
+**Stage 3, same session, in progress: real progress + a wrong reference
+caught and corrected.** New `user/cif/cifd.c3` + `user/bin/cifinit.c3`.
+First attempt used the FreeRTOS cv1835 CIF HAL as a register reference
+(real open source, base addresses matched CV1800B's own devicetree) —
+built clean, ran clean, but the D-PHY link never showed any activity at
+all. Asked to analyze code rather than iterate blindly: re-reading
+`cif_drv.c` found two real gaps (HDR side-effect registers the first
+pass skipped entirely, a `gc2083_restart()` sequence the vendor's sensor
+driver has but `gc2083_init()` never calls) — applied both, no change.
+Register-readback diagnostics (same technique that cracked the I2C
+bring-up) showed something code review alone couldn't explain: some
+writes landed exactly as intended, others read back completely
+unchanged no matter what was written — inconsistent with a plain logic
+bug.
+
+Concluded (wrongly) that this needed hardware measurement to go
+further. Asked to check the SDK harder instead — and this time it paid
+off: `milkv-duo/duo-files`' own **CV1800B-CV1801B Preliminary
+Datasheet**, a real 692-page register-level TRM (distinct from the
+short overview PDF already read for the GC2083 itself), gives CV1800B's
+*actual* register map for this block, and it genuinely differs from
+cv1835's beyond the already-known base-address difference: lane-select
+at different offsets and bit widths, power-down bits at different
+positions — and, the real find, **`SENSOR_MAC_MODE` is a 3-bit field
+where 0 = *Disable***, not CSI as cv1835's own 2-bit encoding has it.
+The first attempt's own reasoning for never touching this field ("left
+at its reset value = CSI", straight from the cv1835 driver's comment)
+was backwards on real silicon — the whole MAC sat disabled the entire
+first pass, regardless of how correct anything else was.
+
+Rewrote `cifd.c3`'s register map from the real datasheet. Re-verified
+on hardware: every diagnostic readback now lands exactly where
+intended. `CSI_STATUS` (the MAC's own documented error/decode register)
+reads a clean `0x00000000` — no ECC/CRC/word-count errors, real
+progress from the garbage/disabled state before — but no packet decoded
+yet either. Removed the speculative `gc2083_restart()` sequence again
+(clean negative result: no change, confirming the vendor's own
+`gc2083_init()` — which never calls `restart()` — really is sufficient
+on its own).
+
+**Continued the same session, at the user's explicit request to keep
+going rather than stop:** the "leave lane-select at reset defaults"
+conclusion turned out to be itself a misreading — the datasheet
+documents this register block TWICE (once for each of two possible
+MIPI-RX links; this board only wires up link0), and the copy read
+first was link1's, whose fields happen to be 2-bit where link0's real
+fields are 3-bit. Link0's actual reset defaults (`d0<-1, d1<-2, ck<-0`)
+are a generic identity mapping, not a match for this board's real
+wiring — corrected to the original schematic-derived values (`ck<-3,
+d0<-2, d1<-4`) at the real offsets (`+0x304`/`+0x308`, not cv1835's
+`+0x028`), verified via readback landing exactly right.
+
+Also restructured `cifd`: split the analog front-end power-up
+(`cif_stream_enable`) out of the driver's own boot-time init into an
+IPC verb triggered only after the sensor is confirmed streaming — the
+reference driver's own `cif_config`/`cif_streaming` split, collapsed
+into one call in the first pass. Its own print output silently didn't
+reach the console from this call path (same symptom `i2cd.c3` hit once
+during the I2C arc) — verified via the IPC reply payload instead of
+trusting the print: the analog front end genuinely powers up correctly
+(`PD_CTRL`'s ibias/rxlp bits read back `0x00` over the wire).
+
+Checked one more concrete, sourced lead: the datasheet's own
+`D0_REG_CTRL_CALIB_0/1` per-lane calibration registers. Read their bit
+descriptions closely — manual/diagnostic self-test infrastructure
+(PRBS9 or fixed-pattern testing against a golden value, with a
+`calib_ignore` bit implying real calibration otherwise runs
+automatically in hardware), not a prerequisite this project's own
+config is missing. The reference driver never touches them either.
+
+Also verified `RST_CSIPHY0`/`RST_CSIPHY0RST_APB` are genuinely
+deasserted — added a register-readback diagnostic (this register reads
+a real, non-degenerate value, unlike the clock-enable registers which
+read `0xffffffff` regardless of actual state on this SoC) and confirmed
+bits 6/7 are set.
+
+**Every register this project can find in the real CV1800B datasheet
+for this path is now verified correct via direct readback.**
+`CSI_STATUS` stays a clean `0x00000000` throughout every attempt — no
+errors, but no packet decoded either. This is a genuine stopping point
+for documentation-only debugging: the remaining gap needs hardware
+measurement (scope/logic analyzer on the physical MIPI lines) or vendor
+engineering input, not more register guessing. Paused here. Full
+account in `cifd.c3`'s own top comment and docs/camera-plan.md.
 
 ---
 
@@ -2831,6 +3340,9 @@ tcc flag from last session.
 `lib/racccoon-libc/src/{stdio,exit,libc_start}.c`.
 **c3c fork (`feat-racccoon-support`):** `src/utils/whereami.c`,
 `src/build/builder.c`.
+
+
+---
 
 ## 2026-09-04 — the self-host chain runs in QEMU: tcc *on racccoon* compiles c3c output
 
@@ -10197,6 +10709,9 @@ for today), or comparison against a second, different real hub.
 still there, just quiet by default — flip it back on to pick this up
 again.
 
+
+---
+
 ## 2026-08-22 (74) — Quiet ethd's bring-up-era diagnostics: `ETHD_VERBOSE`
 
 Small follow-up to entry 72's real-hardware debugging round (the
@@ -10218,6 +10733,9 @@ logic changes — QEMU regression clean (ethd itself is Duo-only, never
 exercised in QEMU); real-hardware confirmation deferred, SD card
 reader disconnected again mid-session (a known recurring flaky-
 connection issue, not a code problem).
+
+
+---
 
 ## 2026-08-22 (73) — Minimal DHCP client: real ping to the Duo confirmed working end to end
 
@@ -10268,6 +10786,9 @@ static fallback).
   bug: the main loop's own poll interval is 500ms, busy-polled rather
   than interrupt-driven, same convention every device driver in this
   codebase already uses; nothing here is latency-tuned yet.
+
+
+---
 
 ## 2026-08-22 (72) — Ethernet Phase 2: real packet TX/RX + ARP/ICMP, confirmed transmitting on real hardware
 
@@ -10360,6 +10881,9 @@ end-to-end validation (a genuine ping from another device on the same
 LAN, which doesn't need the router's own IP stack at all — same
 subnet, pure L2) is still pending the user's own follow-up test.
 
+
+---
+
 ## 2026-08-22 (71) — Directory refactor step 5 (last one): `sdd.c3` split into `sdhci.c3`/`sdd.c3`
 
 Final step of the refactor plan started in entry 68. `sdd.c3` (894
@@ -10396,6 +10920,9 @@ driver that had grown large enough to blur "talks to the wire" vs.
 accordingly, and the shared `virtio.c3`/`main_stub.c3` pieces are
 factored out where real duplication existed. No further steps planned
 from that original plan.
+
+
+---
 
 ## 2026-08-22 (70) — Directory refactor step 4: `ethd.c3` split into `dwmac.c3`/`ephy.c3`/`ethd.c3`
 
@@ -10440,6 +10967,9 @@ kernel image) unaffected.
 
 Step 5 (`sdd.c3` → `sdhci.c3`/`sdd.c3`) is the last one in the
 original refactor plan, still pending.
+
+
+---
 
 ## 2026-08-22 (69) — Idiomatic argc/argv, following on from `main()` (entry 68)
 
@@ -10488,6 +11018,9 @@ dispatching a command), then the identical sequence on real Duo
 hardware against ext2 (case-preserving, unlike FAT32 — `f.txt`/`g.txt`
 stayed lowercase there, a nice independent confirmation the real
 argv content survived intact).
+
+
+---
 
 ## 2026-08-22 (68) — User-space directory refactor (steps 1-3), and an idiomatic `main()`
 
@@ -10588,6 +11121,9 @@ still exactly correct, and `ethd` showed `link up` this round —
 possibly the first real external-carrier confirmation since the
 `cv182xa_ephy_init()` fix (entry 67); worth an explicit `ip link`
 check on the peer side to confirm.
+
+
+---
 
 ## 2026-08-22 (67) — Ethernet Phase 1: MAC+PHY bring-up, real analog link sensing confirmed live
 
@@ -14178,6 +14714,9 @@ syscalls, `Mutex`, `print_uint`), `src/entry.c3` (`SYS_FUTEX_WAIT`/
 removed in favor of `user.c3`'s), `user/shell.c3` (`mutextest`),
 `scripts/build_user.sh` (`atomic.c3` added to every binary's sources).
 
+
+---
+
 ## 2026-08-19 (14) — Real preemptive scheduling
 
 Built directly on the `sepc`-per-process fix (previous entry): the
@@ -14229,6 +14768,9 @@ correct, matching QEMU exactly.
 block above `enable_timer_interrupts()` rewritten to describe the now-
 real preemption instead of the deliberately-deferred slice from the
 previous session).
+
+
+---
 
 ## 2026-08-19 (13) — Real preemption's first prerequisite: sepc needed to become per-process state
 
@@ -16437,6 +16979,9 @@ exists) — resolve the real `LOADER_2ND` `RUNADDR` and the exact
 `scripts/build.sh`, `scripts/build_duo.sh` (new), `src/plic.c3`
 (removed), `src/entry.c3`, `src/process.c3`, `src/kernel.c3`.
 
+
+---
+
 ## 2026-08-15 (12) — RV64/Sv39 port: paging, trap frame, and a real 2GB
 code-model wall
 
@@ -16614,6 +17159,9 @@ documentation rather than assumed from QEMU's virt board.
 `src/kernel/softfloat_stubs.c3` (new), `src/allocation.c3`, `src/page.c3`,
 `src/process.c3`, `src/plic.c3`, `src/entry.c3`, `user/user.c3`,
 `user/diskd.c3`, `user/shell.c3`.
+
+
+---
 
 ## 2026-08-15 (11) — IPC hardened into a true rendezvous, and proof the
 old race was real

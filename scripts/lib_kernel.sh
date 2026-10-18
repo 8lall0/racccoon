@@ -26,7 +26,7 @@ LLVM_MC=${LLVM_MC:-llvm-mc}
 # are linked into every board even though the board's DEVICES table decides
 # which actually spawn: kernel.c3 references each symbol unconditionally.
 # Adding a server = add it here + its externs/service_boot in kernel.c3.
-KERNEL_SERVERS="echod diskd sdd fsd procd envd usbd ethd netd gpiod"
+KERNEL_SERVERS="echod diskd sdd fsd procd envd usbd ethd netd gpiod i2cd cifd"
 
 # kernel_compile <c3c-target> <out>
 #

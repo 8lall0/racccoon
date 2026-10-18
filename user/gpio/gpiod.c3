@@ -68,7 +68,7 @@ import std::nolibc::main_stub;
 // this table simply has no known-safe funcsel address to write, so
 // this driver refuses it rather than guessing.
 //
-// Three pins, verified against every pad this project's own
+// Four pins, verified against every pad this project's own
 // boards/duo/board.c3/user/block/sdhci.c3/user/usb/dwc2.c3/
 // user/net/ephy.c3 already claims at PINMUX_BASE, and against
 // u-boot's own board_init()/pinmux_config() calls for cases actually
@@ -86,6 +86,13 @@ import std::nolibc::main_stub;
 //     named for an onboard SPI-NOR flash chip this board variant
 //     (_sd, not _spinor/_spinand) doesn't populate — safe today, but
 //     claiming it forecloses SPI-NOR support later.
+//   - GPIOC8 (pad PAD_MIPIRX1N, funcsel +0xec): SENSOR_RSTN on the
+//     CAM-GC2083 camera FPC (see boards/duo/board.c3's own camera
+//     comment for the full pin sourcing) — not header-exposed, only
+//     reachable with the camera module attached. The camera's own
+//     I2C1/CAM_MCLK0 pins on the same 4-ball group are alt-function
+//     pins, not plain GPIO, so they're i2cd's own direct PINMUX writes
+//     rather than another entry here.
 // Ruled out along the way: header pins 16/17 (UART0 — the live serial
 // console every single boot message and test result in this project
 // has ever reached anyone through; repurposing it would silence
@@ -107,7 +114,7 @@ const ulong GPIOD_TIMEBASE_HZ = 25000000;
 
 // mmio_read32 / mmio_write32: user/user.c3 (shared).
 
-const int GPIO_PIN_COUNT = 3;
+const int GPIO_PIN_COUNT = 4;
 char[GPIO_PIN_COUNT] gpio_pin_bank_letter; // 'A' or 'C'
 uint[GPIO_PIN_COUNT] gpio_pin_bank_base;
 uint[GPIO_PIN_COUNT] gpio_pin_bit;
@@ -133,6 +140,12 @@ fn void gpio_pin_table_init()
     gpio_pin_bit[2]             = 22;
     gpio_pin_funcsel_offset[2]  = 0x30;
     gpio_pin_funcsel_value[2]   = 3;
+
+    gpio_pin_bank_letter[3]     = 'C';
+    gpio_pin_bank_base[3]       = GPIO_BANK_C_BASE;
+    gpio_pin_bit[3]             = 8;
+    gpio_pin_funcsel_offset[3]  = 0xec;
+    gpio_pin_funcsel_value[3]   = 3;
 }
 
 // -1 if (bank_letter, bit) isn't one of the allowlisted pins above —
@@ -236,6 +249,19 @@ fn void main()
         gpio_configure_pinmux(i);
     }
     gpio_set_dir(0, true); // index 0 = the onboard LED (GPIOC24), output
+
+    // index 3 = GPIOC8, the CAM-GC2083's own SENSOR_RSTN/XSHUTDOWN.
+    // Driven low (reset asserted, a known-safe state) immediately —
+    // the GC2083 datasheet explicitly calls XSHUTDOWN "floating
+    // forbidden", and without this it sits at the GPIO controller's
+    // own power-on default (input, i.e. floating) from boot until
+    // whatever shell command eventually calls GPIO_IPC_SET_DIR on it,
+    // possibly a long time after the sensor's own power rails came up.
+    // camtest.c3's own reset pulse still does the real, controlled
+    // low->high release right before its I2C read; this only closes
+    // the floating gap before that.
+    gpio_set_dir(3, true);
+    gpio_write(3, false);
 
     // Same dynamic srv_post()/ns_mount_wait() two-step usbd.c3 already
     // established — this pid isn't fixed (spawned last, after the

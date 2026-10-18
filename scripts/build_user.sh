@@ -251,6 +251,12 @@ C3_OPT=-O2 build_user_program_stdio test $STDIO_COMMON user/bin/test.c3
 C3_OPT=-O2 build_user_program_stdio expr $STDIO_COMMON user/bin/expr.c3
 build_user_program_stdio usbrw $STDIO_COMMON user/bin/usbrw.c3
 build_user_program_stdio gpio $STDIO_COMMON user/bin/gpio.c3
+# camtest / caminit / cifinit — the CAM-GC2083 bring-up tools
+# (docs/camera-plan.md Stages 1-3): chip-ID read, mode-init script,
+# CSI-2 receiver bring-up + link check. Duo only.
+build_user_program_stdio camtest $STDIO_COMMON user/bin/camtest.c3
+build_user_program_stdio caminit $STDIO_COMMON user/bin/caminit.c3
+build_user_program_stdio cifinit $STDIO_COMMON user/bin/cifinit.c3
 # introspection — dmesg (kernel console log ring, SYS_KLOG_READ) and
 # ps / top (per-process view, SYS_PROC_STAT). Real stdlib for io::printfn's
 # column formatting.
@@ -276,6 +282,8 @@ build_user_program usbd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_D
 build_user_program ethd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/net/eth_proto.c3 user/net/dhcp.c3 user/net/dwmac.c3 user/net/ephy.c3 user/net/ethd.c3
 C3_OPT=-O2 build_user_program netd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/virtio.c3 user/net/eth_proto.c3 user/net/dhcp.c3 user/net/netd.c3
 build_user_program gpiod user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/gpio/gpiod.c3
+build_user_program i2cd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/i2c/i2cd.c3
+build_user_program cifd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/cif/cifd.c3
 
 C3_OPT=-O2 build_user_program_stdio stdiotest \
   src/std/core/mem.c3 src/std/core/nolibc_allocator.c3 src/std/core/nolibc_vmem.c3 \

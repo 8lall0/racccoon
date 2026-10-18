@@ -64,6 +64,10 @@ extern char[] _binary_netd_bin_start @cname("_binary_netd_bin_start");
 extern char[] _binary_netd_bin_end @cname("_binary_netd_bin_end");
 extern char[] _binary_gpiod_bin_start @cname("_binary_gpiod_bin_start");
 extern char[] _binary_gpiod_bin_end @cname("_binary_gpiod_bin_end");
+extern char[] _binary_i2cd_bin_start @cname("_binary_i2cd_bin_start");
+extern char[] _binary_i2cd_bin_end @cname("_binary_i2cd_bin_end");
+extern char[] _binary_cifd_bin_start @cname("_binary_cifd_bin_start");
+extern char[] _binary_cifd_bin_end @cname("_binary_cifd_bin_end");
 
 // @section(".text.boot.entry") — pinned first in .text.boot by both
 // linker scripts so OpenSBI's fixed 0x80200000 payload-entry jump always
@@ -341,6 +345,24 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 		service_boot("gpiod", (char*)&_binary_gpiod_bin_start, (char*)&_binary_gpiod_bin_end,
 			device: gpio_dev);
 		io::print("gpiod created\n");
+	}
+
+	// The CAM-GC2083 camera (docs/camera-plan.md) — Duo: i2cd (I2C1, the
+	// sensor's bus) and cifd (the MIPI CSI-2 receiver). Spawned last for
+	// the same reason as gpiod, and watch_hangs like it.
+	int i2c_dev = device_find("i2c");
+	if (i2c_dev >= 0)
+	{
+		service_boot("i2cd", (char*)&_binary_i2cd_bin_start, (char*)&_binary_i2cd_bin_end,
+			device: i2c_dev);
+		io::print("i2cd created\n");
+	}
+	int cif_dev = device_find("cif");
+	if (cif_dev >= 0)
+	{
+		service_boot("cifd", (char*)&_binary_cifd_bin_start, (char*)&_binary_cifd_bin_end,
+			device: cif_dev);
+		io::print("cifd created\n");
 	}
 
 	// Multi-core scaffold (src/smp.c3): enumerate + start whatever harts

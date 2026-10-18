@@ -290,6 +290,80 @@ const uptr GPIO_BANK_C_BASE = 0x03022000;
 // project has ever used).
 const uptr GPIO_PINMUX_PAGE = 0x03001000;
 
+// CAM-GC2083 (Milk-V's own 16-pin MIPI camera module) — see
+// docs/camera-plan.md. Every constant below was read off Milk-V's own
+// published schematics (not guessed from a sibling chip), fetched this
+// session: the module's own FPC pinout (milkv-duo/Accessories'
+// CAM-GC2083/Hardware_schematics/DUO_CAM_GC2083.pdf) and this board's
+// own mainboard schematic (milkv-duo/duo-files' duo/hardware/
+// duo-schematic-v1.2.pdf, sheet "04 CV1800B PART1"), cross-checked
+// against linux_5.10/drivers/pinctrl/cvitek/cv180x_pinlist_swconfig.h's
+// per-pad alt-function table. This *corrects* an earlier, wrong guess
+// (SENSOR_RSTN = GPIOA2) that turned out to be CV181X's own pin map
+// (a different, sibling chip on the Duo256M/DuoS boards, not this
+// board's actual CV1800B) — a reminder to always re-derive against the
+// exact SoC in hand rather than trust a same-family part's pinout.
+//
+// The camera FPC's 4 non-MIPI-lane signals all land on 4 consecutive
+// QFN68 balls (62-65), each a GPIOC[8..11]-capable pad also usable as a
+// dedicated camera/I2C alt function — same one-owner-per-real-device
+// split as everywhere else in this project: SENSOR_RSTN is a plain GPIO
+// (owned by gpiod, added to its allowlist below) while the I2C pair and
+// MCLK are alt-function pins i2cd claims and muxes itself, the same
+// direct-PINMUX-write pattern sdd/usbd/ethd/gpiod each already use for
+// their own dedicated pads on this same shared PINMUX page:
+//   pin 62 PAD_MIPIRX1N -> SENSOR_RSTN : XGPIOC[8],  funcsel +0xec val 3
+//   pin 63 PAD_MIPIRX1P -> I2C_SDA     : IIC1_SDA,   funcsel +0xf0 val 4
+//   pin 64 PAD_MIPIRX0N -> I2C_SCL     : IIC1_SCL,   funcsel +0xf4 val 4
+//   pin 65 PAD_MIPIRX0P -> SENSOR_CLK  : CAM_MCLK0,  funcsel +0xf8 val 4
+// SENSOR_CLK/CAM_MCLK0 is listed for completeness (matches the
+// schematic) — driven since 2026-09-13 (i2cd's own clk_cam0 gate +
+// funcsel, reusing FSBL's already-configured CAM0PLL rather than
+// reprogramming it; see docs/camera-plan.md).
+const uint SENSOR_RSTN_FUNCSEL_OFFSET = 0xec;
+const uint SENSOR_RSTN_FUNCSEL_VALUE  = 3;
+const uint SENSOR_RSTN_GPIO_BIT       = 8; // bank C
+
+// I2C1 (Synopsys DesignWare APB I2C, "snps,designware-i2c" in
+// cv180x_base.dtsi's own i2c1 node) — the GC2083's own bus
+// (device/milkv-duo-sd/overlay's sensor_cfg_GC2083.ini: bus_id = 1,
+// sns_i2c_addr = 0x37). i2cd (user/i2c/i2cd.c3) owns this page plus the
+// two IIC1_SDA/IIC1_SCL funcsel writes above.
+const uptr I2C1_MMIO_BASE = 0x04010000;
+// Same physical page as SD_CLOCK_PAGE/ETH_CLK_PAGE above (0x03002000,
+// REG_CLK_EN_3 @ +0xc) — i2cd's own defensive clk_i2c/clk_apb_i2c1
+// gate-enable OR-in, same non-destructive read-modify-write pattern.
+const uptr I2C_CLOCK_PAGE = 0x03002000;
+// Same physical page usbd already maps for its own RST_USB bit
+// (board::USB_TOP_RST_PAGE) — RST_I2C1 (reset-controller index 28,
+// linux_5.10/include/dt-bindings/reset/cv180x-resets.h) lives at bit
+// 28 of the first 32-bit register here. i2cd's own deassert of it —
+// no earlier boot stage ever touches I2C1, unlike SD/USB/ETH.
+const uptr I2C_RESET_PAGE = 0x03003000;
+
+// MIPI CSI-2 receiver — cv180x_base.dtsi's own "mipi_rx: cif" node:
+// csi_mac0 (control/status, TOP sub-block @ +0x000, CSI sub-block @
+// +0x400) + csi_wrap0 (the D-PHY analog front end + lane mux). cifd
+// (user/cif/cifd.c3) owns both pages — see its own top comment for the
+// full register/lane-mapping sourcing (docs/camera-plan.md Stage 3).
+const uptr CIF_MAC_PAGE  = 0x0a0c2000;
+const uptr CIF_WRAP_PAGE = 0x0a0d0000;
+
+// The VIP subsystem's own top-level clock/reset gate — cv180x_base.
+// dtsi's "base" node (`compatible = "cvitek,base"`, reg-names =
+// "vip_sys"), a genuinely separate 0x20-byte register block from both
+// pages above. Found 2026-09-13 via the real U-Boot display driver
+// (u-boot-2021.10/drivers/video/cvitek/vip_sys.c's own
+// vip_isp_clk_reset()) — its own clk_csi_mac0_en/rst_csi_mac0 bits gate
+// the CSI MAC's actual decode-logic clock, one tier below the SoC-level
+// CLK_EN_2/3 gates cifd already handles and entirely independent of
+// them. The Duo has no display wired up (no "cvitek,disp" devicetree
+// node referencing this block on this board), so nothing in this
+// project's boot chain — including the reused vendor FSBL — was ever
+// touching it before; it very plausibly sat at its untouched
+// power-on-reset default (clock gated off) this entire arc.
+const uptr CIF_VIP_SYS_PAGE = 0x0a0c8000;
+
 // The devices the kernel hands to boot drivers (src/device.c3) — the MMIO
 // pages each driver needs, its PLIC source, and the DMA regions the kernel
 // allocates for it. This board has an SD controller (sdd), a DWC2 USB core
@@ -317,6 +391,10 @@ const uptr GPIO_PINMUX_PAGE = 0x03001000;
 //        RX needs no kernel routing edit; never fires until its irq_armed is set)
 //   gpio: banks A and C + the shared pinmux page — a fixed set of
 //        compile-time-known registers, no DMA region, no IRQ
+//   i2c: I2C1 + the shared pinmux / clock / reset pages (the CAM-GC2083's
+//        bus, user/i2c/i2cd.c3)
+//   cif: the MIPI CSI-2 receiver's csi_mac0 + csi_wrap0, clock / reset,
+//        and the VIP subsystem gate (user/cif/cifd.c3, docs/camera-plan.md)
 const Device[*] DEVICES = {
 	{
 		.name = "sd",
@@ -345,6 +423,14 @@ const Device[*] DEVICES = {
 	{
 		.name = "gpio",
 		.mmio = { GPIO_BANK_A_BASE, GPIO_BANK_C_BASE, GPIO_PINMUX_PAGE },
+	},
+	{
+		.name = "i2c",
+		.mmio = { I2C1_MMIO_BASE, GPIO_PINMUX_PAGE, I2C_CLOCK_PAGE, I2C_RESET_PAGE },
+	},
+	{
+		.name = "cif",
+		.mmio = { CIF_MAC_PAGE, CIF_WRAP_PAGE, I2C_CLOCK_PAGE, I2C_RESET_PAGE, CIF_VIP_SYS_PAGE },
 	},
 };
 
