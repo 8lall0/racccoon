@@ -531,12 +531,18 @@ const int CIF_STATUS_LOCKED     = 0; // a valid packet header has been decoded, 
 const int CIF_STATUS_NOT_LOCKED = 1; // no errors seen, but no packet decoded yet either
 const int CIF_STATUS_ERROR      = 2; // ECC/CRC/WC error bit set
 
-fn void cifd_ipc_poll()
+// One request, blocking until it arrives (ipc_recv_type_gen). This used
+// to be ipc_poll_type + yield() in main's loop: an always-runnable
+// process that made every scheduler round longer, and with two such
+// servers burst console input on the Duo arrived corrupted (the shell
+// drained the UART too slowly; docs/devlog.md 2026-10-18).
+fn void cifd_ipc_serve()
 {
     char[CIF_IPC_MSG_MAX] buf @noinit;
     uint verb = 0;
-    int from = ipc_poll_type(&buf[0], (int)CIF_IPC_MSG_MAX, &verb);
-    if (from < 0) { return; }
+    uint from_gen = 0;
+    int from = ipc_recv_type_gen(&buf[0], (int)CIF_IPC_MSG_MAX, &verb, &from_gen);
+    if (from <= 0) { return; }
     if (verb != CIF_IPC_GET_STATUS && verb != CIF_IPC_STREAM_ENABLE) { return; }
 
     if (verb == CIF_IPC_STREAM_ENABLE) { cif_stream_enable((uint)(char)buf[0]); }
@@ -569,7 +575,7 @@ fn void cifd_ipc_poll()
     reply[6] = (char)0;
     reply[7] = (char)0;
 
-    ipc_reply(from, verb, &reply[0], (int)CIF_IPC_MSG_MAX, 0);
+    ipc_reply(from, verb, &reply[0], (int)CIF_IPC_MSG_MAX, from_gen);
 }
 
 fn void main()
@@ -581,7 +587,6 @@ fn void main()
 
     for (;;)
     {
-        cifd_ipc_poll();
-        yield();
+        cifd_ipc_serve();
     }
 }

@@ -384,12 +384,18 @@ fn int i2c_xfer(uint addr7, char* wbuf, int write_len, char* rbuf, int read_len)
 const uint I2C_IPC_XFER    = 1;
 const uint I2C_IPC_MSG_MAX = 8;
 
-fn void i2cd_ipc_poll()
+// One request, blocking until it arrives (ipc_recv_type_gen). This used
+// to be ipc_poll_type + yield() in main's loop: an always-runnable
+// process that made every scheduler round longer, and with two such
+// servers burst console input on the Duo arrived corrupted (the shell
+// drained the UART too slowly; docs/devlog.md 2026-10-18).
+fn void i2cd_ipc_serve()
 {
     char[I2C_IPC_MSG_MAX] buf @noinit;
     uint verb = 0;
-    int from = ipc_poll_type(&buf[0], (int)I2C_IPC_MSG_MAX, &verb);
-    if (from < 0) { return; }
+    uint from_gen = 0;
+    int from = ipc_recv_type_gen(&buf[0], (int)I2C_IPC_MSG_MAX, &verb, &from_gen);
+    if (from <= 0) { return; }
     if (verb != I2C_IPC_XFER) { return; }
 
     uint addr7 = (uint)(char)buf[0];
@@ -412,7 +418,7 @@ fn void i2cd_ipc_poll()
     reply[0] = (char)status;
     for (int i = 0; i < 4; i++) { reply[1 + i] = rbuf[i]; }
 
-    ipc_reply(from, verb, &reply[0], (int)I2C_IPC_MSG_MAX, 0);
+    ipc_reply(from, verb, &reply[0], (int)I2C_IPC_MSG_MAX, from_gen);
 }
 
 fn void main()
@@ -426,7 +432,6 @@ fn void main()
 
     for (;;)
     {
-        i2cd_ipc_poll();
-        yield();
+        i2cd_ipc_serve();
     }
 }

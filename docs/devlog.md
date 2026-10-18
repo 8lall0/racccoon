@@ -4,6 +4,37 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-18 (later) — the corrupted console input: busy-polling camera servers, found by A/B on the Duo
+
+The open anomaly from the entry below: on the `fed972e` kernel, console
+input arriving in a burst came out corrupted, while slow typing was fine.
+Three A/B boots on the real Duo, sending the same three burst commands
+(`echo burst number N`) each time:
+
+| kernel | bursts |
+|---|---|
+| previous (Lua round, no camera, unoptimised shell) | clean |
+| `fed972e` minus the `"i2c"`/`"cif"` DEVICES entries (so -O2 shell, no camera servers) | clean |
+| `fed972e` with `i2cd`/`cifd` blocking on IPC (this fix) | clean |
+
+So it was the camera servers, not -O2. Both `i2cd` and `cifd` ran
+`for (;;) { ipc_poll(); yield(); }`, which makes them **always runnable**.
+Every scheduler round went through two extra processes, so the shell's
+getchar loop came round less often than a 115200-baud burst needs to
+drain the UART. (The camera branch always had this, but these servers never
+spawned on master before the port.) Now they block in
+`ipc_recv_type_gen` like `sdd`, and their replies carry the sender's
+generation. They're request-driven servers with nothing to do between
+requests, so nothing is lost. With the fix: bursts clean, `camtest`
+chip-ID 0x2083 PASS, `caminit` PASS, `cifinit` unchanged, `storagekilltest`
+and `luatest` ok.
+
+Not explained: the bytes arrived with *substituted* bits rather than as
+drops, which doesn't fully match a plain FIFO overrun. The A/B pins the
+trigger, and the fix removes it, but the exact UART-side mechanism stays
+unconfirmed. (gpiod, usbd and ethd still poll by design — LED blink, HPRT0, link
+status — and didn't cause this alone.)
+
 ## 2026-10-18 — -O2 userspace, wasm pre-decode and the camera port confirmed on the real Duo
 
 One flash (dev-shell kernel from `fed972e`) plus `populate_duo_bin.sh`
