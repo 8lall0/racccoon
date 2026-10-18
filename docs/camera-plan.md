@@ -110,7 +110,7 @@ resolves it, only the pin/register map underneath stages 0-3.
    confirming writes actually land rather than just "every transfer
    returned OK". Streaming blind — no MIPI receiver involved yet,
    that's Stage 3.
-3. **IN PROGRESS 2026-09-13 — CIF / D-PHY RX / CSI-2 RX bring-up.**
+3. **DONE 2026-10-18 (started 2026-09-13) — CIF / D-PHY RX / CSI-2 RX bring-up.**
    `user/cif/cifd.c3` (new) + `user/bin/cifinit.c3` (new, chains
    camtest/caminit's own reset+chip-ID+mode-init then asks cifd for
    link status). First attempt used the FreeRTOS cv1835 CIF HAL
@@ -281,6 +281,16 @@ resolves it, only the pin/register map underneath stages 0-3.
    lane sync) if Stage 4's go/no-go gate says no — not reached yet,
    paused here for now on physical-hardware-measurement grounds, not
    as a documentation-search stopping point.
+
+   **Resolved 2026-10-18, no scope needed:** the breakout was fine. Milk-V's
+   own Linux image streamed it on this board, and its register state
+   (`docs/camera-linux-*-2026-10-18.txt`) was the golden reference. The
+   blocker was ordering: the D-PHY only syncs on the clock lane's LP→HS
+   start-of-transmission, so the receiver must be enabled *before* the
+   sensor's reset + mode-init starts its stream. `cifinit` now does it in
+   that order, with Linux's receiver settings in cifd and no pn-swap, and
+   locks from a fresh boot (`CSI_STATUS` 0x00080001, PHY in HS, ~40 ms).
+   Full story in docs/devlog.md 2026-10-18.
 4. `vi` raw dump — one RAW10 frame to a file, host-side debayer. The
    risky stage; gated on actually being able to drive the closed `vi`
    block correctly (see sourcing split above).

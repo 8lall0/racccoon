@@ -165,6 +165,18 @@ const uint CAM_MCLK0_FUNCSEL_VALUE  = 4;
 const uint REG_CLK_EN_2      = 0x008;
 const uint CLK_EN_2_CAM0_BIT = 1u << 16; // clk_cam0 gate
 
+// clk_cam0 = the GC2083's MCLK. linux_5.10/drivers/clk/cvitek/clk-cv180x.c:
+// parent mux at [9:8] over {cam0pll, cam0pll_d2, cam0pll_d3, mipimpll_d3},
+// divider at [21:16]. FSBL leaves it at 0x00200001 (cam0pll / 32, ~18.6 MHz);
+// Milk-V's Linux streams the GC2083 with 0x00210201 (cam0pll_d3 / 33, ~6 MHz),
+// read back with devmem while it streamed (docs/camera-linux-regs-2026-10-18.txt).
+// The link locks at either rate (checked on the board), so this isn't what
+// kept CSI_STATUS at 0 — that was the receiver/sensor start order, see
+// cifinit.c3. But at FSBL's rate the sensor runs ~3x faster than the
+// 1080p30 timing its init table is written for, so use Linux's.
+const uint REG_CLK_CAM0_SRC_DIV = 0x8c0;
+const uint CLK_CAM0_SRC_DIV_LINUX = 0x00210201;
+
 // Read-modify-write: only bits [2:0] select the pad's own alternate
 // function, same convention gpiod.c3's own gpio_configure_pinmux uses.
 fn void configure_pinmux(uint offset, uint value)
@@ -214,15 +226,13 @@ fn void i2c_bus_init()
     print("i2cd: IIC1_SCL funcsel readback=0x"); print_hex32(pinmux_reg_read(IIC1_SCL_FUNCSEL_OFFSET)); print("\n");
 
     // SENSOR_CLK bring-up — see CAM_MCLK0_FUNCSEL_OFFSET's own comment.
-    // The live register dump this session showed FSBL already
-    // programs MIPIMPLL (900MHz) and CAM0PLL (~594MHz) at boot,
-    // regardless of whether anything uses them — clk_cam0's own
-    // mux+divider (REG_CLK_CAM0_SRC_DIV) was also already sitting at a
-    // real (not power-on-default) value, computing to ~18.5625MHz.
-    // Nothing has ever gated the clock on or routed it to its actual
-    // pin, though: REG_CLK_EN_2 bit 16 and this pad's own funcsel both
-    // still need setting. Not reprogramming any PLL — reusing whatever
-    // FSBL already set up.
+    // FSBL programs MIPIMPLL (900MHz) and CAM0PLL (~594MHz) at boot, and
+    // those stay as they are. clk_cam0's own mux+divider does NOT: FSBL's
+    // value is not the rate the sensor's init script expects, so set the
+    // one Linux streams with (CLK_CAM0_SRC_DIV_LINUX), then gate the clock
+    // on and route it to its pin.
+    clock_reg_write(REG_CLK_CAM0_SRC_DIV, CLK_CAM0_SRC_DIV_LINUX);
+    print("i2cd: REG_CLK_CAM0_SRC_DIV readback=0x"); print_hex32(clock_reg_read(REG_CLK_CAM0_SRC_DIV)); print("\n");
     configure_pinmux(CAM_MCLK0_FUNCSEL_OFFSET, CAM_MCLK0_FUNCSEL_VALUE);
     print("i2cd: CAM_MCLK0 funcsel readback=0x"); print_hex32(pinmux_reg_read(CAM_MCLK0_FUNCSEL_OFFSET)); print("\n");
     uint clk_en_2 = clock_reg_read(REG_CLK_EN_2);

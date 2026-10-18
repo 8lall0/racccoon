@@ -2,16 +2,13 @@ module user;
 
 import std::io;
 
-// Stage 3 of docs/camera-plan.md: brings the sensor all the way up
-// (reset + chip-ID + full mode-init, same as caminit.c3 — the GC2083's
-// own 0x03fe page-select/reset writes at the start of its mode-init
-// table are believed to also be what starts it streaming, there's no
-// separate "stream on" register in its own init sequence), THEN tells
-// cifd (user/cif/cifd.c3) to enable its D-PHY analog front end (kept
-// separate from cifd's own boot-time static config — see its
-// cif_stream_enable() comment for why), and polls the MAC's own
-// CSI_STATUS register for a couple seconds looking for a clean lock:
-// a valid CSI-2 packet header decoded, no ECC/CRC/word-count errors.
+// Stage 3 of docs/camera-plan.md: tells cifd (user/cif/cifd.c3) to enable
+// its D-PHY receiver, THEN brings the sensor all the way up (reset +
+// chip-ID + full mode-init, same as caminit.c3 — the init table ends with
+// 0x023e = 0x99, stream on), and polls the MAC's own CSI_STATUS register
+// for a couple seconds looking for a clean lock: a valid CSI-2 packet
+// header decoded, no ECC/CRC/word-count errors. See main() for why the
+// order matters.
 // No DMA, no pixels reaching DRAM — that's Stage 4+, gated on the
 // closed `vi` block (see docs/camera-plan.md's sourcing-split note).
 //
@@ -28,6 +25,7 @@ const uint I2C_IPC_MSG_MAX = 8;
 
 const uint CIF_IPC_GET_STATUS    = 1;
 const uint CIF_IPC_STREAM_ENABLE = 2;
+const uint CIF_IPC_PEEK          = 3;
 const uint CIF_IPC_MSG_MAX    = 8;
 const int CIF_STATUS_LOCKED     = 0;
 const int CIF_STATUS_NOT_LOCKED = 1;
@@ -182,31 +180,6 @@ fn bool bring_up_sensor()
     sleep_ms(80);
     io::print("cifinit: sensor mode-init OK\n");
 
-    // gc2083_restart()'s own extra register writes — re-tried here,
-    // this time with the CIF side fully corrected (SENSOR_MAC_MODE,
-    // lane-select/ck-channel, analog PD_CTRL, and now an exhaustive
-    // pn-swap sweep, all datasheet-verified via hardware readback) and
-    // an 8-combination pn-swap sweep coming back completely flat
-    // (0x00000000 regardless of polarity) — evidence pointing at "no
-    // signal reaching the MAC at all" rather than a CIF-side register
-    // bug, which makes it worth re-checking whether the sensor itself
-    // is actually driving its MIPI output. The vendor's own
-    // gc2083_init() never calls this (its production init table alone
-    // is what an earlier attempt tested, before the CIF side was fully
-    // corrected) — 0x003e is documented nowhere in that table, only in
-    // standby()'s 0x00 (stop) and restart()'s 0x91 (start), so the
-    // production path apparently relies on 0x003e's own post-reset
-    // default already being "streaming enabled". If that default is
-    // actually something else on this specific sensor unit, restart()
-    // is the sequence that would fix it.
-    write_reg8(0x03f9, (char)0x42);
-    sleep_ms(1);
-    write_reg8(0x03f7, (char)0x11);
-    write_reg8(0x03fc, (char)0x8e);
-    write_reg8(0x003e, (char)0x91);
-    io::print("cifinit: gc2083_restart() sequence applied (0x03f9=0x42 0x03f7=0x11 0x03fc=0x8e 0x003e=0x91)\n");
-    sleep_ms(10);
-
     return true;
 }
 
@@ -239,62 +212,85 @@ fn int cif_call(uint verb, char payload0, uint* status_reg_out, char* pd_ctrl_by
     return status;
 }
 
-// Sweeps all 8 clock/data0/data1 pn-swap combinations (bit0=ck,
-// bit1=d0, bit2=d1 of cifd's own pnswap_bits) looking for one that
-// makes the link lock. Every identifiable register is datasheet-
-// verified correct via hardware readback already; a reversed
-// differential pair on this third-party GC2083 breakout (not Milk-V's
-// own official camera FPC) is a real, common wiring defect and a
-// small bounded space worth exhausting before calling this
-// documentation-only debugging exhausted.
+// One 32-bit read through cifd's PEEK verb (req[0..3] = addr; reply[0] =
+// 0 ok, reply[1..4] = value). Returns false (and prints) on failure.
+fn bool cif_peek(uint addr, uint* out)
+{
+    char[CIF_IPC_MSG_MAX] req;
+    for (int i = 0; i < 8; i++) { req[i] = i < 4 ? (char)(addr >> (8 * i)) : (char)0; }
+    uint reply_verb = 0;
+    int from = p9_call_path("/srv/cifd/", CIF_IPC_PEEK, &req[0], (int)CIF_IPC_MSG_MAX, &req[0], (int)CIF_IPC_MSG_MAX, &reply_verb);
+    if (from <= 0 || reply_verb != CIF_IPC_PEEK || req[0] != 0) { io::print("cifinit: cifd PEEK failed\n"); return false; }
+    *out = (uint)req[1] | ((uint)req[2] << 8) | ((uint)req[3] << 16) | ((uint)req[4] << 24);
+    return true;
+}
+
+// The D-PHY's live lane state (csi_wrap0 +0x390): bit0 set while the clock
+// lane is in HS, 0x4 = stop state, 0x2 = sensor held in reset. Readback
+// only — undocumented in the public TRM, decoded from Linux-vs-racccoon
+// snapshots streaming and stopped (docs/devlog.md 2026-10-18).
+const uint WRAP_PHY_STATE = 0x0A0D0390;
+
+// Receiver first, sensor second: the D-PHY only syncs on the clock lane's
+// LP->HS start-of-transmission, which this continuous-clock sensor emits
+// once, when its stream starts after reset + mode-init. Bringing the
+// sensor up first and enabling the receiver under an already-running
+// stream never locks (+0x390 stays in stop state) — that, together with
+// the Linux receiver settings in cifd's cif_stream_enable(), is why this
+// tool decoded nothing for months (docs/devlog.md 2026-10-18). No pn-swap: Milk-V's Linux
+// streams with WRAP 0x308 = 0x3 (clock on pad 3, nothing swapped).
 fn void main()
 {
     gc2083_reg_table_init();
+
+    // A re-run finds the sensor still streaming from last time; re-enabling
+    // the receiver under a live HS stream leaves it unable to lock even
+    // after the sensor's reset below. Stop the stream first (fails
+    // harmlessly on a sensor that's still held in reset).
+    write_reg8(0x023e, (char)0x00);
+    sleep_ms(50);
+
+    uint enable_status_reg = 0;
+    char pd_ctrl_byte = 0;
+    if (cif_call(CIF_IPC_STREAM_ENABLE, (char)0, &enable_status_reg, &pd_ctrl_byte) < 0) { return; } // already reported
+    io::printfn("cifinit: cifd D-PHY receiver enabled (PD_CTRL ibias/rxlp byte = 0x%02x)", (uint)pd_ctrl_byte);
+
     if (!bring_up_sensor()) { return; }
 
-    io::print("cifinit: enabling cifd's D-PHY stream, sweeping all 8 ck/d0/d1 pn-swap combinations...\n");
+    // CSI_STATUS is sticky — nothing found on the board clears it (not the
+    // interrupt-clear bits, a write, nor a CSI MAC0 reset pulse) — so on a
+    // re-run a decode_format alone could be last run's. Its ECC bits do
+    // follow each packet header though, so a pass needs a clean ECC result
+    // with the PHY in HS *now*. An ECC error while the sensor is still
+    // coming up is transient: keep polling instead of failing on it.
     ulong hz = timebase_hz();
-    int final_status = -1;
-    uint final_csi_status = 0;
-    uint final_pnswap = 0;
-
-    for (uint pnswap = 0; pnswap < 8; pnswap++)
+    ulong start = rdtime();
+    ulong deadline = start + hz * 2;
+    int status = -1;
+    uint csi_status = 0;
+    uint phy = 0;
+    bool saw_error = false;
+    while (rdtime() < deadline)
     {
-        uint enable_status_reg = 0;
-        char pd_ctrl_byte = 0;
-        if (cif_call(CIF_IPC_STREAM_ENABLE, (char)pnswap, &enable_status_reg, &pd_ctrl_byte) < 0) { return; } // already reported
-        io::printfn("cifinit: [pnswap=%d (ck=%d d0=%d d1=%d)] PD_CTRL ibias/rxlp byte = 0x%02x",
-            pnswap, pnswap & 1, (pnswap >> 1) & 1, (pnswap >> 2) & 1, (uint)pd_ctrl_byte);
-
-        ulong deadline = rdtime() + hz / 4; // 250ms per combination
-        int status = -1;
-        uint csi_status = 0;
-        while (rdtime() < deadline)
-        {
-            char unused_pd_byte = 0;
-            status = cif_call(CIF_IPC_GET_STATUS, (char)0, &csi_status, &unused_pd_byte);
-            if (status < 0) { return; } // already reported
-            if (status == CIF_STATUS_LOCKED || status == CIF_STATUS_ERROR) { break; }
-            sleep_ms(20);
-        }
-
-        uint decode_fmt = (csi_status >> 16) & 0x3F;
-        io::printfn("cifinit: [pnswap=%d] CSI_STATUS (0x440) = 0x%08x (decode_format=0x%02x, status=%d)",
-            pnswap, csi_status, decode_fmt, status);
-
-        final_status = status;
-        final_csi_status = csi_status;
-        final_pnswap = pnswap;
-        if (status == CIF_STATUS_LOCKED) { break; }
+        char unused_pd_byte = 0;
+        status = cif_call(CIF_IPC_GET_STATUS, (char)0, &csi_status, &unused_pd_byte);
+        if (status < 0) { return; } // already reported
+        if (!cif_peek(WRAP_PHY_STATE, &phy)) { return; }
+        if (status == CIF_STATUS_ERROR) { saw_error = true; }
+        if (status == CIF_STATUS_LOCKED && (phy & 1) != 0) { break; }
+        sleep_ms(20);
     }
 
-    if (final_status == CIF_STATUS_LOCKED)
+    uint decode_fmt = (csi_status >> 16) & 0x3F;
+    ulong ms = (rdtime() - start) / (hz / 1000);
+    io::printfn("cifinit: CSI_STATUS (0x440) = 0x%08x (decode_format=0x%02x, status=%d), PHY state 0x%02x, after %d ms%s",
+        csi_status, decode_fmt, status, phy, ms, saw_error ? " (transient ECC error seen first)" : "");
+    if (status == CIF_STATUS_LOCKED && (phy & 1) != 0)
     {
-        io::printfn("cifinit: PASS — D-PHY/CSI-2 link locked with pnswap=%d (ck=%d d0=%d d1=%d), no ECC/CRC/WC errors",
-            final_pnswap, final_pnswap & 1, (final_pnswap >> 1) & 1, (final_pnswap >> 2) & 1);
+        io::print("cifinit: PASS — D-PHY in HS, CSI-2 packets decoding with clean ECC\n");
     }
     else
     {
-        io::print("cifinit: FAIL — no pn-swap combination decoded a valid packet within its 250ms window\n");
+        io::print("cifinit: FAIL — no clean CSI-2 decode with the PHY in HS within 2s\n");
     }
 }

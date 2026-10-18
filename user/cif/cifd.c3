@@ -291,12 +291,16 @@ const uint VIP_ENABLE_RST_CSI_MAC1 = 1u << 1;
 // any other VIP_SYS-gated domain.
 fn void vip_sys_bring_up()
 {
+    // Polarity as Milk-V's Linux actually runs it while streaming: REG_00
+    // bit 20 CLEAR and REG_04 bit 0 SET (0x00000000 / 0x0000ffff,
+    // docs/camera-linux-regs-2026-10-18.txt) — the opposite of what the
+    // header naming (clk_*_en, rst_*) suggested, which this used to do.
     uint reg0 = vipsys_reg_read(VIP_SYS_REG_00);
-    reg0 |= VIP_CLK_CSI_MAC0_EN;
+    reg0 &= ~VIP_CLK_CSI_MAC0_EN;
     vipsys_reg_write(VIP_SYS_REG_00, reg0);
 
     uint reg4 = vipsys_reg_read(VIP_SYS_REG_04);
-    reg4 &= ~VIP_ENABLE_RST_CSI_MAC0;
+    reg4 |= VIP_ENABLE_RST_CSI_MAC0;
     vipsys_reg_write(VIP_SYS_REG_04, reg4);
 
     print("cifd: [diag] VIP_SYS REG_00 (0x0a0c8000)=0x"); print_hex32(vipsys_reg_read(VIP_SYS_REG_00)); print("\n");
@@ -502,6 +506,24 @@ fn void cif_stream_enable(uint pnswap_bits)
     glb = (glb & ~(uint)0xF) | 0x3; // reg_deskew_lane_en = 2-lane
     wrap_reg_write(WRAP_L0_CSI_GLB_CTL0, glb);
 
+    // Milk-V's Linux, read back while it streamed this sensor on this
+    // board (docs/camera-linux-regs-2026-10-18.txt), also has these, which
+    // nothing above sets. Applied verbatim: they're the vendor driver's
+    // working configuration; a rough on-board ablation (docs/devlog.md
+    // 2026-10-18) pointed at the analog block and the lane selects, but
+    // which of these are strictly needed hasn't been pinned down.
+    wrap_reg_write(WRAP_REG_04, 0x00080080);    // clk channel = phys lane 3 (one-hot) + bit 7 (Linux), not bit 6
+    wrap_reg_write(0x07c, 0x00230023);          // D-PHY analog front end (per-lane settings)
+    wrap_reg_write(0x080, 0x0014003f);
+    wrap_reg_write(0x084, 0x00082020);
+    wrap_reg_write(0x088, 0x00002003);
+    wrap_reg_write(0x110, 0x00080000);
+    wrap_reg_write(0x114, 0x00000003);
+    wrap_reg_write(WRAP_L0_LANE_SEL, lane_sel | (1u << 12));  // + d3 <- 1, as Linux has it
+    wrap_reg_write(WRAP_LINK0_BASE + 0x10, 0x00000210);       // Linux: 0x210 (bit 17 clear)
+    mac_reg_write(CIF_MAC_CSI_REG_04, 0x000c0000);
+    mac_reg_write(CIF_MAC_CSI_REG_70, 0x00000f00);
+
     print("cifd: stream enabled (analog front-end powered up, 2 lanes deskew-enabled)\n");
     print("cifd: [diag] WRAP PD_CTRL=0x"); print_hex32(wrap_reg_read(WRAP_PD_CTRL)); print("\n");
     print("cifd: [diag] WRAP L0_CSI_GLB_CTL0=0x"); print_hex32(wrap_reg_read(WRAP_L0_CSI_GLB_CTL0)); print("\n");
@@ -525,6 +547,13 @@ fn void cif_stream_enable(uint pnswap_bits)
 // link works end-to-end at the protocol level, not just electrically.
 const uint CIF_IPC_GET_STATUS    = 1;
 const uint CIF_IPC_STREAM_ENABLE = 2; // no payload either way; reply mirrors GET_STATUS's own format
+// Debug access for bring-up (the dev shell's cifpeek/cifpoke/cifdiff/
+// cifgolden): read or write one 32-bit word, restricted to the pages this
+// driver maps. PEEK: req[0..3] = addr; reply[0] = 0 ok / 1 refused,
+// reply[1..4] = value. POKE: req[0..3] = addr, req[4..7] = value;
+// reply[0] = 0 / 1. All little-endian.
+const uint CIF_IPC_PEEK = 3;
+const uint CIF_IPC_POKE = 4;
 const uint CIF_IPC_MSG_MAX    = 8;
 
 const int CIF_STATUS_LOCKED     = 0; // a valid packet header has been decoded, no errors
@@ -536,6 +565,16 @@ const int CIF_STATUS_ERROR      = 2; // ECC/CRC/WC error bit set
 // process that made every scheduler round longer, and with two such
 // servers burst console input on the Duo arrived corrupted (the shell
 // drained the UART too slowly; docs/devlog.md 2026-10-18).
+// The pages boards/duo/board.c3's "cif" device maps for this process —
+// anything else would fault the driver. Word-aligned only.
+fn bool cif_addr_mapped(uint a)
+{
+    if ((a & 3) != 0) { return false; }
+    uint page = a & ~(uint)0xfff;
+    return page == CIF_MAC_BASE || page == CIF_WRAP_BASE || page == VIP_SYS_BASE
+        || page == CLOCK_BASE || page == RESET_BASE;
+}
+
 fn void cifd_ipc_serve()
 {
     char[CIF_IPC_MSG_MAX] buf @noinit;
@@ -543,6 +582,23 @@ fn void cifd_ipc_serve()
     uint from_gen = 0;
     int from = ipc_recv_type_gen(&buf[0], (int)CIF_IPC_MSG_MAX, &verb, &from_gen);
     if (from <= 0) { return; }
+    if (verb == CIF_IPC_PEEK || verb == CIF_IPC_POKE)
+    {
+        uint addr = (uint)buf[0] | ((uint)buf[1] << 8) | ((uint)buf[2] << 16) | ((uint)buf[3] << 24);
+        char[CIF_IPC_MSG_MAX] pr;
+        bool ok = cif_addr_mapped(addr);
+        uint v = 0;
+        if (ok && verb == CIF_IPC_POKE)
+        {
+            v = (uint)buf[4] | ((uint)buf[5] << 8) | ((uint)buf[6] << 16) | ((uint)buf[7] << 24);
+            mmio_write32((uptr)addr, v);
+        }
+        else if (ok) { v = mmio_read32((uptr)addr); }
+        pr[0] = ok ? (char)0 : (char)1;
+        pr[1] = (char)(v & 0xff); pr[2] = (char)((v >> 8) & 0xff); pr[3] = (char)((v >> 16) & 0xff); pr[4] = (char)((v >> 24) & 0xff);
+        ipc_reply(from, verb, &pr[0], (int)CIF_IPC_MSG_MAX, from_gen);
+        return;
+    }
     if (verb != CIF_IPC_GET_STATUS && verb != CIF_IPC_STREAM_ENABLE) { return; }
 
     if (verb == CIF_IPC_STREAM_ENABLE) { cif_stream_enable((uint)(char)buf[0]); }

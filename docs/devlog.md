@@ -4,6 +4,100 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-18 (latest) — the GC2083 camera link locks: CSI-2 packets decoding on the real Duo
+
+Stage 3 of docs/camera-plan.md, open since 2026-09-13 and parked as "needs a
+scope": `cifinit` now gets a clean CSI-2 lock from a fresh boot, with no
+manual register pokes.
+
+**The golden reference.** The racccoon card was backed up
+(`~/racccoon-duo-sd-backup-20261018.img`) and reused for Milk-V's v1.1.4
+Linux image. That image streams this exact breakout on this board:
+`/proc/mipi-rx` showed RAW10 decoding with 0 errors, clock lane in HS, and
+lanes D2/D4 active. So the hardware was never the problem. With `devmem`
+and `i2ctransfer` I dumped its live state while it streamed: 1601 MMIO
+words (CSI MAC, D-PHY wrapper, VIP_SYS, clocks, resets) in
+`docs/camera-linux-regs-2026-10-18.txt`, and the GC2083's registers in
+`docs/camera-linux-sensor-2026-10-18.txt`. The register words are compiled
+into the dev shell (`user/shell_test_cam_golden.c3`), and new builtins
+`cifdiff`, `cifpeek`, `cifpoke`, `cifgolden`, `cifstat`, `snspeek` and
+`snspoke` (`user/shell_test_cam.c3`) compare them against racccoon's live
+state. They work through new cifd `PEEK`/`POKE` verbs, restricted to the
+pages cifd maps.
+
+**What actually fixed it**, all checked on the board:
+
+- **Order.** The D-PHY only syncs on the clock lane's LP→HS
+  start-of-transmission, which the sensor emits once, when its stream starts.
+  The old `cifinit` brought the sensor up first and enabled the receiver
+  under a stream that was already running, so +0x390 stayed in stop state
+  forever. Now it enables the receiver first, then does the sensor's reset
+  + full mode-init.
+- **The receiver settings Linux uses**, applied verbatim in
+  `cif_stream_enable()`:
+  - WRAP +0x004 = 0x00080080;
+  - the analog block at +0x07c..0x088 and +0x110/0x114;
+  - the d3 lane select in +0x304;
+  - +0x310 = 0x210;
+  - MAC +0x404 = 0x000c0000 and +0x470 = 0xf00;
+  - VIP_SYS reset polarity (REG_00 bit 20 clear, REG_04 bit 0 set).
+
+  A rough ablation pointed at the analog block and the lane selects. Which of
+  these are strictly needed is **not pinned down**.
+- **No pn-swap.** Linux has WRAP 0x308 = 0x3. The old 8-way sweep was
+  dropped, partly because it left the PHY at pn-swap 7.
+- **Stop the stream before a re-run.** Re-enabling the receiver under a live
+  HS stream left it unable to lock even after the sensor reset (0 of 3).
+  Writing 0x023e = 0 first fixes it. The register still *reads back* 0x99
+  afterwards, but +0x390 goes to stop state, so the write does stop the
+  stream.
+
+**Not the fix: the MCLK.** FSBL leaves clk_cam0 at 0x00200001 (cam0pll/32,
+about 18.6 MHz). Linux uses 0x00210201 (cam0pll_d3/33, about 6 MHz). I
+first took this for the key bug. A negative control at the end (FSBL's
+value poked back, then `cifinit` run twice) **still locked**. The only
+difference was lock in 0 ms instead of 40 ms, consistent with a sensor
+clocked about 3× fast. `i2cd` keeps Linux's value, because that's the rate
+the 1080p30 init table is written for, and the comments now say so.
+
+**CSI_STATUS (MAC +0x440) is sticky.** Nothing clears it: not a write, not
+the interrupt-clear bits in +0x404, not toggling SENSOR_MAC_MODE, and not a
+CSI MAC0 reset pulse through VIP_SYS REG_04. So the decode format alone can
+be left over from a previous run. Its ECC bits (1 ok, 2 corrected, 4 error)
+do change per packet header. A full MAC and WRAP snapshot, taken twice
+streaming and once stopped, found no frame counter. The live signal is
+D-PHY +0x390: bit 0 is set in HS (0x21 or 0x01), 0x4 means stop, and 0x2
+means the sensor is held in reset. It's undocumented and decoded from those
+snapshots. `cifinit` now passes only on clean ECC *and* the PHY in HS right
+now. An ECC error while the sensor is still coming up (seen once, right
+after `camtest`) is ridden out instead of ending the poll.
+
+**Verified on the real Duo** (fresh boot, after populating `/bin`):
+
+| run | result |
+|---|---|
+| fresh boot, then 2 repeats | PASS, PHY 0x21/0x01, 40 ms each |
+| 3× `camtest` → `cifinit` | PASS (one with a transient ECC error first) |
+| FSBL MCLK poked back, 2× | PASS, 0 ms |
+| Linux MCLK restored | PASS, 40 ms |
+| `storagekilltest` | ok |
+
+Before the final pass test, the first rewrite "passed" its repeats in 0 ms
+and once "failed" with a late lock. Both were the sticky register, which is
+how it was found.
+
+Remaining differences from Linux, left alone because the link locks without
+them:
+- VIP_SYS +0x10/+0x20/+0x28/+0x38/+0x94;
+- reset 0x03003024 bit 6;
+- sensor 0x0212/0x0213 and 0x0155.
+
+**Next**, Stage 4: pixels into DRAM through the `vi` block, which is still
+closed. The Linux image on the backup card is now a working reference for
+that too.
+
+---
+
 ## 2026-10-18 (later) — the corrupted console input: busy-polling camera servers, found by A/B on the Duo
 
 The open anomaly from the entry below: on the `fed972e` kernel, console

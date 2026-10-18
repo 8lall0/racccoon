@@ -72,6 +72,7 @@ fn void main() {
         if (shell_test_proc_dispatch(cmd, cmd_argv, cmd_argc)) continue;
         if (shell_test_drivers_dispatch(cmd, cmd_argv, cmd_argc)) continue;
         if (shell_test_lang_dispatch(cmd, cmd_argv, cmd_argc)) continue;
+        if (shell_test_cam_dispatch(cmd, cmd_argv, cmd_argc)) continue;
 
         // Not a dev/test builtin: hand the raw line to the real
         // executor. shell_exec_block splits statements and runs

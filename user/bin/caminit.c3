@@ -222,8 +222,16 @@ fn void main()
     uint last_addr = gc2083_reg_addr[GC2083_REG_COUNT - 1];
     char last_expected = gc2083_reg_val[GC2083_REG_COUNT - 1];
     char last_readback = 0;
-    status = read_reg8(last_addr, &last_readback);
-    if (status != 0) { io::print("caminit: FAIL — readback of last register failed\n"); return; }
+    // 0x023e (stream on) can read back late: at the MCLK Linux uses (i2cd's
+    // CLK_CAM0_SRC_DIV_LINUX) it read 0x48 right after the write, the written
+    // value shortly after. Re-read for up to ~200 ms before calling it.
+    for (int tries = 0; tries < 10; tries++)
+    {
+        status = read_reg8(last_addr, &last_readback);
+        if (status != 0) { io::print("caminit: FAIL — readback of last register failed\n"); return; }
+        if (last_readback == last_expected) { break; }
+        sleep_ms(20);
+    }
 
     io::printfn("caminit: post-init chip-ID = 0x%04x, register 0x%04x = 0x%02x (wrote 0x%02x)",
         chip_id, last_addr, (uint)last_readback, (uint)last_expected);
