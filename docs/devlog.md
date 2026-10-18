@@ -4,6 +4,57 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-19 (later) — /bin/wasm runs pre-decoded code: Lua fib(22) 7.6 s → 3.8 s (14× the original) (branch `wasm-predecode`)
+
+The next step after the 7× round: stop interpreting raw wasm bytes.
+`translate_function` now converts each function body once, at load,
+into fixed-size `WIns` (8 bytes: opcode, arity, a 16-bit aux, a 32-bit
+operand). i64/f64 constants go in a side pool (`g_kpool`).
+
+**Static control flow.** The translator tracks the operand-stack height
+through each body (per-opcode stack effects; calls via their type;
+dead code after `br`/`br_table`/`return`/`unreachable` ignored until the
+enclosing `else`/`end`) and keeps a compile-time label stack. So every
+branch is emitted already resolved, with its target instruction, the
+result arity and the height to unwind to. Forward branches are
+back-patched when their `end` arrives. `block`, `loop` and `end` emit
+nothing at all, an `if` is a conditional jump, an `else` an unconditional
+one, and a function's final `end` is `return`. The runtime control stack
+(`g_ctl`, `do_branch`, the block sidetable and `find_block`, `g_block_at`,
+the nested-block batching) is gone, about 150 lines.
+
+**Validation moved to translation.** Local/global/function/type indices,
+branch depths and stack underflow are checked once, so local.get/set/tee
+and global.get/set lost their per-execution bounds checks. The
+translator also records each function's maximum stack height;
+`push_frame` checks that much room once per call, which lets `interp()`
+use unchecked `vpush_u`/`vpop_u` (host calls keep the checked ones). The
+"ip past code" check went too: every body ends in `return` and every
+target is in range.
+
+**Memory.** Everything is sized from byte counts before decoding (linear
+memory must stay the last `SYS_MAP` so `memory.grow` extends in place):
+instructions ≤ code bytes, constants and br_table entries ≤ code bytes / 2,
+and fixups per function (≤ the largest body), reset per function. For
+Lua's 222 KB code section that's ~3.5 MB of *address space*, which counts
+against the Duo's 16 MiB per-process cap, so 16-byte instructions were
+cut to 8. A first cut put the fixup arrays in static `.bss`, which grew
+`wasm.bin` from 150 KB to 682 KB (the flat image stores .bss); they're
+`SYS_MAP`'d now.
+
+**Numbers** (Lua `fib(22)`, QEMU, run alone): 7.6 s → 4.78 s (pre-decode)
+→ 3.57 s (unchecked stack ops) → 3.80 s with 8-byte instructions (within
+QEMU's layout noise, see the 2026-10-17 shell_test-split entry). From the
+original 53.6 s that's 14×. Rebased onto the -O2 / naked-`rdtime` commits, the
+same run gives **2.57 s** (≈21×).
+
+Verified: `wasmtest` (14 fixtures), `wasitest` (5) and `luatest` pass on
+every change above. Full regression on FAT32 / ext2 / dual: identical to master, except
+`tcctest` reporting *skipped* (this worktree has no tinycc checkout). fsck
+clean. Not yet on the Duo.
+
+---
+
 ## 2026-10-19 (later) — userspace built at -O2 (everything QEMU can test), modest gains (branch `userspace-o2`)
 
 The wasm work found that `build_user.sh` passed no `-O`: every userspace
@@ -51,6 +102,8 @@ tests pass. `/bin/wasm` has been -O2 since `7ea002c` with the same latent
 Full regression (after the fix) on FAT32 / ext2 / dual: identical to master,
 including wasitest/luatest/wasmtest; fsck clean. Duo: pending (and the
 Duo-only drivers stay unoptimised regardless).
+
+---
 
 ## 2026-10-19 — Lua on racccoon: sleep(), interpreter-assisted setjmp/longjmp, a 7× faster /bin/wasm, and a FAT32 directory bug
 

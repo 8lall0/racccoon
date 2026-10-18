@@ -993,8 +993,8 @@ the top 25 at exit (about 20% slower while on).
 
 Limits: no sockets, no file holes (writing past EOF fails), paths under 100
 bytes, `getcwd()` inside the program reports `/` (wasi-libc's own emulated
-cwd, though opens still use the real one). It's an interpreter: in QEMU, Lua's
-recursive `fib(22)` takes ~8 s (~1000× native). The dev shell's `wasitest` runs
+cwd, though opens still use the real one). It's an interpreter, running pre-decoded code (branches resolved at load): in
+QEMU, Lua's recursive `fib(22)` takes ~4 s (~500× native). The dev shell's `wasitest` runs
 the fixtures in `test/wasm-src/*.c`.
 
 ## 10. The shell
