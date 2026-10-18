@@ -4,6 +4,36 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-18 — -O2 userspace, wasm pre-decode and the camera port confirmed on the real Duo
+
+One flash (dev-shell kernel from `fed972e`) plus `populate_duo_bin.sh`
+covered the four commits from the AFK round, driven over the serial console:
+
+- **Camera port:** `i2cd created` / `cifd created` via the new `"i2c"` /
+  `"cif"` DEVICES entries, with every i2cd clock/reset/pinmux readback as
+  before. `camtest`: chip-ID **0x2083, PASS**. `caminit`: all 135 mode-init
+  registers written, **PASS**. `cifinit`: all 8 pn-swap combinations
+  `CSI_STATUS = 0x00000000`, identical to the 2026-09-13 result, so the port
+  changed nothing there and the physical-layer question stands. (The user
+  confirmed "webcam" means this MIPI GC2083.)
+- **Pre-decoded /bin/wasm + -O2:** `wasmtest`, `wasitest`, `luatest` ok.
+  Lua `fib(22)` = **1.81 s** on the board (6.9 s before this round, 3.8×).
+- **-O2 userspace (QEMU-testable programs; the Duo-only drivers stay
+  unoptimised):** shell, fsd and the tools behave normally; `devinfotest`,
+  `storagekilltest` (one respawn), `gpiodkilltest` and `usbdkilltest` ok.
+
+**Open anomaly, not chased:** on this boot, console *input* arriving in
+a burst was corrupted (`echo hi` echoed as `esno�ni`, extra bits set),
+while the same characters typed 30 ms apart arrived intact and all
+output was clean. Isolated characters fine but back-to-back bytes
+garbled is the signature of an RX baud/timing mismatch. A single retry
+had cleared a similar one-off corruption right after the previous
+cold boot; this time it persisted. New on this boot: i2cd/cifd's clock
+writes, but they're read-modify-write gate *enables* (no dividers or
+muxes), and the kernel's console path (OpenSBI getchar) is unchanged. An A/B against the previous kernel
+(`fip.bin.bak-20261018-101357`) would tell whether it's this kernel or
+the serial adapter.
+
 ## 2026-10-19 (later) — camera-gc2083 ported onto current master (branch `camera-port`)
 
 `camera-gc2083` (Stages 1-2 done, Stage 3 paused on a physical-layer
