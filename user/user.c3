@@ -1219,8 +1219,6 @@ fn int fs_partition_info(uint* start_sector_out, bool* is_secondary_out, int* st
     return syscall(SYS_FS_PARTITION_INFO, (long)start_sector_out, (long)is_secondary_out, (long)storage_pid_out);
 }
 
-ulong rdtime_tmp @export("rdtime_tmp");
-
 // Direct CSR read, no syscall — trap-free as long as the kernel has set
 // scounteren.TM (see src/entry.c3's enable_user_timer_access(), called
 // once at boot). Generic across any RISC-V hart (QEMU included), unlike
@@ -1228,22 +1226,16 @@ ulong rdtime_tmp @export("rdtime_tmp");
 // into real time — those stay wherever they're actually needed (e.g.
 // user/sdd.c3's own SD_TIMEBASE_HZ), not here.
 //
-// Bridged through a memory temp, not returned straight out of a0 — the
-// structured `asm { }` block form doesn't recognize `rdtime`/`csrr` as
-// instructions at all (compile error), and src/entry.c3's read_reg
-// macro already found the more direct fix (raw a0 via opaque asm()) to
-// be a real hazard: the compiler can't see the side effect, so it can
-// silently clobber a value it still thinks is live in a0. Same opaque-
-// string asm() + memory-bridge pattern as that macro, not the
-// structured block form sdd.c3's own mmio_read32 uses for plain
-// loads/stores.
-fn ulong rdtime() @export("rdtime") {
-    asm(`
-        csrr t0, time
-        la t1, rdtime_tmp
-        sd t0, 0(t1)
-    `);
-    return rdtime_tmp;
+// @naked: `csrr a0, time; ret` returns the value in a0 by the ABI, so the
+// compiler never has to model the asm. The structured `asm { }` form
+// doesn't know csrr, and the previous opaque asm() wrote a global
+// (rdtime_tmp) and clobbered t0/t1 without telling the compiler — fine
+// unoptimised, but at -O2 the read of that global could be reused across
+// calls, so `while (rdtime() < deadline)` never ended (oomtest hung,
+// hungservertest failed; docs/devlog.md 2026-10-19).
+fn ulong rdtime() @naked @noinline @export("rdtime") {
+    asm(`csrr a0, time
+    ret`);
 }
 
 // The `time` CSR tick rate (Hz). rdtime() + timebase_hz() * N == N
