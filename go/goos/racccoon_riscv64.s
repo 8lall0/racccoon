@@ -42,10 +42,26 @@ TEXT ·CPUInit(SB),NOSPLIT|NOFRAME,$0
 	MOV	A1, ·rcArgvBlob(SB)
 
 	// SYS_MAP(RamSize) -> base vaddr, or -1 if the board's per-process
-	// HEAP_MAX_BYTES can't honour it. On failure fall back to 8 MiB so
-	// the runtime still starts (and OOMs cleanly) rather than running
-	// with a wrapped-around stack pointer.
+	// HEAP_MAX_BYTES can't honour it. On failure step down 14, 12, 8 MiB:
+	// the cap counts from USER_BASE, image included, so on the Duo (16 MiB)
+	// 14 MiB is what fits beside a 1-1.5 MiB Go binary — and 8 MiB alone
+	// can't hold the runtime's metadata plus one aligned 4 MiB heap arena
+	// (the first malloc OOMs). The last step still lets the runtime start
+	// and OOM cleanly rather than run with a wrapped-around stack pointer.
+	// SYS_MAP is lazy, so the untouched part of the region costs no RAM.
 	MOV	·RamSize(SB), A0
+	MOV	$SYS_MAP, A3
+	ECALL
+	MOV	$-1, T0
+	BNE	A0, T0, mapped
+	MOV	$(14*1024*1024), A0
+	MOV	A0, ·RamSize(SB)
+	MOV	$SYS_MAP, A3
+	ECALL
+	MOV	$-1, T0
+	BNE	A0, T0, mapped
+	MOV	$(12*1024*1024), A0
+	MOV	A0, ·RamSize(SB)
 	MOV	$SYS_MAP, A3
 	ECALL
 	MOV	$-1, T0

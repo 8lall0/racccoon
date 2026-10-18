@@ -10,8 +10,9 @@
  * `bigdirtest keep` stops after the refill and leaves /bdt behind, for
  * `rm -r /bdt` (the recursive delete) and an e2fsck pass. `-l LEN` sets
  * the name length (default 42, max 90 — fsd's path limit) and `-n N` the
- * count (max 500 — opendir reads 512): the Duo's card has 4 KiB blocks,
- * where `-l 90 -n 500` is what reaches past 12 blocks. Mutating ops are
+ * count (max 500 — opendir reads 512): on a 4 KiB-block ext2 (what
+ * scripts/provision_duo_sd.sh makes), `-l 90 -n 500` is what reaches past
+ * 12 blocks. Mutating ops are
  * retried a few times, like dirpacktest's. */
 #include <stdio.h>
 #include <stdlib.h>

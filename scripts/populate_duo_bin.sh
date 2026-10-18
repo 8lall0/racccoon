@@ -90,6 +90,18 @@ for c in build/libc/*.bin; do
   cp "$c" "$MNT/bin/$(basename "$c" .bin)"
 done
 
+# Go programs (docs/go-port-plan.md), if scripts/build_go.sh produced any
+# (needs TAMAGO exported when scripts/build.sh runs — it wipes build/go):
+# /bin/go-<name>, same names the QEMU images use, for gotest and the
+# gostage*test builtins. The toolchain's own compile/link/go stay off the
+# card — they need GiBs, not 64 MiB.
+for g in build/go/*.elf; do
+  [ -e "$g" ] || continue
+  case "$(basename "$g")" in compile.elf|link.elf|go.elf) continue ;; esac
+  echo "==> Copying $g -> $MNT/bin/go-$(basename "$g" .elf)..."
+  cp "$g" "$MNT/bin/go-$(basename "$g" .elf)"
+done
+
 # Test fixtures — the same data files scripts/build.sh seeds onto the
 # QEMU ext2 images, so the fixture-backed tests (p9fstest, pagelisttest,
 # wasmtest) pass on real hardware instead of failing "file not found".

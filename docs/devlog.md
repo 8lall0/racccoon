@@ -4,6 +4,53 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-18 (latest) — Go runs on the real Duo; tcc re-checked there
+
+Until now Go was QEMU-only, and the plan said the Duo could at most boot a
+hello world. All six Go test programs now pass on the real CV1800B:
+- `gotest`: println, int/float maths, defer, panic/recover;
+- `gostage2test`: the GC (live set survives), goroutines, channels,
+  select, mutex, `time.Sleep`;
+- `gostage3test` and `gostage35test`: file I/O through fsd, raw and via
+  the standard `os` package;
+- `gostage41test` and `gostage42test`: `os/exec`, including output
+  capture through a kernel pipe.
+
+Three things were in the way:
+- **The exec cap.** The Duo installed images up to 1 MiB, and the segment
+  check bounds the loaded extent, not just the file size. GOOS=racccoon
+  binaries are 0.94–1.44 MB. It's now **4 MiB**, which is cheap: the
+  kernel's staging arrays hold a page pointer and a permission per page
+  (~12 KiB at 4 MiB), and the shell's receive buffer is `SYS_MAP`'d
+  lazily, only while it execs. The old comment implied the cap cost RAM
+  proportional to its size.
+- **The heap arena.** The runtime asks for 64 MiB and fell back to 8 MiB
+  on the Duo (16 MiB per-process cap). 8 MiB can't hold the runtime's own
+  metadata plus one aligned 4 MiB heap arena, so the first `malloc` in
+  `schedinit` died with "out of memory: cannot allocate 4194304-byte
+  block (0 in use)". A 16 MiB fallback was refused too: the cap counts
+  from `USER_BASE`, *image included*. The fallback is now a ladder,
+  **14 → 12 → 8 MiB**. 14 MiB fits beside any of the test binaries, and
+  `SYS_MAP` is lazy, so the untouched part costs no RAM.
+- **Getting the binaries on the card.** `populate_duo_bin.sh` now copies
+  `build/go/*.elf` as `/bin/go-<name>`, the same names as the QEMU images.
+  The toolchain's own compile/link/go are skipped.
+
+The GOOS=racccoon toolchain had lived in an old session's scratchpad and
+was gone. It's rebuilt with `scripts/setup_go.sh` at
+`~/Workspace/tamago-go` (outside the repo; `third_party/` isn't ignored),
+so `export TAMAGO=/home/blallo/Workspace/tamago-go/bin/go`.
+
+tcc was already Duo-verified on 2026-08-31. Re-checked now: `tcctest` ok,
+`tcc /src/tcc/tcc.c -o /bin/tcc2` rebuilds itself, and `tcc2` compiles a
+working `hello.c`.
+
+Verified:
+- Duo: all six Go tests, `tcctest`, the tcc self-build, `storagekilltest`.
+- QEMU ext2: the six Go tests, `tcctest`, `storagekilltest`.
+
+---
+
 ## 2026-10-18 (late night) — ext2: directories past 12 blocks
 
 The other half of the old "~11 files per directory" item. Entry packing

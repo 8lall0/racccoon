@@ -6,9 +6,12 @@ Status: **research done, no code yet.** Branch `go-port`. Written
 Goal: compile Go programs on a host targeting racccoon, run the static
 riscv64 binaries as racccoon userspace processes, and eventually run the
 Go toolchain itself on racccoon. This is a **JH7110 / Orange Pi RV**
-goal — see [[racccoon_c3c_selfhost]] and `docs/opi-rv-plan.md`. The Duo
-(64 MiB, no swap) can boot the Stage-1 hello-world but the GC and the
-compiler need the JH7110's gigabytes.
+goal — see [[racccoon_c3c_selfhost]] and `docs/opi-rv-plan.md`. The
+compiler needs the JH7110's gigabytes, but **Go *programs* run on the Duo
+(2026-10-18)**: hello and stages 2–4.2 (GC, goroutines, timers, file I/O,
+`os`, `os/exec` with output capture) all pass on the real CV1800B, in a
+14 MiB heap region (4 MiB exec cap, a 14 → 12 → 8 MiB arena fallback in
+`go/goos/racccoon_riscv64.s`).
 
 ## Why this is tractable (it wasn't obvious)
 
@@ -73,7 +76,7 @@ Step A was done first (Stages 0–4.4); B is a pure rename on top.
 
 | Area | racccoon today | Needed |
 |---|---|---|
-| Exec size caps | ~~`EXEC_MAX_IMAGE_SIZE` 1 MiB~~ **DONE** | Now `board::EXEC_MAX_IMAGE_SIZE` — 4 MiB on QEMU/JH7110, 1 MiB on the Duo. New `SYS_EXEC_MAX` (51) so the shell sizes its exec buffer per-board (`exec_max()` / `exec_buf_max()`). `hello.go` = 1.6 MiB unstripped, 1.0 MiB with `-ldflags "-s -w"`. |
+| Exec size caps | ~~`EXEC_MAX_IMAGE_SIZE` 1 MiB~~ **DONE** | Now `board::EXEC_MAX_IMAGE_SIZE` — 32 MiB on QEMU, 4 MiB on the Duo (raised from 1 MiB 2026-10-18; costs ~12 KiB of page-pointer staging). New `SYS_EXEC_MAX` (51) so the shell sizes its exec buffer per-board (`exec_max()` / `exec_buf_max()`). `hello.go` = 1.6 MiB unstripped, 1.0 MiB with `-ldflags "-s -w"`. |
 | ELF segments | `EXEC_MAX_ELF_SEGMENTS` 8 | **Fine as-is** — a `GOOS=tamago` riscv64 binary has 6 phdrs, only **3 PT_LOAD** (R-E text @ `0x10000`, R rodata, RW data with `.bss` gap). No INTERP, no PT_TLS (Go keeps `g` in a register on riscv64) |
 | Entry / stack ABI | flat blob or ELF, `sepc` → `e_entry`, no auxv/argv-on-stack | tamago's `CPUinit` sets SP itself + jumps `rt0_*_tamago` — no Linux stack layout needed; `os.Args` empty until the provider fills it. Default link base is `0x10000`; relink at `USER_BASE` with `-ldflags "-T 0x1000000"` |
 | Heap region | `SYS_MAP` returns contiguous zeroed anon pages from `heap_top` | `CPUinit` calls `SYS_MAP` for a big arena, sets `goos.RamStart`/`RamSize`/`Bloc` from the return (dynamic, cleaner than tamago's fixed `0x80000000`) |
@@ -455,4 +458,4 @@ accept blocking I/O) and the net stack to actually have a carrier
 - cgo (no C toolchain on racccoon beyond tcc; pure Go only).
 - Signal-based async preemption (`asyncpreemptoff=1` — cooperative
   preemption is enough).
-- The Duo as anything past a Stage-1 curiosity.
+- The Go *toolchain* on the Duo (`go build` needs GiBs; programs run).
