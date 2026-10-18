@@ -1468,6 +1468,41 @@ fn bool ext2_zero_inode(uint inode_num)
 // 8-byte header (inode + rec_len + name_len + file_type) + the name,
 // rounded up to 4. An entry's rec_len can legitimately be larger — the
 // trailing slack is where ext2_place_dirent packs the next entry.
+// Logical block b of a directory -> its on-disk block (0 = hole), for the
+// directory walkers that write or recurse (ext2_place_dirent,
+// ext2_delete_dir_contents, ext2_dir_is_empty): one transient block buffer
+// instead of a ~16 KiB Ext2_block_cache held in the frame. Direct, single- and
+// double-indirect — the reach ext2_ensure_block_for_write can extend a
+// directory to; past that it returns 0.
+fn uint ext2_dir_block(Ext2_inode_info* dir, uint b)
+{
+	if (b < 12) return dir.block[b];
+	uint n = ext2_block_size / 4;
+	char[EXT2_MAX_BLOCK_SIZE] ptr_buf @noinit;
+	uint* ptrs = (uint*)&ptr_buf;
+	if (b < 12 + n)
+	{
+		if (dir.indirect_block == 0 || !ext2_read_block(dir.indirect_block, &ptr_buf)) return 0;
+		return ptrs[b - 12];
+	}
+	if (b < 12 + n + n * n)
+	{
+		uint rel = b - (12 + n);
+		if (dir.double_indirect_block == 0 || !ext2_read_block(dir.double_indirect_block, &ptr_buf)) return 0;
+		uint mid = ptrs[rel / n];
+		if (mid == 0 || !ext2_read_block(mid, &ptr_buf)) return 0;
+		return ptrs[rel % n];
+	}
+	return 0;
+}
+
+// How many logical blocks a directory spans (its size is always a whole
+// number of blocks).
+fn uint ext2_dir_block_count(Ext2_inode_info* dir)
+{
+	return (dir.size + ext2_block_size - 1) / ext2_block_size;
+}
+
 fn uint ext2_dirent_ideal(uint name_len)
 {
 	return (8 + name_len + 3) & ~3u;
@@ -1487,26 +1522,27 @@ fn uint ext2_dirent_ideal(uint name_len)
 // clearing sites (ext2_delete_resolved / ext2_rename) go through
 // ext2_zero_dirent(), also block-granular.
 //
-// Return: -1 = directory genuinely full or an I/O error; 0 = packed
-// into an existing block (dir unchanged, nothing more for the caller to
-// do); 1 = a fresh block was appended — dir.block[]/size/blocks were
-// mutated in place and the caller must ext2_write_inode(dir).
+// Return: -1 = out of space (or past double-indirect reach) or an I/O
+// error; 0 = packed into an existing block (dir unchanged, nothing more
+// for the caller to do); 1 = a fresh block was appended — dir's block
+// pointers/size/blocks were mutated in place and the caller must
+// ext2_write_inode(dir).
 fn int ext2_place_dirent(Ext2_inode_info* dir, char* name, uint child_inode)
 {
 	uint name_len = ext2_strlen(name);
 	uint need = ext2_dirent_ideal(name_len);
 
-	uint free_slot = 12;
-	for (uint s = 0; s < 12; s++)
+	// ext2_dir_block, not an Ext2_block_cache: this runs under fsd's own
+	// request buffers on a 64 KiB stack, with ext2_ensure_block_for_write's
+	// two block buffers below it on an append.
+	uint dir_blocks = ext2_dir_block_count(dir);
+	for (uint s = 0; s < dir_blocks; s++)
 	{
-		if (dir.block[s] == 0)
-		{
-			if (free_slot == 12) free_slot = s;
-			continue;
-		}
+		uint blk = ext2_dir_block(dir, s);
+		if (blk == 0) continue;
 
 		char[EXT2_MAX_BLOCK_SIZE] buf @noinit;
-		if (!ext2_read_block(dir.block[s], &buf)) return -1;
+		if (!ext2_read_block(blk, &buf)) return -1;
 
 		uint off = 0;
 		while (off + 8 <= ext2_block_size)
@@ -1533,15 +1569,18 @@ fn int ext2_place_dirent(Ext2_inode_info* dir, char* name, uint child_inode)
 				buf[new_off + 7] = 0; // file_type — this driver's reader never consults it
 				for (uint k = 0; k < name_len; k++) buf[new_off + EXT2_DIRENT_NAME + k] = name[k];
 
-				return ext2_write_block(dir.block[s], &buf) ? 0 : -1;
+				return ext2_write_block(blk, &buf) ? 0 : -1;
 			}
 			off += rec;
 		}
 	}
 
-	// No block had room — append a fresh one, a single entry spanning it.
-	if (free_slot >= 12) return -1;
-	uint nb = ext2_alloc_block();
+	// No block had room — append a fresh one past the last, a single entry
+	// spanning it. Past the 12 direct pointers this goes into the single-
+	// then double-indirect blocks, allocating them as needed.
+	uint new_blocks = 0;
+	bool data_new = false;
+	uint nb = ext2_ensure_block_for_write(dir, dir_blocks, &new_blocks, &data_new);
 	if (nb == 0) return -1;
 
 	char[EXT2_MAX_BLOCK_SIZE] nbuf @noinit;
@@ -1554,9 +1593,8 @@ fn int ext2_place_dirent(Ext2_inode_info* dir, char* name, uint child_inode)
 	for (uint k = 0; k < name_len; k++) nbuf[EXT2_DIRENT_NAME + k] = name[k];
 	if (!ext2_write_block(nb, &nbuf)) return -1;
 
-	dir.block[free_slot] = nb;
 	dir.size += ext2_block_size;
-	dir.blocks += ext2_block_size / SECTOR_SIZE;
+	dir.blocks += new_blocks * (ext2_block_size / SECTOR_SIZE); // data + any new indirect blocks
 	return 1;
 }
 
@@ -2038,9 +2076,10 @@ fn int ext2_chown(char* name, uint uid, uint requester_uid)
 // ext2_delete free a directory it couldn't actually confirm was empty.
 fn bool ext2_dir_is_empty(Ext2_inode_info* dir)
 {
-	for (uint b = 0; b < 12; b++)
+	uint dir_blocks = ext2_dir_block_count(dir);
+	for (uint b = 0; b < dir_blocks; b++)
 	{
-		uint block = dir.block[b];
+		uint block = ext2_dir_block(dir, b);
 		if (block == 0) continue;
 
 		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;
@@ -2197,9 +2236,10 @@ fn bool ext2_delete_dir_contents(uint dir_inode_num, int depth, uint requester_u
 	Ext2_inode_info dir;
 	if (!ext2_read_inode(dir_inode_num, &dir)) return false;
 
-	for (uint b = 0; b < 12; b++)
+	uint dir_blocks = ext2_dir_block_count(&dir);
+	for (uint b = 0; b < dir_blocks; b++)
 	{
-		uint block = dir.block[b];
+		uint block = ext2_dir_block(&dir, b);
 		if (block == 0) continue;
 
 		char[EXT2_MAX_BLOCK_SIZE] block_buf @noinit;

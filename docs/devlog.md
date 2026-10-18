@@ -4,6 +4,54 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-18 (late night) — ext2: directories past 12 blocks
+
+The other half of the old "~11 files per directory" item. Entry packing
+(`27c476b`, 2026-08-31) fixed the 11-file cap, but `ext2_place_dirent`
+still only looked at, and appended to, the 12 direct block pointers. So
+a racccoon-created directory stopped growing at 12 blocks: about 228
+42-character names at 1 KiB. The readers (`find_in_root`, `find_in_dir`,
+`list`) already walked indirect blocks, because host-seeded directories
+like Go's `runtime` are bigger.
+
+Now:
+- `ext2_place_dirent` scans every block the directory spans and, when
+  none has room, appends block `n` through `ext2_ensure_block_for_write`.
+  That's the file-write allocator, which grows into the single- and then
+  double-indirect blocks and counts the pointer blocks in `i_blocks`.
+- `ext2_dir_is_empty` and the recursive `ext2_delete_dir_contents` walk
+  every block too.
+- All three use a new cacheless `ext2_dir_block(dir, b)`: one transient
+  block buffer instead of a ~16 KiB `Ext2_block_cache`, which matters on
+  fsd's 64 KiB stack (and per level of the recursive delete).
+
+Test: `test/c-src/bigdirtest.c` (`/bin/bigdirtest [keep] [-n N] [-l LEN]`).
+It creates N files, counts them with readdir, stats the first and last,
+deletes every other one and refills the holes, then unlinks everything and
+rmdirs the emptied directory. `keep` leaves `/bdt` behind for `rm -r` and
+fsck. A/B on QEMU ext2: the old fsd **fails at create 228** (12 blocks × 19
+entries); the new one passes.
+
+Verified:
+- QEMU ext2: `bigdirtest`, `bigdirtest -l 90 -n 500`, `bigdirtest keep`
+  then `rm -r /bdt`, `dirpacktest`, `cycletest`, `pagelisttest`,
+  `p9fstest`, `permtest`, `storagekilltest`, `fsdkilltest`, `wasitest`,
+  `luatest` all ok; `e2fsck -fn` clean; debugfs shows the kept `/bdt` as
+  26 blocks, 12 direct + IND + 14.
+- QEMU dual: `bigdirtest`, `mounttest`, `fsdkilltest` ok.
+- QEMU FAT32: `bigdirtest` and `dirpacktest` ok, `fsck.fat` clean.
+- Real Duo: `bigdirtest -l 90 -n 500` ok in ~26 s, `keep` ok,
+  `storagekilltest` ok. The card's `e2fsck -fn` is clean, and
+  `debugfs stat /bdt` shows 50 blocks: 0–11 direct, IND, 12–49. The
+  refill reused the holes (it didn't grow to 75).
+
+Correction to the previous entry: this card's ext2 has **1 KiB** blocks
+(512 MB, 524288 blocks), not 4 KiB. The 12-block cap there was the same
+~228 short names, not ~3000. `/bdt` is still on the card; `rm -r /bdt` on
+the next boot clears it (the recursive delete is verified on QEMU).
+
+---
+
 ## 2026-10-18 (night) — camera: full 1920×1080 frames and auto-exposure
 
 `camcap -f` captures the whole frame. cifd's DMA region is now 760 pages
