@@ -373,9 +373,10 @@ const uptr CIF_VIP_SYS_PAGE = 0x0a0c8000;
 const uptr VI_FE0_PAGE    = 0x0a000000; // PRE_RAW_FE0 +0x000, CSIBDG0 +0x800, DMA_CTL6 +0xb00
 const uptr VI_ISPTOP_PAGE = 0x0a070000;
 const uptr VI_WDMA0_PAGE  = 0x0a072000;
-// One raw frame crop: 2 pixels per 3 bytes (12-bit packed), so 128 pages
-// = 512 KiB holds a 640x480 window (960 B/line) with room to spare.
-const uint VI_FRAME_PAGES = 128;
+// One raw frame: 2 pixels per 3 bytes (12-bit packed), so the full
+// 1920x1080 frame is 2880 B/line x 1080 = 3,110,400 B = 760 pages. Reserved
+// for good once cifd starts (~5% of the Duo's 64 MiB).
+const uint VI_FRAME_PAGES = 760;
 
 // The devices the kernel hands to boot drivers (src/device.c3) — the MMIO
 // pages each driver needs, its PLIC source, and the DMA regions the kernel

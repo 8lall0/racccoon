@@ -50,9 +50,16 @@ def write_png(path, w, h, channels, rows):
 
 
 def stretch(values):
+    """Map the raw (linear) range onto 0..255 with a 1/2.2 display gamma —
+    raw sensor values are linear light, a PNG is expected gamma-encoded."""
     lo, hi = min(values), max(values)
     span = max(hi - lo, 1)
-    return lambda v: (v - lo) * 255 // span
+    lut = {}
+    def f(v):
+        if v not in lut:
+            lut[v] = int(255 * ((max(v - lo, 0) / span) ** (1 / 2.2)) + 0.5)
+        return lut[v]
+    return f
 
 
 def main():

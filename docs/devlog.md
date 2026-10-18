@@ -4,6 +4,54 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-18 (night) — camera: full 1920×1080 frames and auto-exposure
+
+`camcap -f` captures the whole frame. cifd's DMA region is now 760 pages
+(2880 B/line × 1080 = 3.1 MB), allocated contiguously when cifd starts at
+boot and kept from then on, about 5% of the Duo's 64 MiB. The
+FRAME_READ + `fs_write_at` path took the 3.1 MB file without changes, and
+`e2fsck -fn` of the card afterwards was clean. That rules out filesystem
+damage from racccoon's large writes as the cause of the earlier unexplained
+boot without a root fs.
+
+`camcap -a` auto-exposes before the capture, using the vendor driver's own
+registers (`gc2083_cmos.c`: `cmos_inttime_update`, `cmos_gains_update`):
+- exposure in lines at 0x0d03/0x0d04 (1..1117 = VTS 1125 − 8);
+- analog gain as one of 29 table steps, 13 registers each, with the 0x0dc1
+  write bracketed by 0x031d = 0x2e / 0x28;
+- digital gain left at 1.0×.
+
+Each round meters a 320×240 centre window, subtracts the ~256 black level
+and scales exposure × gain toward a target of 850 (about 22% of the range
+above black). The step is capped at 4× in either direction, exposure is used
+before gain, and the loop waits 120 ms for the new setting to apply. It
+always starts from caminit's 514 lines at 1× gain, so a repeat run doesn't
+inherit the last result.
+
+On the board the sensor answered linearly: 4× exposure took the signal from
+84 to 343, and 2.48× more from 343 to 850. It converged in 3 rounds from a
+dark start and in 2 rounds on later runs. `scripts/raw_to_png.py` now applies
+a 1/2.2 display gamma. Without it, linear raw data looks far too dark; with
+it the full frame (a wall, a table edge, the tiled floor) looks like a normal
+photo.
+
+Verified on the real Duo:
+- `cifinit` PASS;
+- `camcap -a -f` PASS twice;
+- `camcap -a` back to back PASS;
+- `camcap -p` PASS;
+- `storagekilltest` ok.
+
+QEMU: `wasitest` and `storagekilltest` ok; `camcap` reports "cifd not
+available".
+
+Also checked: the "ext2 caps a directory at ~11 files" item from the
+roadmap list was already fixed on 2026-08-31 (`27c476b`, dirent packing).
+What's left is the 12-direct-block directory limit: about 750 short-named
+files with QEMU's 1 KiB blocks, about 3000 on the Duo's 4 KiB card.
+
+---
+
 ## 2026-10-18 (evening) — camera Stage 4: the first real GC2083 picture
 
 The `vi` block wasn't closed after all. Sophgo's github.com/sophgo/osdrv

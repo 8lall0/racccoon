@@ -640,7 +640,7 @@ const uint VIP_SYS_LP_CTRL_AXI_RT    = 0x020;
 const uint VIP_SYS_LP_CTRL_X2P       = 0x028;
 const uint VIP_SYS_CLK_RATIO_CSI_MAC0 = 0x038; // NORM_DIV_EN[0] UPDATE_SEL[2] NORM_DIV_VAL[20:16]
 
-const uint VI_FRAME_BYTES = 128 * 4096; // must match boards/duo/board.c3 VI_FRAME_PAGES
+const uint VI_FRAME_BYTES = 760 * 4096; // must match boards/duo/board.c3 VI_FRAME_PAGES
 uptr g_vi_frame_paddr;  // cifd's DMA region (boards/duo/board.c3 VI_FRAME_PAGES), identity-mapped, uncached
 uint g_vi_frame_bytes;  // what the last capture wrote
 

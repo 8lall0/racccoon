@@ -309,10 +309,14 @@ SDK's packaging. Stage 4 below was built from that source.
    white balance, and writes a PNG. The first real frame showed the window,
    roller shutter and tiled wall the camera was pointing at. `camcap -p`
    uses the bridge's pattern generator instead of the sensor: alternating
-   0x000/0xFFF pixels, which pins the packing. Not done: a full 1920×1080
-   frame (needs a ~3.1 MB contiguous region), exposure/gain control (the
-   sensor's defaults, no AE), and anything past the front end (BE, ISP
-   colour pipeline, YUV). Full story in docs/devlog.md 2026-10-18.
+   0x000/0xFFF pixels, which pins the packing. Later the same day: `camcap -f`
+   captures the full 1920×1080 frame (the DMA region is now 760 pages,
+   3.1 MB, reserved once cifd starts), and `camcap -a` runs a simple
+   auto-exposure first. It meters the centre, then sets the GC2083's
+   exposure (0x0d03/0x0d04, 1..1117 lines) and, past the exposure limit,
+   one of the vendor's 29 analog-gain steps, converging in 2-3 rounds. The
+   converter applies a 1/2.2 display gamma. Not done: anything past the
+   front end (BE, ISP colour pipeline, YUV), continuous capture. Full story in docs/devlog.md 2026-10-18.
 5. `camd` service + `capture` tool + double-buffered continuous
    capture.
 
