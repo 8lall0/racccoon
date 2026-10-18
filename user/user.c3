@@ -1378,6 +1378,17 @@ fn void mmio_write32(uptr addr, uint v) @export("mmio_write32") {
 // target (it got silently dropped under -O2 once, falling through into
 // a half-initialized caller; see docs/devlog.md). exit() is a real
 // syscall with a side effect the optimizer can't reason away.
+// At -O2 (build_user.sh's C3_OPT) LLVM turns byte-counting loops into
+// strlen() calls, and nolibc programs have no libc. Weak, so the
+// std::io path's own (user/std_racccoon/libc.c3, also weak) coexists;
+// LLVM never rewrites the loop of a function itself named strlen.
+fn usz strlen(char* s) @cname("strlen") @nostrip @weak
+{
+    usz n = 0;
+    while (s[n] != 0) { n++; }
+    return n;
+}
+
 fn void panic(char* prefix, char* msg) @export("user_panic") {
     print(prefix);
     print(msg);

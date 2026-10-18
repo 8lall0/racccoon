@@ -4,6 +4,54 @@ Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
 
+## 2026-10-19 (later) — userspace built at -O2 (everything QEMU can test), modest gains (branch `userspace-o2`)
+
+The wasm work found that `build_user.sh` passed no `-O`: every userspace
+program and server was unoptimised c3c output. `C3_OPT` (per program)
+already existed for `/bin/wasm`. Now every program QEMU can exercise is at
+`-O2`: the shells, fsd, envd, procd, echod, the virtio drivers (diskd,
+netd), and all the `/bin` tools (nolibc and std::io paths alike, 29 build
+lines). **Not** the Duo-only drivers and tools (sdd, usbd, ethd, gpiod,
+usbrw, gpio): MMIO ordering under optimisation needs real hardware to
+check, so they stay at the level they were tested at until a Duo session.
+
+-O2 makes LLVM turn byte loops into `strlen()` calls. nolibc programs have
+no libc, so `user.c3` now provides a **weak** `strlen` (the std::io path's
+`std_racccoon/libc.c3` already has a weak one; the two coexist), replacing
+the private copy `/bin/wasm` had.
+
+**Gains are modest**, because these workloads are dominated by kernel
+IPC and QEMU, not user-mode CPU (QEMU, ext2, host wall time per command):
+
+| | before | -O2 |
+|---|---|---|
+| `wc` 160 KB / 4000 lines | 0.36 s | 0.17 s |
+| `sort` | 0.35 s | 0.30 s |
+| shell loop, 20 file writes | 3.21 s | 2.98 s |
+| `cat` 160 KB → file | 1.13 s | 1.07 s |
+| `ringbench` (fsd IPC) | 356 µs/op | 410 µs/op |
+
+`ringbench` getting slower is the QEMU layout effect from the 2026-10-17
+entry (every embedded binary changed size, so kernel data and process pages
+moved), not slower code: its per-op counters are unchanged. Output of
+every benchmark command is byte-identical to the unoptimised build.
+
+**The regression caught a real -O2 bug: `rdtime()`.** The first full run
+had `hungservertest` failing and `oomtest` hanging on both filesystems,
+and every waiting loop involved was `while (rdtime() < deadline)`.
+`user.c3`'s `rdtime` was an opaque `asm()` that stored the time CSR into a
+global (`rdtime_tmp`) and clobbered `t0`/`t1` without declaring either.
+Unoptimised that's fine; at -O2 the compiler may reuse a stale read of
+the global, so the deadline never arrives. (It's also free to keep live
+values in t0/t1 across the asm.) Now it's `@naked`: `csrr a0, time; ret`,
+which returns the value by the ABI so nothing has to be modelled. Both
+tests pass. `/bin/wasm` has been -O2 since `7ea002c` with the same latent
+`rdtime`; its sleeps happened to work, so this fixes that too.
+
+Full regression (after the fix) on FAT32 / ext2 / dual: identical to master,
+including wasitest/luatest/wasmtest; fsck clean. Duo: pending (and the
+Duo-only drivers stay unoptimised regardless).
+
 ## 2026-10-19 — Lua on racccoon: sleep(), interpreter-assisted setjmp/longjmp, a 7× faster /bin/wasm, and a FAT32 directory bug
 
 Three items: `poll_oneoff`, a real program on WASI, and interpreter speed.

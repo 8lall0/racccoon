@@ -47,9 +47,10 @@ cd "$ROOT"
 # fine, each one only ever exists in its own process's own page table.
 #
 # C3_OPT (e.g. C3_OPT=-O2 build_user_program …): an optimisation level for
-# that one program. Default is c3c's own (no -O = unoptimised), which every
-# other program — drivers included — is built and tested at; opt in per
-# program after testing it, not globally.
+# that one program. Default is c3c's own (no -O = unoptimised). Everything
+# QEMU can exercise is at -O2 (2026-10-19, docs/devlog.md); the Duo-only
+# drivers/tools (sdd, usbd, ethd, gpiod, usbrw, gpio) stay unoptimised until
+# they're tested at -O2 on the board — opt in per program after testing it.
 build_user_program() {
   local name="$1"
   shift
@@ -154,7 +155,7 @@ build_user_program_stdio() {
   mkdir -p "build/user/$name/obj"
 
   echo "==> Compiling $name (real stdlib)..."
-  c3c compile-only \
+  c3c compile-only ${C3_OPT:-} \
     --safe=no \
     --link-libc=no \
     --custom-libc=yes \
@@ -200,22 +201,22 @@ STUB
   echo "==> Done: build/user/$name.bin.o"
 }
 
-build_user_program shell user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/shell_words.c3 user/shell_jobs.c3 user/shell_common.c3 user/shell.c3
-build_user_program shell_test user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/shell_words.c3 user/shell_jobs.c3 user/shell_common.c3 user/shell_test.c3 user/shell_test_fs.c3 user/shell_test_ipc.c3 user/shell_test_proc.c3 user/shell_test_drivers.c3 user/shell_test_lang.c3
-build_user_program echod user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/sys/echod.c3
+C3_OPT=-O2 build_user_program shell user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/shell_words.c3 user/shell_jobs.c3 user/shell_common.c3 user/shell.c3
+C3_OPT=-O2 build_user_program shell_test user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/shell_words.c3 user/shell_jobs.c3 user/shell_common.c3 user/shell_test.c3 user/shell_test_fs.c3 user/shell_test_ipc.c3 user/shell_test_proc.c3 user/shell_test_drivers.c3 user/shell_test_lang.c3
+C3_OPT=-O2 build_user_program echod user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/sys/echod.c3
 # true/false do zero I/O (just exitcode(0)/(1)) — no benefit from the
 # real stdlib's ~180 KiB, kept on the lightweight std::nolibc path.
-build_user_program true user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/true.c3
-build_user_program false user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/false.c3
+C3_OPT=-O2 build_user_program true user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/true.c3
+C3_OPT=-O2 build_user_program false user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/false.c3
 # ed — the classic line editor (nolibc: hand-rolled parsing, big fixed
 # line buffer, no need for the ~180 KiB stdlib path). Lets racccoon edit
 # a file without host tools.
-build_user_program ed user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/ed.c3
+C3_OPT=-O2 build_user_program ed user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/ed.c3
 # text tools — grep / wc / sort / find / cmp / tr. Small nolibc programs
 # (hand-rolled parsing, literal match — no regexp, matching ed); the
 # shell's pipes / globbing / control flow feed them.
 for t in grep wc sort find cmp tr; do
-  build_user_program "$t" user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 "user/bin/$t.c3"
+  C3_OPT=-O2 build_user_program "$t" user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 "user/bin/$t.c3"
 done
 
 # The small /bin utilities, ported to the real stdlib (io::print/
@@ -232,51 +233,51 @@ STDIO_COMMON="src/std/core/mem.c3 src/std/core/nolibc_allocator.c3 src/std/core/
   user/std_racccoon/rcsys.c3 user/std_racccoon/libc.c3 user/std_racccoon/io_native.c3 \
   user/std_racccoon/trunctfdf2_stub.c3 user/std_racccoon/heap.c3 user/std_racccoon/rt_entry.c3 \
   user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3"
-build_user_program_stdio cat $STDIO_COMMON user/bin/cat.c3
-build_user_program_stdio ls $STDIO_COMMON user/bin/ls.c3
-build_user_program_stdio echo $STDIO_COMMON user/bin/echo.c3
-build_user_program_stdio head $STDIO_COMMON user/bin/head.c3
-build_user_program_stdio whoami $STDIO_COMMON user/bin/whoami.c3
-build_user_program_stdio write $STDIO_COMMON user/bin/write.c3
-build_user_program_stdio rm $STDIO_COMMON user/bin/rm.c3
-build_user_program_stdio mkdir $STDIO_COMMON user/bin/mkdir.c3
-build_user_program_stdio mv $STDIO_COMMON user/bin/mv.c3
-build_user_program_stdio chmod $STDIO_COMMON user/bin/chmod.c3
-build_user_program_stdio chown $STDIO_COMMON user/bin/chown.c3
+C3_OPT=-O2 build_user_program_stdio cat $STDIO_COMMON user/bin/cat.c3
+C3_OPT=-O2 build_user_program_stdio ls $STDIO_COMMON user/bin/ls.c3
+C3_OPT=-O2 build_user_program_stdio echo $STDIO_COMMON user/bin/echo.c3
+C3_OPT=-O2 build_user_program_stdio head $STDIO_COMMON user/bin/head.c3
+C3_OPT=-O2 build_user_program_stdio whoami $STDIO_COMMON user/bin/whoami.c3
+C3_OPT=-O2 build_user_program_stdio write $STDIO_COMMON user/bin/write.c3
+C3_OPT=-O2 build_user_program_stdio rm $STDIO_COMMON user/bin/rm.c3
+C3_OPT=-O2 build_user_program_stdio mkdir $STDIO_COMMON user/bin/mkdir.c3
+C3_OPT=-O2 build_user_program_stdio mv $STDIO_COMMON user/bin/mv.c3
+C3_OPT=-O2 build_user_program_stdio chmod $STDIO_COMMON user/bin/chmod.c3
+C3_OPT=-O2 build_user_program_stdio chown $STDIO_COMMON user/bin/chown.c3
 # test/[ and expr — the primitives the shell's if/for/while build on
 # (docs/roadmap.md §2.5). One test.bin is seeded as both /bin/test and
 # /bin/[ by scripts/build.sh / populate_duo_bin.sh.
-build_user_program_stdio test $STDIO_COMMON user/bin/test.c3
-build_user_program_stdio expr $STDIO_COMMON user/bin/expr.c3
+C3_OPT=-O2 build_user_program_stdio test $STDIO_COMMON user/bin/test.c3
+C3_OPT=-O2 build_user_program_stdio expr $STDIO_COMMON user/bin/expr.c3
 build_user_program_stdio usbrw $STDIO_COMMON user/bin/usbrw.c3
 build_user_program_stdio gpio $STDIO_COMMON user/bin/gpio.c3
 # introspection — dmesg (kernel console log ring, SYS_KLOG_READ) and
 # ps / top (per-process view, SYS_PROC_STAT). Real stdlib for io::printfn's
 # column formatting.
-build_user_program_stdio dmesg $STDIO_COMMON user/bin/dmesg.c3
-build_user_program_stdio ps $STDIO_COMMON user/bin/ps.c3
-build_user_program_stdio top $STDIO_COMMON user/bin/top.c3
+C3_OPT=-O2 build_user_program_stdio dmesg $STDIO_COMMON user/bin/dmesg.c3
+C3_OPT=-O2 build_user_program_stdio ps $STDIO_COMMON user/bin/ps.c3
+C3_OPT=-O2 build_user_program_stdio top $STDIO_COMMON user/bin/top.c3
 # /bin/wasm at -O2: an interpreter's dispatch loop is all hot code, and
 # unoptimised c3c reloads every local from the stack (docs/devlog.md).
 C3_OPT=-O2 build_user_program wasm user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/bin/wasm.c3
-build_user_program diskd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/virtio.c3 user/block/diskd.c3
+C3_OPT=-O2 build_user_program diskd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/virtio.c3 user/block/diskd.c3
 # sdd = the board-independent orchestration (sdd.c3) + ONE SD-controller layer:
 # the Duo's Cvitek SDHCI (sdhci.c3, default) or the Orange Pi's DesignWare MSHC
 # (SDD_SOC_SRC=user/block/dw_mshc.c3 — scripts/build_opi.sh sets it). Every board
 # script runs this script first, so each gets its own sdd.
 build_user_program sdd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 ${SDD_SOC_SRC:-user/block/sdhci.c3} user/block/sd_card.c3 user/block/sdd.c3
-build_user_program fsd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/fs/fsd.c3 user/fs/fat32.c3 user/fs/ext2.c3 user/fs/exfat.c3
+C3_OPT=-O2 build_user_program fsd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/fs/fsd.c3 user/fs/fat32.c3 user/fs/ext2.c3 user/fs/exfat.c3
 # procd — real stdlib: its /proc/<pid>/status text is now formatted with
 # io::bprintf (into the wire buffer, no allocation). Pure-IPC, supervised,
 # no DMA/MMIO — the one server where the stdlib path is a clean win.
-build_user_program_stdio procd $STDIO_COMMON user/sys/procd.c3
-build_user_program envd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/sys/envd.c3
+C3_OPT=-O2 build_user_program_stdio procd $STDIO_COMMON user/sys/procd.c3
+C3_OPT=-O2 build_user_program envd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/sys/envd.c3
 build_user_program usbd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/usb/dwc2.c3 user/usb/xpad.c3 user/usb/kbd.c3 user/usb/msc.c3 user/usb/usbd.c3
 build_user_program ethd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/net/eth_proto.c3 user/net/dhcp.c3 user/net/dwmac.c3 user/net/ephy.c3 user/net/ethd.c3
-build_user_program netd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/virtio.c3 user/net/eth_proto.c3 user/net/dhcp.c3 user/net/netd.c3
+C3_OPT=-O2 build_user_program netd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/virtio.c3 user/net/eth_proto.c3 user/net/dhcp.c3 user/net/netd.c3
 build_user_program gpiod user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/gpio/gpiod.c3
 
-build_user_program_stdio stdiotest \
+C3_OPT=-O2 build_user_program_stdio stdiotest \
   src/std/core/mem.c3 src/std/core/nolibc_allocator.c3 src/std/core/nolibc_vmem.c3 \
   src/std/io/io.c3 src/std/io/os/os.c3 \
   user/std_racccoon/rcsys.c3 user/std_racccoon/libc.c3 user/std_racccoon/io_native.c3 \

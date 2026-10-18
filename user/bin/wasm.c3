@@ -342,16 +342,6 @@ int*    g_elemvals; int  g_nelemvals;     // flat funcidx pool referenced by g_e
 // argv for the host `arg` import — set in main
 String[] g_args;
 
-// At -O2 (build_user.sh) LLVM turns byte-counting loops into strlen()
-// calls, and nolibc userspace has none. LLVM never rewrites the loop of a
-// function itself named strlen into a call to itself.
-fn usz strlen(char* s) @export("strlen")
-{
-    usz n = 0;
-    while (s[n] != 0) { n++; }
-    return n;
-}
-
 // `wasm -p file.wasm …`: count every executed opcode and print the top
 // ones at exit — the profile a sampling profiler can't give from outside
 // (QEMU's gdbstub only stops at the dispatch loop's head).
