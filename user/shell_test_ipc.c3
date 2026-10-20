@@ -12,6 +12,166 @@ import std::nolibc::fmt;
 // 8 KiB frame-local on top of everything else a builtin nests).
 char[8192] ringbench_buf;
 
+// ipcfifotest: the FIFO send queue (src/syscalls.c3, Process.ipc_q_*).
+// A test server stays busy for 3 s before its first ipc_recv, so
+// FIFO_N clients pile up in its send queue. They arrive in the REVERSE
+// of their pid order (client i waits (FIFO_N-1-i) steps first), so a
+// "whoever the scheduler's round-robin finds next" inbox would tend to
+// hand the inbox out by pid instead. The server answers each request
+// with the 1-based position it was received in; client i expects
+// position FIFO_N - i and exits with 1 (in order) or 2 (out of order).
+const int FIFO_N = 5;
+
+// awaittest: SYS_AWAIT (await_any) — wait for the first of several
+// sources. Each case arranges for exactly one source to become ready
+// a few hundred ms in and checks that is what woke the wait.
+int aw_note_seen = 0;
+fn void aw_note_handler(char* msg) {
+    aw_note_seen++;
+    noted(NCONT);
+}
+
+fn void aw_sleep(ulong ticks) {
+    ulong end = rdtime() + ticks;
+    while (rdtime() < end) { yield(); }
+}
+
+fn void await_test() {
+    ulong hz = timebase_hz();
+    int pass = 0;
+    int total = 0;
+
+    // 1. Timeout only: AW_TIMER after ~0.5 s.
+    total++;
+    ulong t0 = rdtime();
+    int r = await_any(0, hz / 2, null, 0);
+    ulong dt = rdtime() - t0;
+    print("awaittest: timeout: ");
+    if (r == (int)AW_TIMER && dt >= hz / 2 && dt < hz * 3) { pass++; print("ok\n"); } else { print("FAILED\n"); }
+
+    // 2. A message from a child arrives 0.3 s in.
+    total++;
+    int me = getpid();
+    uint g = 0;
+    int c = rfork(RFPROC, &g);
+    if (c == 0) {
+        aw_sleep(hz * 3 / 10);
+        char[8] m;
+        m[0] = 'm';
+        ipc_send(me, 1, &m[0], 8);
+        exitcode(0);
+    }
+    r = await_any(AW_MSG, hz * 5, null, 0);
+    char[8] got;
+    got[0] = 0;
+    if (r == (int)AW_MSG) { ipc_recv(&got[0], 8); }
+    join(c, g);
+    print("awaittest: message: ");
+    if (r == (int)AW_MSG && got[0] == 'm') { pass++; print("ok\n"); } else { print("FAILED\n"); }
+
+    // 3. A pipe a child writes into 0.3 s in; also asked for AW_MSG, which
+    // never comes — only the pipe bit may be set.
+    total++;
+    int pid = pipe_new();
+    bool pipe_ok = false;
+    if (pid >= 0) {
+        pipe_hold(pid, 1, 1);   // a writer, so the empty pipe isn't at EOF
+        pipe_hold(pid, 0, 1);   // a reader, so the child's write isn't dropped
+        c = rfork(RFPROC, &g);
+        if (c == 0) {
+            aw_sleep(hz * 3 / 10);
+            pipe_write(pid, "x", 1);
+            exitcode(0);
+        }
+        int[1] pl;
+        pl[0] = pid;
+        r = await_any(AW_MSG, hz * 5, &pl[0], 1);
+        char[4] pb;
+        pb[0] = 0;
+        if (r == (int)AW_PIPE0) { pipe_read(pid, &pb[0], 4); }
+        join(c, g);
+        pipe_hold(pid, 1, -1);
+        pipe_hold(pid, 0, -1);
+        pipe_ok = r == (int)AW_PIPE0 && pb[0] == 'x';
+    }
+    print("awaittest: pipe (with an idle inbox in the mask): ");
+    if (pipe_ok) { pass++; print("ok\n"); } else { print("FAILED\n"); }
+
+    // 4. A note cuts a long wait short: AW_NOTE, and the handler ran.
+    total++;
+    c = rfork(RFPROC, &g);
+    if (c == 0) {
+        aw_note_seen = 0;
+        notify(&aw_note_handler);
+        int rr = await_any(AW_MSG, hz * 10, null, 0);
+        exitcode((rr & (int)AW_NOTE) != 0 && aw_note_seen == 1 ? 3 : 4);
+    }
+    aw_sleep(hz / 2);
+    postnote(c, "wake");
+    r = join(c, g);
+    print("awaittest: note: ");
+    if (r == 3) { pass++; print("ok\n"); } else { print("FAILED\n"); }
+
+    print("awaittest: ");
+    print_uint((uint)pass);
+    print("/");
+    print_uint((uint)total);
+    print(pass == total ? " — PASS\n" : " — FAIL\n");
+}
+
+fn void ipcfifo_test() {
+    ulong hz = timebase_hz();
+    ulong t0 = rdtime();
+    uint sgen = 0;
+    int srv = rfork(RFPROC, &sgen);
+    if (srv == 0) {
+        while (rdtime() < t0 + 3 * hz) { yield(); }   // busy: let the queue form
+        for (int k = 1; k <= FIFO_N; k++) {
+            char[8] rq;
+            uint ty = 0;
+            uint fg = 0;
+            int from = ipc_recv_type_gen(&rq[0], 8, &ty, &fg);
+            rq[0] = (char)k;
+            ipc_reply(from, ty, &rq[0], 8, fg);
+        }
+        exitcode(0);
+    }
+    if (srv < 0) { print("ipcfifotest: rfork failed — FAIL\n"); return; }
+    int[FIFO_N] cpid;
+    uint[FIFO_N] cgen;
+    for (int i = 0; i < FIFO_N; i++) {
+        int c = rfork(RFPROC, &cgen[i]);
+        if (c == 0) {
+            // Arrivals start 1.5 s in (forking the clients alone can take a
+            // few hundred ms under QEMU-TCG) and are 200 ms apart.
+            ulong go = t0 + hz + hz / 2 + (ulong)(FIFO_N - 1 - i) * (hz / 5);
+            while (rdtime() < go) { yield(); }
+            char[8] b;
+            b[0] = 0;
+            if (ipc_call(srv, 1, &b[0], 8, 8, null) < 0) { exitcode(3); }
+            exitcode((int)b[0] == FIFO_N - i ? 1 : 2);
+        }
+        cpid[i] = c;
+    }
+    int in_order = 0;
+    char[FIFO_N + 1] codes;
+    for (int i = 0; i < FIFO_N; i++) {
+        int code = cpid[i] > 0 ? join(cpid[i], cgen[i]) : 9;
+        codes[i] = (char)('0' + (code >= 0 && code <= 9 ? code : 9));
+        if (code == 1) { in_order++; }
+    }
+    codes[FIFO_N] = 0;
+    join(srv, sgen);
+    print("ipcfifotest: ");
+    print_uint((uint)in_order);
+    print("/");
+    print_uint((uint)FIFO_N);
+    print(" clients served in arrival order (per-client 1=ok 2=out-of-order 3=call failed: ");
+    print(&codes[0]);
+    print(")");
+    print(in_order == FIFO_N ? " — PASS\n" : " — FAIL\n");
+}
+
 // ringbench (below) prints per-operation counters as X.YY without a
 // float in sight: total * 100 / iters, then split.
 fn void ringbench_perop(ulong total, ulong iters) {
@@ -569,6 +729,10 @@ fn bool shell_test_ipc_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
         } else {
             print("hungservertest: FAILED\n");
         }
+    } else if (strcmp(cmd, "awaittest") == 0) {
+        await_test();
+    } else if (strcmp(cmd, "ipcfifotest") == 0) {
+        ipcfifo_test();
     } else if (strcmp(cmd, "ipcdeathtest") == 0) {
         // Proves the IPC rendezvous no longer hangs forever when the
         // peer dies mid-transfer (src/syscalls.c3 sys_exit /

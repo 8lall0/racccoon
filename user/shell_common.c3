@@ -263,6 +263,7 @@ char[128] g_prompt_str @noinit;
 
 fn void shell_prompt()
 {
+    g_interrupted = false;   // a ^C only ever stops the command it landed in
     shell_jobs_reap();   // report any background job that finished since last time
     if (g_shell_uid < 0) { shell_refresh_user(); }
 
@@ -354,6 +355,18 @@ fn int shell_readline_p(char* buf, int cap, char* prompt, bool history)
 
     for (;;) {
         int ci = getchar();
+        // ^C while the line is being typed: drop it and start a fresh one.
+        // Checked after every getchar, not only when it fails — the note
+        // can be handled while the shell is inside some other syscall
+        // (echoing a keystroke, reaping a job), and then getchar returns
+        // normally while the flag sits set, waiting to kill whatever
+        // command line comes next.
+        if (g_interrupted) {
+            g_interrupted = false;
+            print("^C\n");
+            buf[0] = 0;
+            return -1;   // callers re-prompt; a half-typed block is dropped too
+        }
         if (ci < 0) { continue; }
         char ch = (char)ci;
 
@@ -775,7 +788,9 @@ fn bool shell_dispatch_common(char* cmd, char** cmd_argv, int cmd_argc)
             mountusb_fsd_argv[0] = "usbd";
 
             uint mountusb_gen = 0;
-            int mountusb_child = rfork(RFPROC, &mountusb_gen);
+            // RFNOTEG: this fsd outlives the command — a later ^C at the
+            // prompt must not take the mount down with it.
+            int mountusb_child = rfork(RFPROC | RFNOTEG, &mountusb_gen);
             if (mountusb_child < 0) {
                 print("mountusb: rfork failed (no free process slot)\n");
             } else if (mountusb_child == 0) {
@@ -947,7 +962,7 @@ fn int shell_spawn(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out, int 
             }
 
             *gen_out = 0;
-            int sh_r = rfork_io(RFPROC, gen_out, stdout_pipe, stdin_pipe);
+            int sh_r = rfork_io(RFPROC | g_spawn_rfork_extra, gen_out, stdout_pipe, stdin_pipe);
             if (sh_r < 0) {
                 print("rfork failed\n");
                 return -1;
@@ -1041,7 +1056,7 @@ fn int shell_spawn_stage(char* cmd, char** cmd_argv, int cmd_argc, uint* gen_out
         return shell_spawn(cmd, cmd_argv, cmd_argc, gen_out, stdout_pipe, stdin_pipe);
     }
     *gen_out = 0;
-    int r = rfork_io(RFPROC, gen_out, stdout_pipe, stdin_pipe);
+    int r = rfork_io(RFPROC | g_spawn_rfork_extra, gen_out, stdout_pipe, stdin_pipe);
     if (r < 0) { print("rfork failed\n"); return -1; }
     if (r == 0) {
         shell_dispatch_common(cmd, cmd_argv, cmd_argc);
@@ -1306,6 +1321,9 @@ fn int shell_run_pipeline(char* seg, int seg_len, bool bg)
     int[MAX_STAGES]  spid @noinit;
     uint[MAX_STAGES] sgen @noinit;
     int spawned = 0;
+    // A background job gets its own note groups, so a ^C meant for the
+    // foreground doesn't kill it.
+    g_spawn_rfork_extra = bg ? RFNOTEG : 0;
     for (int s = 0; s < nstages; s++) {
         char** argv = &stage_words[stage_off[s] + 1];
         int    argc = stage_n[s] - 1;
@@ -1313,6 +1331,7 @@ fn int shell_run_pipeline(char* seg, int seg_len, bool bg)
         int stdout_p = s == nstages - 1 ? out_pipe : mpipe[s];
         spid[s] = shell_spawn_stage(stage_words[stage_off[s]], argv, argc, &sgen[s], stdout_p, stdin_p);
         if (spid[s] < 0) {
+            g_spawn_rfork_extra = 0;
             for (int k = 0; k < spawned; k++) { kill(spid[k], sgen[k]); }
             if (in_pipe  >= 0) { pipe_hold(in_pipe, 1, -1); }
             if (out_pipe >= 0) { pipe_hold(out_pipe, 0, -1); }
@@ -1320,6 +1339,7 @@ fn int shell_run_pipeline(char* seg, int seg_len, bool bg)
         }
         spawned++;
     }
+    g_spawn_rfork_extra = 0;
 
     // Background: hand the whole pipeline to the job table and return
     // now. The inter-stage pipes need no shell-side hold — each child
@@ -1439,6 +1459,7 @@ fn int shell_exec_line(char* line)
         int s = seg_start;
         while (s < p && line[s] == ' ') { s++; }
 
+        if (g_interrupted) { break; }   // ^C: drop the rest of the line
         if (s < p && run) {
             // op == 4 -> this segment is `cmd &`: spawn and don't wait.
             status = shell_run_pipeline(&line[seg_start], seg_len, op == 4);
@@ -1481,6 +1502,28 @@ fn int shell_exec_line(char* line)
 bool g_shell_loop_break    = false;
 bool g_shell_loop_continue = false;
 int  g_shell_loop_depth    = 0;
+
+// ^C (src/note.c3): the console posts "interrupt" to the shell's note
+// group — the shell and its foreground children. A child without a
+// handler dies of it; the shell catches it here and just remembers it.
+// Every loop and sequence below stops when it's set, the line editor
+// drops the line being typed, and it's cleared before the next command.
+// Background jobs (`&`) are rforked with RFNOTEG, so they don't get it.
+bool g_interrupted = false;
+
+// Extra rfork flags for shell_spawn / shell_spawn_stage — RFNOTEG while
+// shell_run_pipeline starts a background job, 0 otherwise.
+int g_spawn_rfork_extra = 0;
+
+fn void shell_note_handler(char* msg) {
+    g_interrupted = true;
+    noted(NCONT);
+}
+
+// Call once at shell start, before the first prompt.
+fn void shell_notes_init() {
+    notify(&shell_note_handler);
+}
 
 fn int sh_strlen(char* s)
 {
@@ -1752,10 +1795,10 @@ fn int shell_do_for(char* s)
                 int after = 0;
                 st = sh_run_body(s, body_at, true, &after);
                 if (g_shell_loop_continue) { g_shell_loop_continue = false; continue; }
-                if (g_shell_loop_break || g_shell_script_stop) { stop = true; break; }
+                if (g_shell_loop_break || g_shell_script_stop || g_interrupted) { stop = true; break; }
             }
         }
-        if (g_shell_loop_break || g_shell_script_stop) { break; }
+        if (g_shell_loop_break || g_shell_script_stop || g_interrupted) { break; }
     }
     g_shell_loop_depth--;
     g_shell_loop_break = false;
@@ -1790,7 +1833,7 @@ fn int shell_do_while(char* s)
         int after = 0;
         st = sh_run_body(s, body_at, true, &after);
         if (g_shell_loop_continue) { g_shell_loop_continue = false; continue; }
-        if (g_shell_loop_break || g_shell_script_stop) { break; }
+        if (g_shell_loop_break || g_shell_script_stop || g_interrupted) { break; }
     }
     g_shell_loop_depth--;
     g_shell_loop_break = false;
@@ -1837,7 +1880,7 @@ fn int shell_exec_block(char* text)
         status = shell_exec_stmt(&text[start]);
         text[end] = save;
 
-        if (g_shell_script_stop || g_shell_loop_break || g_shell_loop_continue) { break; }
+        if (g_shell_script_stop || g_shell_loop_break || g_shell_loop_continue || g_interrupted) { break; }
 
         i = end;
         if (text[i] == '\n' || text[i] == ';') { i++; }

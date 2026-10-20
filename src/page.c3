@@ -203,6 +203,23 @@ fn bool user_range_valid(ulong* table2, uptr vaddr, ulong len, bool want_write)
 	return true;
 }
 
+// The physical address a mapped user vaddr translates to, or 0 if it
+// isn't mapped. No allocation (unlike walk_to_leaf_table). Futexes are
+// keyed by this, so two processes sharing a segment page (segment.c3)
+// meet on the same futex while unrelated processes never do.
+fn uptr user_vaddr_to_paddr(ulong* table2, uptr vaddr)
+{
+	ulong e2 = table2[(vaddr >> 30) & 0x1ff];
+	if ((e2 & PAGE_V) == 0) return 0;
+	ulong* table1 = (ulong*)pte_to_paddr(e2);
+	ulong e1 = table1[(vaddr >> 21) & 0x1ff];
+	if ((e1 & PAGE_V) == 0) return 0;
+	ulong* table0 = (ulong*)pte_to_paddr(e1);
+	ulong e0 = table0[(vaddr >> 12) & 0x1ff];
+	if ((e0 & PAGE_V) == 0) return 0;
+	return pte_to_paddr(e0) + (vaddr & (uptr)(PAGE_SIZE - 1));
+}
+
 // Fallible map_page for the lazy-SYS_MAP fault path (entry.c3's
 // try_lazy_fault): allocates the intermediate tables and the leaf with
 // try_alloc_pages, so an out-of-memory demand fault kills just the

@@ -71,11 +71,19 @@ const int SYS_DISK_ARENA_INFO = 56; // diskd + primary fsd: base+size of the sha
 const int SYS_KLOG_READ     = 57; // kernel console log ring — /bin/dmesg — see src/syscalls.c3's case + klog_read() below
 const int SYS_PROC_STAT     = 58; // per-process state/uid/gen/pages/pid/name — /bin/ps + /bin/top — see src/syscalls.c3's case + proc_stat() below
 const int SYS_GETCHAR_NB    = 59; // non-blocking console read: a keystroke, or -1 if none waiting — see src/syscalls.c3's case + getchar_nb() below
+const int SYS_POSTNOTE    = 61; // post a note to a pid or a note group — see postnote() below / src/note.c3
+const int SYS_NOTIFY      = 62; // register this process's note handler — see notify() below
+const int SYS_NOTED       = 63; // leave the note handler — see noted() below
+const int SYS_INTERRUPTED = 64; // was my last wait interrupted by a note? — see interrupted() below
+const int SYS_AWAIT       = 65; // wait for the first of several sources — see await_any() below
+const int SYS_SEGATTACH   = 66; // map a named shared segment — see segattach() below
+const int SYS_SEGDETACH   = 67; // unmap one — see segdetach() below
 const int SYS_DEV_INFO   = 60; // a0 = out uptr[], a1 = capacity (<= 4): physical base of each DMA region the caller's board device declared (src/device.c3). Returns the region count, or -1 if the caller owns no device — see dev_info() below
 
 // rfork flags — see src/syscalls.c3's SYS_RFORK case for the full design.
 const int RFPROC = 1 << 0; // required — create a new process
 const int RFMEM  = 1 << 1; // share the parent's address space instead of copying it
+const int RFNOTEG = 1 << 2; // the child starts its own note group (a ^C to ours won't reach it)
 
 // @export gives these functions C-compatible names so asm can call them
 fn void exit() @noreturn @export("exit") {
@@ -904,8 +912,99 @@ fn uptr ethd_info() @export("ethd_info") {
 // an unrelated process" (pids are slot-indexed and do get reused; see
 // src/process.c3's Process.generation and SYS_JOIN's case in
 // src/syscalls.c3 for the full reasoning).
+//
+// A note (^C) arriving while we wait interrupts the kernel wait; once our
+// handler has run, keep waiting — the caller asked for the exit status,
+// and the note handler already saw the note. (Without a handler the note
+// killed us and this never returns.)
 fn int join(int pid, uint generation) @export("join") {
-    return syscall(SYS_JOIN, pid, (long)generation, 0);
+    for (;;) {
+        int r = syscall(SYS_JOIN, pid, (long)generation, 0);
+        if (r != -1 || !interrupted()) { return r; }
+    }
+}
+
+// --- notes (src/note.c3) — Plan 9's signals ---------------------------
+// A note is a short string ("interrupt" for the console's ^C, "kill",
+// anything a postnote() sends). With no handler a note kills the
+// process. notify(h) installs h: on a note the process resumes in
+// h(msg), on a small stack carved below the interrupted one, and h must
+// end with noted(NCONT) (carry on where it was interrupted) or
+// noted(NDFLT) (die). Returning from h instead faults and kills.
+// A wait the note interrupted returns -1; interrupted() tells that
+// apart from a real error. "kill" always kills, handler or not.
+const int NCONT = 0;
+const int NDFLT = 1;
+
+fn int notify(void* handler) @export("notify") {
+    return syscall(SYS_NOTIFY, (long)handler, 0, 0);
+}
+
+fn void noted(int how) @export("noted") {
+    syscall(SYS_NOTED, how, 0, 0);
+}
+
+// Post `msg` to process `pid`. Root, or the same uid. 1 = delivered
+// (queued), -1 = no such process / not allowed / its queue was full.
+fn int postnote(int pid, char* msg) @export("postnote") {
+    return syscall(SYS_POSTNOTE, pid, 0, (long)msg);
+}
+
+// Post `msg` to every process in note group `group` (a process's group
+// is its own pid unless it was rforked without RFNOTEG). Returns how many
+// got it, or -1.
+fn int postnote_group(int group, char* msg) @export("postnote_group") {
+    return syscall(SYS_POSTNOTE, group, 1, (long)msg);
+}
+
+// The caller's own pid. Not @export'd: the C libc already exports a
+// `getpid` symbol of its own.
+fn int getpid() {
+    return syscall(SYS_GETPID, 0, 0, 0);
+}
+
+// 1 if the caller's last syscall was a wait that a note cut short.
+fn bool interrupted() @export("interrupted") {
+    return syscall(SYS_INTERRUPTED, 0, 0, 0) == 1;
+}
+
+// --- await_any: wait on several sources at once (SYS_AWAIT) -----------
+// Blocks until at least one asked-for source is ready, then returns the
+// mask of everything ready right now. Consumes nothing: follow up with
+// ipc_recv / getchar / pipe_read, which then won't block.
+//   AW_MSG   — a message (or a driver's IRQ notify) is in our inbox
+//   AW_STDIN — getchar() has input (the console, or our stdin pipe)
+//   AW_PIPE0 << i — pipes[i] has bytes or is at EOF (up to 8 pipes)
+//   AW_TIMER — timeout_ticks (time-CSR ticks, see timebase_hz(); 0 = no
+//              timeout) went by
+//   AW_NOTE  — a note arrived (its handler runs as this call returns)
+// -1 on a bad argument.
+const uint AW_MSG   = 1;
+const uint AW_STDIN = 2;
+const uint AW_TIMER = 4;
+const uint AW_NOTE  = 8;
+const uint AW_PIPE0 = 256;
+
+fn int await_any(uint mask, ulong timeout_ticks, int* pipes, int npipes) @export("await_any") {
+    return syscall4(SYS_AWAIT, (long)mask, (long)timeout_ticks, (long)pipes, (long)npipes);
+}
+
+// --- shared segments (src/segment.c3) ------------------------------
+// segattach maps the segment called `name` (< 16 bytes) into this
+// address space and returns where, creating it — `size` bytes, rounded up
+// to pages, zero-filled, at most 4 MiB — if nobody has yet. Every process
+// that attaches the same name sees the same memory; an rfork child
+// inherits its parent's attachments. size 0 attaches only an existing
+// segment. The creator's uid (or root) may attach it. null on failure.
+// The segment's memory is freed once the last attachment is gone.
+fn char* segattach(char* name, ulong size) @export("segattach") {
+    long r = syscall_long(SYS_SEGATTACH, (long)name, (long)size, 0);
+    return r < 0 ? null : (char*)(uptr)r;
+}
+
+// Unmap a segment segattach mapped at `addr`. 0, or -1.
+fn int segdetach(char* addr) @export("segdetach") {
+    return syscall(SYS_SEGDETACH, (long)addr, 0, 0);
 }
 
 // Returns 0 and fills *state_out/*generation_out/*uid_out if pid is

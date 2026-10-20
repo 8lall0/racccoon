@@ -33,7 +33,7 @@ import std::nolibc::fmt;
 // already is (see user/sdd.c3's own header comment). Scanning past the
 // real max just finds nothing via proc_info's own -1; scanning under it
 // would silently miss live processes, so this errs high.
-const int PROCD_SCAN_MAX = 32;
+const int PROCD_SCAN_MAX = 128;
 
 fn uint procd_parse_pid(char* path)
 {

@@ -11,4 +11,5 @@ typedef int sig_atomic_t;
 #define SIG_ERR  ((void (*)(int))-1)
 void (*signal(int, void (*)(int)))(int);
 int raise(int);
+int kill(int, int);   /* posts the note the signal stands for — lib/racccoon-libc/src/rc_signal.c */
 #endif

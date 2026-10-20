@@ -9,6 +9,322 @@ import std::nolibc::fmt;
 
 int rfork_shared_value = 0;
 
+// proclimittest: more simultaneous processes than the old 16-slot table
+// held. PLT_N children each park in ipc_recv(); the parent checks every
+// one is live, then releases each with a message carrying a per-child
+// exit code and joins it. A wrong code means a message went to the wrong
+// slot; fewer than PLT_N forks means the table (or the page pool behind
+// each slot's kernel stack + inbox) ran out.
+const int PLT_N = 40;
+
+// segtest: named shared segments (src/segment.c3).
+fn void seg_test() {
+    int pass = 0;
+    int total = 0;
+
+    // 1. An rfork child inherits the attachment — and it's the same
+    // memory, not a copy: its write shows up here.
+    total++;
+    char* p = segattach("st", 8192);
+    bool ok = p != null;
+    if (ok) {
+        p[0] = 'A';
+        p[4096] = 'B';
+        uint g = 0;
+        int c = rfork(RFPROC, &g);
+        if (c == 0) {
+            bool seen = p[0] == 'A' && p[4096] == 'B';
+            p[1] = 'C';
+            exitcode(seen ? 1 : 2);
+        }
+        ok = join(c, g) == 1 && p[1] == 'C';
+    }
+    print("segtest: rfork child shares the segment: ");
+    if (ok) { pass++; print("ok\n"); } else { print("FAILED\n"); }
+
+    // 2. Attach by name from another address space (a child that
+    // detached its inherited mapping first).
+    total++;
+    ok = p != null;
+    if (ok) {
+        uint g = 0;
+        int c = rfork(RFPROC, &g);
+        if (c == 0) {
+            if (segdetach(p) != 0) { exitcode(3); }
+            char* q = segattach("st", 0);
+            if (q == null) { exitcode(4); }
+            bool seen = q[0] == 'A' && q[1] == 'C';
+            q[2] = 'D';
+            exitcode(seen ? 1 : 2);
+        }
+        ok = join(c, g) == 1 && p[2] == 'D';
+    }
+    print("segtest: attach by name sees the same pages: ");
+    if (ok) { pass++; print("ok\n"); } else { print("FAILED\n"); }
+
+    // 3. Last detach frees it: attaching the name again gets fresh,
+    // zeroed memory.
+    total++;
+    ok = p != null && segdetach(p) == 0;
+    if (ok) {
+        char* r = segattach("st", 4096);
+        ok = r != null && r[0] == 0 && r[1] == 0 && r[2] == 0;
+        if (r != null) { segdetach(r); }
+    }
+    print("segtest: freed on last detach: ");
+    if (ok) { pass++; print("ok\n"); } else { print("FAILED\n"); }
+
+    // 4. Create/destroy more segments than the table holds (16): only
+    // works if each one is really released.
+    total++;
+    int cycles = 0;
+    for (int i = 0; i < 24; i++) {
+        char[8] nm;
+        nm[0] = 'c'; nm[1] = (char)('a' + i); nm[2] = 0;
+        char* r = segattach(&nm[0], 65536);
+        if (r == null) { break; }
+        r[65535] = 1;
+        if (segdetach(r) != 0) { break; }
+        cycles++;
+    }
+    print("segtest: 24 create/destroy cycles: ");
+    if (cycles == 24) { pass++; print("ok\n"); } else { print("FAILED at "); print_uint((uint)cycles); print("\n"); }
+
+    // 5. Another uid may not attach root's segment.
+    total++;
+    char* pv = segattach("pv", 4096);
+    ok = pv != null;
+    if (ok) {
+        uint g = 0;
+        int c = rfork(RFPROC, &g);
+        if (c == 0) {
+            segdetach(pv);
+            setuid(77);
+            exitcode(segattach("pv", 0) == null ? 1 : 2);
+        }
+        ok = join(c, g) == 1;
+        segdetach(pv);
+    }
+    print("segtest: other uid refused: ");
+    if (ok) { pass++; print("ok\n"); } else { print("FAILED\n"); }
+
+    // 6. Exiting without a detach releases it too (proc_destroy's hook).
+    total++;
+    uint eg = 0;
+    int ec = rfork(RFPROC, &eg);
+    if (ec == 0) {
+        char* e = segattach("ex", 4096);
+        if (e == null) { exitcode(2); }
+        e[0] = 'Z';
+        exitcode(1);
+    }
+    ok = join(ec, eg) == 1;
+    if (ok) {
+        char* e2 = segattach("ex", 4096);
+        ok = e2 != null && e2[0] == 0;
+        if (e2 != null) { segdetach(e2); }
+    }
+    print("segtest: released when the last holder exits: ");
+    if (ok) { pass++; print("ok\n"); } else { print("FAILED\n"); }
+
+    // 7. A Mutex inside the segment works across processes: both sides
+    // hold it across a yield (so the other really blocks in futex_wait)
+    // and bump a shared counter. Needs SYS_FUTEX_WAKE to find a waiter in
+    // a *different* address space — it matches the physical word.
+    total++;
+    char* mseg = segattach("mx", 4096);
+    ok = mseg != null;
+    if (ok) {
+        Mutex* mx = (Mutex*)mseg;
+        int* counter = (int*)(mseg + 64);
+        const int MX_N = 200;
+        uint g = 0;
+        int c = rfork(RFPROC, &g);
+        for (int i = 0; i < MX_N; i++) {
+            mx.lock();
+            int v = *counter;
+            yield();
+            *counter = v + 1;
+            mx.unlock();
+        }
+        if (c == 0) { exitcode(1); }
+        ok = c > 0 && join(c, g) == 1 && *counter == 2 * MX_N;
+        if (!ok) { print("segtest: counter = "); print_uint((uint)*counter); print("\n"); }
+        segdetach(mseg);
+    }
+    print("segtest: Mutex in a segment, across processes: ");
+    if (ok) { pass++; print("ok\n"); } else { print("FAILED\n"); }
+
+    print("segtest: ");
+    print_uint((uint)pass);
+    print("/");
+    print_uint((uint)total);
+    print(pass == total ? " — PASS\n" : " — FAIL\n");
+}
+
+// notetest: notes (src/note.c3). Each case runs in an rforked child —
+// which inherits the shell's own note handler until it installs its own.
+int nt_count = 0;
+char[8] nt_first;
+
+fn void nt_handler(char* msg) {
+    if (nt_count == 0) {
+        for (int i = 0; i < 7; i++) { nt_first[i] = msg[i]; }
+        nt_first[7] = 0;
+    }
+    nt_count++;
+    noted(NCONT);
+}
+
+// Spin (yielding, so each trap can deliver a note) until `n` notes have
+// been handled or ~3 s pass.
+fn void nt_wait_count(int n) {
+    ulong end = rdtime() + timebase_hz() * 3;
+    while (nt_count < n && rdtime() < end) { yield(); }
+}
+
+fn void nt_settle() {
+    ulong end = rdtime() + timebase_hz() / 2;
+    while (rdtime() < end) { yield(); }
+}
+
+fn void note_test() {
+    int pass = 0;
+    int total = 0;
+
+    // 1. Three notes, queued at once, each handled in order.
+    total++;
+    uint g = 0;
+    int c = rfork(RFPROC, &g);
+    if (c == 0) {
+        nt_count = 0;
+        notify(&nt_handler);
+        nt_wait_count(3);
+        bool first_ok = nt_first[0] == 'p' && nt_first[1] == 'i' && nt_first[2] == 'n' && nt_first[3] == 'g' && nt_first[4] == '1';
+        exitcode(nt_count == 3 && first_ok ? 42 : 40 + nt_count);
+    }
+    nt_settle();
+    postnote(c, "ping1");
+    postnote(c, "ping2");
+    postnote(c, "ping3");
+    int r = join(c, g);
+    print("notetest: handler caught 3 queued notes in order: ");
+    if (r == 42) { pass++; print("ok\n"); } else { print("FAILED (code "); print_uint((uint)r); print(")\n"); }
+
+    // 2. No handler: a note kills (join returns -1).
+    total++;
+    c = rfork(RFPROC, &g);
+    if (c == 0) {
+        notify(null);
+        ulong end = rdtime() + timebase_hz() * 3;
+        while (rdtime() < end) { yield(); }
+        exitcode(7);
+    }
+    nt_settle();
+    postnote(c, "interrupt");
+    r = join(c, g);
+    print("notetest: no handler -> killed: ");
+    if (r == -1) { pass++; print("ok\n"); } else { print("FAILED (code "); print_uint((uint)r); print(")\n"); }
+
+    // 3. A blocked ipc_recv is cut short; interrupted() says why.
+    total++;
+    c = rfork(RFPROC, &g);
+    if (c == 0) {
+        nt_count = 0;
+        notify(&nt_handler);
+        char[8] b;
+        int rr = ipc_recv(&b[0], 8);
+        bool intr = interrupted();
+        exitcode(rr == -1 && intr && nt_count == 1 ? 5 : 6);
+    }
+    nt_settle();
+    postnote(c, "wake");
+    r = join(c, g);
+    print("notetest: blocked ipc_recv interrupted: ");
+    if (r == 5) { pass++; print("ok\n"); } else { print("FAILED (code "); print_uint((uint)r); print(")\n"); }
+
+    // 4. "kill" kills even with a handler installed.
+    total++;
+    c = rfork(RFPROC, &g);
+    if (c == 0) {
+        notify(&nt_handler);
+        ulong end = rdtime() + timebase_hz() * 3;
+        while (rdtime() < end) { yield(); }
+        exitcode(7);
+    }
+    nt_settle();
+    postnote(c, "kill");
+    r = join(c, g);
+    print("notetest: kill overrides the handler: ");
+    if (r == -1) { pass++; print("ok\n"); } else { print("FAILED (code "); print_uint((uint)r); print(")\n"); }
+
+    // 5. A group post reaches every member: a leader started with
+    // RFNOTEG and its own child; neither has a handler.
+    total++;
+    c = rfork(RFPROC | RFNOTEG, &g);
+    if (c == 0) {
+        notify(null);
+        uint g2 = 0;
+        rfork(RFPROC, &g2);   // the grandchild shares this note group
+        ulong end = rdtime() + timebase_hz() * 3;
+        while (rdtime() < end) { yield(); }
+        exitcode(7);
+    }
+    nt_settle();
+    int n = postnote_group(c, "interrupt");
+    r = join(c, g);
+    print("notetest: group post reached ");
+    print_uint((uint)n);
+    print(" processes (expect 2), leader killed: ");
+    if (n == 2 && r == -1) { pass++; print("ok\n"); } else { print("FAILED\n"); }
+
+    print("notetest: ");
+    print_uint((uint)pass);
+    print("/");
+    print_uint((uint)total);
+    print(pass == total ? " — PASS\n" : " — FAIL\n");
+}
+
+fn void proclimit_test() {
+    int[PLT_N] plt_pid;
+    uint[PLT_N] plt_gen;
+    int made = 0;
+    for (int i = 0; i < PLT_N; i++) {
+        int r = rfork(RFPROC, &plt_gen[i]);
+        if (r == 0) {
+            char[8] cb;
+            ipc_recv(&cb[0], 8);
+            exitcode((int)cb[0]);
+        }
+        if (r < 0) break;
+        plt_pid[i] = r;
+        made++;
+    }
+    int alive = 0;
+    for (int i = 0; i < made; i++) {
+        uint g = 0;
+        if (proc_info(plt_pid[i], null, &g, null) == 0 && g == plt_gen[i]) alive++;
+    }
+    int good = 0;
+    for (int i = 0; i < made; i++) {
+        char[8] m;
+        m[0] = (char)(i + 1);
+        ipc_send(plt_pid[i], 1, &m[0], 8);
+        if (join(plt_pid[i], plt_gen[i]) == i + 1) good++;
+    }
+    print("proclimittest: forked ");
+    print_uint((uint)made);
+    print(" alive ");
+    print_uint((uint)alive);
+    print(" reaped-with-right-code ");
+    print_uint((uint)good);
+    if (made == PLT_N && alive == PLT_N && good == PLT_N) {
+        print(" — PASS\n");
+    } else {
+        print(" — FAIL\n");
+    }
+}
+
 // threadcreate's own private stack for threadtest, and the shared
 // global the thread writes to — proving the parent can see what the
 // thread wrote is what makes this "shared memory," not just "a process
@@ -752,6 +1068,16 @@ fn bool shell_test_proc_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
         } else {
             if (join(oom_probe, oom_pg) != 7) { oom_probe_killed = true; }
         }
+        // A glutton that's already gone was OOM-killed mid-touch — the
+        // pressure the comment above promises. Counted on its own: with
+        // the 64-slot table every glutton gets a slot, so once they've
+        // all died and handed their RAM back the probe can succeed (the
+        // old 16-slot table refused an rfork first and hid that).
+        bool oom_glutton_killed = false;
+        for (int oi = 0; oi < oom_spawned; oi++) {
+            uint kg = 0;
+            if (proc_info(oom_pid[oi], null, &kg, null) != 0 || kg != oom_gen[oi]) { oom_glutton_killed = true; }
+        }
         // Reap the gluttons and confirm RAM comes back.
         for (int oi = 0; oi < oom_spawned; oi++) { kill(oom_pid[oi], oom_gen[oi]); }
         ulong oom_recover = rdtime() + timebase_hz() * 3;
@@ -771,7 +1097,7 @@ fn bool shell_test_proc_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
             }
             if (rc > 0) { oom_after_code = join(rc, rg); }
         }
-        bool oom_pressure = oom_rfork_refused || oom_probe_killed;
+        bool oom_pressure = oom_rfork_refused || oom_probe_killed || oom_glutton_killed;
         if (oom_spawned > 0 && oom_pressure && oom_after_code == 7) {
             print("oomtest: ok (demand-fault OOM kills the process, no panic, RAM recovered)\n");
         } else {
@@ -868,6 +1194,12 @@ fn bool shell_test_proc_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
         } else {
             print("fputest: FAILED (rfork)\n");
         }
+    } else if (strcmp(cmd, "notetest") == 0) {
+        note_test();
+    } else if (strcmp(cmd, "segtest") == 0) {
+        seg_test();
+    } else if (strcmp(cmd, "proclimittest") == 0) {
+        proclimit_test();
     } else if (strcmp(cmd, "rforktest") == 0) {
         // Plain rfork(RFPROC): the child gets an independent copy of
         // this process's address space (src/syscalls.c3's SYS_RFORK,

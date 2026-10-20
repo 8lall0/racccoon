@@ -11,7 +11,7 @@ module kernel;
 // that races far ahead of its consumer, just blocks until space frees
 // — never grows. Fine at shell scale.
 
-const int PIPES_MAX = 6;
+const int PIPES_MAX = 16; // was 6 — scaled with PROCS_MAX 16 -> 64 (4 KiB BSS each)
 const int PIPE_BUF  = 4096;
 
 struct Pipe
@@ -92,4 +92,12 @@ fn int pipe_try_get(int id, char* out)
 		return 0;
 	}
 	return pipes[id].writers == 0 ? 2 : 1;
+}
+
+// Would a read of pipe `id` return without blocking — bytes buffered, or
+// EOF (no writers left, or the pipe is gone)? SYS_AWAIT's pipe check.
+fn bool pipe_ready(int id)
+{
+	if (!pipe_valid(id)) { return true; }
+	return pipes[id].count > 0 || pipes[id].writers == 0;
 }

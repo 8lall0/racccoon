@@ -35,6 +35,7 @@ fn void main() {
     // wait much longer than this before sending anything anyway.
     // timebase_hz() so an OPI_TEST_SHELL=1 build on the sifive_u harness
     // (1 MHz) settles in 3 s, not 30.
+    shell_notes_init();   // catch ^C (src/note.c3) instead of dying of it
     shell_boot_settle(timebase_hz() * 3);
     shell_bind_user_bin();   // union /usr/root/bin onto /bin (docs/bin-layout.md)
     for (;;) {

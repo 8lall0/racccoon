@@ -425,3 +425,50 @@ int usleep(unsigned usec)
 	do { __asm__ volatile ("rdtime %0" : "=r"(now)); } while (now - start < ticks);
 	return 0;
 }
+
+/* --- poll(2), on SYS_AWAIT ------------------------------------------- */
+#include <poll.h>
+
+#define RC_AW_STDIN 2
+#define RC_AW_NOTE  8
+
+unsigned long __rc_timebase_hz(void);
+
+static int poll_scan(struct pollfd *fds, nfds_t n, int stdin_ready, int *want_stdin)
+{
+	int count = 0;
+	*want_stdin = 0;
+	for (nfds_t i = 0; i < n; i++) {
+		struct pollfd *p = &fds[i];
+		p->revents = 0;
+		if (p->fd < 0) continue;
+		if (p->fd >= FD_MAX || fdtab[p->fd].kind == K_FREE) { p->revents = POLLNVAL; count++; continue; }
+		if (fdtab[p->fd].kind == K_FILE) {
+			p->revents = p->events & (POLLIN | POLLOUT);
+		} else {                                   /* the console fds */
+			p->revents = p->events & POLLOUT;
+			if (p->fd == 0 && (p->events & POLLIN)) {
+				if (stdin_ready) p->revents |= POLLIN; else *want_stdin = 1;
+			}
+		}
+		if (p->revents) count++;
+	}
+	return count;
+}
+
+int poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
+{
+	fd_init();
+	int want_stdin;
+	int n = poll_scan(fds, nfds, 0, &want_stdin);
+	if (n > 0 || (!want_stdin && timeout_ms == 0)) return n;
+	/* Nothing ready yet: only stdin can become ready (or the timeout).
+	 * timeout 0 = just look (1 tick), < 0 = forever (no timeout). */
+	unsigned long ticks = 0;
+	if (timeout_ms == 0) ticks = 1;
+	else if (timeout_ms > 0) ticks = __rc_timebase_hz() / 1000 * (unsigned long)timeout_ms + 1;
+	long r = __rc_syscall5(want_stdin ? RC_AW_STDIN : 0, (long)ticks, 0, 0, 0, RC_SYS_AWAIT);
+	if (r < 0) { errno = EINVAL; return -1; }
+	if (r & RC_AW_NOTE) { errno = EINTR; return -1; }
+	return poll_scan(fds, nfds, (r & RC_AW_STDIN) != 0, &want_stdin);
+}

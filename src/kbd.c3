@@ -17,7 +17,10 @@ module kernel;
 // here and Stage C runs them on different harts. kbd_lock makes the
 // head/tail update atomic w.r.t. the other side.
 
-const uint KBD_QUEUE_SIZE = 64;
+// 256: the serial console drains in here too now (src/note.c3's
+// console_poll, from the timer tick even when nobody is reading), so it
+// holds type-ahead the UART's own FIFO used to.
+const uint KBD_QUEUE_SIZE = 256;
 
 char[KBD_QUEUE_SIZE] kbd_queue;
 uint kbd_queue_head; // next slot to write
@@ -45,4 +48,13 @@ fn int kbd_queue_pop()
     kbd_queue_tail = (kbd_queue_tail + 1) % KBD_QUEUE_SIZE;
     kbd_lock.release();
     return (int)((uint)c & 0xFF);
+}
+
+// True when a keystroke is waiting (SYS_AWAIT's stdin-readable check).
+fn bool kbd_queue_nonempty()
+{
+    kbd_lock.acquire();
+    bool ne = kbd_queue_head != kbd_queue_tail;
+    kbd_lock.release();
+    return ne;
 }

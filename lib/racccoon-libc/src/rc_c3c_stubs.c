@@ -40,14 +40,9 @@ void bench_mark(const char *label) { (void)label; }
 
 /* --- POSIX bits racccoon libc doesn't have yet; c3c's uses are all in
  *     error/cleanup paths that don't fire in a normal --backend=c run. */
-int kill(int pid, int sig) { (void)pid; (void)sig; return -1; }
 int symlink(const char *t, const char *l) { (void)t; (void)l; return -1; }
 char *mkdtemp(char *tmpl) { return tmpl; } /* caller-provided template used as-is */
 
-/* signal(2): c3c installs a SIGINT handler for Ctrl-C during a build.
- * racccoon delivers no such signal to a process — accept and ignore. */
-void (*signal(int sig, void (*h)(int)))(int) { (void)sig; (void)h; return (void (*)(int))0; }
-int raise(int sig) { (void)sig; return 0; }
 
 /* popen/pclose: c3c shells out to the external linker on a full `build`.
  * `c3c compile --backend=c` (emit .c only) never reaches these. */

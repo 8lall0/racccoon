@@ -490,6 +490,9 @@ fn void ipc_timeout_sweep() @noinline
 		return;
 	}
 	g_housekeeping_deadline = hk_now + board::TIMEBASE_HZ;
+	// ^C while every process is parked in a kernel wait (no sret, so no
+	// timer tick either — see yield()'s comment): src/note.c3.
+	console_poll();
 
 	for (int hk_i = 0; hk_i < PROCS_MAX; hk_i++)
 	{
@@ -499,6 +502,22 @@ fn void ipc_timeout_sweep() @noinline
 			hk_p.ipc_timed_out = true;
 			hk_p.ipc_call_deadline = 0;
 			if (hk_p.state == PROC_BLOCKED) { hk_p.state = PROC_RUNNABLE; }
+		}
+		// Safety net for the FIFO send queue: a queued sender sleeps
+		// until ipc_inbox_freed wakes it. Every known way an inbox frees
+		// up calls that, but a missed one would hang the sender forever
+		// — so nudge every queued sender once a second to re-check.
+		// Spurious wakes are harmless (the loops re-test and sleep).
+		if (hk_p.ipc_q_target != 0 && hk_p.state == PROC_BLOCKED)
+		{
+			Process* hk_t = &procs[hk_p.ipc_q_target - 1];
+			if (!hk_t.has_message && !hk_t.in_call_reply_wait && hk_t.ipc_q_head == hk_p.pid)
+			{
+				// It could have deposited: a wake was missed. Say so —
+				// this is a bug to fix, the net only keeps it from hanging.
+				io::printfn("ipc: queued sender pid=%d rescued by the sweep (missed wake, target pid=%d)", hk_p.pid, hk_t.pid);
+			}
+			hk_p.state = PROC_RUNNABLE;
 		}
 	}
 }
@@ -544,6 +563,9 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 			// enabled — an interrupt storm, not a periodic tick.
 			arm_timer(board::TIMEBASE_HZ);
 			timer_tick_count += 1;
+			// Nobody may be reading the console (a compute loop in the
+			// foreground) — look for a ^C here too (src/note.c3).
+			console_poll();
 
 			// Boot-server supervision + the IPC-call timeout sweep, both
 			// via kernel_housekeeping(): ipc_timeout_sweep() (also run
@@ -604,7 +626,13 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 		// failure still sets it to (ulong)(-1), so "non-negative" is the
 		// right success test, not "== 0" (argc can genuinely be nonzero).
 		bool just_execd = syscall_num == SYS_EXEC && (long)f.a0 >= 0;
-		if (!just_execd)
+		// SYS_NOTED (src/note.c3) likewise just restored the interrupted
+		// context's own resume address into saved_sepc — leave it alone.
+		if (current_proc.note_resumed)
+		{
+			current_proc.note_resumed = false;
+		}
+		else if (!just_execd)
 		{
 			current_proc.saved_sepc = user_pc + 4;
 		}
@@ -638,6 +666,16 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 		}
 		io::printfn("unexpected trap scause=%x, stval=%x, sepc=%x, current_pid=%d\n", scause, stval, user_pc, current_proc.pid);
 		panic::panic("it's a trap!");
+	}
+
+	// Deliver a pending note (src/note.c3) on the way back to user mode.
+	// A user process only — never idle or the kernel's own S-mode code
+	// (sstatus.SPP == 1). May not return: a note with no handler (or
+	// "kill") tears the process down like a user fault.
+	if (current_proc.note_count > 0 && current_proc != idle_proc
+		&& (read_reg("sstatus") & SSTATUS_SPP) == 0)
+	{
+		note_deliver(f);
 	}
 
 	// The one place the real sepc CSR actually gets written, always

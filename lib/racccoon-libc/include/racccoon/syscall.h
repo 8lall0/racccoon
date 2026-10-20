@@ -28,6 +28,10 @@
 #define RC_SYS_STDIN_ISATTY 48
 #define RC_SYS_TIMEBASE     49
 #define RC_SYS_GETPID       50
+#define RC_SYS_POSTNOTE     61   /* src/note.c3 — signal()/raise()/kill() sit on notes */
+#define RC_SYS_NOTIFY       62
+#define RC_SYS_NOTED        63
+#define RC_SYS_AWAIT        65   /* poll() */
 
 /* rfork(2) flags (user/user.c3 authoritative) */
 #define RC_RFPROC             (1 << 0)

@@ -3,8 +3,270 @@
 Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
+## 2026-10-20 (latest) — the five "honest list" items confirmed on the real Duo
 
-## 2026-10-18 (latest) — Go runs on the real Duo; tcc re-checked there
+One flash of the dev-shell kernel (`DUO_TEST_SHELL=1 reflash_duo.sh`)
+plus `populate_duo_bin.sh` for `/bin/note` and `sigtest`, driven over
+the serial console.
+
+**New tests:** `proclimittest` (40/40), `ipcfifotest` (5/5 in arrival
+order), `notetest` 5/5, `awaittest` 4/4, `segtest` 7/7 (including the
+cross-process `Mutex`), and `echo hi | sigtest` all pass.
+
+**Real `^C` over the serial line:**
+- at the prompt: the half-typed line was dropped and nothing ran;
+- a compute-bound `wasm /lib/lua.wasm -e "while true do end"`, still
+  running after 5 s, was back at the prompt about 1 s after the `^C`
+  (the timer tick is 1 s);
+- a `while (true) { true }` loop, a blocked `ed` and `dmesg -f` all
+  stopped;
+- a background Lua job survived a `^C` at the prompt and `wait` printed
+  its `bgdone`.
+
+**Existing tests, unchanged:** `rforktest`, `threadtest` (output
+identical to QEMU), `threadjointest`, `racetest`, `mutextest`,
+`killtest`, `ipcdeathtest`, `hungservertest`, `faulttest`, `oomtest`,
+`maptest`, `fputest`, `pstest`, `srvtest`, `envtest`, `runtest`,
+`elftest`, `argvtest`, `permtest`, all four killtests
+(fsd/storage/usbd/gpiod), the six Go tests, `luatest`, `wasmtest`,
+`wasitest`, `tcctest`, and `camtest` (chip-ID 0x2083).
+
+`/bdt` (left by last session's `bigdirtest keep`) is no longer on the
+card.
+
+---
+## 2026-10-20 (5/5) — shared memory: named segments (`segattach`), and futexes keyed by physical address
+
+Last of the five "honest list" items in `docs/manual.md` §14 (branch
+`honest-list`). Two processes had no way to share memory, only threads
+(`RFMEM`) and the driver-only DMA arenas.
+
+`src/segment.c3`, Plan 9's `segattach` cut down:
+- `SYS_SEGATTACH`(66) `name, size` maps a named, zero-filled,
+  physically contiguous run of pages (≤ 4 MiB) at `heap_top`, creating it
+  the first time the name is used. `SYS_SEGDETACH`(67) unmaps it.
+- The pages are mapped `PAGE_SHARED`, so the existing teardown walks
+  (`proc_destroy`, exec's PTE clear) never free them as the process's own,
+  and rfork's copy walk already maps such pages into the child instead of
+  copying them. Nothing in those walkers had to change.
+- Lifetime is a refcount of **attachments**, keyed by page table (so RFMEM
+  threads share one). Hooks: `proc_destroy` and exec release a table's
+  attachments, and rfork duplicates them. rfork checks attachment-table
+  space up front, so the child never maps pages it holds no reference to.
+- The creator's uid owns a segment; root or that uid may attach it.
+
+**A real bug the segments exposed: `SYS_FUTEX_WAKE` matched waiters by
+`page_table` equality.** That works for threads, but a `Mutex` placed in
+a shared segment would put a contending *process* to sleep in
+`futex_wait`, and the other process's `unlock` would never wake it.
+Futexes are now keyed by the **physical** address of the word
+(`user_vaddr_to_paddr`, page.c3; `Process.futex_paddr`). It means the
+same thing for private memory and threads (same table and vaddr, same
+page), and is correct across a segment.
+
+Test: `segtest`, 7 cases:
+- an rfork child sees and writes the parent's segment;
+- attach by name from another address space;
+- a re-attach after the last detach gets zeroed memory;
+- 24 create/destroy cycles against a 16-entry table;
+- another uid is refused;
+- an exit without detaching releases the segment;
+- a `Mutex` inside a segment, contended across two processes with a
+  `yield()` inside the critical section; the counter ends at 400.
+
+## 2026-10-20 (4/5) — `SYS_AWAIT`: wait on the inbox, stdin, pipes and a timeout at once, plus libc `poll()`
+
+`SYS_AWAIT`(65) / `await_any(mask, timeout_ticks, pipes, npipes)` returns
+the mask of everything ready and consumes nothing; the caller follows up
+with `ipc_recv` / `getchar` / `pipe_read`, which then won't block.
+- Sources: `AW_MSG` (the inbox, or a driver's IRQ notify), `AW_STDIN` (the
+  console, or the process's stdin pipe when redirected), up to 8 pipes
+  (`AW_PIPE0 << i`), and `AW_TIMER`.
+- `AW_NOTE` is reported whenever a note arrives, asked for or not.
+- A mask of only `AW_MSG` sleeps (a delivery already wakes a blocked
+  receiver). Anything that has to be polled spins with `yield()`, the
+  same as `getchar`.
+
+`AW_STDIN` covers "stdin", not just "the console", so that libc could
+get a `poll()` (new `<poll.h>`). The libc only knows fd 0, not which
+kernel pipe is behind it. Regular files are always ready, and a note
+makes `poll` return `EINTR`.
+
+One deliberate detail: the loop reads the clock through `time_now()`, a
+`@noinline` call, not `read_reg("time")` inline. `SYS_NS_MOUNT_WAIT`'s
+comment records `read_reg`'s invisible t0/t1 clobber corrupting live
+locals inside exactly this kind of loop.
+
+Tests:
+- `awaittest`: a timeout alone; a message from a child; a pipe a child
+  writes into, with an idle `AW_MSG` also in the mask; a note cutting a
+  10 s wait short.
+- `test/c-src/sigtest.c` (`echo hi | sigtest`) covers `poll` on piped
+  stdin and a 300 ms `poll` timeout.
+
+## 2026-10-20 (3/5) — notes: `^C`, `notify`/`noted`, note groups, libc `signal()`
+
+Plan 9 notes (`src/note.c3`). A note is a short string, posted by
+`SYS_POSTNOTE`(61) to a pid or a note group, or by the console's `^C`
+(`"interrupt"` to `console_noteg`, the shell's group). It is delivered
+at the tail of `handle_trap`, on the way back to U-mode:
+- **No handler, or `"kill"`:** `proc_destroy` + `yield`, the user-fault
+  path.
+- **A handler** (`SYS_NOTIFY`(62)):
+  - the trap frame, sepc and FP registers are parked in the Process;
+  - the message is copied 128 bytes below the user sp;
+  - the process resumes in `handler(msg)` with `ra = 0`, so returning
+    instead of calling `noted` faults.
+- **`SYS_NOTED`(63) `NCONT`** restores the parked context. `handle_trap`
+  then skips its `sepc += 4`, the same way it already does after a
+  successful exec (`Process.note_resumed`).
+- Up to 5 notes queue per process; more arrive while the handler runs and
+  wait their turn.
+
+**Interruptible waits** return −1 when a note is deliverable, with
+`Process.note_intr` set. `SYS_INTERRUPTED`(64) reads it once. It is
+cleared at every other syscall's entry, and saved and restored around
+the handler (the handler's own syscalls would otherwise clear it before
+the interrupted caller looks). The interruptible waits are:
+- `getchar` (console and pipe), `join`, `futex_wait`;
+- pipe read/write, `ipc_recv`/`_gen`;
+- the queued phase of `ipc_send` / `ipc_call`.
+
+Waits where the server already holds the request stay uninterruptible
+(15 s timeout). `user.c3`'s `join` retries after an interruption.
+
+**Note groups:** `create_process` → own group. rfork shares the parent's
+group unless the new `RFNOTEG` flag is given. exec clears the handler and
+keeps pending notes.
+
+**^C plumbing:** `console_poll()` drains `board::console_getchar()` into
+the keystroke queue (raised to 256) and turns `0x03` into the note. It
+runs:
+- on every `SYS_GETCHAR` / `_NB` pass;
+- on the timer tick, so a compute loop is caught;
+- rate-limited in `join` (the shell waiting on its foreground job);
+- in the 1/s housekeeping (everything blocked).
+
+`SYS_KBD_PUSH` does the same for a USB keyboard's `^C`.
+
+**Shell:**
+- a handler sets `g_interrupted`;
+- readline drops the line;
+- `for` / `while` / `;` sequences stop;
+- `&` jobs and the `mountusb` fsd are rforked `RFNOTEG`;
+- the flag is cleared at each prompt.
+
+**`/bin/note [-g] pid [msg]`** posts a note by hand. **libc:**
+`signal`/`raise`/`kill` now sit on notes (`rc_signal.c`) instead of
+being ignored.
+
+**A stale-flag hole, found in testing:** one interactive run dropped a
+command line silently. A `^C` handled while the shell was *not* inside
+`getchar` (echoing, reaping a job) left `g_interrupted` set, and the
+next command's `shell_exec_line` saw it and stopped. readline only
+looked at the flag when `getchar` failed. It now checks after every
+`getchar`, so a `^C` landing anywhere during typing cancels that line
+and nothing later. I couldn't reproduce the original miss afterwards
+(0/20 in a stress of `^C` at an idle prompt); the original log was
+overwritten.
+
+Tests:
+- `notetest`, 5 cases: 3 queued notes handled in order; no handler →
+  killed; a blocked `ipc_recv` interrupted with `interrupted()` true;
+  `"kill"` overrides a handler; a group post reaches the leader and its
+  child.
+- An interactive pty driver, 8 cases, all ok on several runs:
+  - `^C` at the prompt;
+  - a compute-bound `wasm lua -e "while true do end"`, checked still
+    running at the `^C` and killed in ~0.1 s;
+  - `ed` blocked on the console;
+  - a `while (true) { true }` loop;
+  - a background job surviving a `^C`;
+  - `dmesg -f`.
+- `sigtest`: `raise(SIGINT)` runs the handler; `SIG_IGN` ignores it.
+
+## 2026-10-20 (2/5) — FIFO send queue: senders sleep in arrival order instead of yield-spinning
+
+Before: a sender finding a busy inbox (`ipc_send` phase A, `ipc_reply`
+phase A, `ipc_call` phase 1) yield-spun while RUNNABLE. Whoever the
+round-robin scan reached next took the slot, and every waiter burned a
+timeslice per pass.
+
+Now each waiter links itself onto the target's queue
+(`Process.ipc_q_head/next/target`) and sleeps:
+- Only the head may deposit (`ipc_can_deposit`). The exception is the
+  reply a calling client's inbox is reserved for, which bypasses the
+  queue.
+- `ipc_inbox_freed(target)` wakes the queue everywhere the inbox frees:
+  `recv`/`recv_gen`/`poll`, the call's reply consume and every bail-out,
+  and the timeout yank.
+- `proc_destroy` unlinks a dying waiter. Removal is search-based, so a
+  waiter outliving a reset or reused target slot is harmless.
+- A safety net in the 1/s sweep nudges queued sleepers and **logs** any
+  it had to rescue (`ipc: queued sender … rescued`). It never fired in
+  any run.
+
+Test: `ipcfifotest`. A server stays busy for 3 s while five clients
+queue, arriving in the *reverse* of pid order; each checks the position
+it was served in.
+- **A/B:** master's kernel (worktree build, same test) serves 1/5 in
+  order (`22221`, effectively pid order); the queue serves 5/5.
+- The first version of the test failed on the new kernel too. Its
+  arrivals were staggered over 0.3 s, but forking five copies of the
+  569 KB test shell takes longer than that under TCG, so every client
+  called the moment it was created. It's now 1.5 s plus 200 ms steps.
+
+## 2026-10-20 (1/5) — 64 processes: kernel stacks and inboxes move into the page pool
+
+`PROCS_MAX` 16 → 64. The cap was really about memory. `Process` carried
+its 64 KiB kernel stack and 8 KiB IPC inbox inline, so every slot cost
+~75 KiB of BSS whether used or not. Both are now page-pool allocations:
+- `proc_slot_buffers` allocates them the first time a slot is used and
+  keeps them for every later occupant.
+- They are never freed: `proc_destroy(current_proc)` still runs on that
+  stack. Keeping them also avoids fragmenting the pool.
+- Kernel BSS went 1.57 MB → 0.55 MB, 0.61 MB with the later note fields.
+- Bonus: the stack top is page-aligned now, so the `& ~15` workaround for
+  the Orange Pi's misaligned-sscratch fault is gone with its cause.
+
+Alongside: `PIPES_MAX` 6 → 16; envd's table 64 → 256; procd/ps/top scan
+bounds; `rfork` returns −1 if a never-used slot can't get its buffers.
+
+Test: `proclimittest`. 40 rforked children park in `ipc_recv`; all are
+checked alive, then each is released with a message carrying its own
+exit code and joined.
+
+**`oomtest` on FAT32 started failing, and the test was wrong.** It
+claims pressure if a glutton is OOM-killed, but it only counted a refused
+rfork or a killed probe. With 16 slots, rfork ran out of *slots* before
+memory, which hid this. With 64 slots, all 8 gluttons start, die of OOM,
+hand their RAM back, and the probe succeeds. A dead glutton now counts
+as pressure, as the comment said all along.
+
+### Verified (all five stages)
+
+QEMU, full regression against a freshly built master baseline:
+- 48 tests on ext2 and on FAT32, 9 on the dual image;
+- plus `proclimittest`, `ipcfifotest`, `notetest`, `awaittest`,
+  `segtest`, `sigtest`.
+
+Per-test output is identical to master except:
+- `sandboxtest`'s interleaving;
+- the expected extra OOM-kill lines in `oomtest`;
+- the boot-echo spacing of the first command.
+
+`bigreadtest` on the dual image fails identically on master.
+
+Also: two more boots each of ext2 and FAT32 with the new tests, the
+kill/respawn tests, `racetest`, `mutextest` and `gostage2test`; the `^C`
+pty driver; `e2fsck -fn` and `fsck.fat -n` clean on the run images. The
+safety-net rescue line never appeared.
+
+The Duo run is the entry above.
+
+---
+
+## 2026-10-18 — Go runs on the real Duo; tcc re-checked there
 
 Until now Go was QEMU-only, and the plan said the Duo could at most boot a
 hello world. All six Go test programs now pass on the real CV1800B:

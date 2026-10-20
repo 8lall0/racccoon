@@ -244,6 +244,7 @@ C3_OPT=-O2 build_user_program_stdio mkdir $STDIO_COMMON user/bin/mkdir.c3
 C3_OPT=-O2 build_user_program_stdio mv $STDIO_COMMON user/bin/mv.c3
 C3_OPT=-O2 build_user_program_stdio chmod $STDIO_COMMON user/bin/chmod.c3
 C3_OPT=-O2 build_user_program_stdio chown $STDIO_COMMON user/bin/chown.c3
+C3_OPT=-O2 build_user_program_stdio note $STDIO_COMMON user/bin/note.c3
 # test/[ and expr — the primitives the shell's if/for/while build on
 # (docs/roadmap.md §2.5). One test.bin is seeded as both /bin/test and
 # /bin/[ by scripts/build.sh / populate_duo_bin.sh.

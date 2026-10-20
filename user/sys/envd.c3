@@ -36,7 +36,7 @@ import std::nolibc::mem;
 //   FS_LIST("")           -> every var belonging to the caller
 //   FS_DELETE("<name>")   -> remove the caller's own var
 
-const int ENV_MAX = 64;        // flat table across all processes — PROCS_MAX (16) * ~4 vars/process
+const int ENV_MAX = 256;       // flat table across all processes — PROCS_MAX (64) * ~4 vars/process
 const int ENV_NAME_MAX = 32;   // matches FS_LIST_NAME_MAX (user.c3) exactly — a name IS a list-record name
 const int ENV_VALUE_MAX = 64;  // short values, same order as procd's own status fields
 

@@ -17,6 +17,7 @@ fn void main() {
     // the sifive_u harness (1 MHz -> was 150 s). QEMU (10 MHz) drops from
     // 15 s to 6 s — a shorter settle only risks a little boot chatter
     // after the first prompt, never a hang.
+    shell_notes_init();   // catch ^C (src/note.c3) instead of dying of it
     shell_boot_settle(timebase_hz() * 6);
 
     // The console comes up needing a login — `login: <name>`, matched

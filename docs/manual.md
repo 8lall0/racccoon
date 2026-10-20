@@ -14,8 +14,8 @@ protocol, servers reached by name.
 
 > This is an experiment, not a product. There is **no stable ABI** —
 > syscall numbers, wire formats and helper signatures change whenever it
-> is convenient. This manual describes the tree as of commit `ce1aec4`
-> (2026-09-06). When in doubt, the source is authoritative:
+> is convenient. This manual describes the tree as of 2026-10-20 (notes,
+> `SYS_AWAIT`, shared segments, the FIFO send queue, 64 processes). When in doubt, the source is authoritative:
 > `src/syscalls.c3` for syscalls, `user/user.c3` for the userspace API.
 
 Contents:
@@ -164,10 +164,13 @@ about:
 | `heap_top` / `map_floor` | the `SYS_MAP` bump region |
 | `stdout_pipe` / `stdin_pipe` | `-1` = console, else a pipe id |
 | `name` | short label for `ps` / `top` (argv[0] basename, or the server name) |
+| `noteg` / `note_handler` | note group and note handler — see §2.7 |
 
-There are **16 slots** total. `pid = slot + 1`. When a process exits its
+There are **64 slots** total. `pid = slot + 1`. When a process exits its
 slot is freed and the next occupant gets the same pid but an incremented
-`generation`.
+`generation`. A slot's 64 KiB kernel stack and 8 KiB IPC inbox come
+from the page pool the first time the slot is used and stay with it, so
+slots that are never used cost almost nothing.
 
 ### 2.2 Address space
 
@@ -195,9 +198,9 @@ its own page table.
   **demand-paged**: `SYS_MAP` reserves the range, a page fault in it
   maps one zero page. This is the userspace "give me a heap" primitive —
   `/bin/wasm`'s linear memory, the real-stdlib allocator, Go's arena.
-- There is **no `mmap` of files, no shared memory between user
-  processes** (except a couple of driver-only identity-mapped DMA
-  arenas). Everything else moves over IPC.
+- **Shared segments** (`segattach`, §2.8) are the one way two
+  processes share memory (besides a couple of driver-only identity-mapped
+  DMA arenas). There is **no `mmap` of files**; file data moves over IPC.
 
 ### 2.3 rfork, exec, threads
 
@@ -217,6 +220,9 @@ int rfork(int flags, uint* generation_out);
   its next call. Use `threadcreate()` (below), which gives the child a
   fresh stack and entry point in `@naked` asm before any C control flow
   touches the shared stack.
+- `RFNOTEG` — the child starts its own note group (§2.7) instead of
+  sharing the parent's, so a `^C` aimed at the parent's group doesn't
+  reach it. The shell uses it for `&` jobs.
 - `rfork_io(flags, gen_out, stdout_pipe, stdin_pipe)` — `rfork` plus
   atomic pipe wiring, closing the race a follow-up `pipe_setout` leaves
   open. This is what the shell uses for `|` `>` `<`.
@@ -252,8 +258,12 @@ Give it a stack buffer you own; `func(arg)` runs on it. `func` must call
   coarse — a tight non-yielding loop can hold the CPU for up to a
   second before it is forced off.
 - **Blocking syscalls** (`SYS_GETCHAR`, `SYS_IPC_RECV`, `SYS_JOIN`,
-  `SYS_FUTEX_WAIT`, `SYS_IPC_CALL`, `SYS_NS_MOUNT_WAIT`) spin a
-  `yield()` loop in the kernel until their condition is met.
+  `SYS_FUTEX_WAIT`, `SYS_IPC_CALL`, `SYS_AWAIT`, `SYS_NS_MOUNT_WAIT`)
+  wait inside the kernel: some sleep (`PROC_BLOCKED`, woken by whatever
+  they wait for — a message delivery, a futex wake, a note), the ones
+  that must poll (console, pipes, join) spin a `yield()` loop. A sender
+  that finds a server's inbox busy sleeps in that server's FIFO queue
+  (§6.1). Most of these waits are cut short by a note (§2.7).
 - `SYS_YIELD` / `yield()` gives up the rest of the current slice once.
 - There is **no priority, no nice, no real-time**. Cooperative code
   that `yield()`s in its wait loops (every server, the shell) keeps the
@@ -270,7 +280,8 @@ Give it a stack buffer you own; `func(arg)` runs on it. `func` must call
 - `kill(pid, expected_generation)` — root, or exact same uid as the
   target. `generation` 0 = wildcard. A peer blocked mid-IPC-rendezvous
   with the killed process is released with `-1` rather than hanging
-  forever.
+  forever. (The gentler, catchable way to stop a process is a note,
+  §2.7.)
 
 ### 2.6 Out-of-memory
 
@@ -279,6 +290,55 @@ allocating syscall fails cleanly rather than panicking. A userspace
 page fault with `SPP == 0` kills just that process (the supervisor
 respawns it if it was a boot server). There is **no swap** and none is
 planned.
+
+### 2.7 Notes (signals) and `^C`
+
+Racccoon has Plan 9's **notes** (`src/note.c3`): a note is a short
+string posted to a process — `postnote(pid, msg)`, `postnote_group(g,
+msg)`, or the console's `^C`, which posts `"interrupt"` to the console's
+note group. It is delivered the next time the process is about to return
+to user mode:
+
+- **No handler** (the default), or the note is `"kill"`: the process dies
+  (exit status −1), exactly like a user fault.
+- **A handler** (`notify(&h)`): the process resumes in `h(char* msg)` on
+  a small stack carved below the interrupted one. `h` must finish with
+  `noted(NCONT)` (resume where it was interrupted — registers, sepc and
+  FP state are restored) or `noted(NDFLT)` (die). Returning from `h`
+  instead faults and kills. Notes arriving while `h` runs queue (up to 5
+  per process).
+
+A process **sleeping in a wait** when a note arrives is woken and the
+syscall returns −1: `getchar`, `join`, `futex_wait`, `pipe_read` /
+`pipe_write`, `ipc_recv`, `await_any`, and `ipc_send` / `ipc_call` while
+still queued for a busy server. `interrupted()` tells that −1 apart from
+a real failure. Waits where a server already holds the request (the
+rest of `ipc_call`, `ipc_reply`) aren't interrupted; the note lands as
+soon as they finish (bounded by the 15 s call timeout). `join()` itself
+retries after the handler ran.
+
+**Note groups.** Every process is in one (`Process.noteg`). A
+kernel-spawned process starts its own; an `rfork` child shares its
+parent's unless `RFNOTEG` is given. The console's `^C` goes to the
+shell's group: the shell (which has a handler — it drops the line being
+typed, and stops a running loop or `;` sequence) and its foreground
+children (which, without a handler, die). Background jobs and boot
+servers are in other groups and don't see it. The console is checked
+for `^C` on every `getchar`, while the shell waits in `join`, and on the
+timer tick — so even a tight compute loop stops within about a second.
+
+### 2.8 Shared segments
+
+`segattach(name, size)` maps a **named** run of physical pages into the
+caller's address space (`src/segment.c3`), creating it — zero-filled,
+`size` rounded up to pages, at most 4 MiB — the first time the name is
+used. Another process attaching the same name gets the same pages; an
+`rfork` child inherits its parent's attachments (they're shared, not
+copied). `segdetach(addr)` unmaps one; the memory is freed when the last
+attachment goes (a detach, an `exec`, or an exit). Names are global (16
+segments, 15-byte names); the creator's uid owns a segment, and only
+root or that uid may attach it. Synchronise with `Mutex` / `futex_*` on
+a word inside the segment.
 
 ---
 
@@ -348,8 +408,8 @@ completeness but only the matching server can use them.
 | # | name | args → return | notes |
 | --- | --- | --- | --- |
 | 3 | `SYS_EXIT` | `a0` = code → *never returns* | frees pages, wakes joiners |
-| 11 | `SYS_RFORK` | `flags, gen_out*, stdout_pipe, stdin_pipe` → child pid / 0 / -1 | `RFPROC` required; `RFMEM` shares AS |
-| 13 | `SYS_JOIN` | `pid, generation` → 0 / -1 | blocks until that instance is gone |
+| 11 | `SYS_RFORK` | `flags, gen_out*, stdout_pipe, stdin_pipe` → child pid / 0 / -1 | `RFPROC` required; `RFMEM` shares AS; `RFNOTEG` new note group |
+| 13 | `SYS_JOIN` | `pid, generation` → exit code / -1 | blocks until that instance is gone; -1 + `interrupted()` on a note |
 | 24 | `SYS_EXEC` | `image*, image_len, argv_len, _, argc` → -1 / *redirects* | ELF64 or flat; argv blob after image |
 | 27 | `SYS_YIELD` | — → 0 | give up the rest of this slice |
 | 25 | `SYS_SETUID` | `new_uid` → 0 / -1 | only while uid == 0; permanent |
@@ -360,14 +420,23 @@ completeness but only the matching server can use them.
 | 18 | `SYS_KILL` | `pid, expected_generation` → 0 / -1 | root or same-uid; gen 0 = wildcard |
 | 15 | `SYS_FUTEX_WAIT` | `addr*, expected` → 0 / -1 | block while `*addr == expected` |
 | 16 | `SYS_FUTEX_WAKE` | `addr*` → woken count | wake all waiters on `addr` in this AS |
-| 58 | `SYS_PROC_STAT` | `slot(1..16), buf*(≥52)` → 0 / -1 | state/uid/gen/pages/pid/name — `ps`, `top` |
+| 58 | `SYS_PROC_STAT` | `slot(1..64), buf*(≥52)` → 0 / -1 | state/uid/gen/pages/pid/name — `ps`, `top` |
+
+### Notes
+
+| # | name | args → return | notes |
+| --- | --- | --- | --- |
+| 61 | `SYS_POSTNOTE` | `pid_or_group, is_group, msg*` → count / -1 | root or same uid per target; §2.7 |
+| 62 | `SYS_NOTIFY` | `handler` → 0 | 0 = no handler (notes kill) |
+| 63 | `SYS_NOTED` | `NCONT` / `NDFLT` → *resumes* / *dies* | leave the note handler |
+| 64 | `SYS_INTERRUPTED` | — → 1 / 0 | was the last wait cut short by a note? (read-and-clear) |
 
 ### Console
 
 | # | name | args → return | notes |
 | --- | --- | --- | --- |
 | 1 | `SYS_PUTCHAR` | `ch` → — | to `stdout_pipe` if set, else console |
-| 2 | `SYS_GETCHAR` | — → byte | **blocks**; drains USB-kbd queue then serial |
+| 2 | `SYS_GETCHAR` | — → byte / -1 | **blocks**; serial and USB keyboard share one queue; `^C` becomes a note; -1 on EOF (pipe) or a note |
 | 59 | `SYS_GETCHAR_NB` | — → byte / -1 | non-blocking; -1 if nothing waiting or stdin is a pipe |
 | 48 | `SYS_STDIN_ISATTY` | — → 1 / 0 | 1 = console, 0 = pipe |
 | 36 | `SYS_BOOT_QUIET` | `a0` → 0 | shell calls it (a0=0) after a settle delay to drop later boot-server console output; a0=1 (`loud`) restores it |
@@ -378,12 +447,13 @@ completeness but only the matching server can use them.
 
 | # | name | args → return | notes |
 | --- | --- | --- | --- |
-| 6 | `SYS_IPC_SEND` | `dest, type, data*, len` → 0 / -1 | blocks until delivered **and** consumed |
+| 6 | `SYS_IPC_SEND` | `dest, type, data*, len` → 0 / -1 | queues FIFO for a busy inbox; blocks until delivered **and** consumed |
 | 7 | `SYS_IPC_RECV` | `buf*, len, type_out*` → sender pid / -1 | **blocks** |
 | 19 | `SYS_IPC_RECV_GEN` | `buf*, len, type_out*, from_gen_out*` → sender pid / -1 | + sender generation |
 | 20 | `SYS_IPC_REPLY` | `dest, type, data*, len, expected_gen` → 0 / -1 | send + stale-pid guard |
 | 10 | `SYS_IPC_POLL` | `buf*, len, type_out*` → sender pid / -1 | non-blocking recv |
 | 34 | `SYS_IPC_CALL` | `dest, verb, buf*, packed(req_len<<16 \| cap), reply_type_out*` → replier pid / -1 | one-shot RPC, all in kernel |
+| 65 | `SYS_AWAIT` | `mask, timeout_ticks, pipes*, npipes(≤8)` → ready mask / -1 | wait for the first of: inbox, stdin, pipes, timeout, note — consumes nothing |
 
 ### Namespaces
 
@@ -421,6 +491,8 @@ completeness but only the matching server can use them.
 | # | name | args → return | notes |
 | --- | --- | --- | --- |
 | 47 | `SYS_MAP` | `nbytes` → base vaddr / -1 | fresh zero-filled RW, demand-paged, past the image |
+| 66 | `SYS_SEGATTACH` | `name*, size` → vaddr / -1 | map a named shared segment, creating it if new (size 0 = existing only) — §2.8 |
+| 67 | `SYS_SEGDETACH` | `vaddr` → 0 / -1 | unmap it; freed at the last detach |
 
 ### Introspection / misc
 
@@ -465,7 +537,7 @@ function call.
 ```c3
 fn void exit() @noreturn;
 fn void exitcode(int code) @noreturn;
-fn int  rfork(int flags, uint* generation_out);          // RFPROC / RFMEM
+fn int  rfork(int flags, uint* generation_out);          // RFPROC / RFMEM / RFNOTEG
 fn int  rfork_io(int flags, uint* gen_out, int stdout_pipe, int stdin_pipe);
 fn int  exec(char* path, char* buf, uint buf_max, int notify_pid, char** argv, int argc);
 fn int  exec_path(char* name, char* buf, uint buf_max, int notify_pid, char** argv, int argc);
@@ -476,11 +548,22 @@ fn int  proc_info(int pid, uint* state_out, uint* generation_out, int* uid_out);
 fn int  parent_info(int pid, uint* parent_generation_out);
 fn int  setuid(int new_uid);
 fn int  getuid();
+fn int  getpid();
 fn int  proc_stat(int slot, char* out52);                // ps/top: see §4
 fn void yield();
 fn uint exec_max();
 fn ulong rdtime();                                        // the `time` CSR
 fn ulong timebase_hz();                                   // SYS_TIMEBASE
+```
+
+Notes (§2.7):
+
+```c3
+fn int  notify(void* handler);                 // handler(char* msg); 0 = none
+fn void noted(int how);                        // NCONT / NDFLT — ends the handler
+fn int  postnote(int pid, char* msg);          // 1 / -1
+fn int  postnote_group(int group, char* msg);  // count / -1
+fn bool interrupted();                         // last wait cut short by a note?
 ```
 
 `rdtime()` + `timebase_hz()` is the only clock. For a delay:
@@ -504,6 +587,21 @@ fn void print_hex32(uint v);
 fn int  klog_read(char* out, int max, ulong* cursor);   // dmesg
 ```
 
+`getchar()` returns -1 on a pipe's EOF, or when a note cuts the wait
+short (`interrupted()`).
+
+To wait on more than one thing — the inbox, stdin, some pipes, a
+timeout — use `await_any` (`SYS_AWAIT`):
+
+```c3
+fn int await_any(uint mask, ulong timeout_ticks, int* pipes, int npipes);
+// mask: AW_MSG | AW_STDIN; pipes[i] is bit AW_PIPE0 << i; timeout 0 = none
+// returns everything ready now — AW_TIMER / AW_NOTE are reported unasked
+```
+
+It consumes nothing: follow it with `ipc_recv`, `getchar` or `pipe_read`,
+which then won't block. The C library's `poll()` is built on it.
+
 (Real-stdlib programs — see §9.2 — use `std::io::print` / `io::printfn`
 instead; those route to the same console.)
 
@@ -518,9 +616,17 @@ fn int futex_wake(int* addr);
 ```
 
 `Mutex` is a futex-backed sleeping lock — safe to hold across a
-`yield()` or a blocking syscall. Only meaningful between threads
-(`RFMEM` share the address the futex word lives at); separate processes
-don't share memory.
+`yield()` or a blocking syscall. Meaningful between threads (`RFMEM`)
+and between processes sharing a segment:
+
+```c3
+fn char* segattach(char* name, ulong size);   // null on failure — §2.8
+fn int   segdetach(char* addr);
+```
+
+(A futex wakes waiters in the *same address space*, so across separate
+processes `Mutex` degrades to spinning with `yield()` between tries —
+correct, just not asleep.)
 
 ### 5.4 Raw IPC
 
@@ -619,6 +725,14 @@ Every process has **one** inbox slot (`Process.msg_data`, `MSG_MAX` =
 (b) the target has actually consumed the message — a true two-sided
 rendezvous, never a silent overwrite. `ipc_recv` blocks until something
 arrives.
+
+Senders that find the slot busy **queue in arrival order** and sleep
+(`Process.ipc_q_*`): only the head of the queue may deposit, and the
+queue is woken each time the slot frees up. The one exception is a
+server's reply to a client in `ipc_call`, which never waits behind that
+client's other mail (the client's inbox is reserved for it). A server
+still handles one request at a time — the queue makes the waiting fair
+and cheap, not parallel.
 
 A message carries a **type** (`uint`, application-defined) and a byte
 payload. Types are just conventions; the kernel doesn't interpret them.
@@ -1037,12 +1151,21 @@ with a `/` (`./foo`, `/bin/foo`, `sub/foo`) is literal, cwd-relative
 unless it starts with `/`. `/bin` *is* the namespace (a union of the
 real `/bin` and `/usr/$user/bin`), not one entry in a search path.
 
-### 10.5 No `^C`
+### 10.5 `^C`
 
-There are no signals. A runaway foreground program can only be stopped
-by a board reset — which is why `dmesg -f` and `top` poll
-`getchar_nb()` and quit on any keystroke, and why `top N` defaults to a
-finite frame count.
+`^C` posts the `"interrupt"` note to the shell's note group (§2.7):
+
+- at the prompt it drops the line being typed (or a half-entered
+  multi-line block);
+- a foreground program without a note handler dies of it (status −1),
+  including one stuck in a compute loop or blocked reading the console;
+- a running `for` / `while` loop or `;` / `&&` sequence stops;
+- background jobs (`cmd &`) keep running — they get their own note
+  groups.
+
+`note [-g] <pid> [msg]` (`/bin/note`) posts a note by hand (default
+`interrupt`; `kill` always kills). `dmesg -f` and `top` still also quit
+on any keystroke.
 
 ---
 
@@ -1200,24 +1323,24 @@ hardware paths on a real Duo. There is no unit-test framework and no
 Deliberate or just not done — the honest list:
 
 - **No stable ABI.** Syscall numbers and wire formats change freely.
-- **No signals, no `^C`, no job control beyond `jobs` / `wait`.**
-- **No `select`/`poll`** across IPC + console + timer. A program waits
-  on one thing at a time (or polls with the `_nb` / `_poll` variants).
-- **No shared memory between user processes** (drivers excepted).
+- **Notes, not POSIX signals.** One handler per process, string
+  messages, no masks, no `^Z` / `fg` / `bg` (job control is `&`, `jobs`,
+  `wait`). Go programs don't install a handler, so `^C` just kills them.
 - **No `mmap` of files.** All file data moves through 8 KiB IPC
-  messages.
-- **One inbox slot per process** — a server handles one request at a
-  time. No pipelining.
-- **16 processes total.**
+  messages; shared memory is named segments only (§2.8), at most 4 MiB
+  each, 16 at a time.
+- **One request at a time per server.** Senders queue fairly, but a
+  server still processes one message at a time, and a client has one
+  request in flight (no tagged pipelining).
+- **64 processes total.**
 - **One hart.** SMP is a scaffold.
 - **No swap, no overcommit accounting beyond the per-process
   `HEAP_MAX_BYTES` cap.**
-- **`fs_read` / `p9_*` can block indefinitely** against a server that
-  hasn't reached its recv loop yet (e.g. mid-respawn). Clients paper
-  over this with settle delays.
+- **`fs_read` / `p9_*` against a server that isn't serving yet** (e.g.
+  mid-respawn) waits up to the 15 s `SYS_IPC_CALL` timeout, then fails
+  with -1. Clients paper over boot with settle delays.
 - **The filesystem backends read/write "as much as fits"** rather than
-  erroring on a too-deep indirect block or an over-full directory
-  (ext2 dir-create caps around 11 entries per directory).
+  erroring on a too-deep indirect block.
 - **exFAT / FAT32 have no ownership**; `chmod`/`chown` only work on
   ext2.
 - **No network sockets** — `netd`/`ethd` do ARP + ICMP echo + a DHCP
@@ -1244,7 +1367,9 @@ src/
   kernel.c3         boot(), kernel_main(), the server spawn sequence
   supervisor.c3     service_boot() + the respawn watchdog
   pipe.c3           anonymous kernel pipes
-  kbd.c3            the keystroke queue a USB kbd feeds SYS_GETCHAR
+  kbd.c3            the keystroke queue the console + a USB kbd feed SYS_GETCHAR
+  note.c3           notes: post / deliver / noted, note groups, console ^C
+  segment.c3        named shared segments (SYS_SEGATTACH / SEGDETACH)
   smp.c3            hart scaffold (parked)
   spinlock.c3       Stage-B locks
   virtio.c3         shared virtio-mmio helpers (kernel side, minimal)

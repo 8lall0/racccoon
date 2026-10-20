@@ -88,6 +88,13 @@ const SYS_DISK_ARENA_INFO = 56; // diskd + primary fsd only: a0 -> arena paddr, 
 const SYS_KLOG_READ  = 57; // a0 = out buf, a1 = max bytes, a2 = ulong* cursor (bytes-consumed counter; 0 = from the oldest byte still in the ring). Copies newer kernel-console bytes out, advances *cursor, returns the count. The kernel log ring (sbi.c3) — /bin/dmesg.
 const SYS_PROC_STAT  = 58; // a0 = slot (1..PROCS_MAX), a1 = out buf (>= 52 bytes): [0..3] state LE, [4..7] uid LE, [8..11] generation LE, [12..15] resident pages LE, [16..19] real pid LE, [20..51] name (NUL-padded). Returns 0, or -1 for an unused slot. /bin/ps + /bin/top.
 const SYS_GETCHAR_NB = 59; // non-blocking console read: one keystroke from the USB-kbd queue or serial console, or -1 immediately if none waiting. Console only (returns -1 when stdin is a pipe). Lets a follow/redraw loop (`dmesg -f`, `top`) bail on a keypress — racccoon has no ^C.
+const SYS_POSTNOTE   = 61; // a0 = pid (a1 == 0) or note group (a1 == 1), a2 = message: post a note (src/note.c3) — root or same uid per target; returns how many got it, or -1
+const SYS_NOTIFY     = 62; // a0 = note handler address (0 = none: notes kill) — src/note.c3
+const SYS_NOTED      = 63; // a0 = NCONT (resume the interrupted context) / NDFLT (die) — the last thing a note handler does
+const SYS_INTERRUPTED = 64; // 1 if the caller's last interruptible wait returned -1 because of a note, else 0 (read-and-clear)
+const SYS_AWAIT      = 65; // a0 = AW_* mask, a1 = timeout in time-CSR ticks (0 = none), a2 = int* pipe ids, a4 = how many (<= AW_MAX_PIPES): block until any is ready, return the ready AW_* mask — see sys_await
+const SYS_SEGATTACH   = 66; // a0 = name, a1 = size (to create; 0 = attach existing): map a named shared segment, returns its vaddr or -1 — src/segment.c3
+const SYS_SEGDETACH   = 67; // a0 = vaddr from SYS_SEGATTACH: unmap it and drop the reference — src/segment.c3
 const SYS_DEV_INFO   = 60; // a0 = out uptr[] , a1 = capacity (<= 4): the physical base of each DMA region the caller's board device (src/device.c3) declared, in declaration order. Returns how many regions the device has, or -1 for a process that owns no device. One syscall for every hardware driver — replaces SYS_DISKD/USBD/NETD/ETHD/SDD_INFO.
 
 // Per-process SYS_MAP ceiling: the bump pointer can't grow more than this
@@ -139,6 +146,10 @@ const EXEC_MAX_ELF_SEGMENTS = 8;
 // fork_entry for the full mechanism.
 const int RFPROC = 1 << 0;
 const int RFMEM  = 1 << 1;
+// The child starts its own note group (src/note.c3) instead of sharing
+// the parent's — so a ^C aimed at the parent's group (the console's)
+// doesn't reach it. The shell uses it for `&` jobs.
+const int RFNOTEG = 1 << 2;
 
 // Wall-clock ceiling on SYS_IPC_CALL. Without it a client blocks forever
 // against a server that is alive but not yet in its ipc_recv loop (a
@@ -171,6 +182,12 @@ fn void proc_destroy(Process* target, int exit_code) @noinline
 	if (target.in_blocking_wait) blocking_depth--;
 
 	ipc_wake_waiters_on(target);
+	// Leave any send queue the target was waiting on, and drop its own:
+	// every sender queued on it was just woken with ipc_peer_died (they
+	// all have ipc_wait_pid == target) and unlinks itself — a search
+	// that tolerates the head being gone.
+	ipc_q_remove(target);
+	target.ipc_q_head = 0;
 	if (target.stdout_pipe >= 0) { pipe_detach(target.stdout_pipe, true);  target.stdout_pipe = -1; }
 	if (target.stdin_pipe  >= 0) { pipe_detach(target.stdin_pipe,  false); target.stdin_pipe  = -1; }
 
@@ -183,6 +200,10 @@ fn void proc_destroy(Process* target, int exit_code) @noinline
 	}
 	if (!table_shared)
 	{
+		// Shared segments (src/segment.c3) this address space had attached
+		// lose a reference; their pages are PAGE_SHARED, so the walk below
+		// leaves them alone.
+		seg_release_table(target.page_table);
 		ulong* t2 = target.page_table;
 		for (uint vpn2 = 0; vpn2 < 512; vpn2++)
 		{
@@ -306,6 +327,12 @@ fn void sys_rfork(Trap_frame* f) @noinline
 			f.a0 = (ulong)(-1);
 			return;
 		}
+		if (!proc_slot_buffers(child))
+		{
+			child.state = PROC_UNUSED; // OOM on a never-used slot: hand it back
+			f.a0 = (ulong)(-1);
+			return;
+		}
 
 		if (rfork_flags & RFMEM)
 		{
@@ -355,7 +382,8 @@ fn void sys_rfork(Trap_frame* f) @noinline
 					}
 				}
 			}
-			if (free_page_count() < rf_leaves + rf_leaves / 256 + 40)
+			if (free_page_count() < rf_leaves + rf_leaves / 256 + 40
+				|| seg_attach_free_slots() < seg_attachments_of(current_proc.page_table))
 			{
 				child.state = PROC_UNUSED; // hand the reserved slot back
 				f.a0 = (ulong)(-1);
@@ -405,6 +433,9 @@ fn void sys_rfork(Trap_frame* f) @noinline
 				}
 			}
 			child.page_table = child_table;
+			// The walk mapped the parent's shared-segment pages into the
+			// child; give the child its own references to them.
+			seg_dup_attachments(current_proc.page_table, child_table);
 		}
 
 		// Namespace: always copied, regardless of RFMEM — cheap
@@ -428,14 +459,7 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		// otherwise inherit. See fork_entry's own comment in
 		// process.c3 for how this block gets consumed. 32 words of
 		// 8 bytes now (Sv64 port), not 4.
-		// & ~15: see process.c3's own switch_context call site comment —
-		// `&child.stack + STACK_SIZE` is exactly `&child + sizeof(Process)`
-		// (the next array element's own start), a struct/array boundary
-		// with no alignment guarantee of its own. Masked here for the
-		// same reason, even though this particular result then moves 256
-		// bytes further in (less likely to straddle a page than the raw
-		// top, but not guaranteed either).
-		uptr* child_sp = (uptr*)(((uptr)&child.stack + STACK_SIZE) & ~(uptr)15);
+		uptr* child_sp = (uptr*)proc_kstack_top(child);
 		child_sp -= 32;
 
 		mem::copy((void*)child_sp, f, (sz)Trap_frame::size);
@@ -476,6 +500,9 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		child.ipc_wait_generation = 0;
 		child.ipc_peer_died = false;
 		child.in_call_reply_wait = false;
+		child.ipc_q_head = 0;
+		child.ipc_q_next = 0;
+		child.ipc_q_target = 0;
 		child.ipc_call_deadline = 0;
 		child.ipc_timed_out = false;
 		child.is_boot_server = false; // an rfork child is user work, not a boot server
@@ -517,6 +544,21 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		}
 		child.pid   = child_i + 1;
 		child.generation++;
+		// Notes (src/note.c3): the handler is inherited (fork copies the
+		// code it points at), pending notes are not; so is the note group,
+		// unless RFNOTEG asks for a fresh one. A fork from inside a handler
+		// carries the parked context too, so the child's noted() works.
+		child.note_head = 0;
+		child.note_count = 0;
+		child.note_handler = current_proc.note_handler;
+		child.in_note = current_proc.in_note;
+		child.note_frame = current_proc.note_frame;
+		child.note_sepc = current_proc.note_sepc;
+		child.note_fp = current_proc.note_fp;
+		child.note_intr = false;
+		child.note_saved_intr = false;
+		child.note_resumed = false;
+		child.noteg = (rfork_flags & RFNOTEG) ? child.pid : current_proc.noteg;
 		child.sp    = (uptr)child_sp;
 		child.state = PROC_RUNNABLE;
 		// Unlike create_process() (always 0 — see Process.parent_pid's
@@ -941,6 +983,10 @@ fn void sys_exec(Trap_frame* f) @noinline
 			}
 		}
 
+		// The PTE clear above also dropped every shared segment mapping —
+		// release those attachments (src/segment.c3).
+		seg_release_table(current_proc.page_table);
+
 		// Map the newly staged pages at USER_BASE, with each page's
 		// own accumulated permission (uniform RWX for the flat-binary
 		// path, the real per-segment union for ELF — see g_exec_seg_perm's
@@ -966,6 +1012,10 @@ fn void sys_exec(Trap_frame* f) @noinline
 		// argv. Any pages the *old* image had SYS_MAP'd were freed with
 		// every other PAGE_U leaf in the page-table clear above.
 		current_proc.heap_top = exec_argv_base + (uptr)(argv_page_count * PAGE_SIZE);
+		// The old image's note handler is gone with its code; pending notes
+		// stay (a ^C that raced the exec still applies to the new image).
+		current_proc.note_handler = 0;
+		current_proc.in_note = false;
 		current_proc.map_floor = current_proc.heap_top; // lazy SYS_MAP region starts empty
 
 		// This process's own page table entries for USER_BASE just
@@ -1082,6 +1132,76 @@ fn bool ipc_inbox_available(Process* target) @noinline
 	return true;
 }
 
+// --- FIFO send queue (Process.ipc_q_*) -------------------------------
+// Append the current process to `target`'s send queue.
+fn void ipc_q_enqueue(Process* target) @noinline
+{
+	current_proc.ipc_q_next = 0;
+	current_proc.ipc_q_target = target.pid;
+	if (target.ipc_q_head == 0)
+	{
+		target.ipc_q_head = current_proc.pid;
+		return;
+	}
+	Process* w = &procs[target.ipc_q_head - 1];
+	for (int guard = 0; w.ipc_q_next != 0 && guard < PROCS_MAX; guard++)
+	{
+		w = &procs[w.ipc_q_next - 1];
+	}
+	w.ipc_q_next = current_proc.pid;
+}
+
+// Unlink `self` from whatever queue it's on, if any. Search-based, so it
+// is harmless when the target slot has died and been reset (or reused)
+// meanwhile: `self` just isn't found there any more.
+fn void ipc_q_remove(Process* self) @noinline
+{
+	if (self.ipc_q_target != 0)
+	{
+		Process* target = &procs[self.ipc_q_target - 1];
+		int* link = &target.ipc_q_head;
+		for (int guard = 0; *link != 0 && guard < PROCS_MAX; guard++)
+		{
+			if (*link == self.pid)
+			{
+				*link = self.ipc_q_next;
+				break;
+			}
+			link = &procs[*link - 1].ipc_q_next;
+		}
+	}
+	self.ipc_q_next = 0;
+	self.ipc_q_target = 0;
+}
+
+// May the current process (already on `target`'s queue) deposit now?
+// The inbox must be free, and it must be the queue's head — unless
+// `target` is mid-SYS_IPC_CALL waiting for *our* reply, in which case
+// ipc_inbox_available has already said no to everyone but us, and the
+// reply must not wait behind ordinary requests queued for the target.
+fn bool ipc_can_deposit(Process* target) @noinline
+{
+	if (!ipc_inbox_available(target)) { return false; }
+	return target.in_call_reply_wait || target.ipc_q_head == current_proc.pid;
+}
+
+// `target`'s inbox just freed up (a message consumed, a call's
+// reservation lifted, a timed-out request yanked back): wake every
+// queued sender so each re-checks ipc_can_deposit. Waking all of them
+// rather than just the head keeps a reply-in-waiting (which may sit
+// anywhere in the queue) from being missed; FIFO order is still
+// enforced by the head rule.
+fn void ipc_inbox_freed(Process* target) @noinline
+{
+	int q = target.ipc_q_head;
+	for (int guard = 0; q != 0 && guard < PROCS_MAX; guard++)
+	{
+		Process* w = &procs[q - 1];
+		if (w.state == PROC_BLOCKED) { w.state = PROC_RUNNABLE; }
+		q = w.ipc_q_next;
+	}
+}
+
 // Wakes every process blocked in ipc_send/ipc_reply/ipc_call toward
 // `victim` (which is about to become PROC_UNUSED) so those calls return
 // -1 rather than blocking forever. Call before the victim's pid is zeroed.
@@ -1143,22 +1263,37 @@ fn void sys_ipc_send(Trap_frame* f) @noinline
 		// Wait for the target's inbox to actually be free — a
 		// previous sender's message that hasn't been consumed yet
 		// must never be silently overwritten, and if the target is
-		// mid-ipc_call its inbox is reserved for the reply. Busy-poll
-		// like SYS_GETCHAR: nothing specifically wakes a queued sender
-		// when the slot frees up, it's whoever notices next. If the
-		// target exits meanwhile, ipc_peer_gone() bails us out.
-		while (!ipc_inbox_available(ipc_target))
+		// mid-ipc_call its inbox is reserved for the reply. Queued in
+		// arrival order and asleep (Process.ipc_q_*): ipc_inbox_freed
+		// wakes us when the inbox frees. If the target exits
+		// meanwhile, ipc_wake_waiters_on wakes us and ipc_peer_gone()
+		// bails us out.
+		ipc_q_enqueue(ipc_target);
+		while (!ipc_can_deposit(ipc_target))
 		{
-			yield();
-			if (ipc_peer_gone())
+			// Interruptible while still queued: nothing was delivered.
+			if (note_deliverable(current_proc))
 			{
+				ipc_q_remove(current_proc);
 				current_proc.ipc_wait_pid = 0;
+				note_interrupted(current_proc);
 				f.a0 = (ulong)(-1);
 				return;
 			}
+			if (ipc_peer_gone())
+			{
+				ipc_q_remove(current_proc);
+				current_proc.ipc_wait_pid = 0;
+				current_proc.state = PROC_RUNNABLE;
+				f.a0 = (ulong)(-1);
+				return;
+			}
+			current_proc.state = PROC_BLOCKED;
+			yield();
 		}
+		ipc_q_remove(current_proc);
 
-		mem::copy(&ipc_target.msg_data, ipc_data, (sz)ipc_copy_len);
+		mem::copy(ipc_target.msg_data, ipc_data, (sz)ipc_copy_len);
 		ipc_target.msg_from = current_proc.pid;
 		ipc_target.msg_from_generation = current_proc.generation;
 		ipc_target.msg_type = ipc_type;
@@ -1238,18 +1373,23 @@ fn void sys_ipc_reply(Trap_frame* f) @noinline
 		current_proc.ipc_wait_generation = reply_target.generation;
 		current_proc.ipc_peer_died = false;
 
-		while (!ipc_inbox_available(reply_target))
+		ipc_q_enqueue(reply_target);
+		while (!ipc_can_deposit(reply_target))
 		{
-			yield();
 			if (ipc_peer_gone())
 			{
+				ipc_q_remove(current_proc);
 				current_proc.ipc_wait_pid = 0;
+				current_proc.state = PROC_RUNNABLE;
 				f.a0 = (ulong)(-1);
 				return;
 			}
+			current_proc.state = PROC_BLOCKED;
+			yield();
 		}
+		ipc_q_remove(current_proc);
 
-		mem::copy(&reply_target.msg_data, reply_data, (sz)reply_copy_len);
+		mem::copy(reply_target.msg_data, reply_data, (sz)reply_copy_len);
 		reply_target.msg_from = current_proc.pid;
 		reply_target.msg_from_generation = current_proc.generation;
 		reply_target.msg_type = reply_type;
@@ -1334,20 +1474,32 @@ fn void sys_ipc_call(Trap_frame* f) @noinline
 	// to us. See IPC_CALL_DEADLINE_TICKS.
 	current_proc.ipc_call_deadline = read_reg("time") + IPC_CALL_DEADLINE_TICKS;
 
-	// Phase 1: deposit the request into the target's inbox.
-	while (!ipc_inbox_available(call_target))
+	// Phase 1: deposit the request into the target's inbox — queued
+	// FIFO behind earlier senders, asleep until ipc_inbox_freed.
+	ipc_q_enqueue(call_target);
+	while (!ipc_can_deposit(call_target))
 	{
-		yield();
-		if (ipc_peer_gone() || current_proc.ipc_timed_out)
+		// Interruptible while still queued (the request hasn't reached
+		// the server yet); from phase 2 on, the note waits until the
+		// call completes.
+		bool call_intr = note_deliverable(current_proc);
+		if (call_intr || ipc_peer_gone() || current_proc.ipc_timed_out)
 		{
+			if (call_intr) { current_proc.note_intr = true; }
+			ipc_q_remove(current_proc);
 			current_proc.in_call_reply_wait = false;
+			ipc_inbox_freed(current_proc);
 			current_proc.ipc_wait_pid = 0;
 			current_proc.ipc_call_deadline = 0;
+			current_proc.state = PROC_RUNNABLE;
 			f.a0 = (ulong)(-1);
 			return;
 		}
+		current_proc.state = PROC_BLOCKED;
+		yield();
 	}
-	mem::copy(&call_target.msg_data, call_buf, (sz)call_req_len);
+	ipc_q_remove(current_proc);
+	mem::copy(call_target.msg_data, call_buf, (sz)call_req_len);
 	call_target.msg_from = current_proc.pid;
 	call_target.msg_from_generation = current_proc.generation;
 	call_target.msg_type = call_verb;
@@ -1373,8 +1525,10 @@ fn void sys_ipc_call(Trap_frame* f) @noinline
 				&& call_target.msg_from_generation == current_proc.generation)
 			{
 				call_target.has_message = false;
+				ipc_inbox_freed(call_target);
 			}
 			current_proc.in_call_reply_wait = false;
+			ipc_inbox_freed(current_proc);
 			current_proc.ipc_wait_pid = 0;
 			current_proc.ipc_call_deadline = 0;
 			current_proc.state = PROC_RUNNABLE;
@@ -1396,6 +1550,7 @@ fn void sys_ipc_call(Trap_frame* f) @noinline
 		if (ipc_peer_gone() || current_proc.ipc_timed_out)
 		{
 			current_proc.in_call_reply_wait = false;
+			ipc_inbox_freed(current_proc);
 			current_proc.ipc_wait_pid = 0;
 			current_proc.ipc_call_deadline = 0;
 			current_proc.state = PROC_RUNNABLE;
@@ -1407,11 +1562,12 @@ fn void sys_ipc_call(Trap_frame* f) @noinline
 	}
 
 	int call_reply_from = current_proc.msg_from;
-	mem::copy(call_buf, &current_proc.msg_data, (sz)call_buf_cap);
+	mem::copy(call_buf, current_proc.msg_data, (sz)call_buf_cap);
 	if (call_type_out != null) { *call_type_out = current_proc.msg_type; }
 	current_proc.has_message = false;
 	current_proc.ipc_progress++;
 	current_proc.in_call_reply_wait = false;
+	ipc_inbox_freed(current_proc);
 	current_proc.ipc_wait_pid = 0;
 	current_proc.ipc_call_deadline = 0;
 
@@ -1453,7 +1609,7 @@ fn void sys_ipc_recv(Trap_frame* f) @noinline
 			{
 				int recv_copy_len = recv_len > MSG_MAX ? MSG_MAX : recv_len;
 				if (recv_copy_len < 0) recv_copy_len = 0;
-				mem::copy(recv_buf, &current_proc.msg_data, (sz)recv_copy_len);
+				mem::copy(recv_buf, current_proc.msg_data, (sz)recv_copy_len);
 				if (recv_type_out != null)
 				{
 					*recv_type_out = current_proc.msg_type;
@@ -1461,6 +1617,7 @@ fn void sys_ipc_recv(Trap_frame* f) @noinline
 				f.a0 = (ulong)current_proc.msg_from;
 				current_proc.has_message = false;
 				current_proc.ipc_progress++;
+				ipc_inbox_freed(current_proc);
 
 				// Wake the sender: it's genuinely blocked (see
 				// SYS_IPC_SEND) waiting specifically for this ack,
@@ -1475,6 +1632,12 @@ fn void sys_ipc_recv(Trap_frame* f) @noinline
 						recv_acked_sender.state = PROC_RUNNABLE;
 					}
 				}
+				break;
+			}
+			if (note_deliverable(current_proc))
+			{
+				note_interrupted(current_proc);
+				f.a0 = (ulong)(-1);
 				break;
 			}
 			current_proc.state = PROC_BLOCKED;
@@ -1523,7 +1686,7 @@ fn void sys_ipc_recv_gen(Trap_frame* f) @noinline
 			{
 				int recv_gen_copy_len = recv_gen_len > MSG_MAX ? MSG_MAX : recv_gen_len;
 				if (recv_gen_copy_len < 0) recv_gen_copy_len = 0;
-				mem::copy(recv_gen_buf, &current_proc.msg_data, (sz)recv_gen_copy_len);
+				mem::copy(recv_gen_buf, current_proc.msg_data, (sz)recv_gen_copy_len);
 				if (recv_gen_type_out != null)
 				{
 					*recv_gen_type_out = current_proc.msg_type;
@@ -1535,6 +1698,7 @@ fn void sys_ipc_recv_gen(Trap_frame* f) @noinline
 				f.a0 = (ulong)current_proc.msg_from;
 				current_proc.has_message = false;
 				current_proc.ipc_progress++;
+				ipc_inbox_freed(current_proc);
 
 				Process* recv_gen_acked_sender = proc_by_pid(current_proc.msg_from);
 				if (recv_gen_acked_sender != null)
@@ -1545,6 +1709,12 @@ fn void sys_ipc_recv_gen(Trap_frame* f) @noinline
 						recv_gen_acked_sender.state = PROC_RUNNABLE;
 					}
 				}
+				break;
+			}
+			if (note_deliverable(current_proc))
+			{
+				note_interrupted(current_proc);
+				f.a0 = (ulong)(-1);
 				break;
 			}
 			current_proc.state = PROC_BLOCKED;
@@ -1626,7 +1796,7 @@ fn void sys_ipc_poll(Trap_frame* f) @noinline
 			f.a0 = (ulong)(-1);
 			return;
 		}
-		mem::copy(poll_buf, &current_proc.msg_data, (sz)poll_copy_len);
+		mem::copy(poll_buf, current_proc.msg_data, (sz)poll_copy_len);
 		if (poll_type_out != null)
 		{
 			*poll_type_out = current_proc.msg_type;
@@ -1634,6 +1804,7 @@ fn void sys_ipc_poll(Trap_frame* f) @noinline
 		f.a0 = (ulong)current_proc.msg_from;
 		current_proc.has_message = false;
 		current_proc.ipc_progress++;
+		ipc_inbox_freed(current_proc);
 
 		// Same "wake the real sender" step as SYS_IPC_RECV — normally
 		// a no-op here, since diskd's only use of this is for the
@@ -1943,18 +2114,101 @@ fn void sys_join(Trap_frame* f) @noinline
 		// moment it's set, even after the joined pid actually exits.
 		current_proc.in_blocking_wait = true;
 		blocking_depth++;
+		bool join_intr = false;
 		for (;;)
 		{
 			Process* join_target = proc_by_pid(join_pid);
 			if (join_target == null) break;
 			if (join_target.generation != join_generation) break;
+			if (note_deliverable(current_proc)) { join_intr = true; break; }
+			// A shell parked here while its foreground job computes is
+			// the common case of nobody reading the console — keep
+			// looking for a ^C (rate-limited, src/note.c3).
+			console_poll_maybe();
 			yield();
 		}
 		current_proc.in_blocking_wait = false;
 		blocking_depth--;
+		if (join_intr)
+		{
+			note_interrupted(current_proc);
+			f.a0 = (ulong)(-1);
+			return;
+		}
 		// The joined process's exit code, if one was recorded (0 for a
 		// clean exit / no record) — the shell reads this for `&&`/`||`.
 		f.a0 = (ulong)(long)proc_take_exit(join_pid, join_generation);
+}
+
+// SYS_AWAIT — wait for whichever of several sources is ready first: this
+// process's IPC inbox, its stdin (the console, or its stdin pipe when
+// redirected), up to AW_MAX_PIPES other pipes, a timeout, a note. Returns
+// the mask of everything ready at that moment; never consumes anything —
+// the caller follows up with ipc_recv / getchar / pipe_read, which then
+// won't block. AW_TIMER and AW_NOTE are reported whenever they happen,
+// asked for or not (a note also makes the wait return early, like every
+// other interruptible wait). A mask of only AW_MSG sleeps (a delivery
+// wakes us); anything that has to be polled (stdin, pipes, a timeout)
+// spins with yield(), the same as SYS_GETCHAR.
+const uint AW_MSG   = 1;
+const uint AW_STDIN = 2;
+const uint AW_TIMER = 4;
+const uint AW_NOTE  = 8;
+const uint AW_PIPE0 = 256;   // pipe i of the a2 array is bit AW_PIPE0 << i
+const int  AW_MAX_PIPES = 8;
+
+fn void sys_await(Trap_frame* f) @noinline
+{
+	uint aw_mask = (uint)f.a0;
+	ulong aw_timeout = f.a1;
+	int* aw_upipes = (int*)(uptr)f.a2;
+	int aw_np = (int)f.a4;
+	if (aw_np < 0 || aw_np > AW_MAX_PIPES
+		|| (aw_np > 0 && !user_range_valid(current_proc.page_table, (uptr)aw_upipes, (ulong)aw_np * 4, false)))
+	{
+		f.a0 = (ulong)(-1);
+		return;
+	}
+	int[AW_MAX_PIPES] aw_pipes;
+	for (int i = 0; i < aw_np; i++) { aw_pipes[i] = aw_upipes[i]; }
+	ulong aw_deadline = aw_timeout != 0 ? time_now() + aw_timeout : 0;
+	bool aw_poll = (aw_mask & AW_STDIN) != 0 || aw_np > 0 || aw_timeout != 0;
+
+	current_proc.in_blocking_wait = true;
+	blocking_depth++;
+	for (;;)
+	{
+		uint ready = 0;
+		if ((aw_mask & AW_MSG) && (current_proc.has_message || current_proc.driver_irq_pending)) { ready |= AW_MSG; }
+		if (aw_mask & AW_STDIN)
+		{
+			if (current_proc.stdin_pipe >= 0)
+			{
+				if (pipe_ready(current_proc.stdin_pipe)) { ready |= AW_STDIN; }
+			}
+			else
+			{
+				console_poll();
+				if (kbd_queue_nonempty()) { ready |= AW_STDIN; }
+			}
+		}
+		for (int i = 0; i < aw_np; i++)
+		{
+			if (pipe_ready(aw_pipes[i])) { ready |= AW_PIPE0 << i; }
+		}
+		if (aw_deadline != 0 && time_now() >= aw_deadline) { ready |= AW_TIMER; }
+		if (note_deliverable(current_proc)) { ready |= AW_NOTE; }
+		if (ready != 0)
+		{
+			current_proc.state = PROC_RUNNABLE;
+			f.a0 = (ulong)ready;
+			break;
+		}
+		if (!aw_poll) { current_proc.state = PROC_BLOCKED; }
+		yield();
+	}
+	current_proc.in_blocking_wait = false;
+	blocking_depth--;
 }
 
 // futex wait: block while the user word still holds the expected value.
@@ -1986,6 +2240,7 @@ fn void sys_futex_wait(Trap_frame* f) @noinline
 			return;
 		}
 		current_proc.futex_addr = (uptr)futex_addr;
+		current_proc.futex_paddr = user_vaddr_to_paddr(current_proc.page_table, (uptr)futex_addr);
 		current_proc.in_blocking_wait = true;
 		blocking_depth++;
 		for (;;)
@@ -1997,6 +2252,15 @@ fn void sys_futex_wait(Trap_frame* f) @noinline
 			current_proc.state = PROC_BLOCKED;
 			yield();
 			if (current_proc.futex_addr == 0) break;
+			if (note_deliverable(current_proc))
+			{
+				current_proc.futex_addr = 0;
+				note_interrupted(current_proc);
+				current_proc.in_blocking_wait = false;
+				blocking_depth--;
+				f.a0 = (ulong)(-1);
+				return;
+			}
 		}
 		current_proc.in_blocking_wait = false;
 		blocking_depth--;
@@ -2198,8 +2462,27 @@ fn void sys_ns_mount_wait(Trap_frame* f) @noinline
 fn void handle_syscall(Trap_frame* f) @noinline
 {
 	g_prof_syscall_hist[f.a3 & 63]++; // DIAGNOSTIC — see g_prof_syscall_hist, SYS_PROF_HIST
+	// "Was my last wait interrupted?" only ever describes the syscall
+	// right before SYS_INTERRUPTED — see Process.note_intr.
+	if (f.a3 != SYS_INTERRUPTED) { current_proc.note_intr = false; }
 	switch (f.a3)
 	{
+		case SYS_POSTNOTE:
+			sys_postnote(f);
+		case SYS_NOTIFY:
+			current_proc.note_handler = (uptr)f.a0;
+			f.a0 = 0;
+		case SYS_NOTED:
+			if (note_noted(f, (int)f.a0)) { current_proc.note_resumed = true; }
+		case SYS_AWAIT:
+			sys_await(f);
+		case SYS_SEGATTACH:
+			sys_segattach(f);
+		case SYS_SEGDETACH:
+			sys_segdetach(f);
+		case SYS_INTERRUPTED:
+			f.a0 = current_proc.note_intr ? 1 : 0;
+			current_proc.note_intr = false;
 		case SYS_PUTCHAR:
 			if (current_proc.stdout_pipe >= 0)
 			{
@@ -2262,6 +2545,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 					int pr = pipe_try_get(current_proc.stdin_pipe, &pc);
 					if (pr == 0) { f.a0 = (ulong)(uint)pc; break; }
 					if (pr == 2) { f.a0 = (ulong)(-1); break; }
+					if (note_deliverable(current_proc)) { note_interrupted(current_proc); f.a0 = (ulong)(-1); break; }
 					yield();
 				}
 			}
@@ -2269,16 +2553,19 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			{
 				for (;;)
 				{
-					// USB keyboard first (src/kbd.c3, fed by usbd through
-					// SYS_KBD_PUSH), then the serial console — a caller can't
-					// tell which a byte came from, and both stay live at once.
+					// The serial console drains into the same keystroke
+					// queue usbd's USB keyboard feeds (src/kbd.c3, via
+					// SYS_KBD_PUSH) — a caller can't tell which a byte came
+					// from, and both stay live at once. console_poll turns a
+					// ^C into a note on the way (src/note.c3).
+					console_poll();
 					int ch = kbd_queue_pop();
-					if (ch < 0) { ch = board::console_getchar(); }
 					if (ch >= 0)
 					{
 						f.a0 = (ulong)ch;
 						break;
 					}
+					if (note_deliverable(current_proc)) { note_interrupted(current_proc); f.a0 = (ulong)(-1); break; }
 					yield();
 				}
 			}
@@ -2297,9 +2584,8 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			}
 			else
 			{
-				int nb = kbd_queue_pop();
-				if (nb < 0) { nb = board::console_getchar(); }
-				f.a0 = (ulong)nb;
+				console_poll();
+				f.a0 = (ulong)kbd_queue_pop();
 			}
 		case SYS_EXIT:
 			sys_exit(f);
@@ -2660,22 +2946,26 @@ fn void handle_syscall(Trap_frame* f) @noinline
 		case SYS_FUTEX_WAIT:
 			sys_futex_wait(f);
 		case SYS_FUTEX_WAKE:
-			// Wakes every process currently blocked on this exact
-			// address *within the same address space* — page_table
-			// equality is the same "genuinely shares memory" test
-			// SYS_EXIT's own table-teardown skip already uses above:
-			// RFMEM siblings share the literal page_table pointer,
-			// never just a copy, and every ordinary process gets its
-			// own fresh one, so this can't mistake two unrelated
-			// processes' coincidentally-equal user-space addresses for
-			// the same futex.
+			// Wakes every process blocked on the same *physical* word.
+			// Same page table + same vaddr is the same physical word (RFMEM
+			// threads); two unrelated processes' private pages never are,
+			// so equal user addresses can't be confused; and two processes
+			// sharing a segment page (segment.c3) meet on it — which is what
+			// makes a Mutex inside a shared segment work across processes.
+			// (It used to compare page_table pointers, which left a waiter
+			// in another process sleeping forever.)
 			uptr wake_addr = (uptr)f.a0;
+			if (!user_range_valid(current_proc.page_table, wake_addr, 4, false))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			uptr wake_paddr = user_vaddr_to_paddr(current_proc.page_table, wake_addr);
 			for (int wake_i = 0; wake_i < PROCS_MAX; wake_i++)
 			{
 				Process* waiter = &procs[wake_i];
 				if (waiter.state != PROC_BLOCKED) continue;
-				if (waiter.futex_addr != wake_addr) continue;
-				if (waiter.page_table != current_proc.page_table) continue;
+				if (waiter.futex_addr == 0 || waiter.futex_paddr != wake_paddr) continue;
 				waiter.futex_addr = 0;
 				waiter.state = PROC_RUNNABLE;
 			}
@@ -2740,7 +3030,12 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			// same as every other "*_INFO" syscall here — a byte in the
 			// input stream is low-stakes, and usbd is the only thing that
 			// ever calls this.
-			if (kbd_queue_push((char)(f.a0 & 0xFF)))
+			if ((f.a0 & 0xFF) == 3)
+			{
+				console_input_byte(3); // ^C on a USB keyboard: the console's interrupt note
+				f.a0 = 0;
+			}
+			else if (kbd_queue_push((char)(f.a0 & 0xFF)))
 			{
 				f.a0 = 0;
 			}
@@ -2936,6 +3231,7 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				if (rr == 0) { rbuf[rn] = rc; rn++; if (rn >= rmax) { break; } continue; }
 				if (rr == 2) { break; }        // EOF
 				if (rn > 0) { break; }         // return what we have
+				if (note_deliverable(current_proc)) { note_interrupted(current_proc); rn = -1; break; }
 				yield();
 			}
 			f.a0 = (ulong)rn;
@@ -2974,10 +3270,11 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			int wn = 0;
 			while (wn < wlen)
 			{
-				if (pipe_try_put(wid, wbuf[wn])) { wn++; }
-				else { yield(); }
+				if (pipe_try_put(wid, wbuf[wn])) { wn++; continue; }
+				if (note_deliverable(current_proc)) { note_interrupted(current_proc); break; }
+				yield();
 			}
-			f.a0 = (ulong)wn;
+			f.a0 = wn == 0 && current_proc.note_intr ? (ulong)(-1) : (ulong)wn;
 		}
 		default:
 			// An unrecognized syscall number from any process — a

@@ -7,7 +7,7 @@ import std::io;
 // (default 30, ~1 min) then exits; `top N` sets the frame count, `top 0`
 // runs until the board resets.
 
-const int MAXSLOT = 64;
+const int MAXSLOT = 128; // generous ceiling over PROCS_MAX (64)
 
 fn uint le32(char* p) {
     return (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);

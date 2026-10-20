@@ -290,6 +290,7 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 	// already works fine for e.g. hotplugtest's own dangling-fid race.
 	Process* shell_proc = create_process((void*)&_binary_shell_bin_start, (uint)((uptr)&_binary_shell_bin_end - (uptr)&_binary_shell_bin_start));
 	proc_set_name(shell_proc, "shell");
+	console_noteg = shell_proc.noteg; // ^C goes to the shell's note group (src/note.c3)
 	io::print("shell created\n");
 
 	// The remaining hardware drivers — each spawns only on a board that
@@ -390,6 +391,7 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 		{
 			Process* respawned_shell = create_process((void*)&_binary_shell_bin_start, (uint)((uptr)&_binary_shell_bin_end - (uptr)&_binary_shell_bin_start));
 			proc_set_name(respawned_shell, "shell");
+			console_noteg = respawned_shell.noteg;
 		}
 
 		yield();

@@ -5,22 +5,14 @@ import libc;
 import std::io;
 import board;
 
-// Was 8 — too tight even before the second fsd instance: 6 permanent
-// boot processes (idle/echod/diskd-or-sdd/fsd/fsd2/shell) left only 2
-// spare for every test command's own children/threads combined, and
-// racetest alone needs 2 (its two racing threadcreate() threads) on top
-// of whatever rforktest/sandboxtest's own still-live children are
-// already holding. Root-caused a misleading "racetest: a=0 b=0" result
-// (looked like IPC/rendezvous corruption, wasn't) to exactly this: no
-// free slots left meant threadcreate() silently returned -1 for both
-// threads, and join() on a pid that never existed returns immediately —
-// see docs/devlog.md. 16 gives real headroom: the 6 permanent processes
-// plus up to 10 concurrent test/child/thread slots, costing an extra
-// 8 * STACK_SIZE (512KB) of static kernel memory — negligible against
-// the 64MB DRAM budget on both QEMU and the Duo (whose own linker
-// script already sizes free_ram against whatever's left over, so it
-// self-adjusts rather than risking an overflow).
-const PROCS_MAX     = 16; // Maximum number of processes
+// Was 8, then 16 — too tight even before the second fsd instance (the
+// racetest story in docs/devlog.md: no free slot made threadcreate()
+// silently return -1). 16 cost 16 x (64 KiB kernel stack + 8 KiB inbox)
+// of static BSS, which is what kept it small. Those two buffers now live
+// in the page pool, allocated the first time a slot is used (see
+// proc_slot_buffers), so a slot that's never used costs only the struct
+// itself (~3 KiB) and 64 is cheap even on the Duo's 64 MiB.
+const PROCS_MAX     = 64; // Maximum number of processes
 const PROC_UNUSED   = 0; // Unused process control structure
 const PROC_RUNNABLE = 1; // Runnable process
 const PROC_BLOCKED  = 2; // Waiting on SYS_IPC_RECV for a message to arrive
@@ -42,7 +34,7 @@ const PROC_RESERVED = 3;
 // 1128 (= 100-byte name + header + one 1024-byte file block) so bulk
 // transfers — FS_READ/FS_WRITE payloads, and diskd's new multi-sector
 // batches (up to 15 × 512 B + header) — carry ~8x more per round trip.
-// Cost: PROCS_MAX (16) inboxes × 8 KiB = 128 KiB kernel BSS. Must stay
+// Allocated per slot from the page pool (proc_slot_buffers). Must stay
 // == user.c3's FS_MSG_MAX; DISKD_MSG_MAX (user/fs/fsd.c3, user/block/
 // diskd.c3) must stay <= this.
 const MSG_MAX = 8192;
@@ -258,8 +250,11 @@ struct Mount
 // file-system call chain (handle_syscall -> fs_lookup/fs_flush ->
 // read_write_disk -> virtq_kick/virtq_is_busy) overflowed it, corrupting
 // adjacent Process structs in the procs[] array. Confirmed by reproducing
-// with this bumped up and the corruption disappearing.
+// with this bumped up and the corruption disappearing. (The stack is no
+// longer inside the struct — see Process.kstack — but the size stands.)
 const STACK_SIZE    = 65536; // Stack size
+const uint STACK_PAGES = STACK_SIZE / PAGE_SIZE;
+const uint MSG_PAGES   = (MSG_MAX + PAGE_SIZE - 1) / PAGE_SIZE;
 
 struct Process
 {
@@ -312,6 +307,10 @@ struct Process
 	// 0 the rest of the time (every other PROC_BLOCKED reason, e.g.
 	// SYS_IPC_RECV, leaves this untouched at its reset value).
 	uptr futex_addr;
+	// The physical address futex_addr translated to when the wait began —
+	// what SYS_FUTEX_WAKE matches on, so a futex word in a shared segment
+	// (segment.c3) works across processes, not just across RFMEM threads.
+	uptr futex_paddr;
 
 	// Bumped every time this slot is (re)used — never reset, persists
 	// across a slot's unused periods. Exists purely so SYS_JOIN
@@ -403,6 +402,20 @@ struct Process
 	// call completes). Replaces user-space p9_call's old P9_STRAY bounce.
 	bool in_call_reply_wait;
 
+	// FIFO send queue (docs/devlog.md, the "one inbox slot" item). A
+	// sender that finds this process's inbox busy used to yield-spin,
+	// RUNNABLE, until whoever happened to look next found it free — no
+	// ordering, and every waiter burned a timeslice per pass. Now it
+	// links itself onto the target's queue and sleeps (PROC_BLOCKED);
+	// only the head may deposit (ipc_can_deposit, syscalls.c3), and
+	// ipc_inbox_freed wakes the queue whenever the inbox frees up.
+	// All three are pids (= slot index + 1), 0 = none. ipc_q_head is
+	// this process's own queue as a target; ipc_q_next / ipc_q_target
+	// are this process's own link while it waits on someone else's.
+	int ipc_q_head;
+	int ipc_q_next;
+	int ipc_q_target;
+
 	uint msg_from_generation; // sender's own Process.generation, captured at delivery — lets
 	                          // a receiver that intends to reply later (SYS_IPC_RECV_GEN/
 	                          // SYS_IPC_REPLY, src/syscalls.c3) confirm msg_from still names the
@@ -410,7 +423,7 @@ struct Process
 	                          // the reply-side counterpart of the stale-pid hazard
 	                          // Mount.server_generation/SYS_JOIN already close elsewhere.
 	uint msg_type;
-	char[MSG_MAX] msg_data;
+	char* msg_data; // MSG_MAX bytes from the page pool — see proc_slot_buffers
 	bool msg_acked; // set by the receiver once *this* process's own pending send has been consumed
 
 	// An interrupt-driven driver's pending device-completion notify —
@@ -500,7 +513,32 @@ struct Process
 	// padded, may be "" for a process that never got one (idle).
 	char[32] name;
 
-	char[STACK_SIZE] stack; // Kernel stack
+	// Notes (src/note.c3 — Plan 9's signals). A small ring of pending
+	// messages; the handler SYS_NOTIFY registered (0 = none: a note
+	// kills); the context parked while that handler runs (in_note),
+	// restored by SYS_NOTED; this process's note group; and whether the
+	// last interruptible wait bailed out because of a note (read once by
+	// SYS_INTERRUPTED; cleared at every other syscall's entry).
+	char[NOTE_MAX][NNOTE] notes;
+	int  note_head;
+	int  note_count;
+	uptr note_handler;
+	bool in_note;
+	bool note_intr;
+	bool note_saved_intr;   // note_intr as it was when the handler was entered
+	bool note_resumed;      // SYS_NOTED just restored the parked context — handle_trap must not advance sepc
+	Trap_frame note_frame;
+	ulong note_sepc;
+	ulong[33] note_fp;
+	int  noteg;
+
+	// Kernel stack: STACK_SIZE bytes from the page pool, allocated the
+	// first time this slot is used and then kept for every later
+	// occupant (proc_slot_buffers). Never freed: proc_destroy(current_proc)
+	// is still running on it when it yield()s away for the last time.
+	// Page-aligned, so the old "& ~15 on a struct boundary" hazard (the
+	// Orange Pi misaligned-sscratch bug) can't happen any more.
+	char* kstack;
 }
 
 // Copy a NUL-terminated name into p.name (basename only — anything up to
@@ -1087,6 +1125,35 @@ fn uint mount_generation(int pid)
 	return p ? p.generation : 0;
 }
 
+// A slot's kernel stack and IPC inbox, from the page pool. Allocated the
+// first time the slot is used and kept across every later occupant, so
+// the steady state allocates nothing and a long-running system doesn't
+// fragment the pool by freeing/reallocating 16-page runs. false = out of
+// memory (the slot stays without buffers; the caller hands it back).
+fn bool proc_slot_buffers(Process* p)
+{
+	if (p.kstack == null)
+	{
+		uptr ks = try_alloc_pages(STACK_PAGES);
+		if (ks == 0) { return false; }
+		p.kstack = (char*)ks;
+	}
+	if (p.msg_data == null)
+	{
+		uptr mb = try_alloc_pages(MSG_PAGES);
+		if (mb == 0) { return false; }
+		p.msg_data = (char*)mb;
+	}
+	return true;
+}
+
+// Top of a process's kernel stack — the sscratch anchor and the initial
+// switch_context sp. Page-aligned, so already 16-byte aligned.
+fn uptr proc_kstack_top(Process* p)
+{
+	return (uptr)p.kstack + STACK_SIZE;
+}
+
 fn Process* create_process(void* image, uint image_size)
 {
 	// Find an unused process control structure and claim it atomically
@@ -1112,12 +1179,12 @@ fn Process* create_process(void* image, uint image_size)
 	{
 		panic::panic("no free process slots");
 	}
+	if (!proc_slot_buffers(proc))
+	{
+		panic::panic("out of memory for a process kernel stack");
+	}
 
-	// & ~15: same struct/array-boundary alignment hazard as this file's
-	// own switch_context call site below (see its comment) —
-	// `&proc.stack + STACK_SIZE` is `&proc + sizeof(Process)`, the next
-	// array element's own start, with no alignment guarantee of its own.
-	uptr* sp = (uptr*)(((uptr)&proc.stack + STACK_SIZE) & ~(uptr)15);
+	uptr* sp = (uptr*)proc_kstack_top(proc);
 	for (int j = 0; j < 12; j++)
 	{
 		*(--sp) = 0;
@@ -1163,6 +1230,7 @@ fn Process* create_process(void* image, uint image_size)
 	// not be able to pick this process before sp / page_table / fp_area
 	// are all set.
 	proc.pid = i + 1;
+	proc.noteg = proc.pid;
 	proc.generation++;
 	proc.sp = (uptr)sp;
 	proc.page_table = page_table;
@@ -1192,6 +1260,17 @@ fn Process* create_process(void* image, uint image_size)
 	proc.ipc_wait_generation = 0;
 	proc.ipc_peer_died = false;
 	proc.in_call_reply_wait = false;
+	proc.ipc_q_head = 0;   // a reused slot starts with an empty send queue
+	// Notes: a fresh process starts its own note group and has no handler
+	// or pending notes (explicit — a reused slot could leak them).
+	proc.note_head = 0;
+	proc.note_count = 0;
+	proc.note_handler = 0;
+	proc.in_note = false;
+	proc.note_intr = false;
+	proc.note_resumed = false;
+	proc.ipc_q_next = 0;
+	proc.ipc_q_target = 0;
 	proc.ipc_call_deadline = 0;
 	proc.ipc_timed_out = false;
 	// A reused slot must not start life with a previous occupant's
@@ -1378,23 +1457,12 @@ fn void yield() @noinline
 	write_csr("sstatus", (read_reg("sstatus") & ~SSTATUS_FS_MASK) | SSTATUS_FS_CLEAN);
 
 	g_prof_switches++;
-	// & ~15: kernel_entry's very first trap-entry instruction (entry.c3)
-	// is `sd ra, 0(sp)` against this exact value (swapped in from
-	// sscratch) — it must be a naturally-aligned stack pointer. `stack`
-	// is a `char[STACK_SIZE]` field preceded by a long run of mixed-size
-	// fields (ints, bools, ulongs); nothing guarantees its own start
-	// address lands on an 8-byte boundary, only that Process's *total*
-	// size does. Whether `&next.stack` (and so this whole expression)
-	// happens to come out aligned is pure luck of where the linker
-	// places the `procs` array in BSS — found the hard way on the
-	// Orange Pi RV's real hardware (first-ever real boot, immediate
-	// "store/AMO address misaligned" fault on kernel_entry's first
-	// instruction, scause=6): the opi-rv-qemu build's different link
-	// address (0x80200000 vs opi-rv's 0x40200000) shifted overall BSS
-	// layout enough to happen to land aligned there and not here — same
-	// source, same struct layout, no earlier build ever caught this.
-	// STACK_SIZE is 64 KiB; losing up to 15 bytes off the very top is
-	// immaterial.
-	uptr next_sscratch = ((uptr)&next.stack + STACK_SIZE) & ~(uptr)15;
+	// kernel_entry's very first trap-entry instruction (entry.c3) is
+	// `sd ra, 0(sp)` against this exact value (swapped in from sscratch),
+	// so it must be an aligned stack pointer. It used to be computed from
+	// an inline `char[STACK_SIZE]` field, whose alignment was luck of the
+	// BSS layout (the Orange Pi's first real boot faulted on it); the
+	// stack is a page-aligned pool allocation now (Process.kstack).
+	uptr next_sscratch = proc_kstack_top(next);
 	switch_context(&prev.sp, &next.sp, ((ulong)(uptr)next.page_table >> 12) | SATP_SV39, next_sscratch);
 }
