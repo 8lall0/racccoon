@@ -95,6 +95,7 @@ struct Service
 	// this — see docs/devlog.md).
 	bool  ever_ready;
 	int   stall_ticks;
+	bool  respawn_waiting;   // a respawn failed for lack of memory; retrying each tick
 	uint  last_progress;
 }
 
@@ -130,7 +131,9 @@ fn Process* service_boot(char* name, char* bin_start, char* bin_end,
 	s.restarts       = 0;
 	s.given_up       = false;
 
+	s.respawn_waiting = false;
 	Process* p = service_instantiate(s);
+	if (p == null) { panic::panic("boot: can't create a boot server"); }
 
 	// Published last: supervisor_tick() skips an entry until it is `used`,
 	// and must never see one whose pid/generation aren't set yet (a timer
@@ -222,11 +225,12 @@ fn Process* service_instantiate(Service* s)
 	// inheriting a stale pid.
 	if (s.pid_global != null) { *s.pid_global = 0; }
 
-	// create_process() panics on a full table rather than returning
-	// null — same contract every other call site (kernel_main's own
-	// spawns, the shell respawn) already relies on.
+	// null = no slot or not enough memory right now (an out-of-memory
+	// storm can be what killed the server in the first place): the
+	// caller leaves it down and the next tick tries again.
 	uint img_size = (uint)((uptr)s.bin_end - (uptr)s.bin_start);
 	Process* p = create_process((void*)s.bin_start, img_size);
+	if (p == null) { return null; }
 
 	p.is_boot_server = true;
 	proc_set_name(p, s.name);
@@ -246,6 +250,21 @@ fn void supervisor_spawn(Service* s)
 {
 	int old_pid = s.pid;
 	Process* p = service_instantiate(s);
+	if (p == null)
+	{
+		// Retried by the next tick's dead-detection; not counted as a
+		// restart. Said once, not every second.
+		if (!s.respawn_waiting)
+		{
+			svc_puts("svc: can't respawn ");
+			svc_puts(s.name);
+			svc_puts(" yet (no free slot or memory), retrying\n");
+			s.respawn_waiting = true;
+		}
+		s.pid = old_pid;
+		return;
+	}
+	s.respawn_waiting = false;
 	s.restarts++;
 
 	reseat_namespace_mounts(old_pid, p.pid, p.generation);

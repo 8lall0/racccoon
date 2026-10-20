@@ -14,8 +14,9 @@ protocol, servers reached by name.
 
 > This is an experiment, not a product. There is **no stable ABI** —
 > syscall numbers, wire formats and helper signatures change whenever it
-> is convenient. This manual describes the tree as of 2026-10-20 (notes,
-> `SYS_AWAIT`, shared segments, the FIFO send queue, 64 processes). When in doubt, the source is authoritative:
+> is convenient. This manual describes the tree as of 2026-10-21 (notes,
+> `SYS_AWAIT`, shared segments, the FIFO send queue, 64 processes, the
+> TCP/UDP stack at `/net`). When in doubt, the source is authoritative:
 > `src/syscalls.c3` for syscalls, `user/user.c3` for the userspace API.
 
 Contents:
@@ -223,6 +224,8 @@ int rfork(int flags, uint* generation_out);
 - `RFNOTEG` — the child starts its own note group (§2.7) instead of
   sharing the parent's, so a `^C` aimed at the parent's group doesn't
   reach it. The shell uses it for `&` jobs.
+- A child inherits its parent's stdout / stdin (console or pipe), like
+  `fork` — unless `rfork_io` names explicit pipes.
 - `rfork_io(flags, gen_out, stdout_pipe, stdin_pipe)` — `rfork` plus
   atomic pipe wiring, closing the race a follow-up `pipe_setout` leaves
   open. This is what the shell uses for `|` `>` `<`.
@@ -436,6 +439,7 @@ completeness but only the matching server can use them.
 | # | name | args → return | notes |
 | --- | --- | --- | --- |
 | 1 | `SYS_PUTCHAR` | `ch` → — | to `stdout_pipe` if set, else console |
+| 69 | `SYS_WRITE` | `buf*, len` → bytes | a whole buffer to stdout, same routing as `SYS_PUTCHAR` — what `print`, libc `write(1,…)` and `std::io` use |
 | 2 | `SYS_GETCHAR` | — → byte / -1 | **blocks**; serial and USB keyboard share one queue; `^C` becomes a note; -1 on EOF (pipe) or a note |
 | 59 | `SYS_GETCHAR_NB` | — → byte / -1 | non-blocking; -1 if nothing waiting or stdin is a pipe |
 | 48 | `SYS_STDIN_ISATTY` | — → 1 / 0 | 1 = console, 0 = pipe |
@@ -453,7 +457,8 @@ completeness but only the matching server can use them.
 | 20 | `SYS_IPC_REPLY` | `dest, type, data*, len, expected_gen` → 0 / -1 | send + stale-pid guard |
 | 10 | `SYS_IPC_POLL` | `buf*, len, type_out*` → sender pid / -1 | non-blocking recv |
 | 34 | `SYS_IPC_CALL` | `dest, verb, buf*, packed(req_len<<16 \| cap), reply_type_out*` → replier pid / -1 | one-shot RPC, all in kernel |
-| 65 | `SYS_AWAIT` | `mask, timeout_ticks, pipes*, npipes(≤8)` → ready mask / -1 | wait for the first of: inbox, stdin, pipes, timeout, note — consumes nothing |
+| 65 | `SYS_AWAIT` | `mask, timeout_ticks, pipes*, npipes(≤8)` → ready mask / -1 | wait for the first of: inbox, stdin, pipes, doorbell, a driver's IRQ, timeout, note |
+| 68 | `SYS_WAKE` | `pid, generation` → 0 / -1 | ring a process's doorbell (`AW_WAKE`); root or same uid — the network link rings use it |
 
 ### Namespaces
 
@@ -595,12 +600,20 @@ timeout — use `await_any` (`SYS_AWAIT`):
 
 ```c3
 fn int await_any(uint mask, ulong timeout_ticks, int* pipes, int npipes);
-// mask: AW_MSG | AW_STDIN; pipes[i] is bit AW_PIPE0 << i; timeout 0 = none
-// returns everything ready now — AW_TIMER / AW_NOTE are reported unasked
+// mask: AW_MSG | AW_STDIN | AW_WAKE | AW_IRQ; pipes[i] is bit AW_PIPE0 << i;
+// timeout 0 = none; returns everything ready now — AW_TIMER / AW_NOTE are
+// reported unasked
+fn int wake(int pid, uint generation);   // ring pid's doorbell (AW_WAKE)
+fn int write_stdout(char* buf, int len); // SYS_WRITE
 ```
 
-It consumes nothing: follow it with `ipc_recv`, `getchar` or `pipe_read`,
-which then won't block. The C library's `poll()` is built on it.
+It consumes no message, keystroke or pipe bytes: follow it with
+`ipc_recv`, `getchar` or `pipe_read`, which then won't block. `AW_WAKE`
+(a `wake()` doorbell) and `AW_IRQ` (an interrupt-driven driver's device
+completion) *are* consumed by being reported — there is nothing to follow
+up with. A wait that needs no polling (no stdin or pipes in the mask)
+sleeps: the timeout is a real timer deadline, not a spin. The C library's
+`poll()` is built on it.
 
 (Real-stdlib programs — see §9.2 — use `std::io::print` / `io::printfn`
 instead; those route to the same console.)
@@ -1184,12 +1197,13 @@ by the supervisor (respawn on crash / wedge).
 | `envd` | `user/sys/envd.c3` | per-process environment variables; `/env/` |
 | `usbd` | `user/usb/usbd.c3` + `dwc2/kbd/xpad/msc.c3` | DWC2 host stack (Duo): hubs, HID, MSC |
 | `ethd` | `user/net/ethd.c3` + `dwmac/ephy.c3` | DesignWare MAC + on-chip PHY (Duo) |
-| `netd` | `user/net/netd.c3` | virtio-net (QEMU) |
+| `netd` | `user/net/netd.c3` | virtio-net (QEMU) — a link driver |
+| `ipd` | `user/net/ipd.c3` + `ipd_conv.c3` + `ipd_tcp.c3` | the IP stack — ARP/IPv4/ICMP/UDP/TCP/DHCP; `/net/` (§11.2) |
 | `gpiod` | `user/gpio/gpiod.c3` | the on-board LED (Duo) |
 
-`ethd` and `netd` both link `user/net/eth_proto.c3` + `dhcp.c3` — a
-hand-rolled ARP / ICMP-echo responder and DHCP client (that is the
-entire network stack; there are no sockets).
+`ethd` and `netd` are pure link drivers: they move Ethernet frames
+between the device and a link ring (`user/net/link.c3`); everything above
+that is `ipd` (§11.2).
 
 The block driver and `fsd` are the load-bearing pair: `fsd` re-resolves
 the storage pid on an IPC failure, so a supervisor respawn into a new
@@ -1216,6 +1230,75 @@ order. A service that isn't up yet (or was never registered on this board) simpl
 isn't listed.
 
 ---
+
+### 11.2 Networking (`/net`)
+
+**Links.** A link driver creates a shared segment `ether<N>` (§2.8): a
+header (MAC, link state, both pids) and two single-producer /
+single-consumer rings of 32 × 2 KiB frame slots, RX (driver → ipd) and TX
+(ipd → driver). The producer fills a slot, bumps an index and rings the
+consumer's doorbell (`wake()`); nobody ever blocks on the other, and
+frames never pass through the kernel. `ipd` attaches each `ether*` that
+appears (a respawned driver re-attaches the same segment).
+
+**ipd** runs a DHCP client per link, keeps an ARP cache, answers ARP and
+ping, and has a loopback interface (127.0.0.1). It is one
+single-threaded loop: requests, frames and timers are handled as they
+come, and a read with nothing to return is parked — answered when data
+arrives, or after ~1 s with −2 ("ask again", which `net_read` loops on),
+so a slow reader never stalls the stack. TCP: in-order receive, go-back-N
+retransmission with an RTT-estimated RTO (200 ms floor), 8 KiB buffers
+each way, MSS 1460, no SACK / window scaling / Nagle / delayed ACK. Not
+done: IP fragmentation (dropped; DF set), IPv6, multicast, routing beyond
+"on-link or the default gateway".
+
+**Files** (paths below `/net/`):
+
+| file | |
+| --- | --- |
+| `ipifc/<n>/status` | name, mac, ip, mask, gw, dns, link and DHCP state, counters |
+| `arp` | the ARP cache |
+| `<udp\|tcp\|icmp>/clone` | read: allocate a conversation, returns its number |
+| `<proto>/<n>/ctl` | write `connect a.b.c.d!port`, `announce [*!]port`, `bind port`, `headers`, `own`, `close` (tcp half-close), `hangup`; read: `<n>` |
+| `<proto>/<n>/data` | the payload: stream bytes (tcp), datagrams (udp, icmp echo) |
+| `<proto>/<n>/local`, `remote` | `a.b.c.d!port` |
+| `<proto>/<n>/status` | `<proto> <n> <State> rx … tx …` |
+| `tcp/<n>/listen` | read: wait for a connection on an announced conversation, returns its number |
+
+A conversation belongs to the process that read its `clone` (or
+`listen`) file — only that uid or root may use it — and is freed when that
+process is gone or writes `hangup`. `headers` makes each udp datagram
+carry the peer's address (4 bytes) and port (2) in front, so one
+announced conversation can talk to many peers.
+
+**From a program** (user.c3):
+
+```c3
+fn int dial(char* addr);              // "tcp!10.0.2.2!7", "udp!host!53", "icmp!host" — names via DNS
+fn int announce(char* addr);          // "tcp!*!23"
+fn int net_listen(int h);             // tcp: the next connection
+fn int net_read(int h, char* buf, int len);   // waits; 0 = end of stream
+fn int net_read1(int h, char* buf, int len);  // one try: NET_RETRY after ~1 s
+fn int net_write(int h, char* buf, int len);
+fn int net_ctl(int h, char* cmd);
+fn void hangup(int h);
+fn bool dns_resolve(char* name, uint* ip);
+```
+
+C programs get BSD sockets (`<sys/socket.h>`, `<netinet/in.h>`,
+`<arpa/inet.h>`, `<netdb.h>`; `lib/racccoon-libc/src/rc_socket.c`):
+`socket`/`bind`/`listen`/`accept`/`connect`/`send`/`recv`/`sendto`/
+`recvfrom`/`shutdown`/`getsockname`/`getpeername`, `inet_*`,
+`getaddrinfo` (numeric, `localhost`, DNS). A socket fd is a conversation;
+`close()` hangs it up — including in a `fork`ed child that inherited it,
+since there are no shared fd references. `poll()` reports sockets as
+always ready.
+
+**Tools:** `ping [-c n] host`, `nc [-u] [-N] host port` / `nc [-u] -l
+port` (`-N` sends the FIN at the end of stdin), `dnsq name…`, `rshd
+[port]` — a remote shell (`/bin/rc`, the production shell, login prompt
+included) on TCP 23; a `^C` from the client interrupts the remote
+command.
 
 ## 12. Board abstraction & porting
 
@@ -1343,8 +1426,13 @@ Deliberate or just not done — the honest list:
   erroring on a too-deep indirect block.
 - **exFAT / FAT32 have no ownership**; `chmod`/`chown` only work on
   ext2.
-- **No network sockets** — `netd`/`ethd` do ARP + ICMP echo + a DHCP
-  client and nothing else. No TCP, no UDP API.
+- **The network stack is small** (§11.2): IPv4 only, no fragmentation,
+  no SACK or window scaling, one interface route. Sockets don't share
+  references across `fork` (a child's `close()` hangs up the parent's
+  connection too), and `poll()` can't wait on a socket.
+- **No Wi-Fi yet**: the Duo's own Ethernet MAC has never seen a carrier,
+  so real hardware has no working network until the USB Wi-Fi driver
+  lands.
 - Not audited, not hardened. "It boots on my Duo" is the bar for the
   hardware paths.
 
@@ -1400,7 +1488,8 @@ user/
   block/            diskd (virtio), sdd + sdhci (SDHCI)
   fs/               fsd + fat32 + ext2 + exfat
   usb/              usbd + dwc2 + kbd + xpad + msc
-  net/              netd / ethd + dwmac + ephy + eth_proto + dhcp
+  net/              ipd (+ ipd_conv, ipd_tcp, dhcp, eth_proto), link rings,
+                    netd / ethd + dwmac + ephy
   gpio/             gpiod
   bin/              standalone /bin programs
 

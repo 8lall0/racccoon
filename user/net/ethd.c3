@@ -145,167 +145,6 @@ fn uint ethd_init()
     return 0; // unreachable — panic() calls exit()
 }
 
-// Minimal DHCP client (RFC 2131): DISCOVER -> OFFER -> REQUEST -> ACK,
-// once at startup, no lease renewal — see user/net/dhcp.c3's own
-// header comment for full scope/rationale (added specifically because
-// a static IP hit a real router-side ARP-defense wall — see this
-// file's own header comment). Mirrors user/net/netd.c3's own
-// netd_run_dhcp_client() exactly, just over eth_dma_send/
-// eth_dma_try_recv instead of the virtio queues.
-fn bool ethd_run_dhcp_client(char* our_mac, uint* our_ip_out, uint* gateway_ip_out)
-{
-    char[600] scratch @noinit;
-    char[1600] rx_frame @noinit;
-
-    for (int attempt = 0; attempt < 3; attempt++)
-    {
-        uint xid = (uint)rdtime() ^ (uint)attempt;
-
-        uint discover_len;
-        dhcp_build_discover(&scratch[0], &discover_len, our_mac, xid);
-        if (!eth_dma_send(&scratch[0], discover_len)) { continue; }
-
-        uint offered_ip = 0;
-        uint offer_server_ip = 0;
-        bool got_offer = false;
-        ulong offer_start = rdtime();
-        ulong offer_budget = eth_us_to_ticks(2000000);
-        while (rdtime() - offer_start < offer_budget)
-        {
-            uint rx_len;
-            if (eth_dma_try_recv(&rx_frame[0], &rx_len))
-            {
-                uint msg_type, yiaddr, server_id, router;
-                if (dhcp_parse_message(&rx_frame[0], rx_len, xid, &msg_type, &yiaddr, &server_id, &router) && msg_type == DHCP_MSG_OFFER)
-                {
-                    offered_ip = yiaddr;
-                    offer_server_ip = server_id;
-                    got_offer = true;
-                    break;
-                }
-            }
-            yield();
-        }
-        if (!got_offer) { continue; }
-
-        uint request_len;
-        dhcp_build_request(&scratch[0], &request_len, our_mac, xid, offered_ip, offer_server_ip);
-        if (!eth_dma_send(&scratch[0], request_len)) { continue; }
-
-        ulong ack_start = rdtime();
-        ulong ack_budget = eth_us_to_ticks(2000000);
-        while (rdtime() - ack_start < ack_budget)
-        {
-            uint rx_len;
-            if (eth_dma_try_recv(&rx_frame[0], &rx_len))
-            {
-                uint msg_type, yiaddr, server_id, router;
-                if (dhcp_parse_message(&rx_frame[0], rx_len, xid, &msg_type, &yiaddr, &server_id, &router))
-                {
-                    if (msg_type == DHCP_MSG_ACK)
-                    {
-                        *our_ip_out = yiaddr;
-                        *gateway_ip_out = router;
-                        return true;
-                    }
-                    if (msg_type == DHCP_MSG_NAK) { break; }
-                }
-            }
-            yield();
-        }
-    }
-    return false;
-}
-
-// One-shot startup self-test: ARP-resolve the gateway, then ping it,
-// printing the round-trip result either way. Diagnostic only — never
-// panics on failure, since the real point of Phase 2 is the passive
-// responder in main()'s own loop, not this self-test (unlike QEMU's
-// own SLIRP gateway, a real router isn't guaranteed to be reachable or
-// even present — this is a nice-to-have confirmation, not a
-// requirement). Mirrors user/net/netd.c3's own netd_self_test()
-// exactly, just over eth_dma_send/eth_dma_try_recv instead of the
-// virtio queues.
-fn void ethd_self_test(char* our_mac, uint our_ip, uint gateway_ip)
-{
-    char[1600] scratch @noinit;
-    char[1600] rx_frame @noinit;
-    char[6] gateway_mac;
-
-    uint arp_len;
-    eth_build_arp_request(&scratch[0], &arp_len, our_mac, our_ip, gateway_ip);
-    bool sent = eth_dma_send(&scratch[0], arp_len);
-    if (ETHD_VERBOSE)
-    {
-        print("ethd: self-test: diag: ARP send ");
-        print(sent ? "kicked" : "FAILED (tx desc still dma-owned)");
-        print(", tx status right after=0x");
-        print_hex32(eth_tx_desc.txrx_status);
-        print("\n");
-    }
-
-    bool got_mac = false;
-    uint any_rx_count = 0;
-    ulong arp_start = rdtime();
-    ulong arp_budget = eth_us_to_ticks(2000000);
-    while (rdtime() - arp_start < arp_budget)
-    {
-        uint rx_len;
-        if (eth_dma_try_recv(&rx_frame[0], &rx_len))
-        {
-            any_rx_count++;
-            if (eth_parse_arp_reply(&rx_frame[0], rx_len, gateway_ip, &gateway_mac[0]))
-            {
-                got_mac = true;
-                break;
-            }
-        }
-        yield();
-    }
-    print("ethd: self-test: ARP resolve of gateway ");
-    print(got_mac ? "ok\n" : "TIMED OUT\n");
-    if (ETHD_VERBOSE)
-    {
-        print("ethd: self-test: diag: saw ");
-        print_uint(any_rx_count);
-        print(" other frame(s) during that window, tx status now=0x");
-        print_hex32(eth_tx_desc.txrx_status);
-        print(", dma_status=0x");
-        print_hex32(dma_reg_read(DMA_STATUS));
-        print("\n");
-    }
-    if (!got_mac) { return; }
-
-    uint icmp_len;
-    ushort ping_id = 0x1234;
-    ushort ping_seq = 1;
-    eth_build_icmp_echo_request(&scratch[0], &icmp_len, our_mac, our_ip, &gateway_mac[0], gateway_ip, ping_id, ping_seq);
-    if (!eth_dma_send(&scratch[0], icmp_len))
-    {
-        print("ethd: self-test: ping send failed\n");
-        return;
-    }
-
-    bool got_reply = false;
-    ulong ping_start = rdtime();
-    ulong ping_budget = eth_us_to_ticks(2000000);
-    while (rdtime() - ping_start < ping_budget)
-    {
-        uint rx_len;
-        if (eth_dma_try_recv(&rx_frame[0], &rx_len))
-        {
-            if (eth_parse_icmp_echo_reply(&rx_frame[0], rx_len, ping_id, ping_seq))
-            {
-                got_reply = true;
-                break;
-            }
-        }
-        yield();
-    }
-    print("ethd: self-test: ping to gateway ");
-    print(got_reply ? "ok\n" : "TIMED OUT\n");
-}
-
 fn void main()
 {
     uint phy_addr = ethd_init();
@@ -342,134 +181,55 @@ fn void main()
     mac_reg_write(ETH_MAC_CONF, conf);
     print("ethd: MAC address set, RX/TX enabled\n");
 
-    // Wait for the link to actually come up before attempting the
-    // self-test below — auto-negotiation (just restarted a few steps
-    // up, in ethd_init()'s own BMCR fixup) takes real time to
-    // complete, and a real hardware round sent the self-test's own
-    // ARP request while the link was still down, before the peer
-    // switch/router had any reason to be listening at all. Bounded at
-    // 5s — real 100BASE-TX auto-negotiation typically completes well
-    // under that; if it doesn't, the self-test is skipped (not fatal
-    // — the passive responder below works fine once the link
-    // eventually comes up regardless of whether this wait succeeded).
-    bool link_ready = false;
-    ulong link_wait_start = rdtime();
-    ulong link_wait_budget = eth_us_to_ticks(5000000);
-    while (rdtime() - link_wait_start < link_wait_budget)
-    {
-        uint bmsr;
-        if (mdio_read(phy_addr, MII_BMSR, &bmsr) && (bmsr & MII_BMSR_LINK_STATUS) != 0)
-        {
-            link_ready = true;
-            break;
-        }
-        yield();
-    }
+    // A pure link driver from here on (user/net/link.c3): frames go to and
+    // from ipd through the "ether0" rings; ARP/ICMP/DHCP live in ipd.
+    // Polled — the dwmac RX interrupt was never brought up on this board —
+    // every 20 ms, or at once when ipd rings for a transmit.
+    Link link;
+    if (!link_create(&link, "ether0", &ETHD_OUR_MAC[0], 1500)) { panic("ethd: ", "can't create link ether0"); }
+    print("ethd: link ether0 created, polling MDIO link status\n");
 
-    uint our_ip = make_ip(192, 168, 1, 70);
-    uint gateway_ip = make_ip(192, 168, 1, 1);
-    if (link_ready)
-    {
-        // Diagnostic: what did auto-negotiation actually resolve to?
-        // MAC_CONF is hardcoded to FES_100|FULLDPLXMODE below (forced,
-        // never read back from the PHY) — if the real link partner
-        // negotiated something else (e.g. genuine 10Mbps, or
-        // half-duplex), that MAC/PHY mismatch is a well-known real
-        // cause of exactly this failure shape (TX appears to complete
-        // at the DMA level — it only reflects the MAC's own FIFO
-        // accepting the frame, not real successful delivery — while
-        // RX stays completely dead). Gated by ETHD_VERBOSE (see its
-        // own comment) — this whole block exists only to feed the
-        // print below, safe to skip entirely when quiet.
-        if (ETHD_VERBOSE)
-        {
-            uint bmsr_diag = 0;
-            uint anlpar_diag = 0;
-            mdio_read(phy_addr, MII_BMSR, &bmsr_diag);
-            mdio_read(phy_addr, MII_ANLPAR, &anlpar_diag);
-            print("ethd: self-test: diag: autoneg_complete=");
-            print_uint((bmsr_diag & MII_BMSR_AUTONEG_COMPLETE) != 0 ? 1 : 0);
-            print(" link_partner_ability=0x");
-            print_hex32(anlpar_diag);
-            print(" (100fd=");
-            print_uint((anlpar_diag & MII_ANLPAR_100_FULL) != 0 ? 1 : 0);
-            print(" 100hd=");
-            print_uint((anlpar_diag & MII_ANLPAR_100_HALF) != 0 ? 1 : 0);
-            print(" 10fd=");
-            print_uint((anlpar_diag & MII_ANLPAR_10_FULL) != 0 ? 1 : 0);
-            print(" 10hd=");
-            print_uint((anlpar_diag & MII_ANLPAR_10_HALF) != 0 ? 1 : 0);
-            print(")\n");
-        }
-
-        // DHCP — added specifically because a static IP hit a real
-        // router-side wall (see this file's own header comment): a
-        // live tcpdump capture confirmed this board's own ARP
-        // requests reach the wire perfectly formed, but the router
-        // never replies to a device using a static IP it never itself
-        // assigned. Falls back to the static our_ip/gateway_ip above
-        // on failure/timeout — no regression for a network without a
-        // DHCP server at all.
-        uint dhcp_ip;
-        uint dhcp_gateway;
-        if (ethd_run_dhcp_client(&ETHD_OUR_MAC[0], &dhcp_ip, &dhcp_gateway))
-        {
-            our_ip = dhcp_ip;
-            gateway_ip = dhcp_gateway;
-            print("ethd: DHCP: bound, ip=");
-            print_ip(our_ip);
-            print(" gateway=");
-            print_ip(gateway_ip);
-            print("\n");
-        }
-        else
-        {
-            print("ethd: DHCP: failed, falling back to static IP\n");
-        }
-
-        ethd_self_test(&ETHD_OUR_MAC[0], our_ip, gateway_ip);
-    }
-    else
-    {
-        print("ethd: self-test: skipped, link not up within 5s\n");
-    }
-
-    print("ethd: init done, polling MDIO link status\n");
-
-    bool last_up = link_ready;
+    bool last_up = false;
     bool first = true;
+    ulong hz = timebase_hz();
+    ulong next_mdio = 0;
     for (;;)
     {
-        uint bmsr;
-        if (mdio_read(phy_addr, MII_BMSR, &bmsr))
+        if (rdtime() >= next_mdio)
         {
-            bool up = (bmsr & MII_BMSR_LINK_STATUS) != 0;
-            if (up != last_up || first)
+            next_mdio = rdtime() + hz / 2;
+            uint bmsr;
+            if (mdio_read(phy_addr, MII_BMSR, &bmsr))
             {
-                print(up ? "ethd: link up\n" : "ethd: link down\n");
-                last_up = up;
-                first = false;
+                bool up = (bmsr & MII_BMSR_LINK_STATUS) != 0;
+                link.h.link_up = up ? 1 : 0;
+                if (up != last_up || first)
+                {
+                    print(up ? "ethd: link up\n" : "ethd: link down\n");
+                    last_up = up;
+                    first = false;
+                }
             }
         }
 
-        // Passive responder — answers ARP/ICMP-echo requests addressed
-        // to our_ip, same as netd's own main loop.
+        bool got = false;
         char[1600] rx_frame @noinit;
         uint rx_len;
-        if (eth_dma_try_recv(&rx_frame[0], &rx_len))
+        while (eth_dma_try_recv(&rx_frame[0], &rx_len))
         {
-            char[1600] reply @noinit;
-            uint reply_len;
-            if (eth_proto_respond(&rx_frame[0], rx_len, &ETHD_OUR_MAC[0], our_ip, &reply[0], &reply_len))
-            {
-                eth_dma_send(&reply[0], reply_len);
-            }
+            link_put(&link, &rx_frame[0], rx_len);
+            got = true;
+        }
+        if (got) { link_kick(&link); }
+
+        char[LINK_FRAME_MAX] tx_frame @noinit;
+        for (;;)
+        {
+            int n = link_get(&link, &tx_frame[0]);
+            if (n < 0) { break; }
+            if (n > 0) { eth_dma_send(&tx_frame[0], (uint)n); }
         }
 
-        // yield()-paced, not a bare spin — see user/usb/dwc2.c3's own
-        // SYS_YIELD comment for why a genuinely syscall-free poll here
-        // is a real deadlock risk on this kernel, not just wasted CPU.
-        ulong poll_start = rdtime();
-        while (rdtime() - poll_start < eth_us_to_ticks(500000)) { yield(); }
+        await_any(AW_WAKE, hz / 50, null, 0);
     }
 }

@@ -95,6 +95,8 @@ const SYS_INTERRUPTED = 64; // 1 if the caller's last interruptible wait returne
 const SYS_AWAIT      = 65; // a0 = AW_* mask, a1 = timeout in time-CSR ticks (0 = none), a2 = int* pipe ids, a4 = how many (<= AW_MAX_PIPES): block until any is ready, return the ready AW_* mask — see sys_await
 const SYS_SEGATTACH   = 66; // a0 = name, a1 = size (to create; 0 = attach existing): map a named shared segment, returns its vaddr or -1 — src/segment.c3
 const SYS_SEGDETACH   = 67; // a0 = vaddr from SYS_SEGATTACH: unmap it and drop the reference — src/segment.c3
+const SYS_WAKE        = 68; // a0 = pid, a1 = expected generation (0 = any): ring that process's doorbell (AW_WAKE) — root or same uid; 0 / -1
+const SYS_WRITE       = 69; // a0 = buf, a1 = len: write to stdout (pipe or console), same routing as SYS_PUTCHAR; returns bytes written
 const SYS_DEV_INFO   = 60; // a0 = out uptr[] , a1 = capacity (<= 4): the physical base of each DMA region the caller's board device (src/device.c3) declared, in declaration order. Returns how many regions the device has, or -1 for a process that owns no device. One syscall for every hardware driver — replaces SYS_DISKD/USBD/NETD/ETHD/SDD_INFO.
 
 // Per-process SYS_MAP ceiling: the bump pointer can't grow more than this
@@ -382,7 +384,7 @@ fn void sys_rfork(Trap_frame* f) @noinline
 					}
 				}
 			}
-			if (free_page_count() < rf_leaves + rf_leaves / 256 + 40
+			if (free_page_count() < rf_leaves + rf_leaves / 256 + kernel_map_table_pages() + 4
 				|| seg_attach_free_slots() < seg_attachments_of(current_proc.page_table))
 			{
 				child.state = PROC_UNUSED; // hand the reserved slot back
@@ -475,6 +477,8 @@ fn void sys_rfork(Trap_frame* f) @noinline
 
 		child.has_message = false;
 		child.ipc_progress = 0;
+		child.wake_pending = false;
+		child.sleep_deadline = 0;
 		child.driver_irq_pending = false; // reused-slot hygiene (a driver's slot never actually gets rfork'd, but keep it clean)
 		// rfork(RFPROC) copies every PAGE_U leaf, so the child's mapped
 		// region — including any pages the parent SYS_MAP'd — matches the
@@ -522,26 +526,20 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		// pipe id (rfork()/rfork_io() pass -1 when unused; threadcreate
 		// leaves stale values here, hence the RFMEM exclusion). -1 /
 		// invalid = plain console.
+		//
+		// No explicit pipe (or an RFMEM thread): the child inherits the
+		// parent's own stdout/stdin, holding its own reference on each pipe
+		// end — fork semantics. It used to fall back to the console, so a
+		// forked helper inside a pipeline stage (nc's receiving half in
+		// `nc host port | wc -c`) wrote straight to the terminal.
 		int rfork_stdout_pipe = (int)f.a2;
 		int rfork_stdin_pipe  = (int)f.a4;
-		if ((rfork_flags & RFMEM) == 0 && rfork_stdout_pipe >= 0 && pipe_valid(rfork_stdout_pipe))
-		{
-			child.stdout_pipe = rfork_stdout_pipe;
-			pipes[rfork_stdout_pipe].writers++;
-		}
-		else
-		{
-			child.stdout_pipe = -1; // console until a pipe end is wired
-		}
-		if ((rfork_flags & RFMEM) == 0 && rfork_stdin_pipe >= 0 && pipe_valid(rfork_stdin_pipe))
-		{
-			child.stdin_pipe = rfork_stdin_pipe;
-			pipes[rfork_stdin_pipe].readers++;
-		}
-		else
-		{
-			child.stdin_pipe = -1;
-		}
+		bool explicit_out = (rfork_flags & RFMEM) == 0 && rfork_stdout_pipe >= 0 && pipe_valid(rfork_stdout_pipe);
+		bool explicit_in  = (rfork_flags & RFMEM) == 0 && rfork_stdin_pipe >= 0 && pipe_valid(rfork_stdin_pipe);
+		child.stdout_pipe = explicit_out ? rfork_stdout_pipe : current_proc.stdout_pipe;
+		child.stdin_pipe  = explicit_in  ? rfork_stdin_pipe  : current_proc.stdin_pipe;
+		if (child.stdout_pipe >= 0 && pipe_valid(child.stdout_pipe)) { pipes[child.stdout_pipe].writers++; } else { child.stdout_pipe = -1; }
+		if (child.stdin_pipe >= 0 && pipe_valid(child.stdin_pipe)) { pipes[child.stdin_pipe].readers++; } else { child.stdin_pipe = -1; }
 		child.pid   = child_i + 1;
 		child.generation++;
 		// Notes (src/note.c3): the handler is inherited (fork copies the
@@ -2143,9 +2141,14 @@ fn void sys_join(Trap_frame* f) @noinline
 // SYS_AWAIT — wait for whichever of several sources is ready first: this
 // process's IPC inbox, its stdin (the console, or its stdin pipe when
 // redirected), up to AW_MAX_PIPES other pipes, a timeout, a note. Returns
-// the mask of everything ready at that moment; never consumes anything —
-// the caller follows up with ipc_recv / getchar / pipe_read, which then
-// won't block. AW_TIMER and AW_NOTE are reported whenever they happen,
+// the mask of everything ready at that moment; never consumes a message,
+// a keystroke or pipe bytes — the caller follows up with ipc_recv /
+// getchar / pipe_read, which then won't block. Two sources ARE consumed
+// when reported, because there is nothing to follow up with: AW_WAKE (a
+// SYS_WAKE doorbell) and AW_IRQ (an interrupt-driven driver's device
+// completion). A caller that owns an IRQ route also drains the PLIC
+// itself on each pass, the same reason SYS_DRIVER_IRQ_WAIT does (see its
+// comment). AW_TIMER and AW_NOTE are reported whenever they happen,
 // asked for or not (a note also makes the wait return early, like every
 // other interruptible wait). A mask of only AW_MSG sleeps (a delivery
 // wakes us); anything that has to be polled (stdin, pipes, a timeout)
@@ -2154,6 +2157,8 @@ const uint AW_MSG   = 1;
 const uint AW_STDIN = 2;
 const uint AW_TIMER = 4;
 const uint AW_NOTE  = 8;
+const uint AW_WAKE  = 16;
+const uint AW_IRQ   = 32;
 const uint AW_PIPE0 = 256;   // pipe i of the a2 array is bit AW_PIPE0 << i
 const int  AW_MAX_PIPES = 8;
 
@@ -2172,14 +2177,23 @@ fn void sys_await(Trap_frame* f) @noinline
 	int[AW_MAX_PIPES] aw_pipes;
 	for (int i = 0; i < aw_np; i++) { aw_pipes[i] = aw_upipes[i]; }
 	ulong aw_deadline = aw_timeout != 0 ? time_now() + aw_timeout : 0;
-	bool aw_poll = (aw_mask & AW_STDIN) != 0 || aw_np > 0 || aw_timeout != 0;
+	bool aw_driver = irq_route_by_pid(current_proc.pid) != null;
+	// Sources only a poll can see (console, pipes) keep us RUNNABLE and
+	// yield-spinning; everything else — inbox, doorbell, note, timeout, a
+	// driver's IRQ — wakes a PROC_BLOCKED sleeper: the timeout through
+	// sleep_until (entry.c3), the IRQ through service_pending_external_irq
+	// (taken as a trap, or drained by hand in yield()).
+	bool aw_poll = (aw_mask & AW_STDIN) != 0 || aw_np > 0;
 
 	current_proc.in_blocking_wait = true;
 	blocking_depth++;
 	for (;;)
 	{
 		uint ready = 0;
-		if ((aw_mask & AW_MSG) && (current_proc.has_message || current_proc.driver_irq_pending)) { ready |= AW_MSG; }
+		if (aw_driver) { service_pending_external_irq(); }
+		if ((aw_mask & AW_MSG) && current_proc.has_message) { ready |= AW_MSG; }
+		if ((aw_mask & AW_IRQ) && current_proc.driver_irq_pending) { ready |= AW_IRQ; }
+		if ((aw_mask & AW_WAKE) && current_proc.wake_pending) { ready |= AW_WAKE; }
 		if (aw_mask & AW_STDIN)
 		{
 			if (current_proc.stdin_pipe >= 0)
@@ -2200,11 +2214,22 @@ fn void sys_await(Trap_frame* f) @noinline
 		if (note_deliverable(current_proc)) { ready |= AW_NOTE; }
 		if (ready != 0)
 		{
+			if (ready & AW_WAKE) { current_proc.wake_pending = false; }
+			if (ready & AW_IRQ)
+			{
+				current_proc.driver_irq_pending = false;
+				current_proc.ipc_progress++; // a device completion is progress — see Process.ipc_progress
+			}
 			current_proc.state = PROC_RUNNABLE;
+			current_proc.sleep_deadline = 0;
 			f.a0 = (ulong)ready;
 			break;
 		}
-		if (!aw_poll) { current_proc.state = PROC_BLOCKED; }
+		if (!aw_poll)
+		{
+			if (aw_deadline != 0) { sleep_until(aw_deadline); }
+			current_proc.state = PROC_BLOCKED;
+		}
 		yield();
 	}
 	current_proc.in_blocking_wait = false;
@@ -2459,6 +2484,51 @@ fn void sys_ns_mount_wait(Trap_frame* f) @noinline
 		f.a0 = (ulong)(iptr)(mw_ok ? 0 : -1);
 }
 
+// One byte of a process's stdout: into its pipe (blocking while the pipe
+// is full), or the console — with boot servers silenced into the kernel
+// log once the shell has settled. SYS_PUTCHAR and SYS_WRITE both go
+// through here. Returns false if a pipe wait was cut short by a note.
+fn bool stdout_put(int c) @noinline
+{
+	if (current_proc.stdout_pipe >= 0)
+	{
+		// Redirected (a `|` or `>`): into the pipe, blocking while it's
+		// full — interruptible by a note.
+		while (!pipe_try_put(current_proc.stdout_pipe, (char)(c & 0xFF)))
+		{
+			if (note_deliverable(current_proc)) { note_interrupted(current_proc); return false; }
+			yield();
+		}
+	}
+	// Boot servers go silent once the shell has settled (it calls
+	// SYS_BOOT_QUIET) — their init chatter otherwise keeps landing on the
+	// console after the prompt is up. The shell and everything it exec()s
+	// (is_boot_server == false) print normally.
+	else if (g_boot_quiet && current_proc.is_boot_server)
+	{
+		// Silenced, not discarded: a respawned server's bring-up (or its
+		// dying panic() line) stays readable with `dmesg` without the
+		// serial-speed delay `loud` would add — that delay was enough to
+		// hide a timing bug (docs/devlog.md).
+		sbi::klog_put(c);
+	}
+	else if (current_proc.is_boot_server)
+	{
+		// Boot-server chatter (fsd/sdd/usbd/ethd init lines) is worth
+		// keeping in the kernel log — tee it.
+		board::console_putchar(c);
+	}
+	else
+	{
+		// A plain process's stdout is terminal output, not kernel log, so
+		// it takes the raw path: without that split, `dmesg` (which prints
+		// what it reads) re-feeds its own output into the ring and loops
+		// forever.
+		sbi::console_emit(c);
+	}
+	return true;
+}
+
 fn void handle_syscall(Trap_frame* f) @noinline
 {
 	g_prof_syscall_hist[f.a3 & 63]++; // DIAGNOSTIC — see g_prof_syscall_hist, SYS_PROF_HIST
@@ -2476,6 +2546,23 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			if (note_noted(f, (int)f.a0)) { current_proc.note_resumed = true; }
 		case SYS_AWAIT:
 			sys_await(f);
+		case SYS_WAKE:
+		{
+			// The doorbell: a non-blocking "look at our shared ring" from
+			// one process to another (user/net/link.c3). Sticky until the
+			// target's await_any reports AW_WAKE.
+			Process* wt = proc_by_pid((int)f.a0);
+			if (wt == null || wt == idle_proc
+				|| ((uint)f.a1 != 0 && wt.generation != (uint)f.a1)
+				|| (current_proc.uid != 0 && current_proc.uid != wt.uid))
+			{
+				f.a0 = (ulong)(-1);
+				break;
+			}
+			wt.wake_pending = true;
+			if (wt.state == PROC_BLOCKED) { wt.state = PROC_RUNNABLE; }
+			f.a0 = 0;
+		}
 		case SYS_SEGATTACH:
 			sys_segattach(f);
 		case SYS_SEGDETACH:
@@ -2484,45 +2571,26 @@ fn void handle_syscall(Trap_frame* f) @noinline
 			f.a0 = current_proc.note_intr ? 1 : 0;
 			current_proc.note_intr = false;
 		case SYS_PUTCHAR:
-			if (current_proc.stdout_pipe >= 0)
+			stdout_put((int)f.a0);
+		case SYS_WRITE:
+		{
+			// a0 = buf, a1 = len: stdout_put each byte — the whole buffer in
+			// one trap instead of one SYS_PUTCHAR per byte. Returns bytes
+			// written (fewer if a note interrupted a full pipe).
+			char* wbuf = (char*)(uptr)f.a0;
+			long wlen = (long)f.a1;
+			if (wlen < 0 || !user_range_valid(current_proc.page_table, (uptr)wbuf, (ulong)wlen, false))
 			{
-				// Redirected (a `|` or `>`): into the pipe, blocking
-				// while it's full.
-				while (!pipe_try_put(current_proc.stdout_pipe, (char)(f.a0 & 0xFF)))
-				{
-					yield();
-				}
+				f.a0 = (ulong)(-1);
+				break;
 			}
-			// Boot servers go silent once the shell has settled (it
-			// calls SYS_BOOT_QUIET) — their init chatter otherwise keeps
-			// landing on the console after the prompt is up. The shell
-			// and everything it exec()s (is_boot_server == false) print
-			// normally.
-			else if (g_boot_quiet && current_proc.is_boot_server)
+			long wi = 0;
+			for (; wi < wlen; wi++)
 			{
-				// Silenced, not discarded: a respawned server's bring-up
-				// (or its dying panic() line) stays readable with `dmesg`
-				// without the serial-speed delay `loud` would add — that
-				// delay was enough to hide a timing bug (docs/devlog.md).
-				sbi::klog_put((int)f.a0);
+				if (!stdout_put((int)(uint)wbuf[wi])) { break; }
 			}
-			else
-			{
-				// Boot-server chatter (fsd/sdd/usbd/ethd init lines) is
-				// worth keeping in the kernel log — tee it. A plain
-				// process's stdout is terminal output, not kernel log, so
-				// it takes the raw path: without that split, `dmesg`
-				// (which prints what it reads) re-feeds its own output
-				// into the ring and loops forever.
-				if (current_proc.is_boot_server)
-				{
-					board::console_putchar((int)f.a0);
-				}
-				else
-				{
-					sbi::console_emit((int)f.a0);
-				}
-			}
+			f.a0 = (ulong)wi;
+		}
 		case SYS_BOOT_QUIET:
 			// The shell calls this once, after a short settle delay, to
 			// stop boot-server console output landing on the console

@@ -78,6 +78,8 @@ const int SYS_INTERRUPTED = 64; // was my last wait interrupted by a note? — s
 const int SYS_AWAIT       = 65; // wait for the first of several sources — see await_any() below
 const int SYS_SEGATTACH   = 66; // map a named shared segment — see segattach() below
 const int SYS_SEGDETACH   = 67; // unmap one — see segdetach() below
+const int SYS_WAKE        = 68; // ring another process's doorbell (AW_WAKE) — see wake() below
+const int SYS_WRITE       = 69; // write a buffer to stdout in one trap — see write_stdout() below
 const int SYS_DEV_INFO   = 60; // a0 = out uptr[], a1 = capacity (<= 4): physical base of each DMA region the caller's board device declared (src/device.c3). Returns the region count, or -1 if the caller owns no device — see dev_info() below
 
 // rfork flags — see src/syscalls.c3's SYS_RFORK case for the full design.
@@ -972,17 +974,21 @@ fn bool interrupted() @export("interrupted") {
 // Blocks until at least one asked-for source is ready, then returns the
 // mask of everything ready right now. Consumes nothing: follow up with
 // ipc_recv / getchar / pipe_read, which then won't block.
-//   AW_MSG   — a message (or a driver's IRQ notify) is in our inbox
+//   AW_MSG   — a message is in our inbox
 //   AW_STDIN — getchar() has input (the console, or our stdin pipe)
 //   AW_PIPE0 << i — pipes[i] has bytes or is at EOF (up to 8 pipes)
 //   AW_TIMER — timeout_ticks (time-CSR ticks, see timebase_hz(); 0 = no
 //              timeout) went by
 //   AW_NOTE  — a note arrived (its handler runs as this call returns)
+//   AW_WAKE  — someone called wake() on us (consumed by reporting it)
+//   AW_IRQ   — interrupt-driven drivers: our device completed (consumed)
 // -1 on a bad argument.
 const uint AW_MSG   = 1;
 const uint AW_STDIN = 2;
 const uint AW_TIMER = 4;
 const uint AW_NOTE  = 8;
+const uint AW_WAKE  = 16;
+const uint AW_IRQ   = 32;
 const uint AW_PIPE0 = 256;
 
 fn int await_any(uint mask, ulong timeout_ticks, int* pipes, int npipes) @export("await_any") {
@@ -1000,6 +1006,371 @@ fn int await_any(uint mask, ulong timeout_ticks, int* pipes, int npipes) @export
 fn char* segattach(char* name, ulong size) @export("segattach") {
     long r = syscall_long(SYS_SEGATTACH, (long)name, (long)size, 0);
     return r < 0 ? null : (char*)(uptr)r;
+}
+
+// Ring process `pid`'s doorbell: its next await_any(AW_WAKE ...) returns
+// at once (or wakes up now). Non-blocking, carries no data — it says
+// "look at what we share". generation 0 = any. Root or same uid.
+fn int wake(int pid, uint generation) @export("wake") {
+    return syscall(SYS_WAKE, pid, (long)generation, 0);
+}
+
+// --- networking: the /net file tree served by ipd (user/net/ipd.c3) ----
+// A connection handle is (protocol << 8) | conversation number; the files
+// behind it are /net/<udp|tcp|icmp>/<n>/{ctl,data,local,remote,status}.
+// Addresses: "tcp!10.0.2.2!7", "udp!10.0.2.2!53", "icmp!10.0.2.2", and for
+// announce "tcp!*!23" (or just a port). dial() resolves host names
+// through DNS (dns_resolve below).
+const int NET_UDP  = 0;
+const int NET_TCP  = 1;
+const int NET_ICMP = 2;
+const int NET_RETRY = -2;   // ipd's "nothing yet, ask again"
+
+fn char* net_proto_name(int proto) {
+    if (proto == NET_UDP) return "udp";
+    if (proto == NET_TCP) return "tcp";
+    return "icmp";
+}
+
+// "/net/<proto>/<n>/<file>" into out (>= 64 bytes).
+fn void net_file(int h, char* file, char* out) {
+    char* pn = net_proto_name(h >> 8);
+    int o = 0;
+    char* pre = "/net/";
+    for (int i = 0; pre[i] != 0; i++) { out[o] = pre[i]; o++; }
+    for (int i = 0; pn[i] != 0; i++) { out[o] = pn[i]; o++; }
+    out[o] = '/'; o++;
+    uint c = (uint)(h & 0xFF);
+    if (c >= 10) { out[o] = (char)('0' + c / 10); o++; }
+    out[o] = (char)('0' + c % 10); o++;
+    out[o] = '/'; o++;
+    for (int i = 0; file[i] != 0; i++) { out[o] = file[i]; o++; }
+    out[o] = 0;
+}
+
+fn int net_parse_num(char* s, int* at) {
+    int v = 0;
+    bool got = false;
+    while (s[*at] >= '0' && s[*at] <= '9') { v = v * 10 + (s[*at] - '0'); *at = *at + 1; got = true; }
+    return got ? v : -1;
+}
+
+// Allocate a conversation of `proto`. Handle, or -1.
+fn int net_clone(int proto) {
+    char[32] path;
+    char* pn = net_proto_name(proto);
+    int o = 0;
+    char* pre = "/net/";
+    for (int i = 0; pre[i] != 0; i++) { path[o] = pre[i]; o++; }
+    for (int i = 0; pn[i] != 0; i++) { path[o] = pn[i]; o++; }
+    char* cl = "/clone";
+    for (int i = 0; cl[i] != 0; i++) { path[o] = cl[i]; o++; }
+    path[o] = 0;
+    char[16] num;
+    int n = fs_read(&path[0], &num[0], 15);
+    if (n <= 0) return -1;
+    num[n] = 0;
+    int at = 0;
+    int c = net_parse_num(&num[0], &at);
+    return c < 0 ? -1 : (proto << 8) | c;
+}
+
+// Write a ctl command ("connect 10.0.2.2!7", "headers", "hangup", ...).
+fn int net_ctl(int h, char* cmd) {
+    char[64] path;
+    net_file(h, "ctl", &path[0]);
+    int n = 0;
+    while (cmd[n] != 0) n++;
+    return fs_write(&path[0], cmd, n) < 0 ? -1 : 0;
+}
+
+fn int net_status(int h, char* out, int cap) {
+    char[64] path;
+    net_file(h, "status", &path[0]);
+    int n = fs_read(&path[0], out, cap - 1);
+    if (n < 0) return -1;
+    out[n] = 0;
+    return n;
+}
+
+// Split "proto!host!port" — proto into *proto_out, "host!port" (or
+// "host") copied to rest. -1 on an unknown protocol.
+fn int net_split(char* addr, int* proto_out, char* rest) {
+    int i = 0;
+    if (addr[0] == 't' && addr[1] == 'c' && addr[2] == 'p' && addr[3] == '!') { *proto_out = NET_TCP; i = 4; }
+    else if (addr[0] == 'u' && addr[1] == 'd' && addr[2] == 'p' && addr[3] == '!') { *proto_out = NET_UDP; i = 4; }
+    else if (addr[0] == 'i' && addr[1] == 'c' && addr[2] == 'm' && addr[3] == 'p' && addr[4] == '!') { *proto_out = NET_ICMP; i = 5; }
+    else { return -1; }
+    int o = 0;
+    while (addr[i] != 0 && o < 47) { rest[o] = addr[i]; o++; i++; }
+    rest[o] = 0;
+    return 0;
+}
+
+// --- names (DNS) ----------------------------------------------------
+// One A-record query over UDP to the DNS server ipd learned from DHCP
+// (the "dns" field of /net/ipifc/*/status), two tries. Numbers and
+// "localhost" are answered without asking.
+
+fn bool net_parse_ip(char* s, uint* out) {
+    uint ip = 0;
+    int at = 0;
+    for (int k = 0; k < 4; k++) {
+        int v = net_parse_num(s, &at);
+        if (v < 0 || v > 255) return false;
+        ip = (ip << 8) | (uint)v;
+        if (k < 3) { if (s[at] != '.') return false; at++; }
+    }
+    if (s[at] != 0) return false;
+    *out = ip;
+    return true;
+}
+
+fn int net_fmt_ip(char* out, uint ip) {
+    int n = 0;
+    for (int k = 3; k >= 0; k--) {
+        uint b = (ip >> (k * 8)) & 0xFF;
+        if (b >= 100) { out[n] = (char)('0' + b / 100); n++; }
+        if (b >= 10) { out[n] = (char)('0' + (b / 10) % 10); n++; }
+        out[n] = (char)('0' + b % 10); n++;
+        if (k > 0) { out[n] = '.'; n++; }
+    }
+    out[n] = 0;
+    return n;
+}
+
+fn uint dns_server() {
+    for (int i = 0; i < 4; i++) {
+        char[24] path;
+        char* pre = "/net/ipifc/";
+        int o = 0;
+        for (int k = 0; pre[k] != 0; k++) { path[o] = pre[k]; o++; }
+        path[o] = (char)('0' + i); o++;
+        char* suf = "/status";
+        for (int k = 0; suf[k] != 0; k++) { path[o] = suf[k]; o++; }
+        path[o] = 0;
+        char[256] st;
+        int n = fs_read(&path[0], &st[0], 255);
+        if (n <= 0) continue;
+        st[n] = 0;
+        for (int k = 0; k + 4 < n; k++) {
+            if (st[k] == ' ' && st[k + 1] == 'd' && st[k + 2] == 'n' && st[k + 3] == 's' && st[k + 4] == ' ') {
+                char[16] ipt;
+                int j = 0;
+                int at = k + 5;
+                while (st[at] != ' ' && st[at] != 0 && j < 15) { ipt[j] = st[at]; j++; at++; }
+                ipt[j] = 0;
+                uint ip;
+                if (net_parse_ip(&ipt[0], &ip) && ip != 0) return ip;
+            }
+        }
+    }
+    return 0;
+}
+
+// Skip a (possibly compressed) DNS name at msg[at]; returns the offset
+// just past it, or -1 if malformed.
+fn int dns_skip_name(char* msg, int len, int at) {
+    while (at < len) {
+        uint l = (uint)msg[at];
+        if (l == 0) return at + 1;
+        if ((l & 0xC0) == 0xC0) return at + 2;
+        at += (int)l + 1;
+    }
+    return -1;
+}
+
+// Resolve `name` to an IPv4 address. false if it can't be.
+fn bool dns_resolve(char* name, uint* out) {
+    if (net_parse_ip(name, out)) return true;
+    if (strcmp(name, "localhost") == 0) { *out = 0x7F000001; return true; }
+    uint server = dns_server();
+    if (server == 0) return false;
+    char[48] addr;
+    char* pre = "udp!";
+    int o = 0;
+    for (int k = 0; pre[k] != 0; k++) { addr[o] = pre[k]; o++; }
+    o += net_fmt_ip(&addr[o], server);
+    char* port = "!53";
+    for (int k = 0; port[k] != 0; k++) { addr[o] = port[k]; o++; }
+    addr[o] = 0;
+
+    char[300] q;
+    ushort id = (ushort)(rdtime() & 0xFFFF);
+    q[0] = (char)(id >> 8); q[1] = (char)id;
+    q[2] = 0x01; q[3] = 0x00;          // recursion desired
+    q[4] = 0; q[5] = 1;                // one question
+    for (int k = 6; k < 12; k++) q[k] = 0;
+    int qn = 12;
+    int ls = 0;
+    for (int k = 0; ; k++) {
+        if (name[k] == '.' || name[k] == 0) {
+            int l = k - ls;
+            if (l <= 0 || l > 63 || qn + l + 6 > 290) return false;
+            q[qn] = (char)l; qn++;
+            for (int j = ls; j < k; j++) { q[qn] = name[j]; qn++; }
+            ls = k + 1;
+            if (name[k] == 0) break;
+        }
+    }
+    q[qn] = 0; q[qn + 1] = 0; q[qn + 2] = 1; q[qn + 3] = 0; q[qn + 4] = 1;   // root, A, IN
+    qn += 5;
+
+    int h = dial(&addr[0]);
+    if (h < 0) return false;
+    bool found = false;
+    for (int attempt = 0; attempt < 2 && !found; attempt++) {
+        net_write(h, &q[0], qn);
+        char[1024] r;
+        int rn = net_read1(h, &r[0], 1024);
+        if (rn < 12 || r[0] != q[0] || r[1] != q[1]) continue;
+        if (((uint)r[3] & 0x0F) != 0) break;                  // NXDOMAIN etc.
+        int ancount = ((int)r[6] << 8) | (int)r[7];
+        int at = dns_skip_name(&r[0], rn, 12);
+        if (at < 0) break;
+        at += 4;                                              // qtype, qclass
+        for (int a = 0; a < ancount && at > 0 && at + 10 <= rn; a++) {
+            at = dns_skip_name(&r[0], rn, at);
+            if (at < 0 || at + 10 > rn) break;
+            int type = ((int)r[at] << 8) | (int)r[at + 1];
+            int rdlen = ((int)r[at + 8] << 8) | (int)r[at + 9];
+            at += 10;
+            if (type == 1 && rdlen == 4 && at + 4 <= rn) {
+                *out = ((uint)r[at] << 24) | ((uint)r[at + 1] << 16) | ((uint)r[at + 2] << 8) | (uint)r[at + 3];
+                found = true;
+                break;
+            }
+            at += rdlen;
+        }
+    }
+    hangup(h);
+    return found;
+}
+
+// "host!port" or "host" (in place, <= 48 bytes): a host name becomes its
+// dotted quad. false if the name doesn't resolve.
+fn bool net_resolve_rest(char* rest) {
+    char[48] host;
+    int i = 0;
+    while (rest[i] != 0 && rest[i] != '!' && i < 47) { host[i] = rest[i]; i++; }
+    host[i] = 0;
+    if (host[0] == '*') return true;
+    uint ip;
+    if (net_parse_ip(&host[0], &ip)) return true;
+    if (!dns_resolve(&host[0], &ip)) return false;
+    char[48] out;
+    int o = net_fmt_ip(&out[0], ip);
+    while (rest[i] != 0 && o < 47) { out[o] = rest[i]; o++; i++; }
+    out[o] = 0;
+    for (int k = 0; k <= o; k++) rest[k] = out[k];
+    return true;
+}
+
+// Connect to `addr`. A tcp dial waits (up to ~10 s) for the connection
+// to be established; refused or timed out = -1. Handle, or -1.
+fn int dial(char* addr) {
+    int proto;
+    char[48] rest;
+    if (net_split(addr, &proto, &rest[0]) < 0) return -1;
+    if (!net_resolve_rest(&rest[0])) return -1;
+    int h = net_clone(proto);
+    if (h < 0) return -1;
+    char[64] cmd;
+    char* co = "connect ";
+    int o = 0;
+    for (int i = 0; co[i] != 0; i++) { cmd[o] = co[i]; o++; }
+    for (int i = 0; rest[i] != 0; i++) { cmd[o] = rest[i]; o++; }
+    cmd[o] = 0;
+    if (net_ctl(h, &cmd[0]) < 0) { net_ctl(h, "hangup"); return -1; }
+    if (proto != NET_TCP) return h;
+    ulong end = rdtime() + timebase_hz() * 10;
+    char[64] st;
+    while (rdtime() < end) {
+        if (net_status(h, &st[0], 64) < 0) break;
+        // "tcp <n> <State> ..."
+        int sp = 0;
+        int k = 0;
+        while (st[k] != 0 && sp < 2) { if (st[k] == ' ') sp++; k++; }
+        if (st[k] == 'E') return h;                      // Established
+        if (st[k] == 'R' || (st[k] == 'C' && st[k + 1] == 'l')) break;   // Reset / Closed: refused
+        await_any(0, timebase_hz() / 100, null, 0);
+    }
+    net_ctl(h, "hangup");
+    return -1;
+}
+
+// Listen on "proto!*!port" (or "proto!port"). Handle, or -1. For tcp,
+// net_listen() then hands out each incoming connection.
+fn int announce(char* addr) {
+    int proto;
+    char[48] rest;
+    if (net_split(addr, &proto, &rest[0]) < 0) return -1;
+    int h = net_clone(proto);
+    if (h < 0) return -1;
+    char[64] cmd;
+    char* an = "announce ";
+    int o = 0;
+    for (int i = 0; an[i] != 0; i++) { cmd[o] = an[i]; o++; }
+    for (int i = 0; rest[i] != 0; i++) { cmd[o] = rest[i]; o++; }
+    cmd[o] = 0;
+    if (net_ctl(h, &cmd[0]) < 0) { net_ctl(h, "hangup"); return -1; }
+    return h;
+}
+
+// tcp: wait for the next connection on announced handle `h`; returns its
+// handle (owned by the caller), or -1.
+fn int net_listen(int h) {
+    char[64] path;
+    net_file(h, "listen", &path[0]);
+    for (;;) {
+        char[16] num;
+        int n = fs_read(&path[0], &num[0], 15);
+        if (n == NET_RETRY) continue;
+        if (n <= 0) return -1;
+        num[n] = 0;
+        int at = 0;
+        int c = net_parse_num(&num[0], &at);
+        return c < 0 ? -1 : (NET_TCP << 8) | c;
+    }
+}
+
+// One read attempt: bytes, 0 = end of stream (tcp), -1 = error,
+// NET_RETRY = nothing arrived within ~1 s.
+fn int net_read1(int h, char* buf, int len) {
+    char[64] path;
+    net_file(h, "data", &path[0]);
+    if (len > (int)FS_MSG_MAX - 8) len = (int)FS_MSG_MAX - 8;
+    return fs_read(&path[0], buf, len);
+}
+
+// Read whatever arrives next (a datagram, or some stream bytes). Blocks
+// until there is something. 0 = end of stream, -1 = error.
+fn int net_read(int h, char* buf, int len) {
+    for (;;) {
+        int r = net_read1(h, buf, len);
+        if (r != NET_RETRY) return r;
+    }
+}
+
+// Send all of buf (tcp: waits for buffer space). len, or -1.
+fn int net_write(int h, char* buf, int len) {
+    char[64] path;
+    net_file(h, "data", &path[0]);
+    int done = 0;
+    while (done < len) {
+        int chunk = len - done;
+        if (chunk > (int)FS_MSG_MAX - 120) chunk = (int)FS_MSG_MAX - 120;
+        int r = fs_write(&path[0], buf + done, chunk);
+        if (r < 0) return -1;
+        if (r == 0) { await_any(0, timebase_hz() / 200, null, 0); continue; }   // send buffer full
+        done += r;
+        if ((h >> 8) != NET_TCP) break;   // a datagram is all-or-nothing
+    }
+    return len;
+}
+
+fn void hangup(int h) {
+    net_ctl(h, "hangup");
 }
 
 // Unmap a segment segattach mapped at `addr`. 0, or -1.
@@ -1412,10 +1783,15 @@ fn int stdin_is_console() @export("stdin_is_console") {
 }
 
 fn void print(char* s) {
-    while (*s != 0) {
-        putchar(*s);
-        s++;
-    }
+    int n = 0;
+    while (s[n] != 0) { n++; }
+    if (n > 0) { write_stdout(s, n); }
+}
+
+// Write len bytes to stdout (pipe or console) in one syscall. Returns the
+// bytes written (fewer only if a note cut a full-pipe wait short).
+fn int write_stdout(char* buf, int len) @export("write_stdout") {
+    return syscall(SYS_WRITE, (long)buf, len, 0);
 }
 
 // Decimal, no leading zeros (except "0" itself) — every existing test

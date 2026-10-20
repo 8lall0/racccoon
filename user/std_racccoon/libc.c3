@@ -71,12 +71,7 @@ fn CFile* freopen(ZString filename, ZString mode, CFile* stream) @weak @cname("f
 // CRITICAL: std::io uses fwrite for output
 fn usz fwrite(void* ptr, usz size, usz nmemb, CFile* stream) @cname("fwrite") @nostrip
 {
-	char* str = (char*)ptr;
-	usz total = size * nmemb;
-	for (usz i = 0; i < total; i++)
-	{
-		rcsys::rc_putchar(str[i]);
-	}
+	rcsys::rc_write((char*)ptr, size * nmemb);
 	return nmemb;
 }
 

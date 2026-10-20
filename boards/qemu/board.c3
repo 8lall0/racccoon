@@ -93,7 +93,7 @@ const uint FS_PARTITION_2_START_SECTOR = 18432;
 // (scripts/launch64.sh), slot 1 virtio-net.
 const uptr VIRTIO_BLK_PADDR = 0x10001000;
 const uptr VIRTIO_NET_PADDR = 0x10002000;
-const uint IRQ_VIRTIO_NET   = 2; // declared, not routed: netd is fully poll-driven
+const uint IRQ_VIRTIO_NET   = 2; // level (see DEVICES); netd acks the virtio ISR, then re-arms
 
 // The devices the kernel hands to boot drivers (src/device.c3). QEMU virt
 // has virtio-blk (diskd) and virtio-net (netd) and nothing else — no SD
@@ -105,8 +105,9 @@ const uint IRQ_VIRTIO_NET   = 2; // declared, not routed: netd is fully poll-dri
 // diskd_info() reads them, plus the fsd<->diskd payload arena
 // (docs/ipc-rings.md). Edge/latched interrupt, acked via the virtio ISR
 // register in diskd itself.
-// virtio-net: RX and TX virtqueues plus a packet-buffer page (Ethernet
-// Phase 2 — user/net/netd.c3's own fixed offsets), in netd_info()'s order.
+// virtio-net: RX and TX virtqueues, then the RX and TX packet buffers
+// (NETD_RING_N 2 KiB slots each — user/net/netd.c3), in that order.
+// Interrupt-driven: netd sleeps in await_any(AW_IRQ | AW_WAKE).
 const Device[*] DEVICES = {
 	{
 		.name = "virtio-blk",
@@ -121,9 +122,18 @@ const Device[*] DEVICES = {
 	{
 		.name = "virtio-net",
 		.mmio = { VIRTIO_NET_PADDR },
+		.irq = IRQ_VIRTIO_NET,
+		// Level, not edge like virtio-blk: the virtio-mmio line stays up
+		// until the ISR is acked, and netd sleeps between interrupts
+		// (diskd spins) — left enabled it re-fires on every return to user
+		// mode until netd gets to run, starving everyone else. Masked on
+		// each fire; netd re-arms it after acking.
+		.irq_level = true,
+		.irq_armed = true,
 		.dma = { { .pages = kernel::VIRTQ_PAGES, .cached = true },
 		         { .pages = kernel::VIRTQ_PAGES, .cached = true },
-		         { .pages = 1, .cached = true } },
+		         { .pages = 8, .cached = true },
+		         { .pages = 8, .cached = true } },
 	},
 };
 

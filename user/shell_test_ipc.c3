@@ -36,6 +36,42 @@ fn void aw_sleep(ulong ticks) {
     while (rdtime() < end) { yield(); }
 }
 
+// waketest: the SYS_WAKE doorbell (AW_WAKE). A wake rouses a sleeping
+// await, is remembered if it comes first, and is consumed by being
+// reported.
+fn void wake_test() {
+    ulong hz = timebase_hz();
+    int me = getpid();
+    uint g = 0;
+    int c = rfork(RFPROC, &g);
+    if (c == 0) {
+        // 1: asleep in await, woken by the parent ~0.3 s in.
+        int r1 = await_any(AW_WAKE, hz * 5, null, 0);
+        // 2: the parent's second wake arrived while we weren't waiting.
+        aw_sleep(hz / 2);
+        int r2 = await_any(AW_WAKE, hz * 5, null, 0);
+        // 3: nothing pending any more — must time out.
+        int r3 = await_any(AW_WAKE, hz / 5, null, 0);
+        int code = (r1 == (int)AW_WAKE ? 1 : 0) | (r2 == (int)AW_WAKE ? 2 : 0) | (r3 == (int)AW_TIMER ? 4 : 0);
+        exitcode(code);
+    }
+    aw_sleep(hz * 3 / 10);
+    wake(c, g);
+    aw_sleep(hz / 10);
+    wake(c, g);
+    int r = join(c, g);
+    bool bad_target = wake(0x7fff, 0) == -1;
+    print("waketest: woke a sleeper ");
+    print((r & 1) ? "ok" : "FAILED");
+    print(", remembered an early wake ");
+    print((r & 2) ? "ok" : "FAILED");
+    print(", consumed once ");
+    print((r & 4) ? "ok" : "FAILED");
+    print(", bad pid refused ");
+    print(bad_target ? "ok" : "FAILED");
+    print(r == 7 && bad_target ? " — PASS\n" : " — FAIL\n");
+}
+
 fn void await_test() {
     ulong hz = timebase_hz();
     int pass = 0;
@@ -184,7 +220,8 @@ fn void ringbench_perop(ulong total, ulong iters) {
 }
 
 fn bool shell_test_ipc_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
-    if (strcmp(cmd, "ping") == 0) {
+    // Bare `ping` only: `ping <host>` is /bin/ping (ICMP through ipd).
+    if (strcmp(cmd, "ping") == 0 && cmd_argc == 0) {
         // Resolved through the namespace now — "/srv/echo/" is where
         // echod is named (src/process.c3's default mount table),
         // finally landing on the "real name -> pid lookup" this
@@ -729,6 +766,8 @@ fn bool shell_test_ipc_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
         } else {
             print("hungservertest: FAILED\n");
         }
+    } else if (strcmp(cmd, "waketest") == 0) {
+        wake_test();
     } else if (strcmp(cmd, "awaittest") == 0) {
         await_test();
     } else if (strcmp(cmd, "ipcfifotest") == 0) {

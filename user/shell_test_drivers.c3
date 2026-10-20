@@ -152,29 +152,31 @@ fn bool shell_test_drivers_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
         // The storage driver's supervisor path (storagekilltest),
         // one driver over: kill netd and confirm the supervisor
         // re-inits it (device_setup re-runs for the "virtio-net" device) and the
-        // namespace reseat points "/net/" back at the fresh pid.
-        if (ns_mount("/net/", "netd") < 0) {
+        // namespace reseat points our handle back at the fresh pid. The
+        // handle lives at /srv/netd/, not /net/: /net/ is ipd's (the IP
+        // stack) — mounting netd there shadowed it for every later test.
+        if (ns_mount("/srv/netd/", "netd") < 0) {
             print("netdkilltest: FAILED (netd not posted)\n");
         } else {
             uint nk_m = 0;
-            int nk_pid = ns_resolve("/net/", &nk_m);
+            int nk_pid = ns_resolve("/srv/netd/", &nk_m);
             int nk_killed = nk_pid > 0 ? kill(nk_pid, 0) : -1;
             int nk_ok = -1;
             ulong nk_deadline = rdtime() + timebase_hz() * 20; // 20s wall-clock, any board
             while (nk_ok < 0 && rdtime() < nk_deadline) {
                 yield();
                 uint m = 0;
-                int np = ns_resolve("/net/", &m);
-                // m == 5 ("/net/") means it resolved to the netd
+                int np = ns_resolve("/srv/netd/", &m);
+                // m == 10 ("/srv/netd/") means it resolved to the netd
                 // mount, reseated to the live respawn — not the ""
                 // catch-all it falls to while netd is down.
-                if (np > 0 && m == 5) {
+                if (np > 0 && m == 10) {
                     uint g = 0;
                     if (proc_info(np, null, &g, null) == 0) nk_ok = 0;
                 }
             }
             if (nk_pid > 0 && nk_killed == 0 && nk_ok == 0) {
-                print("netdkilltest: ok (netd killed, respawned, /net/ reseated)\n");
+                print("netdkilltest: ok (netd killed, respawned, /srv/netd/ reseated)\n");
             } else {
                 print("netdkilltest: FAILED\n");
             }

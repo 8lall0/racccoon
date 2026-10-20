@@ -32,6 +32,7 @@
 #define RC_SYS_NOTIFY       62
 #define RC_SYS_NOTED        63
 #define RC_SYS_AWAIT        65   /* poll() */
+#define RC_SYS_WRITE        69   /* a whole buffer to stdout */
 
 /* rfork(2) flags (user/user.c3 authoritative) */
 #define RC_RFPROC             (1 << 0)

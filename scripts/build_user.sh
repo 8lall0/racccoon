@@ -202,7 +202,7 @@ STUB
 }
 
 C3_OPT=-O2 build_user_program shell user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/shell_words.c3 user/shell_jobs.c3 user/shell_common.c3 user/shell.c3
-C3_OPT=-O2 build_user_program shell_test user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/shell_words.c3 user/shell_jobs.c3 user/shell_common.c3 user/shell_test.c3 user/shell_test_fs.c3 user/shell_test_ipc.c3 user/shell_test_proc.c3 user/shell_test_drivers.c3 user/shell_test_lang.c3 user/shell_test_cam.c3 user/shell_test_cam_golden.c3
+C3_OPT=-O2 build_user_program shell_test user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/shell_words.c3 user/shell_jobs.c3 user/shell_common.c3 user/shell_test.c3 user/shell_test_fs.c3 user/shell_test_ipc.c3 user/shell_test_proc.c3 user/shell_test_drivers.c3 user/shell_test_lang.c3 user/shell_test_cam.c3 user/shell_test_cam_golden.c3 user/shell_test_net.c3 user/crypto/crypto.c3
 C3_OPT=-O2 build_user_program echod user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/sys/echod.c3
 # true/false do zero I/O (just exitcode(0)/(1)) — no benefit from the
 # real stdlib's ~180 KiB, kept on the lightweight std::nolibc path.
@@ -245,6 +245,13 @@ C3_OPT=-O2 build_user_program_stdio mv $STDIO_COMMON user/bin/mv.c3
 C3_OPT=-O2 build_user_program_stdio chmod $STDIO_COMMON user/bin/chmod.c3
 C3_OPT=-O2 build_user_program_stdio chown $STDIO_COMMON user/bin/chown.c3
 C3_OPT=-O2 build_user_program_stdio note $STDIO_COMMON user/bin/note.c3
+C3_OPT=-O2 build_user_program_stdio ping $STDIO_COMMON user/bin/ping.c3
+C3_OPT=-O2 build_user_program_stdio nc $STDIO_COMMON user/bin/nc.c3
+C3_OPT=-O2 build_user_program_stdio rshd $STDIO_COMMON user/bin/rshd.c3
+C3_OPT=-O2 build_user_program_stdio dnsq $STDIO_COMMON user/bin/dnsq.c3
+# /bin/rc: the production shell, for rshd's remote sessions (the boot
+# console shell itself is embedded in the kernel image).
+cp build/user/shell.bin build/user/rc.bin
 # test/[ and expr — the primitives the shell's if/for/while build on
 # (docs/roadmap.md §2.5). One test.bin is seeded as both /bin/test and
 # /bin/[ by scripts/build.sh / populate_duo_bin.sh.
@@ -281,8 +288,11 @@ C3_OPT=-O2 build_user_program fsd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACC
 C3_OPT=-O2 build_user_program_stdio procd $STDIO_COMMON user/sys/procd.c3
 C3_OPT=-O2 build_user_program envd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/sys/envd.c3
 build_user_program usbd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/usb/dwc2.c3 user/usb/xpad.c3 user/usb/kbd.c3 user/usb/msc.c3 user/usb/usbd.c3
-build_user_program ethd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/net/eth_proto.c3 user/net/dhcp.c3 user/net/dwmac.c3 user/net/ephy.c3 user/net/ethd.c3
-C3_OPT=-O2 build_user_program netd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/virtio.c3 user/net/eth_proto.c3 user/net/dhcp.c3 user/net/netd.c3
+build_user_program ethd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/net/link.c3 user/net/dwmac.c3 user/net/ephy.c3 user/net/ethd.c3
+C3_OPT=-O2 build_user_program netd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/virtio.c3 user/net/link.c3 user/net/netd.c3
+# ipd — the IP stack (user/net/ipd.c3): ARP/IPv4/ICMP/UDP/TCP/DHCP over the
+# link rings, serving /net/.
+C3_OPT=-O2 build_user_program ipd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/net/eth_proto.c3 user/net/dhcp.c3 user/net/link.c3 user/net/ipd.c3 user/net/ipd_conv.c3 user/net/ipd_tcp.c3
 build_user_program gpiod user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/gpio/gpiod.c3
 build_user_program i2cd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/i2c/i2cd.c3
 build_user_program cifd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/cif/cifd.c3

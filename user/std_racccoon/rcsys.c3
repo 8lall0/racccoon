@@ -11,6 +11,7 @@ module rcsys @feat(CUSTOM_LIBC);
 const long SYS_PUTCHAR = 1;
 const long SYS_EXIT    = 3;
 const long SYS_MAP     = 47;
+const long SYS_WRITE   = 69;
 
 // Same asm{} shape as user.c3's own syscall() — all-local operands,
 // the form actually proven to work on this target.
@@ -42,6 +43,12 @@ fn int rc_putchar(int c)
 {
 	rc_syscall(SYS_PUTCHAR, (long)c, 0, 0);
 	return c;
+}
+
+// A whole buffer to stdout in one trap (SYS_WRITE).
+fn void rc_write(char* buf, usz len)
+{
+	if (len > 0) { rc_syscall(SYS_WRITE, (long)buf, (long)len, 0); }
 }
 
 fn void rc_exit(int code) @noreturn

@@ -60,6 +60,8 @@ extern char[] _binary_usbd_bin_start @cname("_binary_usbd_bin_start");
 extern char[] _binary_usbd_bin_end @cname("_binary_usbd_bin_end");
 extern char[] _binary_ethd_bin_start @cname("_binary_ethd_bin_start");
 extern char[] _binary_ethd_bin_end @cname("_binary_ethd_bin_end");
+extern char[] _binary_ipd_bin_start @cname("_binary_ipd_bin_start");
+extern char[] _binary_ipd_bin_end @cname("_binary_ipd_bin_end");
 extern char[] _binary_netd_bin_start @cname("_binary_netd_bin_start");
 extern char[] _binary_netd_bin_end @cname("_binary_netd_bin_end");
 extern char[] _binary_gpiod_bin_start @cname("_binary_gpiod_bin_start");
@@ -159,6 +161,7 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 	io::print("2: Trap handler set\n");
 
 	idle_proc = create_process(null, 0);
+	if (idle_proc == null) { panic::panic("can't create the idle process"); }
 	io::print("3: Idle created\n");
 
 	proc_set_name(idle_proc, "idle");
@@ -264,6 +267,16 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 		mount: "/env/");
 	io::print("envd created\n");
 
+	// ipd (the IP stack, user/net/ipd.c3) — mounted at /net/. No device of
+	// its own: it attaches the link rings ("ether<N>") that netd / ethd /
+	// the Wi-Fi driver create whenever they come up, so it can start
+	// before any of them. Spawned before the shell for the same reason as
+	// procd/envd: the shell's default namespace only gets the mounts of
+	// services that already exist.
+	service_boot("ipd", (char*)&_binary_ipd_bin_start, (char*)&_binary_ipd_bin_end,
+		mount: "/net/");
+	io::print("ipd created\n");
+
 	// The shell — created explicitly here, BEFORE usbd below, not left
 	// to the lazy "idle notices nothing else is runnable" path the
 	// final loop below still handles for every later respawn. Real bug
@@ -289,6 +302,7 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 	// between any number of such processes — the same shape that
 	// already works fine for e.g. hotplugtest's own dangling-fid race.
 	Process* shell_proc = create_process((void*)&_binary_shell_bin_start, (uint)((uptr)&_binary_shell_bin_end - (uptr)&_binary_shell_bin_start));
+	if (shell_proc == null) { panic::panic("can't create the shell"); }
 	proc_set_name(shell_proc, "shell");
 	console_noteg = shell_proc.noteg; // ^C goes to the shell's note group (src/note.c3)
 	io::print("shell created\n");
@@ -374,24 +388,29 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 	smp_start_secondaries();
 
 	// Single call site for create_process(shell) below (a *respawn*
-	// only now — the initial spawn is explicit above), used once idle
-	// notices nothing else is runnable (e.g. the shell itself exiting).
+	// only now — the initial spawn is explicit above): once the console
+	// shell process we started is gone (`exit`, killed, faulted), start a
+	// fresh one. It used to respawn whenever nothing at all was RUNNABLE,
+	// which was a stand-in for "the shell exited" while every wait spun
+	// RUNNABLE — but sleeping waits (the FIFO send queue, timed
+	// await_any, ipd and netd) make "everyone asleep" a normal moment, and
+	// that started a second shell next to a live one (two shells then
+	// split the console's keystrokes).
+	int shell_pid = shell_proc.pid;
+	uint shell_gen = shell_proc.generation;
 	for (;;)
 	{
-		bool shell_running = false;
-		for (int i = 0; i < PROCS_MAX; i++)
-		{
-			if (procs[i].state == PROC_RUNNABLE && procs[i].pid > 0)
-			{
-				shell_running = true;
-				break;
-			}
-		}
-		if (!shell_running)
+		Process* sh = proc_by_pid(shell_pid);
+		if (sh == null || sh.generation != shell_gen)
 		{
 			Process* respawned_shell = create_process((void*)&_binary_shell_bin_start, (uint)((uptr)&_binary_shell_bin_end - (uptr)&_binary_shell_bin_start));
-			proc_set_name(respawned_shell, "shell");
-			console_noteg = respawned_shell.noteg;
+			if (respawned_shell != null)   // out of memory: try again next pass
+			{
+				proc_set_name(respawned_shell, "shell");
+				console_noteg = respawned_shell.noteg;
+				shell_pid = respawned_shell.pid;
+				shell_gen = respawned_shell.generation;
+			}
 		}
 
 		yield();

@@ -1,27 +1,17 @@
 module user;
 
 // netd: the virtio-net driver — QEMU only (the board's "virtio-net" device;
-// the real Duo has an actual Ethernet MAC instead, see
-// user/net/ethd.c3), mirroring diskd.c3's own structure closely (same
-// virtio-mmio legacy register layout, same virtqueue struct shapes)
-// since both are virtio-mmio devices on the same QEMU virt board.
+// the real Duo has an actual Ethernet MAC instead, see user/net/ethd.c3).
+// Same virtio-mmio legacy register layout and virtqueue shapes as
+// diskd.c3.
 //
-// Phase 2 (real packet TX/RX + ARP/ICMP — see docs/devlog.md): the
-// RX/TX virtqueues Phase 1 already configured now actually carry
-// frames. A single RX buffer stays permanently posted to the RX
-// queue, re-armed after every frame consumed; a single TX buffer is
-// reused for whatever this process needs to send next — same one-
-// outstanding-transfer discipline this codebase uses everywhere else
-// (USB's single host channel, diskd/sdd's one request at a time,
-// ethd's own single-descriptor DMA ring). No interrupt reliance: a
-// virtio device processes descriptors and updates its used ring
-// regardless of whether the driver ever handles the completion IRQ,
-// so completion is detected by directly polling `used.index`, the
-// same busy-polled style every other device driver in this codebase
-// already uses.
-//
-// Legacy virtio-mmio (version 1) register offsets — same layout
-// diskd.c3 already uses, confirmed working there.
+// A pure link driver: it moves Ethernet frames between the device and the
+// "ether0" link rings (user/net/link.c3) and knows nothing about IP —
+// ARP, ICMP, DHCP and everything above live in ipd (user/net/ipd.c3).
+// NETD_RING_N receive buffers stay posted to the RX queue (each re-posted
+// as soon as its frame is copied out); up to NETD_RING_N transmits can be
+// in flight. Interrupt-driven: the virtio-net used-ring interrupt (RX or
+// TX completion) and ipd's doorbell both wake one await_any.
 
 import std::nolibc::main_stub;
 import std::nolibc::mem;
@@ -68,370 +58,159 @@ fn void netd_setup_queue(Virtio_virtq* vq, uptr vq_paddr, int queue_index)
     vq.used_index  = &vq.used.index;
 }
 
-// --- Phase 2: real packet TX/RX over the queues Phase 1 configured.
-// Legacy virtio-net header — 10 bytes, all zero (no offload features
-// negotiated: flags/gso_type/hdr_len/gso_size/csum_start/csum_offset),
-// prepended before the actual Ethernet frame in both TX and RX
-// buffers.
+// --- Packet buffers. Legacy virtio-net header — 10 bytes, all zero (no
+// offload features negotiated), prepended before the Ethernet frame in
+// both TX and RX buffers.
 const uint NETD_HDR_LEN  = 10;
-const uint NETD_BUF_SIZE = NETD_HDR_LEN + 1600; // matches ethd's own ETH_DMA_BUF_SIZE (1600, MAC_MAX_FRAME_SZ) plus this header
+const uint NETD_SLOT     = 2048;          // one buffer per 2 KiB, 2 per page
+const uint NETD_RING_N   = 16;            // <= VIRTQ_ENTRY_NUM; 8 DMA pages each way
+const uint NETD_BUF_SIZE = NETD_HDR_LEN + 1600;
 
 Virtio_virtq* netd_rxq;
 Virtio_virtq* netd_txq;
-char* netd_rx_buf;
-char* netd_tx_buf;
-uptr netd_tx_buf_paddr;
+uptr netd_rx_bufs;   // NETD_RING_N x NETD_SLOT, identity-mapped (paddr == vaddr)
+uptr netd_tx_bufs;
+uint netd_tx_inflight;
 
-// Posts (or re-posts) the single RX buffer to the RX queue — must be
-// called once at startup before anything can be received, and again
-// after every frame consumed (netd_try_recv does this itself).
-fn void netd_arm_rx()
+// Post RX buffer `i` (descriptor i) to the device.
+fn void netd_post_rx(uint i)
 {
-    netd_rxq.descs[0].addr  = (ulong)((uptr)netd_rx_buf);
-    netd_rxq.descs[0].len   = NETD_BUF_SIZE;
-    netd_rxq.descs[0].flags = VIRTQ_DESC_F_WRITE;
-    netd_rxq.descs[0].next  = 0;
-    netd_rxq.avail.ring[netd_rxq.avail.index % VIRTQ_ENTRY_NUM] = 0;
+    netd_rxq.descs[i].addr  = (ulong)(netd_rx_bufs + (uptr)i * NETD_SLOT);
+    netd_rxq.descs[i].len   = NETD_BUF_SIZE;
+    netd_rxq.descs[i].flags = VIRTQ_DESC_F_WRITE;
+    netd_rxq.descs[i].next  = 0;
+    netd_rxq.avail.ring[netd_rxq.avail.index % VIRTQ_ENTRY_NUM] = (ushort)i;
+    asm("fence");
     netd_rxq.avail.index++;
-    asm("fence");
-    reg_write32(VIRTIO_REG_QUEUE_NOTIFY, (uint)netd_rxq.queue_index);
 }
 
-// Non-blocking poll for a received frame — copies the Ethernet frame
-// (header already stripped) into frame_out (must have room for
-// NETD_BUF_SIZE - NETD_HDR_LEN bytes) and sets *frame_len_out, then
-// re-arms the RX buffer for the next frame. Returns false if nothing
-// new has arrived.
-fn bool netd_try_recv(char* frame_out, uint* frame_len_out)
+// Move every received frame into the link's RX ring. Returns how many.
+fn uint netd_drain_rx(Link* l)
 {
-    if (*netd_rxq.used_index == netd_rxq.last_used_index) { return false; }
-
-    uint used_len = netd_rxq.used.ring[netd_rxq.last_used_index % VIRTQ_ENTRY_NUM].len;
-    netd_rxq.last_used_index++;
-
-    if (used_len < NETD_HDR_LEN)
+    uint n = 0;
+    while (*netd_rxq.used_index != netd_rxq.last_used_index)
     {
-        netd_arm_rx(); // malformed/too-short — drop and keep listening
-        return false;
+        Virtq_used_elem* e = &netd_rxq.used.ring[netd_rxq.last_used_index % VIRTQ_ENTRY_NUM];
+        uint id = e.id;
+        uint used_len = e.len;
+        netd_rxq.last_used_index++;
+        if (id < NETD_RING_N)
+        {
+            if (used_len > NETD_HDR_LEN)
+            {
+                char* buf = (char*)(netd_rx_bufs + (uptr)id * NETD_SLOT);
+                link_put(l, buf + NETD_HDR_LEN, used_len - NETD_HDR_LEN);
+                n++;
+            }
+            netd_post_rx(id);
+        }
     }
-
-    uint frame_len = used_len - NETD_HDR_LEN;
-    mem::copy(frame_out, &netd_rx_buf[NETD_HDR_LEN], (sz)frame_len);
-    *frame_len_out = frame_len;
-    netd_arm_rx();
-    return true;
+    if (n > 0) { reg_write32(VIRTIO_REG_QUEUE_NOTIFY, (uint)netd_rxq.queue_index); }
+    return n;
 }
 
-// Sends one Ethernet frame, prepending the (zeroed) virtio-net header.
-// Blocks (bounded, 1s) for the device to consume it — this driver
-// only ever has one frame in flight, matching this codebase's own
-// one-outstanding-transfer discipline throughout. Returns false on
-// timeout.
-fn bool netd_send(char* frame, uint frame_len)
+// Reclaim completed transmits, then hand the device whatever ipd queued.
+fn void netd_pump_tx(Link* l)
 {
-    mem::set(netd_tx_buf, 0, (sz)NETD_HDR_LEN);
-    mem::copy(&netd_tx_buf[NETD_HDR_LEN], frame, (sz)frame_len);
-
-    netd_txq.descs[0].addr  = (ulong)netd_tx_buf_paddr;
-    netd_txq.descs[0].len   = NETD_HDR_LEN + frame_len;
-    netd_txq.descs[0].flags = 0;
-    netd_txq.descs[0].next  = 0;
-    netd_txq.avail.ring[netd_txq.avail.index % VIRTQ_ENTRY_NUM] = 0;
-    netd_txq.avail.index++;
-    asm("fence");
-    reg_write32(VIRTIO_REG_QUEUE_NOTIFY, (uint)netd_txq.queue_index);
-
-    ulong start = rdtime();
-    ulong budget = netd_us_to_ticks(1000000);
-    while (*netd_txq.used_index == netd_txq.last_used_index)
+    while (*netd_txq.used_index != netd_txq.last_used_index)
     {
-        if (rdtime() - start > budget) { return false; }
-        yield();
+        netd_txq.last_used_index++;
+        netd_tx_inflight--;
     }
-    netd_txq.last_used_index++;
-    return true;
-}
-
-// QEMU's own SLIRP virtual subnet default for `-netdev user` with no
-// extra flags: guest 10.0.2.15/24, SLIRP's own virtual gateway at
-// 10.0.2.2 — a real, always-ICMP-responsive endpoint SLIRP itself
-// emulates, used below purely as a self-test peer (plain `-netdev
-// user` can't easily deliver an *inbound* ping from the host to test
-// the passive-responder path directly).
-
-// Minimal DHCP client (RFC 2131): DISCOVER -> OFFER -> REQUEST -> ACK,
-// once at startup, no lease renewal — see user/net/dhcp.c3's own
-// header comment for full scope/rationale. Up to 3 DISCOVER attempts,
-// each with a bounded (2s) wait for a matching OFFER; on a real OFFER,
-// one REQUEST + a bounded (2s) wait for ACK/NAK. Returns false (caller
-// falls back to its own static IP) on any timeout/NAK across all
-// attempts.
-fn bool netd_run_dhcp_client(char* our_mac, uint* our_ip_out, uint* gateway_ip_out)
-{
-    char[600] scratch @noinit;
-    char[1600] rx_frame @noinit;
-
-    for (int attempt = 0; attempt < 3; attempt++)
+    bool posted = false;
+    while (netd_tx_inflight < NETD_RING_N && link_pending(l))
     {
-        uint xid = (uint)rdtime() ^ (uint)attempt;
-
-        uint discover_len;
-        dhcp_build_discover(&scratch[0], &discover_len, our_mac, xid);
-        if (!netd_send(&scratch[0], discover_len)) { continue; }
-
-        uint offered_ip = 0;
-        uint offer_server_ip = 0;
-        bool got_offer = false;
-        ulong offer_start = rdtime();
-        ulong offer_budget = netd_us_to_ticks(2000000);
-        while (rdtime() - offer_start < offer_budget)
-        {
-            uint rx_len;
-            if (netd_try_recv(&rx_frame[0], &rx_len))
-            {
-                uint msg_type, yiaddr, server_id, router;
-                if (dhcp_parse_message(&rx_frame[0], rx_len, xid, &msg_type, &yiaddr, &server_id, &router) && msg_type == DHCP_MSG_OFFER)
-                {
-                    offered_ip = yiaddr;
-                    offer_server_ip = server_id;
-                    got_offer = true;
-                    break;
-                }
-            }
-            yield();
-        }
-        if (!got_offer) { continue; }
-
-        uint request_len;
-        dhcp_build_request(&scratch[0], &request_len, our_mac, xid, offered_ip, offer_server_ip);
-        if (!netd_send(&scratch[0], request_len)) { continue; }
-
-        ulong ack_start = rdtime();
-        ulong ack_budget = netd_us_to_ticks(2000000);
-        while (rdtime() - ack_start < ack_budget)
-        {
-            uint rx_len;
-            if (netd_try_recv(&rx_frame[0], &rx_len))
-            {
-                uint msg_type, yiaddr, server_id, router;
-                if (dhcp_parse_message(&rx_frame[0], rx_len, xid, &msg_type, &yiaddr, &server_id, &router))
-                {
-                    if (msg_type == DHCP_MSG_ACK)
-                    {
-                        *our_ip_out = yiaddr;
-                        *gateway_ip_out = router;
-                        return true;
-                    }
-                    if (msg_type == DHCP_MSG_NAK) { break; }
-                }
-            }
-            yield();
-        }
+        // Slot by position in the avail ring: completions are in order for
+        // virtio-net TX, so the oldest in-flight buffer is the next reused.
+        uint slot = netd_txq.avail.index % NETD_RING_N;
+        char* buf = (char*)(netd_tx_bufs + (uptr)slot * NETD_SLOT);
+        int len = link_get(l, buf + NETD_HDR_LEN);
+        if (len <= 0) { continue; }
+        mem::set(buf, 0, (sz)NETD_HDR_LEN);
+        netd_txq.descs[slot].addr  = (ulong)(uptr)buf;
+        netd_txq.descs[slot].len   = NETD_HDR_LEN + (uint)len;
+        netd_txq.descs[slot].flags = 0;
+        netd_txq.descs[slot].next  = 0;
+        netd_txq.avail.ring[netd_txq.avail.index % VIRTQ_ENTRY_NUM] = (ushort)slot;
+        asm("fence");
+        netd_txq.avail.index++;
+        netd_tx_inflight++;
+        posted = true;
     }
-    return false;
-}
-
-// One-shot startup self-test: ARP-resolve the gateway, then ping it,
-// printing the round-trip result either way. Diagnostic only — never
-// panics on failure, since the real point of Phase 2 is the passive
-// responder in main()'s own loop, not this self-test.
-fn void netd_self_test(char* our_mac, uint our_ip, uint gateway_ip)
-{
-    char[1600] scratch @noinit;
-    char[1600] rx_frame @noinit;
-    char[6] gateway_mac;
-
-    uint arp_len;
-    eth_build_arp_request(&scratch[0], &arp_len, our_mac, our_ip, gateway_ip);
-    if (!netd_send(&scratch[0], arp_len))
-    {
-        print("netd: self-test: ARP request send failed\n");
-        return;
-    }
-
-    bool got_mac = false;
-    ulong arp_start = rdtime();
-    ulong arp_budget = netd_us_to_ticks(2000000);
-    while (rdtime() - arp_start < arp_budget)
-    {
-        uint rx_len;
-        if (netd_try_recv(&rx_frame[0], &rx_len))
-        {
-            if (eth_parse_arp_reply(&rx_frame[0], rx_len, gateway_ip, &gateway_mac[0]))
-            {
-                got_mac = true;
-                break;
-            }
-        }
-        yield();
-    }
-    print("netd: self-test: ARP resolve of gateway ");
-    print(got_mac ? "ok\n" : "TIMED OUT\n");
-    if (!got_mac) { return; }
-
-    uint icmp_len;
-    ushort ping_id = 0x1234;
-    ushort ping_seq = 1;
-    eth_build_icmp_echo_request(&scratch[0], &icmp_len, our_mac, our_ip, &gateway_mac[0], gateway_ip, ping_id, ping_seq);
-    if (!netd_send(&scratch[0], icmp_len))
-    {
-        print("netd: self-test: ping send failed\n");
-        return;
-    }
-
-    bool got_reply = false;
-    ulong ping_start = rdtime();
-    ulong ping_budget = netd_us_to_ticks(2000000);
-    while (rdtime() - ping_start < ping_budget)
-    {
-        uint rx_len;
-        if (netd_try_recv(&rx_frame[0], &rx_len))
-        {
-            if (eth_parse_icmp_echo_reply(&rx_frame[0], rx_len, ping_id, ping_seq))
-            {
-                got_reply = true;
-                break;
-            }
-        }
-        yield();
-    }
-    print("netd: self-test: ping to gateway ");
-    print(got_reply ? "ok\n" : "TIMED OUT\n");
+    if (posted) { reg_write32(VIRTIO_REG_QUEUE_NOTIFY, (uint)netd_txq.queue_index); }
 }
 
 fn void main()
 {
-    uptr rxq_paddr;
-    uptr txq_paddr;
-    uptr pktbuf_paddr;
-    netd_info(&rxq_paddr, &txq_paddr, &pktbuf_paddr);
-    netd_rxq = (Virtio_virtq*)rxq_paddr;
-    netd_txq = (Virtio_virtq*)txq_paddr;
-    netd_rx_buf = (char*)pktbuf_paddr;
-    netd_tx_buf = (char*)(pktbuf_paddr + NETD_BUF_SIZE);
-    netd_tx_buf_paddr = pktbuf_paddr + NETD_BUF_SIZE;
+    uptr[4] dma;
+    if (dev_info(&dma[0], 4) < 4) { panic("netd: ", "missing DMA regions"); }
+    netd_rxq = (Virtio_virtq*)dma[0];
+    netd_txq = (Virtio_virtq*)dma[1];
+    netd_rx_bufs = dma[2];
+    netd_tx_bufs = dma[3];
 
-    if (reg_read32(VIRTIO_REG_MAGIC) != 0x74726976)
-    {
-        panic("netd: ", "invalid magic value");
-    }
-    if (reg_read32(VIRTIO_REG_VERSION) != 1)
-    {
-        panic("netd: ", "invalid version");
-    }
-    if (reg_read32(VIRTIO_REG_DEVICE_ID) != VIRTIO_NET_DEVICE_ID)
-    {
-        panic("netd: ", "invalid device id");
-    }
+    if (reg_read32(VIRTIO_REG_MAGIC) != 0x74726976) { panic("netd: ", "invalid magic value"); }
+    if (reg_read32(VIRTIO_REG_VERSION) != 1) { panic("netd: ", "invalid version"); }
+    if (reg_read32(VIRTIO_REG_DEVICE_ID) != VIRTIO_NET_DEVICE_ID) { panic("netd: ", "invalid device id"); }
 
     reg_write32(VIRTIO_REG_DEVICE_STATUS, 0);
     reg_fetch_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_ACK);
     reg_fetch_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER);
 
-    // Negotiate VIRTIO_NET_F_STATUS only — the one feature Phase 1
-    // needed (link-status polling). Real feature negotiation, unlike
-    // diskd's own simplified skip-it-entirely approach: the device
-    // config space's `status` field is only meaningful once this bit
-    // is actually accepted, not just offered. Phase 2's own packet
-    // TX/RX needs no additional features (no checksum/GSO offload, no
-    // merged RX buffers) — the plain 10-byte legacy header is correct
-    // either way.
+    // VIRTIO_NET_F_STATUS only: the config space's link-status field is
+    // valid only once it's accepted. No offloads, no merged RX buffers.
     uint host_features = reg_read32(VIRTIO_REG_HOST_FEATURES);
     uint have_status_feature = host_features & VIRTIO_NET_F_STATUS;
     reg_write32(VIRTIO_REG_GUEST_FEATURES, have_status_feature);
-    print("netd: VIRTIO_NET_F_STATUS ");
-    print(have_status_feature ? "offered, negotiated\n" : "NOT offered by this device\n");
 
     reg_write32(VIRTIO_REG_PAGE_SIZE, PAGE_SIZE);
-    netd_setup_queue(netd_rxq, rxq_paddr, 0);
-    netd_setup_queue(netd_txq, txq_paddr, 1);
-
+    netd_setup_queue(netd_rxq, dma[0], 0);
+    netd_setup_queue(netd_txq, dma[1], 1);
     reg_write32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER_OK);
 
-    // MAC address — device config space bytes 0-5, always valid
-    // regardless of feature negotiation.
-    char[6] our_mac;
+    char[6] mac;
     print("netd: mac=");
     for (int i = 0; i < 6; i++)
     {
         uint b = mmio_read32((uptr)(VIRTIO_NET_PADDR + VIRTIO_REG_DEVICE_CONFIG + (uint)i)) & 0xFF;
-        our_mac[i] = (char)b;
+        mac[i] = (char)b;
         print_hex8(b);
         if (i < 5) { putchar(':'); }
     }
     print("\n");
 
-    netd_arm_rx();
+    Link link;
+    if (!link_create(&link, "ether0", &mac[0], 1500)) { panic("netd: ", "can't create link ether0"); }
 
-    // Static fallback — used as-is if the DHCP client below fails/
-    // times out (e.g. no DHCP server on this network at all): SLIRP's
-    // own default virtual subnet for `-netdev user`, see this file's
-    // own header comment.
-    uint our_ip = make_ip(10, 0, 2, 15);
-    uint gateway_ip = make_ip(10, 0, 2, 2);
+    for (uint i = 0; i < NETD_RING_N; i++) { netd_post_rx(i); }
+    reg_write32(VIRTIO_REG_QUEUE_NOTIFY, (uint)netd_rxq.queue_index);
 
-    uint dhcp_ip;
-    uint dhcp_gateway;
-    if (netd_run_dhcp_client(&our_mac[0], &dhcp_ip, &dhcp_gateway))
-    {
-        our_ip = dhcp_ip;
-        gateway_ip = dhcp_gateway;
-        print("netd: DHCP: bound, ip=");
-        print_ip(our_ip);
-        print(" gateway=");
-        print_ip(gateway_ip);
-        print("\n");
-    }
-    else
-    {
-        print("netd: DHCP: failed, falling back to static IP\n");
-    }
+    srv_post("netd");   // netdkilltest's handle on us
+    print("netd: link ether0 up\n");
 
-    netd_self_test(&our_mac[0], our_ip, gateway_ip);
-
-    // Posts under "netd" so a client (today just netdkilltest, which
-    // needs a handle to kill it) can reach it by name — same
-    // Plan-9-style srv_post the other drivers use. netd has no
-    // request/reply clients yet otherwise.
-    srv_post("netd");
-
-    print("netd: init done, polling link status\n");
-
-    bool last_up = false;
-    bool first = true;
+    ulong hz = timebase_hz();
     for (;;)
     {
-        bool up = true; // devices that never offered the feature are treated as always-up — nothing to poll, matches virtio-net's own "no VIRTIO_NET_F_STATUS = assume link up" spec language
+        uint up = 1;   // no VIRTIO_NET_F_STATUS = always up, per the spec
         if (have_status_feature)
         {
-            ushort status = reg_read16(VIRTIO_REG_DEVICE_CONFIG + 6);
-            up = (status & VIRTIO_NET_S_LINK_UP) != 0;
+            up = (reg_read16(VIRTIO_REG_DEVICE_CONFIG + 6) & VIRTIO_NET_S_LINK_UP) != 0 ? 1 : 0;
         }
-        if (up != last_up || first)
-        {
-            print(up ? "netd: link up\n" : "netd: link down\n");
-            last_up = up;
-            first = false;
-        }
+        link.h.link_up = up;
 
-        // Passive responder — answers ARP/ICMP-echo requests addressed
-        // to our_ip, same as ethd's own main loop.
-        char[1600] rx_frame @noinit;
-        uint rx_len;
-        if (netd_try_recv(&rx_frame[0], &rx_len))
-        {
-            char[1600] reply @noinit;
-            uint reply_len;
-            if (eth_proto_respond(&rx_frame[0], rx_len, &our_mac[0], our_ip, &reply[0], &reply_len))
-            {
-                netd_send(&reply[0], reply_len);
-            }
-        }
+        // Ack the device first, then do the work: a completion that lands
+        // after the ack re-raises the (edge) interrupt.
+        uint isr = reg_read32(VIRTIO_REG_INTERRUPT_STATUS);
+        if (isr != 0) { reg_write32(VIRTIO_REG_INTERRUPT_ACK, isr); }
 
-        // yield()-paced, not a bare spin — see user/usb/dwc2.c3's own
-        // SYS_YIELD comment for why a genuinely syscall-free poll here
-        // is a real deadlock risk on this kernel, not just wasted CPU.
-        ulong poll_start = rdtime();
-        while (rdtime() - poll_start < netd_us_to_ticks(250000)) { yield(); }
+        if (netd_drain_rx(&link) > 0) { link_kick(&link); }
+        netd_pump_tx(&link);
+        // The PLIC masked our (level) source when it fired; the ISR is
+        // acked now, so let the next completion through.
+        syscall(SYS_DRIVER_IRQ_ARM, 0, 0, 0);
+
+        // Asleep until the device interrupts (RX or TX done), ipd rings
+        // (TX queued), or a second passes (link-status refresh).
+        await_any(AW_IRQ | AW_WAKE, hz, null, 0);
     }
 }

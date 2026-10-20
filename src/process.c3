@@ -435,6 +435,15 @@ struct Process
 	// itself (see docs/devlog.md).
 	bool driver_irq_pending;
 
+	// SYS_WAKE doorbell (syscalls.c3): set by a peer, sticky until this
+	// process's await_any reports AW_WAKE. Used by the network link rings
+	// (user/net/link.c3), where neither side may block on the other.
+	bool wake_pending;
+
+	// Non-zero while PROC_BLOCKED in a timed SYS_AWAIT: the `time` value
+	// at which entry.c3's timed_wakeups() makes it RUNNABLE again.
+	ulong sleep_deadline;
+
 	// Per-process namespace: path prefix -> server pid. Every process gets
 	// an identical default namespace today (populated in create_process) —
 	// there's no fork()/namespace inheritance yet to make private ones
@@ -452,10 +461,11 @@ struct Process
 
 	// stdout / stdin redirection for `|` and `>`/`<` (src/pipe.c3):
 	// -1 = the console (the default). A pipe id otherwise — SYS_PUTCHAR
-	// / SYS_GETCHAR route through it. Reset to -1 in create_process and
-	// the rfork child (a fresh process gets the console); the shell
-	// sets a child's ends explicitly via SYS_PIPE_SETOUT/SETIN, and
-	// SYS_EXEC keeps them.
+	// / SYS_GETCHAR route through it. -1 in create_process (a fresh
+	// process gets the console); an rfork child inherits its parent's
+	// unless rfork is given explicit pipe ids (the shell's `|`, Go's
+	// os/exec); SYS_PIPE_SETOUT/SETIN can rewire them; SYS_EXEC keeps
+	// them.
 	int stdout_pipe;
 	int stdin_pipe;
 
@@ -1154,6 +1164,31 @@ fn uptr proc_kstack_top(Process* p)
 	return (uptr)p.kstack + STACK_SIZE;
 }
 
+// Page-table pages a new address space's kernel identity map costs:
+// every 4 KiB page from __kernel_map_base to __free_ram_end gets a PTE, so
+// one leaf table per 2 MiB and one middle table per 1 GiB (plus slack for
+// the PLIC/console pages and a span that straddles a boundary). Hundreds
+// on QEMU's 1.8 GiB pool, a few dozen on the Duo — create_process and
+// rfork check for this much before they start, because map_page itself
+// panics when the pool runs dry.
+fn uint kernel_map_table_pages()
+{
+	ulong span = (ulong)((uptr)&__free_ram_end - (uptr)&__kernel_map_base);
+	return (uint)(span / (2 * 1024 * 1024) + span / (1024 * 1024 * 1024) + 8);
+}
+
+// Can create_process build a process with an image of `image_size`
+// bytes in a free slot right now? (Root table, identity map, the image,
+// and a never-used slot's kernel stack + inbox.)
+fn bool create_process_fits(uint image_size)
+{
+	uint need = 1 + kernel_map_table_pages() + (image_size + PAGE_SIZE - 1) / PAGE_SIZE
+		+ STACK_PAGES + MSG_PAGES + 4;
+	return free_page_count() >= need;
+}
+
+// null when there's no free slot or not enough memory — boot-time callers
+// treat that as fatal, the supervisor and the shell respawn retry later.
 fn Process* create_process(void* image, uint image_size)
 {
 	// Find an unused process control structure and claim it atomically
@@ -1175,13 +1210,11 @@ fn Process* create_process(void* image, uint image_size)
 	}
 	proc_table_lock.release();
 
-	if (!proc)
+	if (!proc) { return null; }
+	if (!create_process_fits(image_size) || !proc_slot_buffers(proc))
 	{
-		panic::panic("no free process slots");
-	}
-	if (!proc_slot_buffers(proc))
-	{
-		panic::panic("out of memory for a process kernel stack");
+		proc.state = PROC_UNUSED;   // hand the claimed slot back
+		return null;
 	}
 
 	uptr* sp = (uptr*)proc_kstack_top(proc);
@@ -1288,6 +1321,8 @@ fn Process* create_process(void* image, uint image_size)
 	// DISKD_IRQ_NOTIFY instead of its real inbox state. Missing here was
 	// a gap — create_process is the supervisor's respawn path.
 	proc.driver_irq_pending = false;
+	proc.wake_pending = false;
+	proc.sleep_deadline = 0;
 	proc.is_boot_server = false; // kernel.c3 / supervisor_spawn set it for servers
 	for (int ni = 0; ni < 32; ni++) { proc.name[ni] = 0; } // kernel.c3 / sys_exec fill it
 	proc.cwd[0] = 0; // root
@@ -1377,6 +1412,7 @@ fn void map_console_mmio(ulong* table)
 }
 
 Process* current_proc; // Currently running process
+ulong g_plic_poll_next; // yield()'s hand PLIC drain, see there
 Process* idle_proc;    // Idle process
 
 // --- lightweight profiling counters (SYS_PROF, `prof` shell builtin) ---
@@ -1417,6 +1453,19 @@ fn void yield() @noinline
 	// reuse) is unsafe to run from an arbitrary yield() depth; it stays
 	// on the timer tick.
 	ipc_timeout_sweep();
+	// Timed SYS_AWAIT sleepers whose deadline has passed (entry.c3).
+	ulong y_now = time_now();
+	timed_wakeups(y_now);
+	// An interrupt-driven driver asleep in SYS_AWAIT relies on its IRQ
+	// waking it, but while every process is inside a kernel wait loop
+	// SIE stays clear and no interrupt is ever taken (see
+	// SYS_DRIVER_IRQ_WAIT's comment). Drain the PLIC by hand here, at
+	// most ~every millisecond, so that case still gets its wakeup.
+	if (y_now >= g_plic_poll_next)
+	{
+		g_plic_poll_next = y_now + board::TIMEBASE_HZ / 1000;
+		service_pending_external_irq();
+	}
 
 	Process* next = idle_proc;
 	for (int i = 0; i < PROCS_MAX; i++)

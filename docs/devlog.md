@@ -3,7 +3,137 @@
 Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
-## 2026-10-20 (latest) — the five "honest list" items confirmed on the real Duo
+## 2026-10-21 (later) — Wi-Fi groundwork: WPA2 crypto, reference driver (branch `net`)
+
+Part II's first QEMU-testable piece. `user/crypto/crypto.c3` is everything
+a WPA2-PSK supplicant needs in software, since the RTL8192EU does CCMP for
+data frames itself (rtl8xxxu programs its CAM):
+- SHA-1, HMAC-SHA1;
+- PBKDF2-HMAC-SHA1 (passphrase + SSID → PMK);
+- the 802.11i PRF (PMK → PTK);
+- AES-128 (S-box generated from its definition, not tabled);
+- RFC 3394 key unwrap (the GTK in EAPOL message 3).
+
+`cryptotest` checks them against FIPS 180, RFC 2202, IEEE 802.11i H.4,
+FIPS 197 and RFC 3394 vectors: 11/11 on the first build. One passphrase
+hash takes 239 ms under QEMU.
+
+Reference: Linux's `drivers/net/wireless/realtek/rtl8xxxu/` (core.c,
+8192e.c, regs.h, rtl8xxxu.h — fetched from git.kernel.org; raw GitHub
+URLs failed) and `rtl8192eu_nic.bin` from the host's linux-firmware (32
+KiB), both kept out of the repo. **Open question for the user before W1:**
+rtl8xxxu is GPL-2.0 and racccoon is MIT. Porting its init tables and
+bring-up sequences would put GPL-derived code in the tree. The choices are
+a separately GPL-licensed driver directory, or tables taken from captured
+Linux USB traffic.
+
+---
+## 2026-10-21 — TCP/UDP: ipd and /net, link rings, rshd, DNS, BSD sockets (branch `net`)
+
+Part I of the networking plan, in QEMU. Before this, racccoon's network
+was ARP, ICMP echo and a DHCP client baked into each link driver. Now:
+
+**Kernel:**
+- `SYS_WAKE`(68), a doorbell. `await_any` reports `AW_WAKE` and, for
+  interrupt-driven drivers, `AW_IRQ` (both consumed when reported).
+- **Timed sleeps.** An `await_any` with a timeout used to spin RUNNABLE,
+  which would have made ipd an always-runnable server (the Duo
+  console-input lesson). Now it sleeps BLOCKED with
+  `Process.sleep_deadline`:
+  - `timed_wakeups()` runs from `yield()` and the timer;
+  - the timer is programmed for the earlier of the 1 s tick and the
+    earliest deadline;
+  - the once-a-second watchdog work still runs only on the real tick.
+- `yield()` drains the PLIC about once a millisecond, so a driver asleep
+  in `await_any` still gets its IRQ while SIE is off (everyone in kernel
+  waits).
+- `SYS_WRITE`(69): a whole buffer to stdout. `print()`, libc `write()`
+  and `std::io` used one `SYS_PUTCHAR` per byte.
+- rfork children inherit their parent's stdout/stdin pipes (they got the
+  console).
+
+**Links** (`user/net/link.c3`): a shared segment `ether<N>` with RX/TX
+single-producer/single-consumer frame rings and doorbells. netd and ethd
+are now pure link drivers. Plain IPC both ways would deadlock (ipd
+sending TX while the driver sends RX).
+
+**ipd** (`user/net/ipd*.c3`, boot server, mounted at `/net/`):
+- ARP, IPv4, ICMP, a DHCP client per link, loopback;
+- UDP (headers mode for servers);
+- TCP: go-back-N with Jacobson/Karels RTO, 8 KiB buffers, half-close,
+  accept queue;
+- reads with no data are parked and answered later, or with −2 after
+  ~1 s.
+
+**Userspace:**
+- user.c3: `dial`/`announce`/`net_*`, a DNS resolver.
+- Tools: `ping`, `nc` (`-N` half-close), `dnsq`, `rshd` with `/bin/rc`
+  (the production shell, which now skips the boot settle and exits at
+  stdin EOF when stdin is a pipe).
+- libc BSD sockets (`rc_socket.c`, `K_NET` fds, `getaddrinfo`).
+
+**Bugs found on the way:**
+- **Forked helpers wrote to the console.** `nc host port | wc -c` counted
+  10 bytes: nc's receiving child is a plain `rfork`, which got the
+  console instead of the pipe. That's the stdio-inheritance fix.
+- **"Early EOF" was the test harness.** The Python host server never read
+  the guest's request, and Linux sends RST when a socket with unread data
+  is closed; slirp then drops what it hasn't delivered yet.
+  - `dltest` (TCP alone, no pipe) got all 4 MiB intact; `nc` stopped at
+    ~2 MB.
+  - Real bug found while chasing it: TIME_WAIT freed a control block that
+    still held unread bytes (`tcb_finish` keeps it until drained).
+- **virtio-net's IRQ is level, not edge.** Declared edge like
+  virtio-blk, the line stayed up between netd's sleeps and re-fired on
+  every return to user mode. Under a big download plus file writes the
+  watchdog killed diskd, then fsd, as wedged (3 of 5 runs). It's now
+  masked on each fire and re-armed by netd: 0 of 3 since.
+- **`netdkilltest` mounted netd at `/net/`**, shadowing ipd for every
+  later test (requests piled up in netd's never-read inbox). It's now
+  `/srv/netd/`.
+- **nc half-closed at stdin EOF.** Cloudflare (example.com) closes on an
+  early FIN without answering. nc now only half-closes with `-N`, like
+  OpenBSD nc.
+- **Bound UDP sockets received nothing**, and neither did one given its
+  port by its first `sendto`. They now take datagrams from anyone (BSD
+  semantics).
+- **c3c 0.8.x asserts** (`alignment <= LLVMGetAlignment`) on
+  `*(int*)&buf[k] = v` into a byte array in `ipd_conv.c3`. Found by
+  bisecting; it now uses byte helpers.
+- **FAT32 `oomtest` panicked the kernel.** `create_process` (the
+  supervisor's respawn) allocated with panicking calls, and each address
+  space's kernel identity map costs one PTE per 4 KiB of RAM: ~900 table
+  pages on QEMU's 1.8 GiB pool, not the "~35" rfork's pre-check assumed.
+  - `create_process` now checks `kernel_map_table_pages()` up front and
+    returns null; the supervisor and the shell respawn retry.
+  - rfork's pre-check uses the same number.
+- **Two shells.** The idle loop respawned the shell whenever nothing was
+  RUNNABLE, a stand-in for "the shell exited" that sleeping waits broke:
+  during nettest's long-poll everyone sleeps, so a second shell appeared
+  and the two split the console. It now respawns only when the shell
+  process it started is gone.
+
+**Verified (QEMU):**
+- `waketest`, `nettest` 4/4, `tcptest` (refused connect; 1 MiB loopback
+  with half-close), `socktest` (TCP echo, shutdown/EOF, refused, UDP
+  `sendto`/`recvfrom`, `getaddrinfo`).
+- Host interop over slirp, 8/8:
+  - TCP out and in (`hostfwd`), ping, UDP;
+  - a 4 MiB download intact (~690 KiB/s through `| wc -c`; 6.6 MB/s TCP
+    alone);
+  - an `rshd` login and command;
+  - DNS, and HTTP to example.com by name.
+- **Full regression** (ext2, FAT32, dual; every new test from the last two
+  days included): identical to the master baseline apart from the pids
+  one higher (ipd), netdkilltest's new mount name and rforktest's
+  interleaving. `oomtest` passes on both images again. `bigreadtest` on
+  the dual image fails as it does on master.
+
+Not on the Duo yet. There's no network there until the Wi-Fi driver
+(Part II).
+
+---
+## 2026-10-20 — the five "honest list" items confirmed on the real Duo
 
 One flash of the dev-shell kernel (`DUO_TEST_SHELL=1 reflash_duo.sh`)
 plus `populate_duo_bin.sh` for `/bin/note` and `sigtest`, driven over

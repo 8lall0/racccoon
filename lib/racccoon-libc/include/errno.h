@@ -43,4 +43,13 @@ extern int errno;
 #define ELOOP           40
 #define EOVERFLOW       75
 
+/* sockets (rc_socket.c) — Linux's numbers */
+#define ENOTSOCK        88
+#define EPROTONOSUPPORT 93
+#define EAFNOSUPPORT    97
+#define EADDRINUSE      98
+#define ECONNRESET      104
+#define ENOTCONN        107
+#define ETIMEDOUT       110
+#define ECONNREFUSED    111
 #endif

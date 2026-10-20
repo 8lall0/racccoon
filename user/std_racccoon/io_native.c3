@@ -37,10 +37,7 @@ fn long? my_ftell(void* file)
 
 fn sz? my_fwrite(void* file, char[] buffer)
 {
-	foreach (char c : buffer)
-	{
-		rcsys::rc_putchar(c);
-	}
+	rcsys::rc_write(buffer.ptr, buffer.len);
 	return buffer.len;
 }
 

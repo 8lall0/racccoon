@@ -45,7 +45,7 @@ char *getcwd(char *buf, size_t size)
 
 #define FD_MAX 64
 
-enum { K_FREE = 0, K_CONSOLE, K_FILE };
+enum { K_FREE = 0, K_CONSOLE, K_FILE, K_NET };   /* K_NET: a /net conversation (rc_socket.c) */
 
 struct fdent {
 	int  kind;
@@ -62,6 +62,38 @@ static void fd_init(void)
 	if (fdtab_inited) return;
 	fdtab[0].kind = fdtab[1].kind = fdtab[2].kind = K_CONSOLE;
 	fdtab_inited = 1;
+}
+
+/* Hooks for rc_socket.c, which keeps a socket's /net conversation
+ * directory ("/net/tcp/3") in the fd's path, its flags in flags and its
+ * bound port in off. */
+ssize_t __rc_net_read(int fd, void *buf, size_t n);
+ssize_t __rc_net_write(int fd, const void *buf, size_t n);
+void    __rc_net_close(int fd);
+
+static int fd_alloc(void);
+
+int __rc_fd_new_net(const char *dir, int flags)
+{
+	int fd = fd_alloc();
+	if (fd < 0) return -1;
+	fdtab[fd].kind = K_NET;
+	fdtab[fd].flags = flags;
+	fdtab[fd].off = 0;
+	int i = 0;
+	for (; dir[i] && i < 127; i++) fdtab[fd].path[i] = dir[i];
+	fdtab[fd].path[i] = 0;
+	return fd;
+}
+
+/* The conversation directory of socket `fd`, or NULL if it isn't one. */
+char *__rc_fd_net_dir(int fd, int **flags, unsigned long **port)
+{
+	fd_init();
+	if (fd < 0 || fd >= FD_MAX || fdtab[fd].kind != K_NET) return NULL;
+	if (flags) *flags = &fdtab[fd].flags;
+	if (port) *port = &fdtab[fd].off;
+	return fdtab[fd].path;
 }
 
 static int fd_alloc(void)
@@ -123,15 +155,16 @@ int close(int fd)
 {
 	fd_init();
 	if (fd < 0 || fd >= FD_MAX || fdtab[fd].kind == K_FREE) { errno = EBADF; return -1; }
+	if (fdtab[fd].kind == K_NET) __rc_net_close(fd);
 	if (fd >= 3) fdtab[fd].kind = K_FREE;   /* 0/1/2 stay open */
 	return 0;
 }
 
 static ssize_t console_write(const void *buf, size_t n)
 {
-	const char *p = buf;
-	for (size_t i = 0; i < n; i++) __rc_syscall3((long)(unsigned char)p[i], 0, 0, RC_SYS_PUTCHAR);
-	return (ssize_t)n;
+	if (n == 0) return 0;
+	long r = __rc_syscall3((long)buf, (long)n, 0, RC_SYS_WRITE);
+	return r < 0 ? -1 : (ssize_t)r;
 }
 
 static ssize_t console_read(void *buf, size_t n)
@@ -152,6 +185,7 @@ ssize_t read(int fd, void *buf, size_t count)
 	fd_init();
 	if (fd < 0 || fd >= FD_MAX || fdtab[fd].kind == K_FREE) { errno = EBADF; return -1; }
 	if (fdtab[fd].kind == K_CONSOLE) return console_read(buf, count);
+	if (fdtab[fd].kind == K_NET) return __rc_net_read(fd, buf, count);
 
 	/* fsd returns at most ~1 KiB per IPC — loop so a regular-file read()
 	 * fills the caller's buffer (short only at EOF), which is what
@@ -173,6 +207,7 @@ ssize_t write(int fd, const void *buf, size_t count)
 	fd_init();
 	if (fd < 0 || fd >= FD_MAX || fdtab[fd].kind == K_FREE) { errno = EBADF; return -1; }
 	if (fdtab[fd].kind == K_CONSOLE) return console_write(buf, count);
+	if (fdtab[fd].kind == K_NET) return __rc_net_write(fd, buf, count);
 
 	const char *p = buf;
 	size_t done = 0;
@@ -443,7 +478,9 @@ static int poll_scan(struct pollfd *fds, nfds_t n, int stdin_ready, int *want_st
 		p->revents = 0;
 		if (p->fd < 0) continue;
 		if (p->fd >= FD_MAX || fdtab[p->fd].kind == K_FREE) { p->revents = POLLNVAL; count++; continue; }
-		if (fdtab[p->fd].kind == K_FILE) {
+		if (fdtab[p->fd].kind == K_FILE || fdtab[p->fd].kind == K_NET) {
+			/* A socket counts as ready: ipd can't be waited on alongside
+			 * stdin, and a socket read blocks only until data arrives. */
 			p->revents = p->events & (POLLIN | POLLOUT);
 		} else {                                   /* the console fds */
 			p->revents = p->events & POLLOUT;

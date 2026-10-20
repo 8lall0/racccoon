@@ -367,7 +367,12 @@ fn int shell_readline_p(char* buf, int cap, char* prompt, bool history)
             buf[0] = 0;
             return -1;   // callers re-prompt; a half-typed block is dropped too
         }
-        if (ci < 0) { continue; }
+        if (ci < 0) {
+            // End of a piped stdin (a remote session hung up): the shell
+            // is done. The console never reaches EOF.
+            if (stdin_is_console() == 0) { exit(); }
+            continue;
+        }
         char ch = (char)ci;
 
         // ESC sequence: ESC [ <final>, or ESC [ <digits> ~

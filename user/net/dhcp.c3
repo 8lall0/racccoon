@@ -37,6 +37,7 @@ const uint DHCP_MSG_NAK      = 6;
 
 const uint DHCP_OPT_SUBNET_MASK    = 1;
 const uint DHCP_OPT_ROUTER         = 3;
+const uint DHCP_OPT_DNS            = 6;
 const uint DHCP_OPT_REQUESTED_IP   = 50;
 const uint DHCP_OPT_MSG_TYPE       = 53;
 const uint DHCP_OPT_SERVER_ID      = 54;
@@ -108,11 +109,12 @@ fn void dhcp_build_discover(char* out, uint* out_len, char* our_mac, uint xid)
     dhcp[options_end + 1] = (char)1;
     dhcp[options_end + 2] = (char)DHCP_MSG_DISCOVER;
     dhcp[options_end + 3] = (char)DHCP_OPT_PARAM_REQUEST;
-    dhcp[options_end + 4] = (char)2;
+    dhcp[options_end + 4] = (char)3;
     dhcp[options_end + 5] = (char)DHCP_OPT_SUBNET_MASK;
     dhcp[options_end + 6] = (char)DHCP_OPT_ROUTER;
-    dhcp[options_end + 7] = (char)DHCP_OPT_END;
-    uint dhcp_len = options_end + 8;
+    dhcp[options_end + 7] = (char)DHCP_OPT_DNS;
+    dhcp[options_end + 8] = (char)DHCP_OPT_END;
+    uint dhcp_len = options_end + 9;
 
     build_udp_header(udp, dhcp_len, 0, 0xFFFFFFFF, (ushort)DHCP_CLIENT_PORT, (ushort)DHCP_SERVER_PORT);
 
@@ -158,8 +160,13 @@ fn void dhcp_build_request(char* out, uint* out_len, char* our_mac, uint xid, ui
     dhcp[options_end + 9]  = (char)DHCP_OPT_SERVER_ID;
     dhcp[options_end + 10] = (char)4;
     write_be32(&dhcp[options_end + 11], server_ip);
-    dhcp[options_end + 15] = (char)DHCP_OPT_END;
-    uint dhcp_len = options_end + 16;
+    dhcp[options_end + 15] = (char)DHCP_OPT_PARAM_REQUEST;
+    dhcp[options_end + 16] = (char)3;
+    dhcp[options_end + 17] = (char)DHCP_OPT_SUBNET_MASK;
+    dhcp[options_end + 18] = (char)DHCP_OPT_ROUTER;
+    dhcp[options_end + 19] = (char)DHCP_OPT_DNS;
+    dhcp[options_end + 20] = (char)DHCP_OPT_END;
+    uint dhcp_len = options_end + 21;
 
     build_udp_header(udp, dhcp_len, 0, 0xFFFFFFFF, (ushort)DHCP_CLIENT_PORT, (ushort)DHCP_SERVER_PORT);
 
@@ -187,7 +194,7 @@ fn void dhcp_build_request(char* out, uint* out_len, char* our_mac, uint xid, ui
 // real server sends it; server_id is required by spec, always
 // present on a real OFFER/ACK). Returns false for anything that isn't
 // a UDP:67->68 DHCP reply with a matching transaction ID.
-fn bool dhcp_parse_message(char* frame, uint len, uint expect_xid, uint* msg_type_out, uint* yiaddr_out, uint* server_id_out, uint* router_out)
+fn bool dhcp_parse_message(char* frame, uint len, uint expect_xid, uint* msg_type_out, uint* yiaddr_out, uint* server_id_out, uint* router_out, uint* mask_out, uint* dns_out)
 {
     if (len < 14 + 20 + 8 + DHCP_FIXED_LEN + 4) { return false; }
     if (read_be16(&frame[12]) != (ushort)ETH_TYPE_IPV4) { return false; }
@@ -217,6 +224,8 @@ fn bool dhcp_parse_message(char* frame, uint len, uint expect_xid, uint* msg_typ
     *msg_type_out = 0;
     *server_id_out = 0;
     *router_out = 0;
+    *mask_out = 0;
+    *dns_out = 0;
 
     // Walk the TLV option list (starts right after the magic cookie,
     // at fixed offset 240) until DHCP_OPT_END or the message runs
@@ -242,6 +251,14 @@ fn bool dhcp_parse_message(char* frame, uint len, uint expect_xid, uint* msg_typ
         else if (opt == DHCP_OPT_ROUTER && opt_len >= 4)
         {
             *router_out = read_be32(&dhcp[i + 2]); // first router if the server offered more than one
+        }
+        else if (opt == DHCP_OPT_SUBNET_MASK && opt_len >= 4)
+        {
+            *mask_out = read_be32(&dhcp[i + 2]);
+        }
+        else if (opt == DHCP_OPT_DNS && opt_len >= 4)
+        {
+            *dns_out = read_be32(&dhcp[i + 2]); // first server
         }
         i += 2 + opt_len;
     }

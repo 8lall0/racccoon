@@ -163,6 +163,62 @@ const SIE_STIE = (1 << 5); // sie: supervisor timer interrupt enable
 // session's own verification used it directly — see docs/devlog.md).
 ulong timer_tick_count = 0;
 
+// --- timed sleeps (SYS_AWAIT with a timeout) ---------------------------
+// A process sleeping in await_any with a timeout is PROC_BLOCKED with
+// Process.sleep_deadline set; timed_wakeups() makes it RUNNABLE again
+// once `time` passes the deadline. It runs from yield() (which the idle
+// loop and every kernel wait loop call constantly — the case where
+// nobody is in user mode to take a timer interrupt) and from the timer
+// interrupt, which is programmed for whichever comes first: the next
+// 1 s housekeeping tick (g_tick_due) or the earliest sleep deadline
+// (g_sleep_next). The 1 s work — watchdog, IPC timeouts, console poll —
+// still runs only on the real tick: the supervisor counts in ticks.
+const ulong NO_DEADLINE = 0xFFFFFFFFFFFFFFFF;
+ulong g_tick_due;
+ulong g_sleep_next = NO_DEADLINE;
+
+fn void timed_wakeups(ulong now) @noinline
+{
+	if (now < g_sleep_next) { return; }
+	ulong next = NO_DEADLINE;
+	for (int i = 0; i < PROCS_MAX; i++)
+	{
+		Process* p = &procs[i];
+		if (p.sleep_deadline == 0) { continue; }
+		if (p.state == PROC_UNUSED || p.state == PROC_RESERVED) { p.sleep_deadline = 0; continue; }
+		if (now >= p.sleep_deadline)
+		{
+			p.sleep_deadline = 0;
+			if (p.state == PROC_BLOCKED) { p.state = PROC_RUNNABLE; }
+		}
+		else if (p.sleep_deadline < next)
+		{
+			next = p.sleep_deadline;
+		}
+	}
+	g_sleep_next = next;
+}
+
+// Program the timer for the earlier of the next tick and the earliest
+// sleep deadline.
+fn void arm_next_timer() @noinline
+{
+	ulong at = g_tick_due < g_sleep_next ? g_tick_due : g_sleep_next;
+	sbi::__set_timer(at);
+}
+
+// Register a sleep deadline for the current process (it is about to go
+// PROC_BLOCKED). Re-arms the timer if this is now the earliest one.
+fn void sleep_until(ulong deadline) @noinline
+{
+	current_proc.sleep_deadline = deadline;
+	if (deadline < g_sleep_next)
+	{
+		g_sleep_next = deadline;
+		arm_next_timer();
+	}
+}
+
 // Real preemptive-scheduling support (see docs/devlog.md): the sstc
 // timer interrupt fires, re-arms, and — for real processes — forces a
 // reschedule via yield() (see the SCAUSE_SUPERVISOR_TIMER case in
@@ -214,7 +270,8 @@ fn void enable_timer_interrupts()
 	// `time >= stimecmp` already true the instant STIE goes live —
 	// enabling the source with a real future deadline already in place
 	// avoids that spurious-immediate-fire window entirely.
-	arm_timer(board::TIMEBASE_HZ); // first tick ~1 second out
+	g_tick_due = read_reg("time") + board::TIMEBASE_HZ; // first tick ~1 second out
+	arm_next_timer();
 	write_csr("sie", read_reg("sie") | SIE_STIE);
 }
 
@@ -561,16 +618,27 @@ fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 			// again), so leaving the old, already-elapsed value in
 			// place would refire the instant interrupts are next
 			// enabled — an interrupt storm, not a periodic tick.
-			arm_timer(board::TIMEBASE_HZ);
-			timer_tick_count += 1;
-			// Nobody may be reading the console (a compute loop in the
-			// foreground) — look for a ^C here too (src/note.c3).
-			console_poll();
+			// The interrupt fires for the next 1 s tick or an earlier
+			// sleep deadline (see g_tick_due); only the former does the
+			// once-a-second work below. Re-arming for the next of the two
+			// is what clears the pending interrupt.
+			ulong tick_now = read_reg("time");
+			timed_wakeups(tick_now);
+			bool svc_killed_current = false;
+			if (tick_now >= g_tick_due)
+			{
+				g_tick_due = tick_now + board::TIMEBASE_HZ;
+				timer_tick_count += 1;
+				// Nobody may be reading the console (a compute loop in the
+				// foreground) — look for a ^C here too (src/note.c3).
+				console_poll();
 
-			// Boot-server supervision + the IPC-call timeout sweep, both
-			// via kernel_housekeeping(): ipc_timeout_sweep() (also run
-			// from yield(), ~1/s) + the supervisor watchdog (timer only).
-			bool svc_killed_current = kernel_housekeeping();
+				// Boot-server supervision + the IPC-call timeout sweep, both
+				// via kernel_housekeeping(): ipc_timeout_sweep() (also run
+				// from yield(), ~1/s) + the supervisor watchdog (timer only).
+				svc_killed_current = kernel_housekeeping();
+			}
+			arm_next_timer();
 
 			// Real preemption: force a reschedule on every tick, not
 			// just when a process happens to yield() on its own. See

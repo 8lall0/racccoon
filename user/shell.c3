@@ -18,7 +18,10 @@ fn void main() {
     // 15 s to 6 s — a shorter settle only risks a little boot chatter
     // after the first prompt, never a hang.
     shell_notes_init();   // catch ^C (src/note.c3) instead of dying of it
-    shell_boot_settle(timebase_hz() * 6);
+    // The boot console shell waits out the servers' bring-up; a shell run
+    // as /bin/rc with a pipe for stdin (rshd's remote sessions) starts
+    // after boot and goes straight to the login prompt.
+    if (stdin_is_console() != 0) { shell_boot_settle(timebase_hz() * 6); }
 
     // The console comes up needing a login — `login: <name>`, matched
     // against /adm/users, then setuid + cd $home. `root` is always
