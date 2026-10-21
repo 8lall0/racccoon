@@ -166,7 +166,7 @@ const EXEC_MAX_IMAGE_SIZE = 134217728;
 // a Go process reserves a 64/448 MiB heap arena (lazy since 2026-09-02,
 // docs/devlog.md) with room for the GC to cycle. The Duo keeps 16 MiB
 // (boards/duo/board.c3) — 64 MiB DRAM total.
-const uptr HEAP_MAX_BYTES = 512 * 1024 * 1024;
+const uptr HEAP_MAX_BYTES = 1536 * 1024 * 1024;
 
 // Console input: 0 = read it through the SBI legacy getchar (sbi::__getchar),
 // which works on QEMU and the Duo. A board whose firmware mangles that call

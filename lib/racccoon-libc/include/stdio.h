@@ -61,6 +61,8 @@ int    puts(const char *s);
 
 int    fseek(FILE *f, long off, int whence);
 long   ftell(FILE *f);
+int    fseeko(FILE *f, off_t off, int whence);   /* off_t is long: same as fseek */
+off_t  ftello(FILE *f);
 void   rewind(FILE *f);
 int    fgetpos(FILE *f, fpos_t *pos);
 int    fsetpos(FILE *f, const fpos_t *pos);
@@ -87,6 +89,11 @@ int    vasprintf(char **out, const char *fmt, va_list ap);
 int    asprintf(char **out, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 int    sscanf(const char *s, const char *fmt, ...) __attribute__((format(scanf, 2, 3)));
 int    vsscanf(const char *s, const char *fmt, va_list ap);
+/* scanf / fscanf read ONE line from the stream and scan it with vsscanf:
+ * a conversion never continues onto the next line. */
+int    vfscanf(FILE *f, const char *fmt, va_list ap);
+int    fscanf(FILE *f, const char *fmt, ...) __attribute__((format(scanf, 2, 3)));
+int    scanf(const char *fmt, ...) __attribute__((format(scanf, 1, 2)));
 
 void   perror(const char *s);
 int    remove(const char *path);

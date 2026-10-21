@@ -396,7 +396,10 @@ fn bool glob_match(char* pat, char* name)
 // bytes packed into `names[*nb..]` (bounded by nb_cap). Only the last
 // path component may hold `*` / `?`; earlier components are literal.
 // Returns the match count — 0 means "no match", and the caller keeps
-// the pattern literal (rc's behaviour, not sh's).
+// the pattern literal (rc's behaviour, not sh's). The matches come out
+// sorted by byte order, as in rc and sh — not in directory order, which
+// differs between filesystems and with history (a build script's `*.o`
+// is a link order).
 fn int shell_glob_into(char* pat, char* names, int* nb, int nb_cap, char** words, int* sw, int sw_cap)
 {
     int slash = -1;
@@ -424,6 +427,7 @@ fn int shell_glob_into(char* pat, char* names, int* nb, int nb_cap, char** words
     if (cnt < 0) { return 0; }
 
     int matched = 0;
+    int first = *sw;
     for (int e = 0; e < cnt; e++) {
         char* nm = &lb[e * 36];
         if (!glob_match(base, nm)) { continue; }
@@ -440,6 +444,13 @@ fn int shell_glob_into(char* pat, char* names, int* nb, int nb_cap, char** words
         (*sw)++;
         *nb = w;
         matched++;
+    }
+    // insertion sort of this glob's words (a directory's worth at most)
+    for (int i = first + 1; i < *sw; i++) {
+        char* cur = words[i];
+        int j = i - 1;
+        while (j >= first && strcmp(words[j], cur) > 0) { words[j + 1] = words[j]; j--; }
+        words[j + 1] = cur;
     }
     return matched;
 }

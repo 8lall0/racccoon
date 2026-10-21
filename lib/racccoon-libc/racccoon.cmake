@@ -48,8 +48,9 @@ set(RC_LINK_TAIL "${RC_CXX}/lib/libc++.a ${RC_LIBC}/libracccoon.a ${RC_LIBGCC}")
 set(CMAKE_C_LINK_EXECUTABLE   "${RC_LINK} <OBJECTS> -o <TARGET> <LINK_LIBRARIES> ${RC_LINK_TAIL}")
 set(CMAKE_CXX_LINK_EXECUTABLE "${RC_LINK} <OBJECTS> -o <TARGET> <LINK_LIBRARIES> ${RC_LINK_TAIL}")
 
-# Never pick up the host's libraries or headers.
-set(CMAKE_FIND_ROOT_PATH "${RC_ROOT}/lib/racccoon-libc" "${RC_LIBC}" "${RC_CXX}")
+# Never pick up the host's libraries or headers: only racccoon-libc and
+# what's been built for racccoon under build/ (libc++, LLVM + lld for c3c).
+set(CMAKE_FIND_ROOT_PATH "${RC_ROOT}/lib/racccoon-libc" "${RC_ROOT}/build")
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)

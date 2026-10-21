@@ -195,7 +195,7 @@ its own page table.
 
 - The **image + a fixed 64 KiB stack** are mapped eagerly.
 - **`SYS_MAP`** hands out address space above the image, page-aligned,
-  bounded by `HEAP_MAX_BYTES` (16 MiB Duo / 512 MiB QEMU). It is
+  bounded by `HEAP_MAX_BYTES` (16 MiB Duo / 1.5 GiB QEMU). It is
   **demand-paged**: `SYS_MAP` reserves the range, a page fault in it
   maps one zero page. This is the userspace "give me a heap" primitive —
   `/bin/wasm`'s linear memory, the real-stdlib allocator, Go's arena.
@@ -1235,6 +1235,40 @@ the host ld.lld's, and the program's output). Under QEMU llc takes ~5 s,
 llc + ld.lld + run ~22 s. These need QEMU's 128 MiB exec cap
 (`boards/qemu/board.c3`); the Duo's 4 MiB is too small.
 
+**c3c.** `lib/racccoon-libc/build_c3c.sh` builds the C3 compiler itself
+for racccoon — the normal LLVM backend and lld linked in — as `/bin/c3c`
+(56.8 MiB). Source: `C3C_SRC` (default `~/Workspace/c3c-llvm`), upstream
+v0.8.5 (the version that builds racccoon) plus the racccoon commits on the
+fork's `racccoon-llvm` branch: no `/proc/self/exe`, the rv64 default
+target, 128 MiB vmem arenas (`C3_SMALL_ARENAS`: reservations count
+against the heap cap), `C3_LLVM_NO_THREADS`, and two reproducibility
+fixes (sources collected in sorted order, not readdir order; a pointer
+difference no longer depends on the C compiler's argument evaluation
+order). Every LLVM target but RISC-V is `*_DISABLE`d. Its standard
+library is `/lib/c3/std` (c3c finds it there by itself). It needs QEMU's
+1.5 GiB heap cap.
+
+```
+c3c compile-only --target elf-riscv64 --single-module=yes prog.c3 -o prog.o
+```
+
+**racccoon builds its own kernel.** The images carry `/src/racccoon/`
+— `project.json`, `src/`, `boards/`, the user programs the QEMU test
+kernel embeds (`embed/*.bin.o`) and `selfbuild.rc`, which is
+`lib_kernel.sh`'s compile + link done on racccoon:
+
+```
+. /src/racccoon/selfbuild.rc   # c3c build racccoon … -g0 → 19 .ll; llc each; ld.lld
+```
+
+→ `/src/racccoon/build/kernel.elf`, a bootable QEMU kernel. `selfbuildtest`
+runs it (~6 min under QEMU) and checks the ELF is byte-identical to
+`/src/racccoon-ref/kernel.elf`: `scripts/selfbuild_ref.sh` ran the same
+steps on the host with the same c3c source built natively against the
+host's LLVM of the same version. `-g0` because DWARF would carry the
+different absolute source paths. `c3ctest` does the same for one small
+file (`test/c3-src/c3ctest.c3`).
+
 ### 9.9 Debugging with gdb (QEMU)
 
 ```
@@ -1277,11 +1311,17 @@ output to the console), `kbdpush`, `synhist`, and profiling helpers.
 
 ### 10.2 Control flow
 
-`#!`-style scripts (run by `. script` or by exec), `if` / `else`,
+`#!`-style scripts (run by `. script` or by name — the shell interprets
+them itself), `if` / `else`,
 `for NAME in LIST`, `while`, `break`, `continue`. Command substitution:
 `` `cmd` `` or `` `{cmd} ``. Shell-local variables: `NAME=value` (no
 `export`; they're per-shell). `/bin/test`, `/bin/[`, `/bin/expr` back
 the conditionals.
+
+Globs (`*`, `?` in the last path component) expand in **byte order**, as
+in rc and sh. A command line, its expansion or a glob that doesn't fit
+the shell's buffers (1 KiB raw, 2 KiB expanded, 64 words, a glob's
+matches) is refused with an error — never silently cut.
 
 ### 10.3 Line editing
 
@@ -1468,7 +1508,7 @@ What a board provides:
   (`2099200` on the Duo card, `0` on the QEMU whole-disk image).
 - **`TIMEBASE_HZ`** (10 MHz QEMU / 25 MHz Duo), **`SMP_MAX_HARTS`** (8),
   **`EXEC_MAX_IMAGE_SIZE`** (32 MiB QEMU / 1 MiB Duo),
-  **`HEAP_MAX_BYTES`** (512 MiB QEMU / 16 MiB Duo).
+  **`HEAP_MAX_BYTES`** (1.5 GiB QEMU / 16 MiB Duo).
 - **`console_putchar` / `console_getchar`** — both currently route to
   the SBI legacy calls.
 
@@ -1655,10 +1695,12 @@ lib/
 third_party/
   tinycc/, lua/, musl/  submodules: TinyCC, Lua (for /bin/wasm), musl (libm,
                         float formatting/parsing for racccoon-libc)
+                        (c3c's source is outside the repo: C3C_SRC, see §9.8)
 
 test/
   c-src/, cxx-src/      C / C++ test programs -> /bin
   llvm-src/             llctest's IR fixture
+  c3-src/               c3ctest's fixture
   wasm-src/             WASI fixtures for wasitest
 
 scripts/
@@ -1672,6 +1714,8 @@ scripts/
   populate_duo_bin.sh   seed /bin + the tree onto the Duo's ext2 partition
   launch64*.sh          QEMU boot variants (extra args go to QEMU, e.g. -s)
   gdb_qemu.sh           host gdb on QEMU's stub: kernel + one program, ubreak/curproc
+  selfbuild_ref.sh      the self-build: stages /src/racccoon, makes the host reference
+  seed_selfbuild.sh     seeds it + c3c's stdlib onto the QEMU images
 
 docs/
   manual.md            this file

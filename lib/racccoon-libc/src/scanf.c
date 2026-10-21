@@ -159,3 +159,29 @@ int sscanf(const char *str, const char *fmt, ...)
 	va_end(ap);
 	return n;
 }
+
+/* Stream scanning: one line, then the string scanner. */
+int vfscanf(FILE *f, const char *fmt, va_list ap)
+{
+	char line[4096];
+	if (!fgets(line, sizeof line, f)) return EOF;
+	return vsscanf(line, fmt, ap);
+}
+
+int fscanf(FILE *f, const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vfscanf(f, fmt, ap);
+	va_end(ap);
+	return n;
+}
+
+int scanf(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vfscanf(stdin, fmt, ap);
+	va_end(ap);
+	return n;
+}

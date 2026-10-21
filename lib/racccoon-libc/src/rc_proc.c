@@ -402,3 +402,6 @@ int fstatvfs(int fd, struct statvfs *buf)
 	rc_statvfs_fill(buf);
 	return 0;
 }
+
+int shm_open(const char *name, int oflag, mode_t mode) { (void)name; (void)oflag; (void)mode; errno = ENOSYS; return -1; }
+int shm_unlink(const char *name) { (void)name; errno = ENOSYS; return -1; }

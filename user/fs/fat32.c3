@@ -266,6 +266,28 @@ fn void fat32_short_name_to_display(char* name11, char* out_name)
 	out_name[ni] = 0;
 }
 
+// Windows NT / VFAT case flags in a short entry's byte 12: a name that is
+// valid 8.3 except for being lowercase ("panic.c3", "kernel") is stored
+// as an uppercase short name with no LFN chain plus these bits — Linux
+// (vfat, mtools) and Windows write them. Without honouring them such a
+// file lists as "PANIC.C3", and case-sensitive callers (c3c's ".c3"
+// suffix match) miss it.
+const uint FAT32_DIRENT_NT_CASE = 12;
+const char FAT32_NT_LOWER_BASE  = (char)0x08;
+const char FAT32_NT_LOWER_EXT   = (char)0x10;
+
+fn void fat32_apply_nt_case(char* entry, char* name)
+{
+	char flags = entry[FAT32_DIRENT_NT_CASE];
+	bool ext = false;
+	for (int i = 0; name[i] != 0; i++)
+	{
+		if (name[i] == '.') { ext = true; continue; }
+		bool lower = ext ? (flags & FAT32_NT_LOWER_EXT) != 0 : (flags & FAT32_NT_LOWER_BASE) != 0;
+		if (lower && name[i] >= 'A' && name[i] <= 'Z') name[i] = (char)(name[i] - 'A' + 'a');
+	}
+}
+
 // Case-insensitive comparison — FAT's own name matching always is,
 // long name or short.
 fn bool fat32_name_eq_ci(char* a, char* b)
@@ -425,6 +447,7 @@ fn void fat32_lfn_finish(char* short_entry, char* lfn_buf, int expected_seq, cha
 		return;
 	}
 	fat32_short_name_to_display(&short_entry[FAT32_DIRENT_NAME], out_name);
+	fat32_apply_nt_case(&short_entry[0], out_name);
 }
 
 // Scans dir_cluster's own directory for an entry whose real name —

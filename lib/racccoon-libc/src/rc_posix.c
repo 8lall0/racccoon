@@ -327,6 +327,8 @@ int fstat(int fd, struct stat *st)
 int mkdir(const char *path, mode_t mode)
 {
 	(void)mode;
+	struct stat st;
+	if (stat(path, &st) == 0) { errno = EEXIST; return -1; }
 	if (__rc_fs_mkdir(path) != 0) { errno = EIO; return -1; }
 	return 0;
 }
@@ -426,8 +428,6 @@ char *realpath(const char *path, char *resolved)
 /* fsd carries no mode bits — accept and ignore. */
 int chmod(const char *path, mode_t mode) { (void)path; (void)mode; return 0; }
 
-/* fsd has no truncate primitive. length 0 is the common case (rewrite a
- * file from scratch) — delete + recreate. Non-zero is best-effort no-op. */
 /* The FS protocol has no truncate: growing appends zeros; shrinking
  * keeps the first `length` bytes by reading them, recreating the file
  * empty and writing them back. The fd's offset is left alone. */
@@ -613,4 +613,53 @@ int fchown(int fd, uid_t uid, gid_t gid)
 	fd_init();
 	if (fd < 0 || fd >= FD_MAX || fdtab[fd].kind != K_FILE) { errno = EBADF; return -1; }
 	return chown(fdtab[fd].path, uid, gid);
+}
+
+#include <utime.h>
+int utime(const char *path, const struct utimbuf *times)
+{
+	(void)times;
+	struct stat st;
+	return stat(path, &st);   /* no times to set: the filesystems keep none */
+}
+
+/* mkstemp / mkdtemp: fill the trailing XXXXXX from a counter mixed with
+ * the pid and the clock, and create exclusively; retry on a collision. */
+static int rc_fill_template(char *tmpl, unsigned long seed)
+{
+	size_t n = strlen(tmpl);
+	if (n < 6 || strcmp(tmpl + n - 6, "XXXXXX") != 0) { errno = EINVAL; return -1; }
+	static const char chars[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+	for (int i = 0; i < 6; i++) { tmpl[n - 6 + i] = chars[seed % 36]; seed /= 36; }
+	return 0;
+}
+
+static unsigned long rc_tmp_seed(void)
+{
+	static unsigned long counter;
+	unsigned long t;
+	__asm__ volatile ("rdtime %0" : "=r"(t));
+	return (t ^ ((unsigned long)getpid() << 20)) + 7919UL * ++counter;
+}
+
+int mkstemp(char *tmpl)
+{
+	for (int tries = 0; tries < 100; tries++) {
+		if (rc_fill_template(tmpl, rc_tmp_seed()) != 0) return -1;
+		int fd = open(tmpl, O_RDWR | O_CREAT | O_EXCL, 0600);
+		if (fd >= 0 || errno != EEXIST) return fd;
+	}
+	errno = EEXIST;
+	return -1;
+}
+
+char *mkdtemp(char *tmpl)
+{
+	for (int tries = 0; tries < 100; tries++) {
+		if (rc_fill_template(tmpl, rc_tmp_seed()) != 0) return 0;
+		if (mkdir(tmpl, 0700) == 0) return tmpl;
+		if (errno != EEXIST) return 0;
+	}
+	errno = EEXIST;
+	return 0;
 }

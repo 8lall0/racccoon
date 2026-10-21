@@ -47,6 +47,7 @@ if [ ! -e "$OUT/build.ninja" ] || [ "$0" -nt "$OUT/build.ninja" ] \
     -DLLVM_DEFAULT_TARGET_TRIPLE=riscv64-unknown-elf \
     -DLLVM_TARGETS_TO_BUILD=RISCV \
     -DLLVM_ENABLE_PROJECTS=lld \
+    -DLLVM_APPEND_VC_REV=OFF \
     -DLLVM_ENABLE_THREADS=OFF \
     -DLLVM_ENABLE_PIC=OFF \
     -DLLVM_ENABLE_ZLIB=OFF \

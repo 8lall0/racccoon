@@ -1120,21 +1120,30 @@ fn int shell_exec_external(char* cmd, char** cmd_argv, int cmd_argc)
 // one (`cd`, `su`, …) hits the /bin path and 127s.
 fn int shell_run_pipeline(char* seg, int seg_len, bool bg)
 {
-    char[256] raw @noinit;
-    int rn = seg_len < 255 ? seg_len : 255;
+    // Every limit below refuses a command that doesn't fit, rather than
+    // cutting it: a silently truncated argv (a long ld.lld line lost its
+    // last arguments, 2026-10-22) is worse than an error.
+    const int PL_RAW = 1024;
+    const int PL_EXP = 2048;
+    if (seg_len > PL_RAW - 1) { print("shell: command too long\n"); return 2; }
+    char[PL_RAW] raw @noinit;
+    int rn = seg_len;
     for (int k = 0; k < rn; k++) { raw[k] = seg[k]; }
     raw[rn] = 0;
 
-    char[512] exp @noinit;
-    char[512] qm  @noinit;
-    if (shell_expand_q(&raw[0], &exp[0], &qm[0], 512) < 0) {
+    char[PL_EXP] exp @noinit;
+    char[PL_EXP] qm  @noinit;
+    if (shell_expand_q(&raw[0], &exp[0], &qm[0], PL_EXP) < 0) {
         print("shell: unterminated quote\n");
         return 2;
     }
+    int el = 0;
+    while (exp[el] != 0) { el++; }
+    if (el >= PL_EXP - 1) { print("shell: command too long after expansion\n"); return 2; }
 
     // Tokenise on unquoted whitespace. A token is an operator only if
     // it's an unquoted, bare `|` / `<` / `>` / `>>`.
-    const int PL_MAX_TOKENS = 20;
+    const int PL_MAX_TOKENS = 64;
     char*[PL_MAX_TOKENS] tokens   @noinit;
     bool[PL_MAX_TOKENS]  tok_op   @noinit;
     bool[PL_MAX_TOKENS]  tok_glob @noinit;   // token has an unquoted * or ?
@@ -1172,6 +1181,8 @@ fn int shell_run_pipeline(char* seg, int seg_len, bool bg)
 
         nt++;
     }
+    while (exp[ti] == ' ' && qm[ti] == 0) { ti++; }
+    if (exp[ti] != 0) { print("shell: too many words\n"); return 2; }
     if (nt == 0) { return 0; }
 
     // Split the tokens into pipeline stages on `|`, collecting each
@@ -1179,7 +1190,7 @@ fn int shell_run_pipeline(char* seg, int seg_len, bool bg)
     // `>` / `>>` targets. `stage_words` is flat storage; stage s's argv
     // is stage_words[stage_off[s] ..] with element 0 the command name.
     const int MAX_STAGES = 6;
-    const int STAGE_WORDS_MAX = MAX_STAGES * 12;   // headroom for glob expansion
+    const int STAGE_WORDS_MAX = MAX_STAGES * 32;   // headroom for glob expansion
     char*[STAGE_WORDS_MAX] stage_words @noinit;
     int[MAX_STAGES] stage_off @noinit;
     int[MAX_STAGES] stage_n   @noinit;
@@ -1187,7 +1198,7 @@ fn int shell_run_pipeline(char* seg, int seg_len, bool bg)
     // Packed storage for glob-expanded path strings — stage_words[] holds
     // pointers into here, so it has to outlive the spawn loop below (it
     // does: same function scope).
-    const int GLOB_NAMES_BUF = 2048;
+    const int GLOB_NAMES_BUF = 4096;
     char[GLOB_NAMES_BUF] glob_names @noinit;
     int gnb = 0;
 
@@ -1246,13 +1257,18 @@ fn int shell_run_pipeline(char* seg, int seg_len, bool bg)
 
         for (int b = 0; b < bn; b++) {
             char* w = bres[b];
+            if (sw >= STAGE_WORDS_MAX) { print("shell: too many words\n"); return 2; }
             if (tok_glob[i]) {
                 int gm = shell_glob_into(w, &glob_names[0], &gnb, GLOB_NAMES_BUF,
                                          &stage_words[0], &sw, STAGE_WORDS_MAX);
+                if (sw >= STAGE_WORDS_MAX || gnb >= GLOB_NAMES_BUF - 100) {
+                    print("shell: glob matched too much\n");   // shell_glob_into stops at either cap
+                    return 2;
+                }
                 stage_n[nstages - 1] += gm;
                 // rc: a pattern that matches nothing stands as a literal word.
-                if (gm == 0 && sw < STAGE_WORDS_MAX) { stage_words[sw] = w; sw++; stage_n[nstages - 1]++; }
-            } else if (sw < STAGE_WORDS_MAX) {
+                if (gm == 0) { stage_words[sw] = w; sw++; stage_n[nstages - 1]++; }
+            } else {
                 stage_words[sw] = w; sw++; stage_n[nstages - 1]++;
             }
         }
@@ -1787,11 +1803,22 @@ fn int shell_do_for(char* s)
 
             bool has_meta = false;
             for (int g = 0; word[g] != 0; g++) { if (word[g] == '*' || word[g] == '?') { has_meta = true; break; } }
-            char[512] gnames @noinit;
+            // Room for a directory's worth (a kernel build's 19 *.ll); a
+            // glob that still doesn't fit is an error, not a short loop.
+            const int FOR_GLOB_NAMES = 4096;
+            const int FOR_GLOB_WORDS = 128;
+            char[FOR_GLOB_NAMES] gnames @noinit;
             int gnb = 0;
-            char*[16] gwords @noinit;
+            char*[FOR_GLOB_WORDS] gwords @noinit;
             int gsw = 0;
-            int gn = has_meta ? shell_glob_into(word, &gnames[0], &gnb, 512, &gwords[0], &gsw, 16) : 0;
+            int gn = has_meta ? shell_glob_into(word, &gnames[0], &gnb, FOR_GLOB_NAMES, &gwords[0], &gsw, FOR_GLOB_WORDS) : 0;
+            if (gsw >= FOR_GLOB_WORDS || gnb >= FOR_GLOB_NAMES - 100) {
+                print("shell: glob matched too much\n");
+                st = 2;
+                stop = true;
+                g_shell_loop_break = true;   // the whole for, not just this word
+                break;
+            }
 
             int matches = gn > 0 ? gn : 1;
             for (int m = 0; m < matches; m++) {

@@ -641,6 +641,64 @@ fn bool shell_test_lang_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
                 print(" bytes, identical to the host's)\n");
             }
         }
+    } else if (strcmp(cmd, "c3ctest") == 0) {
+        // /bin/c3c (lib/racccoon-libc/build_c3c.sh): the C3 compiler,
+        // LLVM backend inside, compiling /src/c3ctest.c3
+        // (test/c3-src/c3ctest.c3) on racccoon. No --stdlib: it must find
+        // /lib/c3 by itself. The object must match the host's
+        // (scripts/selfbuild_ref.sh: same c3c source, same LLVM). Skips
+        // without /bin/c3c.
+        char*[10] cc_av;
+        cc_av[0] = "compile-only";
+        cc_av[1] = "--target";
+        cc_av[2] = "elf-riscv64";
+        cc_av[3] = "--use-stdlib=no";
+        cc_av[4] = "--no-entry";
+        cc_av[5] = "--single-module=yes";
+        cc_av[6] = "-g0";
+        cc_av[7] = "/src/c3ctest.c3";
+        cc_av[8] = "-o";
+        cc_av[9] = "/c3ctmp.o";
+        char[1024] cc_out;
+        int cc_code = lang_run_captured("bin/c3c", &cc_av[0], 10, &cc_out, 1024);
+        if (cc_code == 127) {
+            print("c3ctest: skipped (no /bin/c3c)\n");
+        } else {
+            int cc_same = cc_code == 0 ? lang_same_file("/c3ctmp.o", "/src/racccoon-ref/c3ctest.o") : -1;
+            fs_delete("/c3ctmp.o");
+            if (cc_same > 0) {
+                print("c3ctest: ok (");
+                print_uint((uint)cc_same);
+                print(" bytes, identical to the host c3c's)\n");
+            } else {
+                print(cc_code == 0 ? "c3ctest: FAILED (object differs from the host c3c's)\n" : "c3ctest: FAILED (c3c exit != 0)\n");
+            }
+        }
+    } else if (strcmp(cmd, "selfbuildtest") == 0) {
+        // racccoon building its own kernel: /src/racccoon/selfbuild.rc
+        // runs c3c (IR), llc (objects) and ld.lld (the QEMU test kernel
+        // with the embedded user programs) — scripts/selfbuild_ref.sh
+        // generated it and ran the same steps on the host. The two
+        // kernel.elf must be byte-identical. Long under QEMU (minutes).
+        // A script is interpreted by the shell, not exec'd, so it runs
+        // here (its `cd` too — undone after). Skips without the script
+        // (no C3C_SRC at build time).
+        uint sb_size = 0;
+        int sb_type = 0;
+        if (fs_stat("/src/racccoon/selfbuild.rc", &sb_size, &sb_type) != 0) {
+            print("selfbuildtest: skipped (no /src/racccoon/selfbuild.rc)\n");
+        } else {
+            shell_run_script("/src/racccoon/selfbuild.rc", null, 0);
+            chdir("/");
+            int sb_same = lang_same_file("/src/racccoon/build/kernel.elf", "/src/racccoon-ref/kernel.elf");
+            if (sb_same > 0) {
+                print("selfbuildtest: ok (racccoon built its own kernel: ");
+                print_uint((uint)sb_same);
+                print(" bytes, identical to the host's)\n");
+            } else {
+                print("selfbuildtest: FAILED (kernel.elf missing or differs from the host's)\n");
+            }
+        }
     } else {
         return false;
     }

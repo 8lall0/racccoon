@@ -30,6 +30,10 @@ int   mprotect(void *addr, size_t length, int prot);
 int   msync(void *addr, size_t length, int flags);
 int   madvise(void *addr, size_t length, int advice);
 int   posix_madvise(void *addr, size_t length, int advice);
+/* No named shared-memory objects (racccoon's shared memory is
+ * segattach): both fail with ENOSYS. */
+int   shm_open(const char *name, int oflag, mode_t mode);
+int   shm_unlink(const char *name);
 
 #define MS_ASYNC      1
 #define MS_INVALIDATE 2

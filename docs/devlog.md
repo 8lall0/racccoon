@@ -3,6 +3,116 @@
 Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
+## 2026-10-22 (later) — LLVM milestone 5: c3c on racccoon, and racccoon builds its own kernel
+
+**racccoon compiles and links its own kernel.** `selfbuildtest`:
+1. `/bin/c3c` (the real C3 compiler, LLVM backend + lld inside) turns
+   `/src/racccoon` into 19 LLVM IR modules.
+2. `/bin/llc` turns each into an object.
+3. `/bin/ld.lld` links them with the embedded user programs into a 2,238,136-byte
+   `kernel.elf`, **byte-identical** to the host build of the same steps.
+
+The whole run takes 5 min 45 s under QEMU. That ELF, pulled off the disk
+image, **boots**: runtest, killtest, stdiotest, cxxtest, llctest and nettest
+pass on it. This closes the loop the parked tcc/C-backend arc was after.
+
+- **The compiler:**
+  - Upstream c3c **v0.8.5** (`640091d33`, exactly the host's) on a new fork
+    branch `racccoon-llvm`, in a plain clone at `~/Workspace/c3c-llvm`. A git
+    worktree broke c3c's `.git/HEAD` version rule.
+  - Branch commits:
+    - the two portability patches cherry-picked from the parked branch (small
+      vmem arenas; no /proc/self/exe + the rv64 default target);
+    - `whereami.c` takes its /proc path when nothing defines `__linux__`;
+    - `C3_LLVM_NO_THREADS` exempts the LLVMIsMultithreaded() assert, as
+      Emscripten already is (c3c runs codegen on one thread here);
+    - two reproducibility fixes (below).
+  - None of it is pushed.
+  - `lib/racccoon-libc/build_c3c.sh` builds all of LLVM's libraries, then c3c
+    with racccoon.cmake. Settings: `C3_SMALL_ARENAS=128`, every non-RISC-V
+    target `*_DISABLE`d (c3c already has the switches), lld headers via
+    `C3_LLD_INCLUDE_DIR`. Result: 56.8 MiB flat `/bin/c3c`.
+- **c3c's stdlib:** seeded as `/lib/c3/std`. c3c finds it with no flags,
+  because its search already tries `<exe dir>/lib/c3/` and the exe dir is
+  "" here.
+- **Heap cap 512 MiB → 1.5 GiB on QEMU.** c3c's 6.5 arenas × 128 MiB of
+  reservations count against it. They're demand-paged, so they cost nothing
+  until touched. The host kernel compile peaks at 188 MiB RSS.
+- **libc, found on the way:**
+  - `utime.h` (the filesystems keep no times);
+  - `fseeko`/`ftello`;
+  - real `mkstemp`/`mkdtemp` (mkdtemp was a stub that returned the template);
+  - `mkdir` → EEXIST;
+  - `shm_open` (ENOSYS) and `scanf`/`fscanf` (one line → vsscanf), so the
+    JIT parts of LLVM build too;
+  - the c3c-only stubs moved out of `libracccoon.a` to `c3c-tcc-stubs.c`
+    (they collided with the real c3c).
+- **Bug: relative paths at `/` never worked in C programs.**
+  - The kernel reports an unset cwd as "". `getcwd()` maps that to "/", but
+    `__rc_abspath` passed the bare relative name to fsd. With a set cwd of
+    "/" it made "//x".
+  - c3c's "Failed to resolve t.c3" found it.
+- **Shell bugs found by the self-build script:**
+  - **Globs came out in directory order.** That is a build's link order; rc
+    and sh sort. They are now sorted.
+  - **Silent truncation:**
+    - a command was cut to 255 bytes, expansion to 511, 20 words;
+    - a `for` loop's glob to 16 matches / 512 bytes.
+
+    The first self-build lost its ld.lld line's tail ("cannot open
+    embed/i2cd.bin."). The next silently compiled only 13 of the 19 `.ll`, and
+    the link "worked" without `boot`.
+
+    The limits are now 1 KiB / 2 KiB / 64 words / 128 matches, and anything
+    over is an error.
+  - `selfbuildtest` runs the script in-process (`shell_run_script`): racccoon
+    scripts are interpreted by the shell, never exec'd. Exec'ing one faults.
+- **Byte-identical took three fixes beyond "it compiles":**
+  1. **c3c added sources in readdir order.** The order decides decl
+     numbering and module layout. Host ext4 and racccoon's FS gave e.g.
+     `atomic_lock_table.5381` vs `.1919`, plus reordered types and comdats.
+     Fixed in c3c: collect, qsort, walk. This is also a host-to-host
+     reproducibility bug.
+  2. **`LLVMBuildSub(b, LLVMBuildPtrToInt(lhs), LLVMBuildPtrToInt(rhs))`** left
+     the two instructions' order to C's argument evaluation. The host's
+     GCC-built c3c and racccoon's clang-built one disagreed. These were the
+     only two such sites in c3c's codegen (scanned for it). Now sequenced.
+  3. **racccoon's ld.lld stamped `.comment` with the llvm-project git hash**;
+     the distro lld doesn't. Fixed with `LLVM_APPEND_VC_REV=OFF`.
+- **The reference:**
+  - `scripts/selfbuild_ref.sh` builds the same c3c source natively against
+    the host's LLVM (same version), stages the tree, and generates
+    `selfbuild.rc` from the same definitions.
+  - It runs the identical steps on the host with `LC_ALL=C` globs. `-g0` on
+    both sides: DWARF carries absolute paths; the -g0 IR has none.
+  - `scripts/seed_selfbuild.sh` puts it all on both images.
+  - `c3ctest` covers one small file the same way: an identical object,
+    without `--stdlib`.
+- **FAT32 found two more bugs:** ext2 passed first; FAT32 failed both c3c
+  tests.
+  - **FAT32 driver: short names ignored the NT lowercase flags.** A name
+    that's valid 8.3 apart from being lowercase ("panic.c3", "kernel") is
+    stored, by Linux vfat, mtools and Windows, as an uppercase short entry with
+    no LFN chain plus case bits in byte 12 (0x08 base, 0x10 extension).
+    racccoon listed it as `PANIC.C3`, so c3c's case-sensitive `.c3` match
+    skipped every such file: "No module named 'panic'". Now honoured
+    (`fat32_apply_nt_case`). Any short lowercase file copied onto a FAT card
+    had been listing in uppercase.
+  - **libc: paths weren't normalized.** c3c's `opendir(".")` became "/.",
+    and FAT32's root has no "." entry, which ext2's does.
+    `__rc_abspath` now collapses `//`, `.` and `..` (`rc_normalize`;
+    `..` at the root stays there).
+- **Not ours:** the host's tamago `go` printed a `modfile` slice-bounds panic
+  during build.sh's Go toolchain-closure step. The build continued and the Go
+  tests still pass. Not chased.
+- **Verified:** the full QEMU suite on FAT32 and ext2 matches the baseline.
+  - All nine LLVM-arc tests pass on both filesystems: cxxtest, alloctest,
+    malloctest, llvmtest, mathtest, llctest, lldtest, c3ctest, selfbuildtest.
+  - selfbuildtest takes ~6 min each.
+  - The racccoon-built kernel boots and passes the spot tests above.
+  - fsck clean.
+
+---
 ## 2026-10-22 — LLVM milestone 4: `ld.lld`, and compile → link → run entirely on racccoon
 
 **racccoon now builds a program by itself.**

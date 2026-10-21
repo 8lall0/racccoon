@@ -410,3 +410,6 @@ ssize_t getdelim(char **lineptr, size_t *n, int delim, FILE *f)
 	return (ssize_t)len;
 }
 ssize_t getline(char **lp, size_t *n, FILE *f) { return getdelim(lp, n, '\n', f); }
+
+int fseeko(FILE *f, off_t off, int whence) { return fseek(f, (long)off, whence); }
+off_t ftello(FILE *f) { return (off_t)ftell(f); }

@@ -34,33 +34,62 @@ static int rc_fsd_call(int pid, unsigned verb, char *buf, int req_len, unsigned 
 	                          (long)verb_out, RC_SYS_IPC_CALL);
 }
 
+/* Collapse "//", "." and ".." in an absolute path, in place ("/a/./b/.."
+ * → "/a"; ".." at the root stays at the root). Filesystems resolve names
+ * literally — FAT32's root has no "." entry — so it must happen here. */
+static void rc_normalize(char *p)
+{
+	char tmp[128];
+	int o = 0;
+	int i = 0;
+	tmp[o++] = '/';
+	while (p[i]) {
+		while (p[i] == '/') i++;
+		if (!p[i]) break;
+		int s = i;
+		while (p[i] && p[i] != '/') i++;
+		int n = i - s;
+		if (n == 1 && p[s] == '.') continue;
+		if (n == 2 && p[s] == '.' && p[s + 1] == '.') {
+			if (o > 1) {
+				o--;                                   /* drop the trailing '/' */
+				while (o > 1 && tmp[o - 1] != '/') o--;
+			}
+			continue;
+		}
+		if (o > 1 && tmp[o - 1] != '/') tmp[o++] = '/';
+		for (int k = 0; k < n && o < 127; k++) tmp[o++] = p[s + k];
+	}
+	if (o > 1 && tmp[o - 1] == '/') o--;
+	tmp[o] = 0;
+	for (int k = 0; k <= o; k++) p[k] = tmp[k];
+}
+
 void __rc_abspath(const char *rel, char *out)
 {
 	if (rel[0] == '/') {
 		int i = 0;
 		while (rel[i] && i < 127) { out[i] = rel[i]; i++; }
 		out[i] = 0;
+		rc_normalize(out);
 		return;
 	}
 	char cw[128];
 	int n = rc_getcwd(cw, sizeof cw);
+	if (n <= 0 || cw[0] == 0) { cw[0] = '/'; cw[1] = 0; n = 1; }   /* no cwd set = the root, as getcwd() says */
 	if (rel[0] == 0) {
 		int i = 0;
 		while (i < n && i < 127) { out[i] = cw[i]; i++; }
 		out[i] = 0;
-		return;
-	}
-	if (n <= 0) {
-		int i = 0;
-		while (rel[i] && i < 127) { out[i] = rel[i]; i++; }
-		out[i] = 0;
+		rc_normalize(out);
 		return;
 	}
 	int o = 0;
 	for (int i = 0; i < n && o < 127; i++) out[o++] = cw[i];
-	if (o < 127) out[o++] = '/';
+	if (o < 127 && (o == 0 || out[o - 1] != '/')) out[o++] = '/';   /* cwd "/" + "x" = "/x", not "//x" */
 	for (int i = 0; rel[i] && o < 127; i++) out[o++] = rel[i];
 	out[o] = 0;
+	rc_normalize(out);
 }
 
 /* Resolve `path` (already absolute) to (fsd pid, server-relative path

@@ -42,6 +42,10 @@ ext2_seed_tree() {
   # host llvm-tblgen.
   bash lib/racccoon-libc/build_llvm.sh
 
+  # c3c itself, LLVM backend + lld inside, for racccoon (/bin/c3c). Needs
+  # C3C_SRC (default ~/Workspace/c3c-llvm); no-op without it.
+  bash lib/racccoon-libc/build_c3c.sh
+
   # TinyCC, cross-built against that libc (roadmap §7.7). No-ops unless
   # the third_party/tinycc submodule is checked out. Produces
   # build/tcc/tcc.bin + build/tcc/lib/ (the CONFIG_TCCDIR payload).
@@ -511,6 +515,13 @@ GOEOF
   kernel_link "$SHELL_OBJ" src/kernel.ld kernel
 
   echo "==> Done: build/kernel.elf"
+
+  # racccoon building its own kernel (selfbuildtest): stage the sources +
+  # the embedded objects just built, make the host reference, and seed it
+  # all — plus c3c's stdlib as /lib/c3 — onto the FAT32 and ext2 images.
+  bash scripts/selfbuild_ref.sh
+  bash scripts/seed_selfbuild.sh fat32 build/disk.img
+  bash scripts/seed_selfbuild.sh ext2 build/disk_ext2.img
 
   # build_tcc.sh applied lib/tcc/racccoon.patch to the submodule in place
   # (seed_tcc.sh needs the patched riscv64-link.c / riscv64-asm.c on the
