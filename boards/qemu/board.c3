@@ -153,12 +153,13 @@ const ulong TIMEBASE_HZ = 10000000;
 const uint SMP_MAX_HARTS = 8;
 
 // Largest image SYS_EXEC will install (src/syscalls.c3's EXEC_MAX_IMAGE_SIZE
-// and the ~96 KiB staging arrays it sizes at this value). 32 MiB on QEMU
-// — RAM is plentiful (1792 MiB free_ram) and Stage 4 of the Go port runs
-// `go tool compile`, a ~23 MiB GOOS=tamago binary (docs/go-port-plan.md).
-// Ordinary Go programs are 1.5-2 MiB, the C toolchain ~640 KiB. The Duo
-// keeps 1 MiB (boards/duo/board.c3) — 64 MiB DRAM, no Go.
-const EXEC_MAX_IMAGE_SIZE = 33554432;
+// and the staging arrays it sizes at this value, 12 bytes per page: 384 KiB
+// of kernel .bss here). 128 MiB on QEMU — RAM is plentiful (1792 MiB
+// free_ram). The LLVM tools set it: llc is 27.8 MiB, ld.lld 32.3 MiB, and
+// c3c with LLVM + lld inside will be bigger (docs/manual.md §9.8). `go
+// tool compile` is ~23 MiB, ordinary Go programs 1.5-2 MiB. The Duo keeps
+// 4 MiB (boards/duo/board.c3) — 64 MiB DRAM.
+const EXEC_MAX_IMAGE_SIZE = 134217728;
 
 // Per-process SYS_MAP ceiling (src/syscalls.c3's HEAP_MAX_BYTES). 512 MiB
 // on QEMU — the free_ram window is 1792 MiB (src/kernel.ld, -m 2G), and

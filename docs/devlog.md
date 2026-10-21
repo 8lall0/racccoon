@@ -3,6 +3,66 @@
 Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
+## 2026-10-22 — LLVM milestone 4: `ld.lld`, and compile → link → run entirely on racccoon
+
+**racccoon now builds a program by itself.**
+- `/bin/llc` compiles `/hello.ll`.
+- `/bin/ld.lld` links it against racccoon-libc from `/lib/racccoon/`
+  (`crt0.o`, `libracccoon.a`, `libgcc.a`, `racccoon-libc.ld`).
+- The resulting ELF runs and prints `hello from llc`.
+- The ELF (334,848 bytes) is byte-identical to the host ld.lld 23.1.3's
+  link of the host llc's object.
+- About 22 s for the three steps under QEMU (`lldtest`).
+
+- **Survey:**
+  - lld needed `lld/` and `libunwind/` in the sparse checkout. lld's Mach-O
+    port includes `mach-o/compact_unwind_encoding.h` from libunwind.
+  - One libc symbol was missing, `__cxa_thread_atexit`: libc++abi only
+    builds it with threads. It joins the `__cxa_atexit` LIFO table, because
+    the one thread's exit is the process's.
+  - lld's flat image is 32.3 MiB, just over QEMU's 32 MiB exec cap.
+- **Exec cap → 128 MiB on QEMU**, with headroom for c3c + LLVM + lld in M5.
+  - Cost: SYS_EXEC's per-page staging tables become 384 KiB of kernel
+    `.bss`, and their per-exec zeroing loop runs 32,768 iterations.
+  - User VA goes up to 0x9000000, far below the PLIC alias.
+  - `racccoon-libc.ld`'s assert matches.
+- **FAT32 test image 64 → 256 MiB.** llc had taken it to 81%.
+- **The real bug lld found: thread-locals aliased `.bss`.**
+  - On racccoon, ld.lld faulted at `stval=0x65722e007373622e`. That is ASCII
+    `".bss\0.re"`: a string table's bytes loaded as a pointer.
+  - The PC was in `CrashRecoveryContextImpl::HandleCrash`, reading
+    `CrashRecoveryContext`'s `thread_local` current-context pointer.
+  - Cause: a NOBITS TLS section takes no address space, so the linker put
+    `.bss` at `.tbss`'s own address. In lld, `.tbss` (960 B) started 8 B
+    before `.bss`.
+  - racccoon has no per-thread TLS copy: the template at
+    `tp = __tls_start` is the live block. So every zero-initialised
+    thread_local shared memory with the start of `.bss`.
+  - **This was already true for every C3 std::io program.** cat.elf's
+    17-byte `.tbss` sat exactly on `.bss`, covering the stdlib's tlocal
+    allocator state. It just never visibly broke.
+  - Fix: `. = ADDR(.tbss) + SIZEOF(.tbss);` after `.tbss` in
+    `racccoon-libc.ld`. The reserved bytes sit inside the RW load segment,
+    so both the ELF loader and the flat image zero them.
+  - build_llvm.sh's relink guard now also watches the linker script.
+- **`ftruncate`:**
+  - It used to accept any nonzero length and do nothing.
+  - Now growing zero-fills and shrinking rewrites the kept prefix; the FS
+    protocol has no truncate.
+  - LLVM's FileOutputBuffer sizes its temp file with it before trying a
+    writable `mmap`. Our `mmap` refuses that, with ENODEV, and LLVM falls
+    back to an in-memory buffer. That path is what lld uses here.
+- **`lldtest`** runs the three steps and checks each exit code, the
+  program's output and the byte comparison. It shares
+  `lang_run_captured`/`lang_same_file` with llctest.
+- **Verified:** the full QEMU suite on FAT32 and ext2 matches the baseline.
+  - The seven LLVM-arc tests pass: cxxtest, alloctest, malloctest,
+    llvmtest, mathtest, llctest, lldtest.
+  - The exec-path tests (elftest, runtest, gotest, gostage42test) are fine
+    with the 128 MiB cap.
+  - fsck clean; the FAT32 image is now 36% used.
+
+---
 ## 2026-10-21 (late night) — LLVM milestone 3: musl's libm, exact printf/strtod, `llc` on racccoon
 
 **`/bin/llc` (LLVM's code generator, RISC-V backend, 27.8 MiB flat) compiles

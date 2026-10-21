@@ -428,15 +428,41 @@ int chmod(const char *path, mode_t mode) { (void)path; (void)mode; return 0; }
 
 /* fsd has no truncate primitive. length 0 is the common case (rewrite a
  * file from scratch) — delete + recreate. Non-zero is best-effort no-op. */
+/* The FS protocol has no truncate: growing appends zeros; shrinking
+ * keeps the first `length` bytes by reading them, recreating the file
+ * empty and writing them back. The fd's offset is left alone. */
 int ftruncate(int fd, off_t length)
 {
 	fd_init();
 	if (fd < 0 || fd >= FD_MAX || fdtab[fd].kind != K_FILE) { errno = EBADF; return -1; }
-	if (length == 0) {
-		__rc_fs_delete(fdtab[fd].path, 0);
-		if (__rc_fs_write_at(fdtab[fd].path, "", 0, 0) < 0) { errno = EIO; return -1; }
-		fdtab[fd].off = 0;
+	if (length < 0) { errno = EINVAL; return -1; }
+	const char *path = fdtab[fd].path;
+	unsigned long size = 0;
+	int type = 0;
+	if (__rc_fs_stat(path, &size, &type) != 0) { errno = EIO; return -1; }
+	unsigned long want = (unsigned long)length;
+	if (want == size) return 0;
+	if (want > size) {
+		static const char zeros[1024];
+		while (size < want) {
+			long n = want - size > sizeof zeros ? (long)sizeof zeros : (long)(want - size);
+			if (__rc_fs_write_at(path, zeros, n, size) != n) { errno = EIO; return -1; }
+			size += (unsigned long)n;
+		}
+		return 0;
 	}
+	char *keep = want ? malloc(want) : 0;
+	if (want && !keep) { errno = ENOMEM; return -1; }
+	unsigned long got = 0;
+	while (got < want) {
+		long n = __rc_fs_read_at(path, keep + got, (long)(want - got), got);
+		if (n <= 0) { free(keep); errno = EIO; return -1; }
+		got += (unsigned long)n;
+	}
+	__rc_fs_delete(path, 0);
+	long w = __rc_fs_write_at(path, want ? keep : "", (long)want, 0);
+	free(keep);
+	if (w != (long)want) { errno = EIO; return -1; }
 	return 0;
 }
 

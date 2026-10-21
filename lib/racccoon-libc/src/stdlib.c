@@ -157,6 +157,20 @@ int atexit(void (*fn)(void))
 	return __cxa_atexit((void (*)(void *))fn, 0, 0);
 }
 
+/* Destructors of C++ thread_local objects. The one thread's exit is the
+ * process's exit, so they join the same LIFO table; registered on first
+ * use, they run before the statics constructed earlier, as C++ wants.
+ * (libc++abi only provides these when built with threads.) */
+int __cxa_thread_atexit(void (*fn)(void *), void *obj, void *dso)
+{
+	return __cxa_atexit(fn, obj, dso);
+}
+
+int __cxa_thread_atexit_impl(void (*fn)(void *), void *obj, void *dso)
+{
+	return __cxa_atexit(fn, obj, dso);
+}
+
 void *__dso_handle = &__dso_handle;
 
 /* environment: getenv / setenv / putenv / unsetenv live in rc_env.c */

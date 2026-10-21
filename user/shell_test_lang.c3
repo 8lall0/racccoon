@@ -34,6 +34,24 @@ fn int lang_run_captured(char* path, char** argv, int argc, char* out, int cap) 
     return join(c, g);
 }
 
+// Byte-compares two files: their common length if identical, -1 if they
+// differ (in content or size) or either can't be read.
+fn int lang_same_file(char* a, char* b) {
+    uint off = 0;
+    char[1024] ba;
+    char[1024] bb;
+    for (;;) {
+        int na = fs_read_at(a, &ba, 1024, off);
+        int nb = fs_read_at(b, &bb, 1024, off);
+        if (na != nb || na < 0) { return -1; }
+        if (na == 0) { return (int)off; }
+        for (int i = 0; i < na; i++) {
+            if (ba[i] != bb[i]) { return -1; }
+        }
+        off += (uint)na;
+    }
+}
+
 // True if NUL-terminated `hay` contains `needle`.
 fn bool lang_has_text(char* hay, char* needle) {
     for (int i = 0; hay[i] != 0; i++) {
@@ -566,28 +584,61 @@ fn bool shell_test_lang_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
         if (lc_code == 127) {
             print("llctest: skipped (no /bin/llc)\n");
         } else {
-            // compare in 1 KiB chunks; a short read on one side only = a size mismatch
-            bool lc_same = lc_code == 0;
-            uint lc_off = 0;
-            char[1024] lc_a;
-            char[1024] lc_b;
-            while (lc_same) {
-                int na = fs_read_at("/llctmp.o", &lc_a, 1024, lc_off);
-                int nb = fs_read_at("/hello.ref.o", &lc_b, 1024, lc_off);
-                if (na != nb || na < 0) { lc_same = false; break; }
-                if (na == 0) { break; }
-                for (int i = 0; i < na; i++) {
-                    if (lc_a[i] != lc_b[i]) { lc_same = false; }
-                }
-                lc_off += (uint)na;
-            }
+            int lc_same = lc_code == 0 ? lang_same_file("/llctmp.o", "/hello.ref.o") : -1;
             fs_delete("/llctmp.o");
-            if (lc_same && lc_off > 0) {
+            if (lc_same > 0) {
                 print("llctest: ok (");
-                print_uint(lc_off);
+                print_uint((uint)lc_same);
                 print(" bytes, identical to the host llc's)\n");
             } else {
                 print(lc_code == 0 ? "llctest: FAILED (object differs from the host llc's)\n" : "llctest: FAILED (llc exit != 0)\n");
+            }
+        }
+    } else if (strcmp(cmd, "lldtest") == 0) {
+        // The whole toolchain on racccoon: /bin/llc compiles /hello.ll,
+        // /bin/ld.lld links it with the files in /lib/racccoon (crt0,
+        // libracccoon.a, libgcc.a, the linker script), and the result
+        // runs. The ELF must be byte-identical to /hello.ref.elf, the
+        // host ld.lld's link of the host llc's object (build_llvm.sh).
+        // Skips without /bin/ld.lld.
+        char[512] ld_out;
+        char*[5] ld_cav;
+        ld_cav[0] = "-mattr=+m,+a,+f,+d,+c";
+        ld_cav[1] = "-filetype=obj";
+        ld_cav[2] = "/hello.ll";
+        ld_cav[3] = "-o";
+        ld_cav[4] = "/lldtmp.o";
+        int ld_cc = lang_run_captured("bin/llc", &ld_cav[0], 5, &ld_out, 512);
+        char*[8] ld_lav;
+        ld_lav[0] = "-T";
+        ld_lav[1] = "/lib/racccoon/racccoon-libc.ld";
+        ld_lav[2] = "/lib/racccoon/crt0.o";
+        ld_lav[3] = "/lldtmp.o";
+        ld_lav[4] = "/lib/racccoon/libracccoon.a";
+        ld_lav[5] = "/lib/racccoon/libgcc.a";
+        ld_lav[6] = "-o";
+        ld_lav[7] = "/lldtmp";
+        int ld_lc = ld_cc == 0 ? lang_run_captured("bin/ld.lld", &ld_lav[0], 8, &ld_out, 512) : -1;
+        if (ld_cc == 127 || ld_lc == 127) {
+            print("lldtest: skipped (no /bin/llc or /bin/ld.lld)\n");
+        } else {
+            int ld_same = ld_lc == 0 ? lang_same_file("/lldtmp", "/hello.ref.elf") : -1;
+            int ld_rc = ld_lc == 0 ? lang_run_captured("/lldtmp", null, 0, &ld_out, 512) : -1;
+            bool ld_ran = ld_rc == 0 && lang_has_text(&ld_out, "hello from llc");
+            fs_delete("/lldtmp.o");
+            fs_delete("/lldtmp");
+            if (ld_cc != 0) {
+                print("lldtest: FAILED (llc exit != 0)\n");
+            } else if (ld_lc != 0) {
+                print("lldtest: FAILED (ld.lld exit != 0)\n");
+            } else if (!ld_ran) {
+                print("lldtest: FAILED (the linked program didn't run right)\n");
+            } else if (ld_same <= 0) {
+                print("lldtest: FAILED (ELF differs from the host ld.lld's)\n");
+            } else {
+                print("lldtest: ok (compiled, linked, ran; ");
+                print_uint((uint)ld_same);
+                print(" bytes, identical to the host's)\n");
             }
         }
     } else {

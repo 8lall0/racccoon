@@ -142,9 +142,9 @@ ext2_seed_tree() {
   # `-F 32` forces FAT32 specifically: dosfstools defaults to FAT16 below
   # its own size threshold, and fsd.c3 only parses the FAT32 BPB layout.
   # mtools' mcopy writes into the image directly, no root/loop-mount
-  # needed. 64M comfortably clears FAT32's own minimum practical size.
+  # needed. 256 MiB: the LLVM tools (llc 28 MiB, ld.lld 32 MiB) filled 64.
   rm -f build/disk.img
-  dd if=/dev/zero of=build/disk.img bs=1M count=64 status=none
+  dd if=/dev/zero of=build/disk.img bs=1M count=256 status=none
   mkfs.vfat -F 32 build/disk.img > /dev/null
   mcopy -i build/disk.img disk/*.txt ::
   mcopy -i build/disk.img disk/greet.rc ::greet.rc   # §2.5 shell-script fixture
@@ -214,7 +214,14 @@ ext2_seed_tree() {
   if [ -e build/llvm-fixtures/hello.ref.o ]; then
     mcopy -i build/disk.img test/llvm-src/hello.ll ::hello.ll
     mcopy -i build/disk.img build/llvm-fixtures/hello.ref.o ::hello.ref.o
+    mcopy -i build/disk.img build/llvm-fixtures/hello.ref.elf ::hello.ref.elf
   fi
+  # What ld.lld on racccoon links a C program with (lldtest).
+  mmd -i build/disk.img ::lib/racccoon 2>/dev/null || true
+  for f in build/libc/crt0.o build/libc/libracccoon.a lib/racccoon-libc/racccoon-libc.ld \
+           "$(riscv64-unknown-elf-gcc -print-libgcc-file-name)"; do
+    mcopy -i build/disk.img "$f" "::lib/racccoon/$(basename "$f")"
+  done
   bash scripts/seed_tcc.sh fat32 build/disk.img
 
   # manyfiles/ — 60 entries, past FS_LIST's 31-per-reply cap (see the
@@ -357,7 +364,13 @@ GOEOF
   if [ -e build/llvm-fixtures/hello.ref.o ]; then
     debugfs -w -R "write test/llvm-src/hello.ll hello.ll" build/disk_ext2.img > /dev/null
     debugfs -w -R "write build/llvm-fixtures/hello.ref.o hello.ref.o" build/disk_ext2.img > /dev/null
+    debugfs -w -R "write build/llvm-fixtures/hello.ref.elf hello.ref.elf" build/disk_ext2.img > /dev/null
   fi
+  debugfs -w -R "mkdir lib/racccoon" build/disk_ext2.img > /dev/null 2>&1 || true
+  for f in build/libc/crt0.o build/libc/libracccoon.a lib/racccoon-libc/racccoon-libc.ld \
+           "$(riscv64-unknown-elf-gcc -print-libgcc-file-name)"; do
+    debugfs -w -R "write $f lib/racccoon/$(basename "$f")" build/disk_ext2.img > /dev/null
+  done
   bash scripts/seed_tcc.sh ext2 build/disk_ext2.img
   for w in build/wasm/*.wasm; do debugfs -w -R "write $w $(basename "$w")" build/disk_ext2.img > /dev/null; done
   debugfs -w -R "write build/lua/lua.wasm lib/lua.wasm" build/disk_ext2.img > /dev/null

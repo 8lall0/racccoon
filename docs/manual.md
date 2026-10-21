@@ -1165,6 +1165,10 @@ seed as `/bin/<name>`.
   `newlocale` refuses other names (ENOENT). Threads: one per program —
   mutexes count, `pthread_once`/keys work, `pthread_create` aborts, an
   untimed `pthread_cond_wait` aborts (nobody could signal it).
+- `ftruncate` really grows (zero-fill) and shrinks (rewrites the kept
+  prefix — the FS protocol has no truncate). Thread-locals (`.tdata` +
+  `.tbss`) form the one thread's TLS block at `tp = __tls_start`; the
+  linker script reserves `.tbss` so it can't overlap `.bss`.
 - Honest gaps: no symlinks or extra hard links (`symlink`/`link` fail
   EPERM, `readlink` EINVAL), no ownership changes (`chown` EPERM), no
   dynamic loading (`dlopen(NULL)` only), no password database (`getpw*`
@@ -1207,14 +1211,29 @@ libc++ + racccoon-libc, so configure checks see what the libc has.
 terminfo/backtraces/plugins, the RISC-V target; tablegen = the host's
 `llvm-tblgen`, which must be the same version) into `build/llvm-racccoon/`, and
 links **`llvm-readobj` as `/bin/llvm-readelf`** (4.6 MiB; readobj picks
-readelf mode from `argv[0]`) and **`llc` as `/bin/llc`** (27.8 MiB, the
-RISC-V backend: IR → assembly or objects). Their output on racccoon is
-byte-identical to the host's. `llvmtest` runs `llvm-readelf -h
-/bin/echod.elf`; `llctest` runs `llc -mattr=+m,+a,+f,+d,+c -filetype=obj
-/hello.ll` (`test/llvm-src/hello.ll`) and compares the object with
-`/hello.ref.o`, the host llc's for the same file (build_llvm.sh). Both
-need QEMU's 32 MiB exec cap; the Duo's 4 MiB is too small. A tool is
-relinked whenever libracccoon.a / libc++.a / crt0_mapped.o is newer.
+readelf mode from `argv[0]`), **`llc` as `/bin/llc`** (27.8 MiB, the
+RISC-V backend: IR → assembly or objects) and **`lld` as `/bin/ld.lld`**
+(32.3 MiB, flavor from `argv[0]`). Their output on racccoon is
+byte-identical to the host's. A tool is relinked whenever libracccoon.a /
+libc++.a / crt0_mapped.o / the linker script is newer. LLVM_SRC needs
+`llvm/`, `lld/` and `libunwind/` (one of its headers) besides the runtimes.
+
+The whole pipeline runs on racccoon — the images carry `/lib/racccoon/`
+(`crt0.o`, `libracccoon.a`, `libgcc.a`, `racccoon-libc.ld`):
+
+```
+llc -mattr=+m,+a,+f,+d,+c -filetype=obj /hello.ll -o /hello.o
+ld.lld -T /lib/racccoon/racccoon-libc.ld /lib/racccoon/crt0.o /hello.o \
+       /lib/racccoon/libracccoon.a /lib/racccoon/libgcc.a -o /hello
+/hello                     # an ELF: SYS_EXEC loads it directly
+```
+
+Tests: `llvmtest` (`llvm-readelf -h /bin/echod.elf`), `llctest` (the
+object for `/hello.ll`, `test/llvm-src/hello.ll`, vs `/hello.ref.o`, the
+host llc's), `lldtest` (the three steps above; the ELF vs `/hello.ref.elf`,
+the host ld.lld's, and the program's output). Under QEMU llc takes ~5 s,
+llc + ld.lld + run ~22 s. These need QEMU's 128 MiB exec cap
+(`boards/qemu/board.c3`); the Duo's 4 MiB is too small.
 
 ### 9.9 Debugging with gdb (QEMU)
 

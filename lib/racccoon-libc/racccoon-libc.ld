@@ -79,6 +79,14 @@ SECTIONS {
     .tbss : ALIGN(8) {
         *(.tbss .tbss.*)
     }
+    /* A NOBITS TLS section takes no address space — the linker places
+       the next section at .tbss's own address. Here the one thread's
+       TLS block IS this template (tp = __tls_start), so reserve it, or
+       every zero-initialised thread_local aliases the start of .bss
+       (found 2026-10-21: ld.lld's CrashRecoveryContext pointer overlaid
+       a string table and it faulted; C3 std::io programs' tlocal
+       allocator state overlapped .bss the same way). */
+    . = ADDR(.tbss) + SIZEOF(.tbss);
 
     .bss : ALIGN(8) {
         *(.bss .bss.* .sbss .sbss.* COMMON)
@@ -87,8 +95,8 @@ SECTIONS {
         . += 64 * 1024;  /* 64 KiB stack */
         __stack_top = .;
 
-        /* The largest per-board EXEC_MAX_IMAGE_SIZE (QEMU, 32 MiB); each
+        /* The largest per-board EXEC_MAX_IMAGE_SIZE (QEMU, 128 MiB); each
            board's own, smaller cap is enforced by SYS_EXEC at run time. */
-        ASSERT(. < 0x3000000, "C program image too large (>32 MiB — EXEC_MAX_IMAGE_SIZE)")
+        ASSERT(. < 0x9000000, "C program image too large (>128 MiB — EXEC_MAX_IMAGE_SIZE)")
     }
 }

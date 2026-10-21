@@ -9,6 +9,10 @@
 #   llvm-readobj -> /bin/llvm-readelf   (readobj picks readelf mode from
 #                                        argv[0], which exec passes)
 #   llc          -> /bin/llc            (IR -> RISC-V asm / objects)
+#   lld          -> /bin/ld.lld         (the ELF linker; flavor from argv[0])
+#
+# LLVM_SRC must have llvm/, lld/ and libunwind/ (lld's Mach-O port
+# includes one of its headers) besides what build_cxx.sh needs.
 #
 # tablegen runs on the host: the system llvm-tblgen must be the same
 # version as the checkout's tag (the host clang's).
@@ -42,6 +46,7 @@ if [ ! -e "$OUT/build.ninja" ] || [ "$0" -nt "$OUT/build.ninja" ] \
     -DLLVM_HOST_TRIPLE=riscv64-unknown-elf \
     -DLLVM_DEFAULT_TARGET_TRIPLE=riscv64-unknown-elf \
     -DLLVM_TARGETS_TO_BUILD=RISCV \
+    -DLLVM_ENABLE_PROJECTS=lld \
     -DLLVM_ENABLE_THREADS=OFF \
     -DLLVM_ENABLE_PIC=OFF \
     -DLLVM_ENABLE_ZLIB=OFF \
@@ -65,17 +70,17 @@ if [ ! -e "$OUT/build.ninja" ] || [ "$0" -nt "$OUT/build.ninja" ] \
     > "$OUT.configure.log" 2>&1 || { tail -40 "$OUT.configure.log"; exit 1; }
 fi
 
-# racccoon.cmake's link rule names libracccoon.a / libc++.a / crt0 as
+# racccoon.cmake's link rule names libracccoon.a / libc++.a / crt0 / the linker script as
 # text, not as ninja inputs, so a libc change alone wouldn't relink:
 # drop any tool older than them.
-for t in llvm-readobj llc; do
-  for lib in build/libc/libracccoon.a build/libc/crt0_mapped.o build/cxx/install/lib/libc++.a; do
+for t in llvm-readobj llc lld; do
+  for lib in build/libc/libracccoon.a build/libc/crt0_mapped.o build/cxx/install/lib/libc++.a lib/racccoon-libc/racccoon-libc.ld; do
     [ "$lib" -nt "$OUT/bin/$t" ] && rm -f "$OUT/bin/$t"
   done
 done
 
-echo "==> LLVM: building llvm-readobj llc"
-ninja -k 0 -C "$OUT" llvm-readobj llc > "$OUT.build.log" 2>&1 \
+echo "==> LLVM: building llvm-readobj llc lld"
+ninja -k 0 -C "$OUT" llvm-readobj llc lld > "$OUT.build.log" 2>&1 \
   || { grep -E "error|undefined symbol" "$OUT.build.log" | sort -u | head -60; exit 1; }
 
 flat() {   # flat() <tool in $OUT/bin> <name in /bin>
@@ -84,8 +89,15 @@ flat() {   # flat() <tool in $OUT/bin> <name in /bin>
 }
 flat llvm-readobj llvm-readelf
 flat llc llc
+flat lld ld.lld
 
 # llctest's fixture: the host llc's object for test/llvm-src/hello.ll —
 # the same LLVM version, so racccoon's llc must produce identical bytes.
 mkdir -p build/llvm-fixtures
 llc -mattr=+m,+a,+f,+d,+c -filetype=obj test/llvm-src/hello.ll -o build/llvm-fixtures/hello.ref.o   # = llctest's flags
+
+# lldtest's: the host ld.lld (same version) linking that object with the
+# exact files build.sh seeds as /lib/racccoon/ — racccoon's ld.lld must
+# produce the same bytes.
+ld.lld -T lib/racccoon-libc/racccoon-libc.ld build/libc/crt0.o build/llvm-fixtures/hello.ref.o \
+  build/libc/libracccoon.a "$(riscv64-unknown-elf-gcc -print-libgcc-file-name)" -o build/llvm-fixtures/hello.ref.elf
