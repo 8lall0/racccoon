@@ -9,6 +9,7 @@ module rcsys @feat(CUSTOM_LIBC);
 // decoupled from user.c3 — a program that wants both just calls
 // user::fs_read/exec/etc directly and lets this handle console output.
 const long SYS_PUTCHAR = 1;
+const long SYS_GETCHAR = 2;
 const long SYS_EXIT    = 3;
 const long SYS_MAP     = 47;
 const long SYS_WRITE   = 69;
@@ -49,6 +50,12 @@ fn int rc_putchar(int c)
 fn void rc_write(char* buf, usz len)
 {
 	if (len > 0) { rc_syscall(SYS_WRITE, (long)buf, (long)len, 0); }
+}
+
+// The next stdin byte (console or the shell's pipe), -1 at a pipe's EOF.
+fn int rc_getchar()
+{
+	return rc_syscall(SYS_GETCHAR, 0, 0, 0);
 }
 
 fn void rc_exit(int code) @noreturn

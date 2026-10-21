@@ -54,6 +54,16 @@ int __rc_isnan(double x)    { return x != x; }
 int __rc_isinf(double x)    { return !__rc_isnan(x) && (x == __rc_huge_val() || x == -__rc_huge_val()); }
 int __rc_isfinite(double x) { return !__rc_isnan(x) && !__rc_isinf(x); }
 int __rc_signbit(double x)  { unsigned long long b; __builtin_memcpy(&b, &x, 8); return (int)(b >> 63); }
+int __rc_fpclassify(double x)
+{
+	unsigned long long b;
+	__builtin_memcpy(&b, &x, 8);
+	unsigned e = (unsigned)(b >> 52) & 0x7ff;
+	unsigned long long m = b & 0xfffffffffffffULL;
+	if (e == 0x7ff) return m ? FP_NAN : FP_INFINITE;
+	if (e == 0) return m ? FP_SUBNORMAL : FP_ZERO;
+	return FP_NORMAL;
+}
 
 double trunc(double x) { return (double)(long long)x; }
 double floor(double x) { double t = trunc(x); return (t > x) ? t - 1.0 : t; }

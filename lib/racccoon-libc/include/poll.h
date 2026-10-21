@@ -1,5 +1,8 @@
 #ifndef _RACCCOON_POLL_H
 #define _RACCCOON_POLL_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 /* poll(2) on SYS_AWAIT (lib/racccoon-libc/src/rc_posix.c). Regular files
  * are always ready; stdin waits for the console or its pipe; stdout and
  * stderr are always writable. A note (^C) makes it return -1/EINTR. */
@@ -12,4 +15,7 @@ struct pollfd { int fd; short events; short revents; };
 #define POLLHUP  0x010
 #define POLLNVAL 0x020
 int poll(struct pollfd *fds, nfds_t nfds, int timeout_ms);
+#ifdef __cplusplus
+}
+#endif
 #endif

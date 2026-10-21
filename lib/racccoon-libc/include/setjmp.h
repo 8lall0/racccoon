@@ -1,5 +1,8 @@
 #ifndef _SETJMP_H
 #define _SETJMP_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* rv64 / lp64d: ra, sp, s0-s11 (12), fs0-fs11 (12) = 26 doublewords.
  * Layout must match src/setjmp.S. */
@@ -10,4 +13,7 @@ __attribute__((noreturn)) void longjmp(jmp_buf env, int val);
 
 #define setjmp(env)  setjmp(env)
 
+#ifdef __cplusplus
+}
+#endif
 #endif

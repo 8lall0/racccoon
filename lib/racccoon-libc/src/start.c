@@ -11,6 +11,8 @@ void _start(void)
 {
 	__asm__ volatile(
 		"la sp, __stack_top\n\t"
+		".weak __tls_start\n\t"     /* racccoon-tcc.ld has no TLS: tp = 0 there */
+		"la tp, __tls_start\n\t"   /* thread-locals: .tdata, no TCB (racccoon-libc.ld) */
 		"call __libc_start\n\t"
 	);
 }

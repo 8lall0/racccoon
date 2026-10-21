@@ -165,6 +165,10 @@ int  abs(int x)  { return x < 0 ? -x : x; }
 long labs(long x) { return x < 0 ? -x : x; }
 long long llabs(long long x) { return x < 0 ? -x : x; }
 
+div_t div(int n, int d) { div_t r = { n / d, n % d }; return r; }
+ldiv_t ldiv(long n, long d) { ldiv_t r = { n / d, n % d }; return r; }
+lldiv_t lldiv(long long n, long long d) { lldiv_t r = { n / d, n % d }; return r; }
+
 long imaxabs(long j) { return j < 0 ? -j : j; }
 long strtoimax(const char *s, char **end, int base) { return (long)strtoull(s, end, base); }
 unsigned long strtoumax(const char *s, char **end, int base) { return strtoull(s, end, base); }
@@ -225,16 +229,31 @@ void *bsearch(const void *key, const void *base, size_t n, size_t size,
 
 /* --- atexit (LIFO, wired into exit() in src/exit.c) --- */
 
-#define ATEXIT_MAX 32
-void (*__libc_atexit_fns[ATEXIT_MAX])(void);
+/* One LIFO table for atexit() and C++'s __cxa_atexit() (destructors of
+ * static objects), so the two run interleaved in reverse registration
+ * order, as C++ requires. A plain atexit handler takes no argument; it's
+ * stored as the one-argument kind and called with a null it ignores. */
+#define ATEXIT_MAX 256
+struct __libc_atexit_ent { void (*fn)(void *); void *arg; };
+struct __libc_atexit_ent __libc_atexit_fns[ATEXIT_MAX];
 int  __libc_atexit_n = 0;
+
+int __cxa_atexit(void (*fn)(void *), void *arg, void *dso)
+{
+	(void)dso;   /* one static image: there are no DSOs to unload */
+	if (__libc_atexit_n >= ATEXIT_MAX) return -1;
+	__libc_atexit_fns[__libc_atexit_n].fn = fn;
+	__libc_atexit_fns[__libc_atexit_n].arg = arg;
+	__libc_atexit_n++;
+	return 0;
+}
 
 int atexit(void (*fn)(void))
 {
-	if (__libc_atexit_n >= ATEXIT_MAX) return -1;
-	__libc_atexit_fns[__libc_atexit_n++] = fn;
-	return 0;
+	return __cxa_atexit((void (*)(void *))fn, 0, 0);
 }
+
+void *__dso_handle = &__dso_handle;
 
 /* environment: getenv / setenv / putenv / unsetenv live in rc_env.c */
 

@@ -1,5 +1,8 @@
 #ifndef _STDLIB_H
 #define _STDLIB_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <stddef.h>
 
@@ -13,6 +16,8 @@ void *malloc(size_t size);
 void *calloc(size_t nmemb, size_t size);
 void *realloc(void *ptr, size_t size);
 void  free(void *ptr);
+int   posix_memalign(void **memptr, size_t alignment, size_t size);
+void *aligned_alloc(size_t alignment, size_t size);
 
 /* --- process exit --- */
 __attribute__((noreturn)) void _exit(int code);
@@ -36,6 +41,13 @@ long double    strtold(const char *s, char **end);
 int            abs(int x);
 long           labs(long x);
 long long      llabs(long long x);
+
+typedef struct { int quot, rem; } div_t;
+typedef struct { long quot, rem; } ldiv_t;
+typedef struct { long long quot, rem; } lldiv_t;
+div_t          div(int num, int den);
+ldiv_t         ldiv(long num, long den);
+lldiv_t        lldiv(long long num, long long den);
 long long      atoll(const char *s);
 
 /* --- sort / search --- */
@@ -57,4 +69,7 @@ int   system(const char *command);
 int  rand(void);
 void srand(unsigned seed);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

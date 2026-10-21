@@ -1,5 +1,8 @@
 #ifndef _SYS_TIME_H
 #define _SYS_TIME_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <sys/types.h>
 
@@ -17,4 +20,7 @@ struct timezone {
  * so a bench delta is still meaningful; tz is zeroed. Always returns 0. */
 int gettimeofday(struct timeval *tv, void *tz);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

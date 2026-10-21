@@ -1,5 +1,8 @@
 #ifndef _STRINGS_H
 #define _STRINGS_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <stddef.h>
 
@@ -9,4 +12,7 @@ void  bzero(void *s, size_t n);
 void  bcopy(const void *src, void *dst, size_t n);
 int   ffs(int v);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

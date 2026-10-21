@@ -1,5 +1,8 @@
 #ifndef _RACCCOON_SIGNAL_H
 #define _RACCCOON_SIGNAL_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 typedef int sig_atomic_t;
 #define SIGINT   2
 #define SIGABRT  6
@@ -12,4 +15,7 @@ typedef int sig_atomic_t;
 void (*signal(int, void (*)(int)))(int);
 int raise(int);
 int kill(int, int);   /* posts the note the signal stands for — lib/racccoon-libc/src/rc_signal.c */
+#ifdef __cplusplus
+}
+#endif
 #endif

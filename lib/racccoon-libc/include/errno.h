@@ -1,5 +1,8 @@
 #ifndef _ERRNO_H
 #define _ERRNO_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* Single-threaded, so errno is a plain global (src/errno.c). The
  * numbers follow the common Linux/asm-generic values so ported code
@@ -52,4 +55,7 @@ extern int errno;
 #define ENOTCONN        107
 #define ETIMEDOUT       110
 #define ECONNREFUSED    111
+#ifdef __cplusplus
+}
+#endif
 #endif

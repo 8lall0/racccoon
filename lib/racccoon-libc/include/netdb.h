@@ -1,5 +1,8 @@
 #ifndef _RACCCOON_NETDB_H
 #define _RACCCOON_NETDB_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 #include <netinet/in.h>
 struct addrinfo {
 	int ai_flags, ai_family, ai_socktype, ai_protocol;
@@ -23,4 +26,7 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
 void freeaddrinfo(struct addrinfo *res);
 const char *gai_strerror(int err);
 struct hostent *gethostbyname(const char *name);
+#ifdef __cplusplus
+}
+#endif
 #endif

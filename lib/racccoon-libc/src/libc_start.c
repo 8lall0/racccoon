@@ -48,8 +48,25 @@ __attribute__((noreturn)) void _exit(int code)
 	for (;;) { }   /* SYS_EXIT never returns; keep the compiler happy */
 }
 
+/* Static constructors (C++ globals, __attribute__((constructor))), run
+ * before main. Weak: tcc's linker may not define the bounds, and then
+ * both are null and nothing runs. */
+extern void (*__preinit_array_start[])(void) __attribute__((weak));
+extern void (*__preinit_array_end[])(void) __attribute__((weak));
+extern void (*__init_array_start[])(void) __attribute__((weak));
+extern void (*__init_array_end[])(void) __attribute__((weak));
+
+static void run_init_arrays(void)
+{
+	for (long i = 0; i < __preinit_array_end - __preinit_array_start; i++)
+		__preinit_array_start[i]();
+	for (long i = 0; i < __init_array_end - __init_array_start; i++)
+		__init_array_start[i]();
+}
+
 __attribute__((used, noreturn)) void __libc_start(int argc, char *blob)
 {
+
 	int n = argc;
 	if (n < 0) n = 0;
 	if (n > LIBC_ARGV_MAX) n = LIBC_ARGV_MAX;
@@ -76,6 +93,7 @@ __attribute__((used, noreturn)) void __libc_start(int argc, char *blob)
 			libc_envp[e] = 0;
 		}
 
+		run_init_arrays();
 		exit(main(n, libc_argv, environ));
 	}
 
@@ -84,6 +102,7 @@ __attribute__((used, noreturn)) void __libc_start(int argc, char *blob)
 		 * is never NULL. */
 		libc_argv[0] = libc_argv0;
 		libc_argv[1] = 0;
+		run_init_arrays();
 		exit(main(1, libc_argv, environ));
 	}
 
@@ -96,5 +115,6 @@ __attribute__((used, noreturn)) void __libc_start(int argc, char *blob)
 	}
 	libc_argv[n] = 0;
 
+	run_init_arrays();
 	exit(main(n, libc_argv, environ));
 }

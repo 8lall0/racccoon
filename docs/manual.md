@@ -1012,7 +1012,12 @@ build_user_program_stdio countdown $STDIO_COMMON user/bin/countdown.c3
 
 `io::print` needs an explicit `(ZString)` cast for a plain `char*`
 (otherwise it prints the pointer). Floats (`%f %e %g`), `DString`,
-`List` all work.
+`List` all work. So do `io::stdin()` reads and `io::readline` (console
+or the shell's pipe, through `SYS_GETCHAR`) and the temp allocator
+(`tmem`, `@pool`). `fn int main` returns the exit code. Files go through
+`user.c3`'s `fs_read_at` / `fs_write_at`: `file::open` and C `fopen`
+are refused here (null / an error), and so is the libc `malloc` (use
+`mem`).
 
 ### 9.4 c3 gotchas on this target
 
@@ -1123,6 +1128,63 @@ bytes, `getcwd()` inside the program reports `/` (wasi-libc's own emulated
 cwd, though opens still use the real one). It's an interpreter, running pre-decoded code (branches resolved at load): in
 QEMU, Lua's recursive `fib(22)` takes ~4 s (~500× native). The dev shell's `wasitest` runs
 the fixtures in `test/wasm-src/*.c`.
+
+### 9.8 Path D — C and C++ (racccoon-libc, libc++)
+
+**C.** `lib/racccoon-libc/` is a small libc + POSIX layer (stdio, malloc
+over `SYS_MAP`, files over the FS protocol, fork/exec, sockets, `poll`
+on `SYS_AWAIT`). `lib/racccoon-libc/build.sh` builds it with
+`riscv64-unknown-elf-gcc` (rv64imafdc, lp64d, medany) into
+`build/libc/crt0.o` + `libracccoon.a`, and every `test/c-src/*.c` into a
+flat `build/libc/<name>.bin`, which `scripts/build.sh` and
+`populate_duo_bin.sh` seed as `/bin/<name>`. `crt0` sets `sp` and `tp`,
+runs `.preinit_array`/`.init_array` before `main`, and `exit()` runs the
+`atexit`/`__cxa_atexit` handlers (one LIFO table), then `.fini_array`.
+tcc (`/bin/tcc`) compiles C on racccoon itself against the same library.
+
+**C++.** `lib/racccoon-libc/build_cxx.sh` cross-builds static **libc++
++ libc++abi** (LLVM's) against racccoon-libc with the host clang, from
+an llvm-project checkout at the tag matching that clang (`LLVM_SRC`,
+default `~/Workspace/llvm-project`; skipped without one), then every
+`test/cxx-src/*.cpp` into `build/libc/<name>.bin`:
+
+```
+clang++ --target=riscv64-unknown-elf -march=rv64imafdc -mabi=lp64d -mcmodel=medany \
+  -std=c++20 -Os -g -fno-exceptions -fno-rtti -nostdinc++ -nostdinc \
+  -isystem build/cxx/install/include/c++/v1 -isystem lib/racccoon-libc/include …
+ld.lld --gc-sections -T lib/racccoon-libc/racccoon-libc.ld \
+  build/libc/crt0.o prog.o build/cxx/install/lib/libc++.a build/libc/libracccoon.a libgcc.a
+```
+
+It's the subset LLVM itself builds with: **no exceptions, no RTTI, no
+threads, no locale/iostreams, no `<filesystem>`, no `random_device`**.
+Containers, strings, algorithms, `std::function`, smart pointers,
+`optional`/`variant`, static constructors and destructors, aligned `new`
+all work (`cxxtest`). A failed allocation or a broken precondition aborts
+the program (exit 134). A C++ "hello" with a few containers is ~110 KiB.
+
+### 9.9 Debugging with gdb (QEMU)
+
+```
+scripts/launch64.sh -s                    # terminal 1: QEMU + gdb stub on :1234 (-S: stop at reset)
+scripts/gdb_qemu.sh build/libc/cxxtest.elf   # terminal 2: host gdb, attached
+(gdb) ubreak main cxxtest                 # break in main() only while `cxxtest` runs
+(gdb) continue                            # …then run `cxxtest` in terminal 1
+(gdb) bt / next / p s / curproc
+```
+
+`gdb_qemu.sh` loads `build/kernel.elf` plus one program's ELF (every
+program links at `USER_BASE`, so one at a time; build it with `-g` for
+source lines). A breakpoint on a user address fires in whichever process
+runs that address, so `ubreak LOCATION NAME` filters by `Process.name`
+(what `ps` shows), and `curproc` prints the pid and name on the CPU.
+gdb doesn't know C3: kernel *types* aren't usable in expressions, but
+symbols and line numbers are. The script reads `current_proc`'s address
+and `Process.name`'s offset out of `kernel.elf` on every run, and reads
+the kernel through QEMU's physical-memory mode (from a user-mode stop,
+supervisor pages aren't readable virtually). QEMU's TCG stub keeps
+breakpoints itself, so a user breakpoint never patches another process's
+memory at the same address.
 
 ## 10. The shell
 
@@ -1450,6 +1512,10 @@ Deliberate or just not done — the honest list:
 
   The Duo's own Ethernet MAC can report a carrier with no cable plugged in.
   ipd then retries DHCP on `ether0` forever, which is harmless.
+- **C++ is the LLVM subset** (§9.8): no exceptions, RTTI, threads,
+  locale/iostreams or `<filesystem>`. racccoon-libc's `malloc` never
+  returns blocks over 1 KiB to its free lists (`free` leaks them), which
+  a real C++ workload will feel.
 - Not audited, not hardened. "It boots on my Duo" is the bar for the
   hardware paths.
 
@@ -1510,6 +1576,15 @@ user/
   gpio/             gpiod
   bin/              standalone /bin programs
 
+lib/
+  racccoon-libc/        the C library + POSIX layer; build.sh (C), build_cxx.sh
+                        (libc++/libc++abi + C++ programs)
+  tcc/                  TinyCC's racccoon config, crt1, linker script
+
+test/
+  c-src/, cxx-src/      C / C++ test programs -> /bin
+  wasm-src/             WASI fixtures for wasitest
+
 scripts/
   build.sh              kernel + user + QEMU disk images
   build_user.sh         the two build paths + every program's build line
@@ -1519,7 +1594,8 @@ scripts/
   lib_kernel.sh         shared kernel compile / test-shell / link steps
   reflash_duo.sh        repackage fip.bin on the SD card + flash (no sudo)
   populate_duo_bin.sh   seed /bin + the tree onto the Duo's ext2 partition
-  launch64*.sh          QEMU boot variants
+  launch64*.sh          QEMU boot variants (extra args go to QEMU, e.g. -s)
+  gdb_qemu.sh           host gdb on QEMU's stub: kernel + one program, ubreak/curproc
 
 docs/
   manual.md            this file

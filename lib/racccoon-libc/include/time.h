@@ -1,5 +1,8 @@
 #ifndef _TIME_H
 #define _TIME_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <sys/types.h>
 
@@ -34,4 +37,7 @@ double     difftime(time_t a, time_t b);
 time_t     mktime(struct tm *tm);
 clock_t    clock(void);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

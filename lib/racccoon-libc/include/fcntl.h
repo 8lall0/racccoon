@@ -1,5 +1,8 @@
 #ifndef _FCNTL_H
 #define _FCNTL_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <sys/types.h>
 
@@ -31,4 +34,7 @@ int open(const char *path, int flags, ...);
 int creat(const char *path, mode_t mode);
 int fcntl(int fd, int cmd, ...);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

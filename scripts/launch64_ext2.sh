@@ -26,4 +26,4 @@ qemu-system-riscv64 \
   -device virtio-blk-device,drive=drive0,bus=virtio-mmio-bus.0 \
   -netdev user,id=net0 \
   -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.1 \
-  -kernel ../build/kernel.elf
+  -kernel ../build/kernel.elf "$@"   # extra QEMU args, e.g. -s for scripts/gdb_qemu.sh

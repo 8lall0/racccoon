@@ -1,5 +1,8 @@
 #ifndef _RACCCOON_GLOB_H
 #define _RACCCOON_GLOB_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 #include <stddef.h>
 typedef struct { size_t gl_pathc; char **gl_pathv; size_t gl_offs; } glob_t;
 #define GLOB_ERR      0x0001
@@ -13,4 +16,7 @@ typedef struct { size_t gl_pathc; char **gl_pathv; size_t gl_offs; } glob_t;
 #define GLOB_ABORTED  3
 int glob(const char *, int, int (*)(const char *, int), glob_t *);
 void globfree(glob_t *);
+#ifdef __cplusplus
+}
+#endif
 #endif

@@ -23,24 +23,46 @@ CFile* stdout @export("stdout") = &__stdout_struct;
 CFile* stderr @export("stderr") = &__stderr_struct;
 CFile* stdin @export("stdin")   = &__stdin_struct;
 
+// No stub below may be `unreachable()`: at -O2 that compiles to zero
+// bytes, the linker folds the empty bodies onto their neighbours, and a
+// call silently runs fwrite or fputc instead (devlog 2026-10-21). They
+// fail the way C says instead, or really work for stdin.
+//
+// The only stream that can be read is stdin — SYS_GETCHAR, which is the
+// console or the pipe the shell wired up. std::io's stdin File carries a
+// null handle on this target, so null counts as stdin too.
+bool stdin_eof;
+
+fn bool is_stdin(CFile* stream) @private
+{
+	return stream == null || stream == stdin;
+}
+
+fn void die(String what) @private
+{
+	rcsys::rc_write(what.ptr, what.len);
+	rcsys::rc_write(" unavailable on racccoon\n", 25);
+	rcsys::rc_exit(127);
+}
+
 fn void longjmp(JmpBuf* buffer, CInt value) @weak @cname("longjmp") @nostrip
 {
-	unreachable("longjmp unavailable");
+	die("longjmp");
 }
 
 fn CInt setjmp(JmpBuf* buffer) @weak @cname("setjmp") @nostrip
 {
-	unreachable("setjmp unavailable");
+	return 0;   // nothing can longjmp back (see longjmp)
 }
 
 fn void* malloc(usz size) @weak @cname("malloc") @nostrip
 {
-	unreachable("malloc unavailable");
+	return null;
 }
 
 fn void* calloc(usz count, usz size) @weak @cname("calloc") @nostrip
 {
-	unreachable("calloc unavailable");
+	return null;
 }
 
 fn void free(void* ptr) @weak @cname("free") @nostrip
@@ -50,22 +72,22 @@ fn void free(void* ptr) @weak @cname("free") @nostrip
 
 fn void* realloc(void* ptr, usz size) @weak @cname("realloc") @nostrip
 {
-	unreachable("realloc unavailable");
+	return null;
 }
 
 fn int fseek(CFile* stream, SeekIndex offset, int whence) @weak @cname("fseek") @nostrip
 {
-	unreachable("'fseek' not available.");
+	return -1;
 }
 
 fn CFile* fopen(ZString filename, ZString mode) @weak @cname("fopen") @nostrip
 {
-	unreachable("'fopen' not available.");
+	return null;
 }
 
 fn CFile* freopen(ZString filename, ZString mode, CFile* stream) @weak @cname("freopen") @nostrip
 {
-	unreachable("'freopen' not available.");
+	return null;
 }
 
 // CRITICAL: std::io uses fwrite for output
@@ -77,12 +99,23 @@ fn usz fwrite(void* ptr, usz size, usz nmemb, CFile* stream) @cname("fwrite") @n
 
 fn usz fread(void* ptr, usz size, usz nmemb, CFile* stream) @weak @cname("fread") @nostrip
 {
-	unreachable("'fread' not available.");
+	if (!is_stdin(stream) || size == 0) return 0;
+	// C semantics: fill all of it unless stdin ends first.
+	char* p = ptr;
+	usz want = size * nmemb;
+	usz got = 0;
+	while (got < want)
+	{
+		int c = fgetc(stream);
+		if (c < 0) break;
+		p[got++] = (char)c;
+	}
+	return got / size;
 }
 
 fn int fclose(CFile* stream) @weak @cname("fclose") @nostrip
 {
-	unreachable("'fclose' not available.");
+	return 0;   // nothing to release: no fopen, and stdin/stdout stay open
 }
 
 fn int fflush(CFile* stream) @cname("fflush") @nostrip
@@ -98,17 +131,31 @@ fn int fputc(int c, CFile* stream) @cname("fputc") @nostrip
 
 fn char* fgets(ZString str, int n, CFile* stream) @weak @cname("fgets") @nostrip
 {
-	unreachable("'fgets' not available.");
+	if (n <= 0) return null;
+	int i = 0;
+	while (i < n - 1)
+	{
+		int c = fgetc(stream);
+		if (c < 0) break;
+		str[i++] = (char)c;
+		if (c == '\n') break;
+	}
+	if (i == 0) return null;
+	str[i] = '\0';
+	return (char*)str;
 }
 
 fn int fgetc(CFile* stream) @weak @cname("fgetc") @nostrip
 {
-	unreachable("'fgetc' not available.");
+	if (!is_stdin(stream) || stdin_eof) return -1;
+	int c = rcsys::rc_getchar();
+	if (c < 0) stdin_eof = true;
+	return c;
 }
 
 fn int feof(CFile* stream) @weak @cname("feof") @nostrip
 {
-	unreachable("'feof' not available.");
+	return is_stdin(stream) && stdin_eof ? 1 : 0;
 }
 
 fn int putc(int c, CFile* stream) @cname("putc") @nostrip

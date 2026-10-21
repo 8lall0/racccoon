@@ -1,5 +1,8 @@
 #ifndef _UNISTD_H
 #define _UNISTD_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <sys/types.h>
 
@@ -63,4 +66,7 @@ void         *__rc_map_pages(unsigned long nbytes);
 int           __rc_stdin_is_console(void);
 unsigned long __rc_timebase_hz(void);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

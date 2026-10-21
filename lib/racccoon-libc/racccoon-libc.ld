@@ -35,10 +35,27 @@ SECTIONS {
        anything that just runs at load time — user/std_racccoon/
        rt_entry.c3's _start has to walk this array and call each one
        before `main`, same as any real crt0 would. */
+    /* C/C++ static constructors and destructors: walked by
+       src/libc_start.c (before main) and src/exit.c (after the atexit
+       handlers). */
+    .preinit_array : ALIGN(8) {
+        __preinit_array_start = .;
+        KEEP(*(.preinit_array))
+        __preinit_array_end = .;
+    }
+
     .init_array : ALIGN(8) {
         __init_array_start = .;
-        *(.init_array .init_array.*)
+        KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*)))
+        KEEP(*(.init_array))
         __init_array_end = .;
+    }
+
+    .fini_array : ALIGN(8) {
+        __fini_array_start = .;
+        KEEP(*(SORT_BY_INIT_PRIORITY(.fini_array.*)))
+        KEEP(*(.fini_array))
+        __fini_array_end = .;
     }
 
     /* Thread-local storage (c3's `tlocal` — std::core::mem::allocators::
@@ -70,6 +87,8 @@ SECTIONS {
         . += 64 * 1024;  /* 64 KiB stack */
         __stack_top = .;
 
-        ASSERT(. < 0x1040000, "C program image too large (>256 KiB — EXEC_MAX_IMAGE_SIZE)")
+        /* The largest per-board EXEC_MAX_IMAGE_SIZE (QEMU, 32 MiB); each
+           board's own, smaller cap is enforced by SYS_EXEC at run time. */
+        ASSERT(. < 0x3000000, "C program image too large (>32 MiB — EXEC_MAX_IMAGE_SIZE)")
     }
 }

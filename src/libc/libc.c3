@@ -16,6 +16,12 @@ CFile* stdout @export("stdout") = &__stdout_struct;
 CFile* stderr @export("stderr") = &__stderr_struct;
 CFile* stdin @export("stdin")   = &__stdin_struct;
 
+// The kernel has no files and no input stream through libc: the stubs
+// below fail the way C says (null / -1 / 0 / EOF) rather than
+// `unreachable()`, which an optimised build compiles to nothing — see
+// user/std_racccoon/libc.c3. longjmp/setjmp stay unreachable: there is
+// no honest value for them, and nothing in the kernel calls them.
+
 fn void longjmp(JmpBuf* buffer, CInt value) @weak @cname("longjmp") @nostrip
 {
 	unreachable("longjmp unavailable");
@@ -28,12 +34,12 @@ fn CInt setjmp(JmpBuf* buffer) @weak @cname("setjmp") @nostrip
 
 fn void* malloc(usz size) @weak @cname("malloc") @nostrip
 {
-	unreachable("malloc unavailable");
+	return null;
 }
 
 fn void* calloc(usz count, usz size) @weak @cname("calloc") @nostrip
 {
-	unreachable("calloc unavailable");
+	return null;
 }
 
 fn void free(void* ptr) @weak @cname("free") @nostrip
@@ -43,22 +49,22 @@ fn void free(void* ptr) @weak @cname("free") @nostrip
 
 fn void* realloc(void* ptr, usz size) @weak @cname("realloc") @nostrip
 {
-	unreachable("realloc unavailable");
+	return null;
 }
 
 fn int fseek(CFile* stream, SeekIndex offset, int whence) @weak @cname("fseek") @nostrip
 {
-	unreachable("'fseek' not available.");
+	return -1;
 }
 
 fn CFile* fopen(ZString filename, ZString mode) @weak @cname("fopen") @nostrip
 {
-	unreachable("'fopen' not available.");
+	return null;
 }
 
 fn CFile* freopen(ZString filename, ZString mode, CFile* stream) @weak @cname("freopen") @nostrip
 {
-	unreachable("'freopen' not available.");
+	return null;
 }
 
 // CRITICAL: std::io uses fwrite for output
@@ -75,12 +81,12 @@ fn usz fwrite(void* ptr, usz size, usz nmemb, CFile* stream) @cname("fwrite") @n
 
 fn usz fread(void* ptr, usz size, usz nmemb, CFile* stream) @weak @cname("fread") @nostrip
 {
-	unreachable("'fread' not available.");
+	return 0;
 }
 
 fn int fclose(CFile* stream) @weak @cname("fclose") @nostrip
 {
-	unreachable("'fclose' not available.");
+	return 0;
 }
 
 fn int fflush(CFile* stream) @cname("fflush") @nostrip
@@ -95,17 +101,17 @@ fn int fputc(int c, CFile* stream) @cname("fputc") @nostrip
 
 fn char* fgets(ZString str, int n, CFile* stream) @weak @cname("fgets") @nostrip
 {
-	unreachable("'fgets' not available.");
+	return null;
 }
 
 fn int fgetc(CFile* stream) @weak @cname("fgetc") @nostrip
 {
-	unreachable("'fgetc' not available.");
+	return -1;
 }
 
 fn int feof(CFile* stream) @weak @cname("feof") @nostrip
 {
-	unreachable("'feof' not available.");
+	return 1;
 }
 
 fn int putc(int c, CFile* stream) @cname("putc") @nostrip

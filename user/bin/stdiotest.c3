@@ -16,8 +16,46 @@ import std::collections::list;
 // existing convention.
 alias IntList = List {int};
 
-fn void main()
+extern fn void* c_fopen(ZString name, ZString mode) @cname("fopen");
+extern fn CInt c_fclose(void* f) @cname("fclose");
+
+// `stdiotest -stdin`: the stdin half, run by the shell's stdiotest
+// builtin with a pipe holding "alpha\nbeta\n" as stdin. Reads it back
+// line by line through io::readline (File.read_byte -> libc fgetc ->
+// SYS_GETCHAR) and checks the unfillable libc stubs fail the C way
+// instead of running some other function (devlog 2026-10-21).
+fn int stdin_check()
 {
+    int bad = 0;
+    String? a = io::readline(mem, io::stdin());
+    String? b = io::readline(mem, io::stdin());
+    String? c = io::readline(mem, io::stdin());
+    bool a_ok = false;
+    bool b_ok = false;
+    if (try a) { a_ok = a == "alpha"; free(a); }
+    if (try b) { b_ok = b == "beta"; free(b); }
+    bool eof_ok = true;
+    if (try c) { eof_ok = false; free(c); }
+    bool open_refused = true;
+    if (try f = file::open("/adm/users", "r")) { open_refused = false; (void)f.close(); }
+    bad += check("stdin line 1 via readline", a_ok);
+    bad += check("stdin line 2 via readline", b_ok);
+    bad += check("stdin EOF", eof_ok);
+    bad += check("fopen() stub returns null", c_fopen("/adm/users", "r") == null);
+    bad += check("fclose(stdin) returns 0", c_fclose(null) == 0);
+    bad += check("file::open refused", open_refused);
+    return bad;
+}
+
+fn int check(String what, bool ok)
+{
+    io::printfn("stdiotest: %s: %s", what, ok ? "ok" : "FAILED");
+    return ok ? 0 : 1;
+}
+
+fn int main(String[] args)
+{
+    if (args.len == 1 && args[0] == "-stdin") return stdin_check() == 0 ? 0 : 1;
     io::printn("stdiotest: hello from std::io");
     io::printfn("stdiotest: %d + %d = %d", 2, 3, 5);
     io::printfn("stdiotest: hex=%x", (uint)0xdeadbeef);
@@ -47,4 +85,5 @@ fn void main()
     // risk, per that file's own comment); kept as a real regression
     // guard now that it's a known-good path, not just an open question.
     io::printfn("stdiotest: pi~=%f e~=%e tiny~=%g", 3.14, 12345.6789, 0.0001234);
+    return 0;
 }

@@ -75,9 +75,21 @@ void *malloc(size_t nbytes)
 	return bump_alloc(payload);
 }
 
+/* An over-aligned block (posix_memalign below) sits inside a normal one;
+ * its header slot holds ALIGNED_TAG | the distance back to the real
+ * payload instead of a size. */
+#define ALIGNED_TAG ((size_t)1 << 63)
+
+static void *real_payload(void *ap)
+{
+	size_t h = *(size_t *)((char *)ap - HDR);
+	return (h & ALIGNED_TAG) ? (char *)ap - (h & ~ALIGNED_TAG) : ap;
+}
+
 void free(void *ap)
 {
 	if (!ap) return;
+	ap = real_payload(ap);
 	char *blk = (char *)ap - HDR;
 	size_t payload = *(size_t *)blk;
 	int c = class_of((unsigned)payload);
@@ -99,6 +111,13 @@ void *realloc(void *ptr, size_t size)
 {
 	if (ptr == NULL) return malloc(size);
 	if (size == 0) { free(ptr); return NULL; }
+	char *rp = real_payload(ptr);
+	if (rp != ptr) {                            /* over-aligned: copy out, never grow in place */
+		size_t avail = *(size_t *)(rp - HDR) - (size_t)((char *)ptr - rp);
+		void *np = malloc(size);
+		if (np) { memcpy(np, ptr, avail < size ? avail : size); free(ptr); }
+		return np;
+	}
 
 	size_t old = *((size_t *)((char *)ptr - HDR));
 	if (old >= round_payload(size)) return ptr;
@@ -108,4 +127,31 @@ void *realloc(void *ptr, size_t size)
 	memcpy(np, ptr, old < size ? old : size);
 	free(ptr);
 	return np;
+}
+
+/* Alignment above 16 (C++ aligned operator new, alignas(64) …): take a
+ * normal block with `align` bytes of slack and hand out the aligned
+ * address inside it. Both are 16-aligned and align >= 32, so there's
+ * always a full header slot between them for the tag. */
+int posix_memalign(void **out, size_t align, size_t size)
+{
+	if (align < sizeof(void *) || (align & (align - 1))) return 22;   /* EINVAL */
+	if (align <= ALIGN) {
+		void *p = malloc(size ? size : 1);
+		if (!p) return 12;                                             /* ENOMEM */
+		*out = p;
+		return 0;
+	}
+	char *p = malloc((size ? size : 1) + align);
+	if (!p) return 12;
+	char *q = (char *)(((size_t)p + align - 1) & ~(align - 1));
+	if (q != p) *(size_t *)(q - HDR) = ALIGNED_TAG | (size_t)(q - p);
+	*out = q;
+	return 0;
+}
+
+void *aligned_alloc(size_t align, size_t size)
+{
+	void *p;
+	return posix_memalign(&p, align, size) == 0 ? p : NULL;
 }

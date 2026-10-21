@@ -1,5 +1,8 @@
 #ifndef _STDIO_H
 #define _STDIO_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <stddef.h>
 #include <stdarg.h>
@@ -86,4 +89,7 @@ char  *tmpnam(char *s);
 ssize_t getline(char **lineptr, size_t *n, FILE *f);
 ssize_t getdelim(char **lineptr, size_t *n, int delim, FILE *f);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

@@ -8,6 +8,9 @@
  * src/syscall.c (not inline — some callers want a stable address). */
 #ifndef RACCCOON_SYSCALL_H
 #define RACCCOON_SYSCALL_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define RC_SYS_PUTCHAR          1
 #define RC_SYS_GETCHAR          2
@@ -63,4 +66,7 @@ long __rc_syscall3(long a0, long a1, long a2, long sysno);
 long __rc_syscall4(long a0, long a1, long a2, long a4, long sysno);
 long __rc_syscall5(long a0, long a1, long a2, long a4, long a5, long sysno);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

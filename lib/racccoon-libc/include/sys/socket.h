@@ -1,5 +1,8 @@
 #ifndef _RACCCOON_SYS_SOCKET_H
 #define _RACCCOON_SYS_SOCKET_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 /* BSD sockets on racccoon's /net (ipd, user/net/ipd.c3) — IPv4 TCP/UDP.
  * lib/racccoon-libc/src/rc_socket.c. A socket is a /net conversation;
  * setsockopt is accepted and ignored; poll() reports sockets as always
@@ -39,4 +42,7 @@ int setsockopt(int fd, int level, int name, const void *val, socklen_t len);
 int getsockopt(int fd, int level, int name, void *val, socklen_t *len);
 int getsockname(int fd, struct sockaddr *addr, socklen_t *len);
 int getpeername(int fd, struct sockaddr *addr, socklen_t *len);
+#ifdef __cplusplus
+}
+#endif
 #endif

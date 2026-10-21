@@ -2,6 +2,9 @@
  * for a hosted-C program (c3c) built freestanding for racccoon. */
 #ifndef _RACCCOON_LIMITS_H
 #define _RACCCOON_LIMITS_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define CHAR_BIT   8
 #define SCHAR_MIN  (-128)
@@ -30,4 +33,7 @@
 #define PATH_MAX   4096
 #define NAME_MAX   255
 
+#ifdef __cplusplus
+}
+#endif
 #endif

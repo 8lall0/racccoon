@@ -1,5 +1,8 @@
 #ifndef _RACCCOON_NETINET_IN_H
 #define _RACCCOON_NETINET_IN_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 #include <stdint.h>
 #include <sys/socket.h>
 typedef uint32_t in_addr_t;
@@ -19,4 +22,7 @@ static inline uint16_t htons(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)
 static inline uint16_t ntohs(uint16_t v) { return htons(v); }
 static inline uint32_t htonl(uint32_t v) { return ((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v >> 8) & 0xff00) | (v >> 24); }
 static inline uint32_t ntohl(uint32_t v) { return htonl(v); }
+#ifdef __cplusplus
+}
+#endif
 #endif

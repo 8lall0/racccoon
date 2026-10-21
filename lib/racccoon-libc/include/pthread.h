@@ -4,6 +4,9 @@
  * only ever uses the single-threaded path (c3c: build_threads == 1). */
 #ifndef _RACCCOON_PTHREAD_H
 #define _RACCCOON_PTHREAD_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 #include <stddef.h>
 
 typedef unsigned long pthread_t;
@@ -37,4 +40,7 @@ int pthread_cond_wait(pthread_cond_t *, pthread_mutex_t *);
 int pthread_cond_signal(pthread_cond_t *);
 int pthread_cond_broadcast(pthread_cond_t *);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

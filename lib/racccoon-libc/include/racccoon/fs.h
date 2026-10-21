@@ -4,6 +4,9 @@
  * layer speaks fsd's wire protocol itself). Not a public header. */
 #ifndef RACCCOON_FS_H
 #define RACCCOON_FS_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <stddef.h>
 
@@ -24,4 +27,7 @@ int   __rc_fs_mkdir(const char *path);
 int   __rc_fs_delete(const char *path, int recursive);
 int   __rc_fs_rename(const char *oldp, const char *newp);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

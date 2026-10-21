@@ -121,6 +121,26 @@ fn bool shell_test_lang_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
             exitcode(127);
         }
         int st_code = join(st_c, st_gen);
+        // Second run: stdin wired to a pipe holding two lines, read back
+        // through io::readline (libc fgetc -> SYS_GETCHAR), plus the
+        // libc stubs failing the C way (user/std_racccoon/libc.c3).
+        int st_p = pipe_new();
+        if (st_p < 0) {
+            st_code = -1;
+        } else {
+            pipe_hold(st_p, 1, 1);   // our writer end, released below = EOF
+            uint st_gen2 = 0;
+            int st_c2 = rfork_io(RFPROC, &st_gen2, -1, st_p);
+            if (st_c2 == 0) {
+                char*[1] st_av2;
+                st_av2[0] = "-stdin";   // exec() prepends the program path itself
+                exec("bin/stdiotest", exec_buf(), exec_buf_max(), 0, &st_av2[0], 1);
+                exitcode(127);
+            }
+            pipe_write(st_p, "alpha\nbeta\n", 11);
+            pipe_hold(st_p, 1, -1);
+            if (join(st_c2, st_gen2) != 0) { st_code = -1; }
+        }
         print(st_code == 0 ? "stdiotest: ok\n" : "stdiotest: FAILED\n");
     } else if (strcmp(cmd, "gotest") == 0 || strcmp(cmd, "gostage2test") == 0 || strcmp(cmd, "gostage3test") == 0 || strcmp(cmd, "gostage35test") == 0 || strcmp(cmd, "gostage41test") == 0 || strcmp(cmd, "gostage42test") == 0) {
         // Go on racccoon (docs/go-port-plan.md). /bin/go-* are
@@ -459,6 +479,47 @@ fn bool shell_test_lang_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
             int tt_run = join(tt_c2, tt_g2);
             fs_delete("/tcctmp");
             print(tt_run == 0 ? "tcctest: ok\n" : "tcctest: FAILED (compiled binary exit != 0)\n");
+        }
+    } else if (strcmp(cmd, "cxxtest") == 0) {
+        // /bin/cxxtest (test/cxx-src/cxxtest.cpp): C++ on racccoon —
+        // static libc++/libc++abi over racccoon-libc. Its stdout comes
+        // back through a pipe and is echoed, because the last check (a
+        // global destructor's "dtor ran", printed after main returned)
+        // can't show up in the exit code. Skips without /bin/cxxtest
+        // (no llvm-project checkout at build time).
+        int ct_p = pipe_new();
+        pipe_hold(ct_p, 0, 1);   // a reader from the start, so no write is dropped
+        uint ct_g = 0;
+        int ct_c = rfork_io(RFPROC, &ct_g, ct_p, -1);
+        if (ct_c == 0) {
+            exec("bin/cxxtest", exec_buf(), exec_buf_max(), 0, null, 0);
+            exitcode(127);
+        }
+        char[1024] ct_out;
+        int ct_n = 0;
+        for (;;) {
+            char[128] ct_chunk;
+            int got = pipe_read(ct_p, &ct_chunk, 128);
+            if (got <= 0) { break; }
+            for (int i = 0; i < got; i++) {
+                putchar(ct_chunk[i]);
+                if (ct_n < 1023) { ct_out[ct_n] = ct_chunk[i]; ct_n++; }
+            }
+        }
+        ct_out[ct_n] = 0;
+        pipe_hold(ct_p, 0, -1);
+        int ct_code = join(ct_c, ct_g);
+        bool ct_dtor = false;
+        char* ct_mark = "dtor ran";
+        for (int i = 0; i + 8 <= ct_n && !ct_dtor; i++) {
+            int k = 0;
+            while (k < 8 && ct_out[i + k] == ct_mark[k]) { k++; }
+            ct_dtor = k == 8;
+        }
+        if (ct_code == 127) {
+            print("cxxtest: skipped (no /bin/cxxtest)\n");
+        } else {
+            print(ct_code == 0 && ct_dtor ? "cxxtest: ok\n" : "cxxtest: FAILED\n");
         }
     } else {
         return false;

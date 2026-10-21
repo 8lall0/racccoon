@@ -1,5 +1,8 @@
 #ifndef _MATH_H
 #define _MATH_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* A small <math.h>: racccoon's userspace does no floating-point numerics
  * beyond what a compiler needs for constant folding (TinyCC's float
@@ -14,6 +17,7 @@ int         __rc_isnan(double x);
 int         __rc_isinf(double x);
 int         __rc_isfinite(double x);
 int         __rc_signbit(double x);
+int         __rc_fpclassify(double x);
 
 #define HUGE_VAL  (__rc_huge_val())
 #define HUGE_VALF ((float)__rc_huge_val())
@@ -25,6 +29,20 @@ int         __rc_signbit(double x);
 #define isinf(x)    __rc_isinf((double)(x))
 #define isfinite(x) __rc_isfinite((double)(x))
 #define signbit(x)  __rc_signbit((double)(x))
+
+#define FP_NAN       0
+#define FP_INFINITE  1
+#define FP_ZERO      2
+#define FP_SUBNORMAL 3
+#define FP_NORMAL    4
+#define fpclassify(x) __rc_fpclassify((double)(x))
+#define isnormal(x)   (__rc_fpclassify((double)(x)) == FP_NORMAL)
+#define isunordered(a, b)    (isnan(a) || isnan(b))
+#define isgreater(a, b)      (!isunordered(a, b) && (a) > (b))
+#define isgreaterequal(a, b) (!isunordered(a, b) && (a) >= (b))
+#define isless(a, b)         (!isunordered(a, b) && (a) < (b))
+#define islessequal(a, b)    (!isunordered(a, b) && (a) <= (b))
+#define islessgreater(a, b)  (!isunordered(a, b) && (a) != (b))
 
 double      ldexp(double x, int exp);
 long double ldexpl(long double x, int exp);
@@ -40,4 +58,7 @@ double log10(double x);
 double round(double x);
 double nan(const char *tag);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

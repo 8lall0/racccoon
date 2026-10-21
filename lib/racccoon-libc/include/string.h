@@ -1,5 +1,8 @@
 #ifndef _STRING_H
 #define _STRING_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <stddef.h>
 
@@ -37,4 +40,7 @@ int    strncasecmp(const char *a, const char *b, size_t n);
 
 char  *strerror(int errnum);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

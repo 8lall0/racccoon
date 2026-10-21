@@ -88,11 +88,19 @@ fn void _rt_run(int exec_argc, char* blob) @export("_rt_run")
         q++;
     }
 
+    // The temp allocator (tmem, @pool — io::readline uses it) is only
+    // created implicitly on a hosted-libc target; here it's set up
+    // explicitly, over the same SYS_MAP heap. main's return value is
+    // the exit code (c3c's generated main returns 0 for `fn void main`).
+    int code;
     mem::@scoped(&rcsys_heap::heap)
     {
-        real_main(real_argc, &argv[0]);
+        @pool_init(&rcsys_heap::heap, 32 * 1024)
+        {
+            code = real_main(real_argc, &argv[0]);
+        };
     };
-    rcsys::rc_exit(0);
+    rcsys::rc_exit(code);
 }
 
 // `tp` (thread pointer) has to be set here too, before anything can

@@ -31,6 +31,12 @@ ext2_seed_tree() {
   # userspace doesn't depend on it. Produces build/libc/*.bin.
   bash lib/racccoon-libc/build.sh
 
+  # C++: libc++/libc++abi against that libc + test/cxx-src/*.cpp (first
+  # step towards LLVM on racccoon). No-ops without an llvm-project
+  # checkout (LLVM_SRC, default ~/Workspace/llvm-project). Produces
+  # build/libc/cxxtest.bin, seeded with the C programs below.
+  bash lib/racccoon-libc/build_cxx.sh
+
   # TinyCC, cross-built against that libc (roadmap §7.7). No-ops unless
   # the third_party/tinycc submodule is checked out. Produces
   # build/tcc/tcc.bin + build/tcc/lib/ (the CONFIG_TCCDIR payload).

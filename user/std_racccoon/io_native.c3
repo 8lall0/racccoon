@@ -1,6 +1,7 @@
 module io_native @feat(CUSTOM_LIBC);
 import rcsys;
 import std::io;
+import libc;
 
 // Userspace counterpart to src/std/io/io_native.c3 — the fopen/fwrite/
 // fputc/etc. hooks std::io::os's file_nolibc.c3 calls through
@@ -17,7 +18,7 @@ fn void*? my_fopen(String filename, String mode)
 
 fn void? my_fclose(void* file)
 {
-	return io::UNSUPPORTED_OPERATION~;
+	// Only stdin/stdout/stderr exist (my_fopen refuses), and they stay open.
 }
 
 fn void*? my_freopen(void* file, String filename, String mode)
@@ -41,9 +42,20 @@ fn sz? my_fwrite(void* file, char[] buffer)
 	return buffer.len;
 }
 
+// stdin only (std::io's stdin File has a null handle here): like
+// read(2) on a terminal, return at the end of a line, so a line-reading
+// caller doesn't block for a full buffer. 0 = end of input.
 fn sz? my_fread(void* file, char[] buffer)
 {
-	return io::UNSUPPORTED_OPERATION~;
+	sz n = 0;
+	while (n < buffer.len)
+	{
+		int c = libc::fgetc(file);   // -1 for anything but stdin
+		if (c < 0) break;
+		buffer[n++] = (char)c;
+		if (c == '\n') break;
+	}
+	return n;
 }
 
 fn void? my_fputc(int c, void* file)

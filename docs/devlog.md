@@ -3,7 +3,84 @@
 Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
-## 2026-10-21 (later) — Wi-Fi groundwork: WPA2 crypto, reference driver (branch `net`)
+## 2026-10-21 (evening) — C++ on racccoon (libc++), gdb on QEMU, honest libc stubs
+
+First milestone of "LLVM on racccoon": C++ programs run. Plus the
+debugger the parked c3c work was missing.
+
+- **libc stubs that ran the wrong function.** `user/std_racccoon/libc.c3`
+  (the C3 std::io path) had `unreachable()` bodies for `malloc`,
+  `fopen`, `fgetc`, `fclose`, `setjmp`, … At `-O2` those compile to
+  **zero bytes**, and the linker gives several of them the same address.
+  In `cat.elf`, `fopen`/`fseek`/`realloc` shared an address with
+  `fwrite`, and `fgetc`/`fclose`/`feof` collapsed onto a copy of `fputc`.
+  Every std::io program references `fgetc` and `fclose`
+  (`File.read_byte`/`File.close` call libc directly). Nothing called them
+  yet, so nothing broke.
+  - Now they fail the C way (null / -1 / 0); `longjmp` prints and exits 127.
+  - `fgetc`/`fgets`/`fread`/`feof` really read stdin (`SYS_GETCHAR`), and
+    `io_native.c3`'s `my_fread` reads a line, so `io::stdin()` and
+    `io::readline` work.
+  - Same treatment for the kernel's `src/libc/libc.c3`.
+- **Two more std::io runtime gaps**, found by the new stdin test:
+  - `io::readline` uses the temp allocator, which the stdlib only creates
+    implicitly on a hosted libc ("Use '@pool_init()'…" and a fault).
+    `rt_entry.c3` now wraps `main` in `@pool_init` over the SYS_MAP heap.
+  - `_rt_run` exited 0 whatever `main` returned; `fn int main` now sets
+    the exit code. `stdiotest` is the only std::io program with one.
+- **`stdiotest` stdin half:** the builtin feeds "alpha\nbeta\n" through a
+  pipe and runs `stdiotest -stdin`: both lines, EOF, the `fopen`/`fclose`
+  stubs, `file::open` refused. A `malloc(16) == null` check was dropped:
+  LLVM folds that comparison for a known allocator without calling it.
+- **C++ runtime.** `lib/racccoon-libc/build_cxx.sh` cross-builds static
+  libc++ + libc++abi with the host clang (23.1.3) from a sparse
+  llvm-project checkout at `llvmorg-23.1.3` (`LLVM_SRC`, default
+  `~/Workspace/llvm-project`, skipped if absent). Config = what LLVM
+  builds with: no exceptions/RTTI/threads/locale/filesystem.
+  - What racccoon-libc lacked:
+    - `extern "C"` guards on every header;
+    - `.preinit_array`/`.init_array` before `main` and `.fini_array` after;
+    - `__cxa_atexit` + `__dso_handle` (one LIFO table with `atexit`);
+    - `tp` in `_start`;
+    - `posix_memalign`/`aligned_alloc`;
+    - `div`/`ldiv`/`lldiv`, `FP_*` + `fpclassify` and friends;
+    - `<fenv.h>` on the fflags/frm CSRs;
+    - `wchar_t` not redefined in C++, `mbstate_t`.
+  - libc++ wraps the C library with `using_if_exists`, so a missing libc
+    function only matters when a program calls it. The thin `<math.h>` is
+    fine for now.
+  - The C linker script's stale 256 KiB assert is now 32 MiB (QEMU's exec
+    cap); `__tls_start` is weak in crt0 because tcc's linker script has
+    none.
+- **`/bin/cxxtest`** (`test/cxx-src/cxxtest.cpp`, 112 KiB): static ctor,
+  once-only local static, string/to_string, a 10 000-element vector +
+  sort, map/unordered_map, virtual dispatch + virtual dtor via
+  unique_ptr, std::function with a capture, `alignas(64)` new,
+  optional/variant/string_view, and a global destructor after `main`.
+  The builtin pipes its output back to check that last one. **10/10 on
+  the first boot.**
+- **gdb:** `scripts/gdb_qemu.sh [PROG.elf]` + `launch64*.sh -s`.
+  - gdb has no C3, so kernel types aren't usable. The script pulls
+    `current_proc`'s address (symbol table) and `Process.name`'s offset
+    (DWARF, 0x8df) out of `kernel.elf` on each run.
+  - From a user-mode stop QEMU refuses virtual reads of supervisor pages
+    ("Cannot access memory at 0x804946f0"); the kernel is identity-mapped,
+    so the helpers flip `Qqemu.PhyMemMode` for the read.
+  - `ubreak LOCATION NAME` filters a user breakpoint by process name
+    (every program shares USER_BASE); `curproc` shows pid + name.
+  - Verified: stopped in `cxxtest`'s `main`, `curproc` = `pid 10
+    cxxtest`, stepped C++ lines, printed a libc++ `std::string`.
+- **Verified:** full QEMU suite (58 + `cxxtest`) on FAT32 and ext2 equals
+  the previous baseline, `cxxtest` ok on both, fsck clean.
+  - A first run (two suites in parallel plus builds) failed
+    `fsdkilltest` with `svc: diskd wedged (unconsumed IPC)` and so
+    `storagekilltest`. It didn't repeat when run alone. The same wedge
+    message showed up during the W4 `nc` session, so it looks like a
+    watchdog false positive under load; not chased.
+- **Seen, for later:** racccoon-libc's `malloc` never reuses blocks over
+  1 KiB (`free` leaks them). LLVM will need a real allocator. The
+  next milestone is a first LLVM tool (`llvm-readelf`).
+- Not yet run on the Duo.
 
 Part II's first QEMU-testable piece. `user/crypto/crypto.c3` is everything
 a WPA2-PSK supplicant needs in software, since the RTL8192EU does CCMP for

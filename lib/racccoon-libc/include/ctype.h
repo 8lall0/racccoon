@@ -1,5 +1,8 @@
 #ifndef _CTYPE_H
 #define _CTYPE_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* ASCII only — racccoon has no locale. Defined as functions in
  * src/ctype.c (not macros) so &isdigit etc. work and the addresses are
@@ -20,4 +23,7 @@ int isxdigit(int c);
 int tolower(int c);
 int toupper(int c);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

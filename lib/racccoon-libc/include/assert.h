@@ -12,5 +12,11 @@ void __libc_assert_fail(const char *expr, const char *file, int line, const char
 
 #ifndef _ASSERT_H
 #define _ASSERT_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 #define static_assert _Static_assert
+#ifdef __cplusplus
+}
+#endif
 #endif
