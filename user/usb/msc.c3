@@ -287,8 +287,17 @@ fn void usb_msc_ipc_poll()
 {
     char[USB_MSC_IPC_MSG_MAX] buf @noinit;
     uint verb = 0;
-    int from = ipc_poll_type(&buf[0], USB_MSC_IPC_MSG_MAX, &verb);
-    if (from < 0) { return; }
+    // ipc_poll hands back a pending device-interrupt notice (from == 0)
+    // before the inbox, and with the Wi-Fi adapter streaming bulk IN one is
+    // pending nearly all the time — skip past those to reach a request.
+    int from = 0;
+    for (int tries = 0; tries < 4; tries++)
+    {
+        from = ipc_poll_type(&buf[0], USB_MSC_IPC_MSG_MAX, &verb);
+        if (from != 0) { break; }
+    }
+    if (from <= 0) { return; }
+    if (verb >= WIFI_IPC_SCAN && verb <= WIFI_IPC_LEAVE) { wifi_ipc(from, verb, &buf[0]); return; }
     if (verb != USB_MSC_IPC_READ && verb != USB_MSC_IPC_WRITE) { return; }
 
     bool is_write = verb == USB_MSC_IPC_WRITE;

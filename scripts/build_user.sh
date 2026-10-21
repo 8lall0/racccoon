@@ -249,6 +249,7 @@ C3_OPT=-O2 build_user_program_stdio ping $STDIO_COMMON user/bin/ping.c3
 C3_OPT=-O2 build_user_program_stdio nc $STDIO_COMMON user/bin/nc.c3
 C3_OPT=-O2 build_user_program_stdio rshd $STDIO_COMMON user/bin/rshd.c3
 C3_OPT=-O2 build_user_program_stdio dnsq $STDIO_COMMON user/bin/dnsq.c3
+C3_OPT=-O2 build_user_program_stdio wifi $STDIO_COMMON user/crypto/crypto.c3 user/bin/wifi.c3
 # /bin/rc: the production shell, for rshd's remote sessions (the boot
 # console shell itself is embedded in the kernel image).
 cp build/user/shell.bin build/user/rc.bin
@@ -287,7 +288,8 @@ C3_OPT=-O2 build_user_program fsd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACC
 # no DMA/MMIO — the one server where the stdlib path is a clean win.
 C3_OPT=-O2 build_user_program_stdio procd $STDIO_COMMON user/sys/procd.c3
 C3_OPT=-O2 build_user_program envd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/sys/envd.c3
-build_user_program usbd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/usb/dwc2.c3 user/usb/xpad.c3 user/usb/kbd.c3 user/usb/msc.c3 user/usb/usbd.c3
+build_user_program usbd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/usb/dwc2.c3 user/usb/xpad.c3 user/usb/kbd.c3 user/usb/msc.c3 user/net/link.c3 user/crypto/crypto.c3 user/usb/rtl8192eu_regs.c3 user/usb/rtl_wpa.c3 user/usb/rtl8192eu.c3 user/usb/usbd.c3
+build_user_program wpatest user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/crypto/crypto.c3 user/usb/rtl8192eu_regs.c3 user/usb/rtl_wpa.c3 user/bin/wpatest.c3
 build_user_program ethd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/net/link.c3 user/net/dwmac.c3 user/net/ephy.c3 user/net/ethd.c3
 C3_OPT=-O2 build_user_program netd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/virtio.c3 user/net/link.c3 user/net/netd.c3
 # ipd — the IP stack (user/net/ipd.c3): ARP/IPv4/ICMP/UDP/TCP/DHCP over the

@@ -42,7 +42,7 @@ fi
 # image's own bin/ — kept in sync by hand, same convention this
 # project already uses for the small protocol constants duplicated
 # across diskd.c3/fsd.c3.
-BINARIES="echod cat ls echo true false ed grep wc sort find cmp tr dmesg ps top head whoami write rm mkdir mv chmod chown note ping nc rshd rc dnsq test expr usbrw fsd gpio wasm camtest caminit cifinit camcap"
+BINARIES="echod cat ls echo true false ed grep wc sort find cmp tr dmesg ps top head whoami write rm mkdir mv chmod chown note ping nc rshd rc dnsq wifi test expr usbrw fsd gpio wasm camtest caminit cifinit camcap"
 
 for b in $BINARIES; do
   if [ ! -f "build/user/$b.bin" ]; then
@@ -78,6 +78,17 @@ cp "build/user/test.bin" "$MNT/bin/["
 if [ -f "build/user/echod.elf" ]; then
   echo "==> Copying build/user/echod.elf -> $MNT/bin/echod.elf..."
   cp "build/user/echod.elf" "$MNT/bin/echod.elf"
+fi
+
+# Wi-Fi firmware for the RTL8192EU driver (user/usb/rtl8192eu.c3), from
+# the host's linux-firmware — redistributable, but not kept in this repo.
+FW=/usr/lib/firmware/rtlwifi/rtl8192eu_nic.bin
+if [ -f "$FW.zst" ] || [ -f "$FW" ]; then
+  mkdir -p "$MNT/lib/firmware"
+  if [ -f "$FW.zst" ]; then zstd -dqf -o "$MNT/lib/firmware/rtl8192eu_nic.bin" "$FW.zst"; else cp "$FW" "$MNT/lib/firmware/"; fi
+  echo "==> Copied rtl8192eu_nic.bin -> $MNT/lib/firmware/"
+else
+  echo "==> (no $FW on this host — the Wi-Fi driver will report missing firmware)"
 fi
 
 # C libc test programs (roadmap §7), if the C libc build produced any —

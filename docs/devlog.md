@@ -19653,3 +19653,89 @@ at minimum) so the shell can actually talk to the console — tutorial ch.14.
 
 **Files changed this session:** `src/process.c3`, `src/kernel.c3`,
 `scripts/build_user.sh`, `user/user.ld`.
+
+## 2026-10-21 — Wi-Fi W3 on the real Duo: scan + `/bin/wifi` answer
+
+- **RSSI fixed.** `rtl_rx_transfer` read PHY-status byte 1 as the signal level, which is wrong.
+  - It now picks the formula from the RX descriptor's rate field (dword 3 bits 0–6), as rtl8xxxu does.
+  - CCK (rate < 4): `lna_gain[lna_idx] − 2·vga_idx`. Both indexes come from the CCK AGC report (PHY byte 5). The LNA table is chosen by `FPGA0_XA_HSSI_PARM2`'s CCK high-power bit, read at init.
+  - OFDM: `(PHY byte 4 >> 1) − 110`.
+  - Duo scan list: about 20 real APs at −56 to −88 dBm.
+- **`wifi status`/`list`/`scan` got "no answer from usbd" (15 s timeout).**
+  - Cause: `dwc2.c3`'s `hc_wait_chhltd` drained its IRQ notice with `ipc_poll_type(buf, 0, …)`. With no notice pending, SYS_IPC_POLL took the **next real message** instead and dropped it.
+  - With the RTL8192EU's bulk IN polled all the time, nearly every client request landed inside one of those waits. `sdhci.c3`'s SDMA completion wait had the same pattern.
+  - Fix: SYS_IPC_POLL with `len < 0` now consumes only an IRQ notice and never a message (manual §syscalls). Both drivers pass −1. `usb_msc_ipc_poll` also skips up to 4 IRQ notices to reach a request.
+  - Verified on the Duo: all three verbs answer, a rescan works, and SD reads work.
+- The driver's boot lines (mac, firmware, "up, scanning") go to the dmesg ring under quiet boot, not the console.
+- Next: W4, auth/assoc on an open network → ether1 → ipd DHCP.
+
+## 2026-10-21 — Wi-Fi W4: open-network join, DHCP, ping, DNS, TCP over the air
+
+- **Station code in `rtl8192eu.c3`:**
+  - `wifi join <ssid>` (IPC verb 43) picks the strongest scanned BSS with that SSID, scanning first and repeating the scan until it shows up.
+  - Then: tune the channel, write REG_BSSID, set RCR to check-BSSID.
+  - Then: open-system auth (seq 1/2), then an assoc req (ESS + short preamble/slot; rates 1/2/5.5/11/6/9/12/18 + ext 24/36/48/54). Each step is retried 5× at 300 ms.
+  - `wifi leave` (44) sends a deauth. A deauth or disassoc from the AP drops the link and rejoins.
+  - Encrypted BSSes are refused until W5.
+- **Data path:**
+  - FromDS data (QoS/HT headers skipped, LLC/SNAP stripped) becomes an Ethernet II frame on the `ether1` link ring. The link is created at probe time, and `link_up` follows association.
+  - In the other direction, ipd's TX ring becomes ToDS data with LLC/SNAP.
+  - Management goes at 1 Mb/s and data at a fixed 11 Mb/s CCK.
+  - usbd's build now includes `user/net/link.c3`.
+- **Real Duo, phone hotspot "asd":** the first try worked end to end.
+  - `joining asd on ch 1` → `associated, aid 1` → `ipd: ether1 bound 172.26.63.215 gw 172.26.63.214`.
+  - Ping to the gateway: 4/4, 0.5–0.9 s (phone power save plus polling, not tuned). Ping to 8.8.8.8: 3/4.
+  - `dnsq example.com` resolves.
+  - `nc 104.20.23.154 80` gets a real HTTP/1.1 200 from Cloudflare.
+  - This was the first time the RTL8192EU TX path ran at all.
+- **Seen, not fixed:**
+  - One `svc: sdd wedged (unconsumed IPC)` + fsd kill during the first `echo | nc` pipeline. Both respawned cleanly, and three reruns plus a 659 KB SD read didn't reproduce it.
+  - It came right after `ethd: link up`. The Duo's MAC PHY reported a carrier with no cable, so ipd retries DHCP on ether0. Whether that's related is unknown.
+  - Ping RTTs are high, and one RTT of 0.59 ms looks like a late reply matched to the wrong seq.
+- Next: W5, WPA2-PSK (RSN IE, EAPOL 4-way with `crypto.c3`, CAM keys, hardware CCMP).
+
+## 2026-10-21 — Wi-Fi W5 prepared: WPA2-PSK supplicant + `/adm/wifi` autojoin (awaiting a real AP)
+
+- **New `user/usb/rtl_wpa.c3`, the supplicant inside usbd:**
+  - RSN IE: CCMP/CCMP/PSK.
+  - EAPOL-Key 4-way handshake: msg1 → SNonce + PTK (PRF-384) → msg2 with our RSN IE; msg3 → MIC check, AES key unwrap, GTK KDE → msg4 in the clear, then the keys go in.
+  - Group rekey: group msg1 → msg2, encrypted. Key descriptor version 2 only.
+  - Keys go into the chip's CAM the way rtl8xxxu's `cam_write`/`set_key` do: CR.SECURITY_ENABLE + SECURITY_CFG; pairwise in slot 0 (key id 0), the GTK in the slot of its key id, so a rekey doesn't kill the old key mid-flight.
+  - CCMP: on TX the driver writes the 8-byte CCMP header (48-bit PN, ExtIV, key id 0), sets Protected and TXDESC_SEC_AES, and the chip encrypts and appends the MIC. On RX the chip decrypts (rxdesc security ≠ 0, !swdec), and the driver drops the CCMP header and the 8-byte MIC.
+- **Join policy:**
+  - The scan parses each BSS's RSN IE (`rtl_rsn_check`) and refuses, with a reason: a TKIP group cipher (WPA/WPA2 mixed mode), no CCMP, no PSK AKM (WPA3-only / Enterprise), MFP required, WEP/WPA1.
+  - New state STA_KEYS between association and link-up, with a 5 s handshake timeout.
+  - A deauth prints its reason code. 3 consecutive failed joins → give up ("wrong passphrase?").
+- **PMK:** computed in `/bin/wifi` (-O2), not in usbd.
+  - `wifi join SSID PASSPHRASE` sends `[ssid 33][flag][pmk 32]`.
+  - 64 hex digits are taken as the PSK itself.
+  - `wifi save SSID [PASS]` writes `/adm/wifi` (SSID + hex PMK, mode 0600), then joins.
+  - usbd reads `/adm/wifi` once, after its first boot scan, and joins it (W6 autojoin).
+- **Checked offline:** new `/bin/wpatest` (QEMU) runs the real `rtl_wpa.c3` against the 4 EAPOL frames of Wireshark's `wpa-Induction.pcap` (SSID Coherer / passphrase Induction), with the chip stubbed. **17/17:**
+  - the PMK equals the published one;
+  - our msg2 has the right structure and its MIC verifies;
+  - the derived PTK verifies the **captured** station's msg2 and msg4 MICs;
+  - msg3 MIC ok and GTK unwrapped;
+  - our msg4 is byte-identical to the captured one, apart from the key-length field (RSN: 0, that 2007 station: 16) and so the MIC;
+  - keys reach the CAM;
+  - a wrong passphrase shows up as a msg3 MIC mismatch.
+- Not yet run on hardware: the CAM, CCMP and RX-decrypt paths need the user's WPA2 router.
+
+## 2026-10-21 — Wi-Fi W5 works on the real Duo: WPA2-PSK on the home router
+
+- **Setup:** reflashed the kernel (W5 usbd). `/bin/wifi` came from the earlier populate. The network was saved once with `wifi save`.
+- **First attempt — a stale kernel, not a bug:** `wifi save` ran against the old W4 kernel and the join was refused with W4's "WPA2 isn't supported yet". `/bin` was new, but usbd lives in the kernel image.
+- **After the reflash, the boot was unattended:**
+  - `wifi: autojoin H6745-76487385 (/adm/wifi)`
+  - `joining … on ch 4`
+  - `associated, aid 2`
+  - `WPA2 handshake done, link up`
+  - `ipd: ether1 bound 192.168.1.9 gw 192.168.1.1 dns 192.168.1.8`
+- **Everything first time:** the CAM keys, the hardware-encrypted TX (DHCP itself goes out CCMP-protected) and the hardware-decrypted RX. No driver changes needed.
+- **Traffic:**
+  - `ping 192.168.1.1` 4/4; `ping 8.8.8.8` 4/4 (176–441 ms);
+  - `dnsq example.com` → 172.66.147.243;
+  - `nc example.com 80` + GET → `HTTP/1.1 200 OK`.
+  - From the PC (192.168.1.7, same LAN): `ping 192.168.1.9` 3/3. Logging in to `rshd` on TCP 23 works and runs commands (`echo`, `wifi status` → `data rx/tx 59/48 wpa2`).
+- **Still slow:** RTTs vary a lot (50 ms–1 s). The rates are fixed at 1/11 M CCK, and usbd polls bulk IN on its own tick.
+- **Next:** W6 robustness (beacon-loss detection + rejoin, `usbdkilltest` with the dongle attached), then the RTT.

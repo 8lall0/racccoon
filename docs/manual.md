@@ -455,7 +455,7 @@ completeness but only the matching server can use them.
 | 7 | `SYS_IPC_RECV` | `buf*, len, type_out*` → sender pid / -1 | **blocks** |
 | 19 | `SYS_IPC_RECV_GEN` | `buf*, len, type_out*, from_gen_out*` → sender pid / -1 | + sender generation |
 | 20 | `SYS_IPC_REPLY` | `dest, type, data*, len, expected_gen` → 0 / -1 | send + stale-pid guard |
-| 10 | `SYS_IPC_POLL` | `buf*, len, type_out*` → sender pid / -1 | non-blocking recv |
+| 10 | `SYS_IPC_POLL` | `buf*, len, type_out*` → sender pid / -1 | non-blocking recv; `len < 0` drains only a pending IRQ notice, never a message |
 | 34 | `SYS_IPC_CALL` | `dest, verb, buf*, packed(req_len<<16 \| cap), reply_type_out*` → replier pid / -1 | one-shot RPC, all in kernel |
 | 65 | `SYS_AWAIT` | `mask, timeout_ticks, pipes*, npipes(≤8)` → ready mask / -1 | wait for the first of: inbox, stdin, pipes, doorbell, a driver's IRQ, timeout, note |
 | 68 | `SYS_WAKE` | `pid, generation` → 0 / -1 | ring a process's doorbell (`AW_WAKE`); root or same uid — the network link rings use it |
@@ -1430,9 +1430,26 @@ Deliberate or just not done — the honest list:
   no SACK or window scaling, one interface route. Sockets don't share
   references across `fork` (a child's `close()` hangs up the parent's
   connection too), and `poll()` can't wait on a socket.
-- **No Wi-Fi yet**: the Duo's own Ethernet MAC has never seen a carrier,
-  so real hardware has no working network until the USB Wi-Fi driver
-  lands.
+- **Wi-Fi is open or WPA2-Personal (CCMP) only.** The Duo's network is a
+  USB RTL8192EU adapter (TP-Link TL-WN823N), driven from inside usbd
+  (`user/usb/rtl8192eu.c3`, the supplicant in `rtl_wpa.c3`, firmware in
+  `/lib/firmware/`).
+  - Commands: `wifi scan|list|status|leave`, `wifi join SSID [PASSPHRASE]`,
+    and `wifi save SSID [PASSPHRASE]`.
+    - `/bin/wifi` computes the PMK itself.
+    - `save` stores the SSID and the hex PMK in `/adm/wifi` (mode 0600).
+      usbd joins that network after its first scan at boot.
+  - Once associated, the link is `ether1`, and ipd runs DHCP on it.
+  - The chip does CCMP itself, using keys from the 4-way and group-key
+    handshakes.
+  - Refused:
+    - TKIP (incl. a WPA/WPA2 mixed-mode group cipher);
+    - WPA3/SAE and required management frame protection;
+    - Enterprise.
+  - Fixed 1/11 Mb/s rates, no rate adaptation or power saving.
+
+  The Duo's own Ethernet MAC can report a carrier with no cable plugged in.
+  ipd then retries DHCP on `ether0` forever, which is harmless.
 - Not audited, not hardened. "It boots on my Duo" is the bar for the
   hardware paths.
 

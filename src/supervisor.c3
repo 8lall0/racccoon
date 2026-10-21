@@ -41,7 +41,7 @@ fn void svc_puts(char* s) @noinline
 // ns_resolve(). An fid held open across the crash is still dead; a client
 // that gets -1 from a p9 op is expected to re-attach (see the roadmap).
 
-const int SVC_MAX = 10;
+const int SVC_MAX = 16; // the Duo runs 11 boot servers since ipd (echod sdd fsd procd envd ipd usbd ethd gpiod i2cd cifd)
 const int SVC_RESTART_LIMIT = 5;
 
 // Watchdog (docs/roadmap.md §5.6): a supervised server with an

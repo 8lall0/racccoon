@@ -547,6 +547,13 @@ fn void usb_enumerate_hub_port_device(uint hub_addr, uint hub_max_packet0, uint 
         return;
     }
 
+    // Vendor-specific Wi-Fi adapters are matched by vid:pid (rtl8192eu.c3).
+    if (rtl_match(vendor_id, product_id))
+    {
+        rtl_probe(USB_DOWNSTREAM_ADDR, max_packet0, &config_buf[0], 256);
+        return;
+    }
+
     uint iface_num;
     uint num_endpoints;
     uint ep_start;
@@ -1045,6 +1052,7 @@ fn void main()
         while (rdtime() - poll_start < usb_us_to_ticks(100000))
         {
             usb_hid_poll();
+            rtl_poll();
             yield();
         }
     }
