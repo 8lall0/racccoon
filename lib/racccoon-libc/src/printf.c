@@ -12,6 +12,10 @@
 #include <stdarg.h>
 #include <string.h>
 #include <stddef.h>
+#include <math.h>
+#include <float.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 struct out {
@@ -90,83 +94,55 @@ static void put_str(struct out *o, const char *s, int flags, int width, int prec
 	if (flags & 1) pad(o, ' ', space);
 }
 
-static void put_float(struct out *o, double val, char conv,
+/* --- floating point: musl's fmt_fp (exact, any precision, long double) */
+#define ALT_FORM (1U << ('#' - ' '))
+#define ZERO_PAD (1U << ('0' - ' '))
+#define LEFT_ADJ (1U << ('-' - ' '))
+#define PAD_POS  (1U << (' ' - ' '))
+#define MARK_POS (1U << ('+' - ' '))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+static void fp_out(struct out *o, const char *s, size_t l) { o->emit(o, s, l); }
+
+static void fp_pad(struct out *o, char c, int w, int l, int fl)
+{
+	char b[64];
+	if (fl & (LEFT_ADJ | ZERO_PAD) || l >= w) return;
+	l = w - l;
+	memset(b, c, sizeof b);
+	for (; l >= (int)sizeof b; l -= (int)sizeof b) fp_out(o, b, sizeof b);
+	fp_out(o, b, (size_t)l);
+}
+
+static char *fp_fmt_u(uintmax_t x, char *s)
+{
+	unsigned long y;
+	for (; x > ULONG_MAX; x /= 10) *--s = (char)('0' + x % 10);
+	for (y = x; y; y /= 10) *--s = (char)('0' + y % 10);
+	return s;
+}
+
+static const char xdigits[17] = "0123456789ABCDEF";   /* musl's, for %a */
+
+/* musl's code, verbatim: its warnings are its own */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#pragma GCC diagnostic ignored "-Wparentheses"
+#include "fmt_fp.inc"
+#pragma GCC diagnostic pop
+
+static void put_float(struct out *o, long double val, char conv,
                       int flags, int width, int prec)
 {
 	enum { F_MINUS = 1, F_PLUS = 2, F_SPACE = 4, F_HASH = 8, F_ZERO = 16 };
-	if (prec < 0) prec = 6;
-
-	int neg = 0;
-	/* -0.0 and negatives */
-	unsigned long long bits;
-	memcpy(&bits, &val, 8);
-	if (bits >> 63) { neg = 1; val = -val; }
-
-	char buf[512];
-	char *p = buf;
-
-	if (val != val) { memcpy(p, "nan", 3); p += 3; neg = 0; goto emit; }
-	if (val > 1.7976931348623157e308) { memcpy(p, "inf", 3); p += 3; goto emit; }
-
-	if (conv == 'e' || conv == 'E') {
-		int exp = 0;
-		if (val != 0.0) {
-			while (val >= 10.0) { val /= 10.0; exp++; }
-			while (val < 1.0)   { val *= 10.0; exp--; }
-		}
-		/* round */
-		double scale = 1.0; for (int i = 0; i < prec; i++) scale *= 10.0;
-		val = ((double)(long long)(val * scale + 0.5)) / scale;
-		if (val >= 10.0) { val /= 10.0; exp++; }
-		long long ip = (long long)val;
-		*p++ = (char)('0' + ip);
-		if (prec > 0 || (flags & F_HASH)) {
-			*p++ = '.';
-			double frac = val - (double)ip;
-			for (int i = 0; i < prec; i++) { frac *= 10.0; int d = (int)frac; *p++ = (char)('0' + d); frac -= d; }
-		}
-		*p++ = (conv == 'E') ? 'E' : 'e';
-		*p++ = exp < 0 ? '-' : '+';
-		if (exp < 0) exp = -exp;
-		*p++ = (char)('0' + (exp / 10) % 10);
-		*p++ = (char)('0' + exp % 10);
-	} else if (conv == 'g' || conv == 'G') {
-		if (prec == 0) prec = 1;
-		/* crude: use %e if exponent < -4 or >= prec, else %f */
-		int exp = 0; double t = val;
-		if (t != 0.0) { while (t >= 10.0) { t /= 10.0; exp++; } while (t < 1.0) { t *= 10.0; exp--; } }
-		if (exp < -4 || exp >= prec)
-			put_float(o, neg ? -val : val, conv == 'G' ? 'E' : 'e', flags, width, prec - 1);
-		else
-			put_float(o, neg ? -val : val, 'f', flags, width, prec - 1 - exp);
-		return;
-	} else { /* f / F */
-		double scale = 1.0; for (int i = 0; i < prec; i++) scale *= 10.0;
-		unsigned long long ip = (unsigned long long)val;
-		double frac = val - (double)ip;
-		unsigned long long fp = (unsigned long long)(frac * scale + 0.5);
-		if (fp >= (unsigned long long)scale) { fp -= (unsigned long long)scale; ip++; }
-
-		char ib[32]; char *ipd = utoa(ip, ib + sizeof ib, 10, 0);
-		while (*ipd) *p++ = *ipd++;
-		if (prec > 0 || (flags & F_HASH)) {
-			*p++ = '.';
-			char fb[32]; char *fpd = utoa(fp, fb + sizeof fb, 10, 0);
-			int flen = (int)strlen(fpd);
-			for (int i = flen; i < prec; i++) *p++ = '0';
-			while (*fpd) *p++ = *fpd++;
-		}
-	}
-
-emit:;
-	int len = (int)(p - buf);
-	char sign = neg ? '-' : (flags & F_PLUS) ? '+' : (flags & F_SPACE) ? ' ' : 0;
-	int space = width - len - (sign ? 1 : 0);
-	if (!(flags & F_MINUS) && !(flags & F_ZERO)) pad(o, ' ', space);
-	if (sign) o->emit(o, &sign, 1);
-	if (!(flags & F_MINUS) && (flags & F_ZERO)) pad(o, '0', space);
-	o->emit(o, buf, (size_t)len);
-	if (flags & F_MINUS) pad(o, ' ', space);
+	int fl = 0;
+	if (flags & F_MINUS) fl |= LEFT_ADJ;
+	if (flags & F_PLUS)  fl |= MARK_POS;
+	if (flags & F_SPACE) fl |= PAD_POS;
+	if (flags & F_HASH)  fl |= ALT_FORM;
+	if (flags & F_ZERO)  fl |= ZERO_PAD;
+	fmt_fp(o, val, width, prec, (int)fl, conv);
 }
 
 static int vformat(struct out *o, const char *fmt, va_list ap)
@@ -200,11 +176,12 @@ static int vformat(struct out *o, const char *fmt, va_list ap)
 		}
 
 		int lng = 0;   /* 0=int 1=long 2=long long, also z/t map to long */
+		int ldbl = 0;  /* L: a long double argument */
 		for (;;) {
 			if (*f == 'l') { lng++; f++; }
 			else if (*f == 'h') { f++; }               /* narrowing — read as int, fine */
 			else if (*f == 'z' || *f == 't' || *f == 'j') { lng = 1; f++; }
-			else if (*f == 'L') { f++; }
+			else if (*f == 'L') { ldbl = 1; f++; }
 			else break;
 		}
 
@@ -254,12 +231,17 @@ static int vformat(struct out *o, const char *fmt, va_list ap)
 		case 's':
 			put_str(o, va_arg(ap, const char *), flags, width, prec);
 			break;
-		case 'f': case 'F': case 'e': case 'E': case 'g': case 'G':
-			put_float(o, va_arg(ap, double), c, flags, width, prec);
+		case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A':
+			put_float(o, ldbl ? va_arg(ap, long double) : (long double)va_arg(ap, double),
+			          c, flags, width, prec);
 			break;
-		case 'n':
-			(void)va_arg(ap, void *);   /* parsed, ignored */
+		case 'n': {
+			void *np = va_arg(ap, void *);
+			if (lng >= 2) *(long long *)np = (long long)o->len;
+			else if (lng == 1) *(long *)np = (long)o->len;
+			else *(int *)np = (int)o->len;
 			break;
+		}
 		case '%':
 			o->emit(o, "%", 1);
 			break;

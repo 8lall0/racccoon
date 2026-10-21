@@ -3,6 +3,71 @@
 Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
+## 2026-10-21 (late night) — LLVM milestone 3: musl's libm, exact printf/strtod, `llc` on racccoon
+
+**`/bin/llc` (LLVM's code generator, RISC-V backend, 27.8 MiB flat) compiles
+`test/llvm-src/hello.ll` to an object on racccoon in ~4 s under QEMU, and the
+2,968-byte object is byte-identical to the host llc 23.1.3's.**
+
+- **Survey:** with M2's libc, llc compiled completely; its link failed only on
+  18 libm functions (sin, log, exp, atan2, erf, …).
+- **libm = musl 1.2.5**, added as the submodule `third_party/musl`, pinned
+  `v1.2.5`, the same pattern as tinycc/lua.
+  - `lib/racccoon-libc/build.sh` compiles every `src/math/*.c`; the riscv64
+    versions replace the generic ones.
+  - It builds against racccoon's headers plus `src/musl_shim.h` (`hidden`,
+    `weak_alias`) and an empty `musl-compat/features.h`. 232 objects.
+  - `include/math.h` is now musl's declarations. The feature gates are
+    removed, and `INFINITY`/`NAN` use plain C under tcc, which claims a recent
+    `__GNUC__` but has no `__builtin_inff`. The host cross tcc compiles
+    `mathtest.c` against it.
+  - The old `src/math.c` and `quad.c` are gone.
+  - Deviation from the plan: the submodule is **required** (a clear error if
+    missing), not a fallback to the old math. A musl-shaped header with the
+    old implementations behind it would have been two libms to keep consistent.
+- **`mathtest` found that racccoon's printf/strtod float code was wrong:**
+  - `%e` wrote only 2 exponent digits (`-2.5e300` printed as `…e+00`);
+  - `%f` overflowed `long long`;
+  - digits came from repeated `*10.0`;
+  - `L` was ignored, so `%Lf` read a double;
+  - strtod accumulated `val*10`, scaled by repeated multiplication, and had no
+    inf/nan.
+
+  Fixed with musl's exact algorithms:
+  - `src/fmt_fp.inc`: `fmt_fp` copied verbatim from vfprintf.c, 4 renames only,
+    behind adapters for racccoon's `struct out`. This adds `%a` and real `%Lf`.
+  - `src/floatscan.c`: musl's floatscan verbatim over a string-only `shgetc`
+    stand-in, plus musl's strto* wrappers. They're copies because floatscan.c's
+    `#include "shgetc.h"` always resolves to musl's own internal header next to it.
+  - `%n` now stores the count instead of being skipped.
+
+  `mathtest`: 62 checks — values, the old trunc/floor/ceil failures (1e300,
+  inf, -0.0), classification on all three types, binary128, printf
+  formatting, and strtod round trips including subnormals and hex.
+- **Build fixes found on the way:**
+  - `build_llvm.sh` lived in `build/llvm/`, which `scripts/lib_kernel.sh`
+    owns (kernel IR) and `rm -rf`s on every kernel build, so every
+    `scripts/build.sh` silently reconfigured LLVM from scratch. Now
+    `build/llvm-racccoon/`.
+  - racccoon.cmake's link rule names the libc archives as text, not ninja
+    inputs, so a libc-only change never relinked llc. build_llvm.sh now drops
+    any tool older than libracccoon.a / libc++.a / crt0_mapped.o.
+- **The llctest reference:**
+  - The host llc warned "Hard-float 'd' ABI can't be used for a target that
+    doesn't support the D extension (ignoring target-abi)" until both sides got
+    an explicit `-mattr=+m,+a,+f,+d,+c`. The function attributes alone don't
+    set the module ABI.
+  - build_llvm.sh generates `/hello.ref.o` with the host llc; build.sh seeds it
+    and `/hello.ll` on the FAT32 and ext2 images.
+- llc.bin at 27.8 MiB fits QEMU's 32 MiB exec cap, so no kernel change was
+  needed. lld and c3c will need a larger cap or demand-loaded exec.
+- **Verified:** the full QEMU suite on FAT32 and ext2 matches the baseline.
+  Also ok: alloctest, malloctest, cxxtest, llvmtest, plus the new mathtest
+  and llctest. tcctest stays green with musl's math.h. fsck clean.
+  - The FAT32 test image is now 81% full (104,930/129,022 clusters) with llc
+    on it. The next big tool will need a bigger image.
+
+---
 ## 2026-10-21 (night) — LLVM milestone 2: dlmalloc, a POSIX-complete-enough libc, `llvm-readelf` on racccoon
 
 The first program built from LLVM's own libraries runs on racccoon:

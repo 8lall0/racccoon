@@ -210,6 +210,11 @@ ext2_seed_tree() {
   mcopy -i build/disk.img lib/lua/lua ::bin/lua
   # C test programs (roadmap §7), if the C libc build produced any.
   for c in build/libc/*.bin; do [ -e "$c" ] && mcopy -i build/disk.img "$c" "::bin/$(basename "$c" .bin)"; done
+  # llctest's input + the host llc's object for it (build_llvm.sh).
+  if [ -e build/llvm-fixtures/hello.ref.o ]; then
+    mcopy -i build/disk.img test/llvm-src/hello.ll ::hello.ll
+    mcopy -i build/disk.img build/llvm-fixtures/hello.ref.o ::hello.ref.o
+  fi
   bash scripts/seed_tcc.sh fat32 build/disk.img
 
   # manyfiles/ — 60 entries, past FS_LIST's 31-per-reply cap (see the
@@ -349,6 +354,10 @@ GOEOF
   # `cat > file` copy.
   debugfs -w -R "write build/user/whoami.bin usr/root/bin/mywho" build/disk_ext2.img > /dev/null
   for c in build/libc/*.bin; do [ -e "$c" ] && debugfs -w -R "write $c bin/$(basename "$c" .bin)" build/disk_ext2.img > /dev/null; done
+  if [ -e build/llvm-fixtures/hello.ref.o ]; then
+    debugfs -w -R "write test/llvm-src/hello.ll hello.ll" build/disk_ext2.img > /dev/null
+    debugfs -w -R "write build/llvm-fixtures/hello.ref.o hello.ref.o" build/disk_ext2.img > /dev/null
+  fi
   bash scripts/seed_tcc.sh ext2 build/disk_ext2.img
   for w in build/wasm/*.wasm; do debugfs -w -R "write $w $(basename "$w")" build/disk_ext2.img > /dev/null; done
   debugfs -w -R "write build/lua/lua.wasm lib/lua.wasm" build/disk_ext2.img > /dev/null

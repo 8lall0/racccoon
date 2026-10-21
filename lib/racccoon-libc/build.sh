@@ -76,6 +76,26 @@ for src in lib/racccoon-libc/src/*.c lib/racccoon-libc/src/*.S; do
     "$OUT/obj/$name.o" 2>/dev/null || true
 done
 
+# libm: musl's src/math (third_party/musl, MIT), against racccoon's
+# headers — include/math.h is musl's declarations. Where musl has a
+# riscv64 version (the FPU's sqrt, fma, fmin/fmax, fabs, copysign, …) it
+# replaces the generic file. musl's warnings are its own, so -w.
+MUSL=third_party/musl
+if [ ! -e "$MUSL/src/math/sin.c" ]; then
+  echo "lib/racccoon-libc/build.sh: the third_party/musl submodule isn't checked out" >&2
+  echo "  (git submodule update --init third_party/musl) — racccoon-libc's libm comes from it." >&2
+  exit 1
+fi
+MUSL_CFLAGS="$CFLAGS -std=gnu11 -w -I lib/racccoon-libc/musl-compat -I $MUSL/src/internal -I $MUSL/arch/generic
+             -include lib/racccoon-libc/src/musl_shim.h"
+for src in "$MUSL"/src/math/*.c; do
+  name=$(basename "$src" .c)
+  [ -e "$MUSL/src/math/riscv64/$name.c" ] && src="$MUSL/src/math/riscv64/$name.c"
+  $CC_RC $MUSL_CFLAGS -c "$src" -o "$OUT/obj/m_$name.o"
+  $OBJCOPY_RC --remove-section=.riscv.attributes --remove-section=.comment \
+    "$OUT/obj/m_$name.o" 2>/dev/null || true
+done
+
 # crt0 (start.o) is linked explicitly by every program, not pulled from
 # the archive — keep it out of the .a. crt0_mapped.o (start_mapped.o) is
 # the variant with an 8 MiB SYS_MAP stack, for big programs (LLVM tools).

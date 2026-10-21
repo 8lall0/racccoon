@@ -1152,6 +1152,15 @@ seed as `/bin/<name>`.
 - `malloc` is **dlmalloc 2.8.6** (`src/rc_malloc.c` + the verbatim
   `src/dlmalloc.inc`), growing through `SYS_MAP`; memory is reused but
   never handed back to the kernel. `alloctest` checks the reuse.
+- **libm is musl's** (1.2.5, the `third_party/musl` submodule, required):
+  every `src/math/*.c` is compiled into `libracccoon.a`, the riscv64
+  versions (hardware sqrt/fma/fmin/…) replacing the generic ones;
+  `include/math.h` is musl's declarations (tcc-safe `INFINITY`/`NAN`).
+  `long double` is binary128, done in software by libgcc. Float
+  formatting (`%e %f %g %a`, with `L`) is musl's `fmt_fp` and
+  `strtod`/`strtof`/`strtold` musl's `floatscan`, both exact and
+  correctly rounded (`src/fmt_fp.inc`, `src/floatscan.c`). `mathtest`
+  checks values, edge cases, classification and printf/strtod.
 - The locale is "C" only: one byte per character, ASCII classes;
   `newlocale` refuses other names (ENOENT). Threads: one per program —
   mutexes count, `pthread_once`/keys work, `pthread_create` aborts, an
@@ -1196,11 +1205,16 @@ libc++ + racccoon-libc, so configure checks see what the libc has.
 **LLVM.** `lib/racccoon-libc/build_llvm.sh` configures LLVM itself from
 `LLVM_SRC/llvm` with that toolchain (MinSizeRel, no threads/zlib/zstd/
 terminfo/backtraces/plugins, the RISC-V target; tablegen = the host's
-`llvm-tblgen`, which must be the same version) into `build/llvm/`, and
+`llvm-tblgen`, which must be the same version) into `build/llvm-racccoon/`, and
 links **`llvm-readobj` as `/bin/llvm-readelf`** (4.6 MiB; readobj picks
-readelf mode from `argv[0]`). Its output on racccoon is byte-identical to
-the host's. `llvmtest` runs `llvm-readelf -h /bin/echod.elf`. It needs
-QEMU's 32 MiB exec cap; the Duo's 4 MiB is too small.
+readelf mode from `argv[0]`) and **`llc` as `/bin/llc`** (27.8 MiB, the
+RISC-V backend: IR → assembly or objects). Their output on racccoon is
+byte-identical to the host's. `llvmtest` runs `llvm-readelf -h
+/bin/echod.elf`; `llctest` runs `llc -mattr=+m,+a,+f,+d,+c -filetype=obj
+/hello.ll` (`test/llvm-src/hello.ll`) and compares the object with
+`/hello.ref.o`, the host llc's for the same file (build_llvm.sh). Both
+need QEMU's 32 MiB exec cap; the Duo's 4 MiB is too small. A tool is
+relinked whenever libracccoon.a / libc++.a / crt0_mapped.o is newer.
 
 ### 9.9 Debugging with gdb (QEMU)
 
@@ -1552,8 +1566,7 @@ Deliberate or just not done — the honest list:
   The Duo's own Ethernet MAC can report a carrier with no cable plugged in.
   ipd then retries DHCP on `ether0` forever, which is harmless.
 - **C/C++ run single-threaded, in the "C" locale** (§9.8): C++ has no
-  exceptions, RTTI or `<filesystem>`; `pthread_create` aborts. `<math.h>`
-  is thin (and `trunc`/`floor`/`ceil` are wrong for |x| ≥ 2^63).
+  exceptions, RTTI or `<filesystem>`; `pthread_create` aborts.
 - Not audited, not hardened. "It boots on my Duo" is the bar for the
   hardware paths.
 
@@ -1620,8 +1633,13 @@ lib/
                         tools), racccoon.cmake (CMake toolchain file)
   tcc/                  TinyCC's racccoon config, crt1, linker script
 
+third_party/
+  tinycc/, lua/, musl/  submodules: TinyCC, Lua (for /bin/wasm), musl (libm,
+                        float formatting/parsing for racccoon-libc)
+
 test/
   c-src/, cxx-src/      C / C++ test programs -> /bin
+  llvm-src/             llctest's IR fixture
   wasm-src/             WASI fixtures for wasitest
 
 scripts/

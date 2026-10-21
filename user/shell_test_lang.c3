@@ -550,6 +550,46 @@ fn bool shell_test_lang_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
                 && lang_has_text(&lt_out, "Entry point address:               0x1000000");
             print(lt_ok ? "llvmtest: ok\n" : "llvmtest: FAILED\n");
         }
+    } else if (strcmp(cmd, "llctest") == 0) {
+        // /bin/llc (build_llvm.sh): LLVM IR -> a RISC-V object on
+        // racccoon. /hello.ll is test/llvm-src/hello.ll; /hello.ref.o is
+        // the host llc's object for it (same LLVM version), so the two
+        // must be byte-identical. Skips without /bin/llc.
+        char*[5] lc_av;
+        lc_av[0] = "-mattr=+m,+a,+f,+d,+c";   // = build_llvm.sh's reference run
+        lc_av[1] = "-filetype=obj";
+        lc_av[2] = "/hello.ll";
+        lc_av[3] = "-o";
+        lc_av[4] = "/llctmp.o";
+        char[512] lc_out;
+        int lc_code = lang_run_captured("bin/llc", &lc_av[0], 5, &lc_out, 512);
+        if (lc_code == 127) {
+            print("llctest: skipped (no /bin/llc)\n");
+        } else {
+            // compare in 1 KiB chunks; a short read on one side only = a size mismatch
+            bool lc_same = lc_code == 0;
+            uint lc_off = 0;
+            char[1024] lc_a;
+            char[1024] lc_b;
+            while (lc_same) {
+                int na = fs_read_at("/llctmp.o", &lc_a, 1024, lc_off);
+                int nb = fs_read_at("/hello.ref.o", &lc_b, 1024, lc_off);
+                if (na != nb || na < 0) { lc_same = false; break; }
+                if (na == 0) { break; }
+                for (int i = 0; i < na; i++) {
+                    if (lc_a[i] != lc_b[i]) { lc_same = false; }
+                }
+                lc_off += (uint)na;
+            }
+            fs_delete("/llctmp.o");
+            if (lc_same && lc_off > 0) {
+                print("llctest: ok (");
+                print_uint(lc_off);
+                print(" bytes, identical to the host llc's)\n");
+            } else {
+                print(lc_code == 0 ? "llctest: FAILED (object differs from the host llc's)\n" : "llctest: FAILED (llc exit != 0)\n");
+            }
+        }
     } else {
         return false;
     }
