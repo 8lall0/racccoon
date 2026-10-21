@@ -664,7 +664,7 @@ fn bool sdd_block_rw_dma(char* data, uint sector, bool is_write)
 		{
 			char[8] sc @noinit;
 			uint sv;
-			ipc_poll_type(&sc[0], 0, &sv); // drain the wake; SD_INT_STATUS is the truth
+			ipc_poll_type(&sc[0], -1, &sv); // drain the wake only; SD_INT_STATUS is the truth
 			yield();                        // DMA runs CPU-free — let others work
 		}
 	}

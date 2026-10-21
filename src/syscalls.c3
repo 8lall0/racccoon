@@ -1782,7 +1782,10 @@ fn void sys_ipc_poll(Trap_frame* f) @noinline
 			return;
 		}
 
-		if (!current_proc.has_message)
+		// poll_len < 0: "drain the IRQ notice only" — a driver's
+		// completion-wait must not consume (and drop) a client request
+		// that happens to be in the inbox.
+		if (!current_proc.has_message || poll_len < 0)
 		{
 			f.a0 = (ulong)(-1);
 			return;

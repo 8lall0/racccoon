@@ -774,7 +774,7 @@ fn int hc_wait_chhltd(uint* hcint_out)
         }
         if (USBD_INTERRUPT_DRIVEN)
         {
-            ipc_poll_type(&notify_scratch[0], 0, &notify_verb); // drain notify; value irrelevant
+            ipc_poll_type(&notify_scratch[0], -1, &notify_verb); // drain the notify only — never a client request
             // Tight-spin only while the transfer could plausibly be
             // about to finish (a control/interrupt transfer or a NAK
             // cycle is well under 300us). Past that it's a slow one — a
