@@ -93,3 +93,30 @@ double log10(double x)
 	double ln = e * 0.6931471805599453 + 2.0 * sum;
 	return ln * 0.4342944819032518; /* / ln(10) */
 }
+
+/* rint: round to an integer in the current rounding mode. Adding and
+ * subtracting 2^52 makes the FPU do the rounding; |x| >= 2^52 (and NaN,
+ * inf) is already integral. */
+double rint(double x)
+{
+	const double two52 = 4503599627370496.0;
+	if (!(__builtin_fabs(x) < two52)) return x;
+	volatile double y = x < 0 ? (x - two52) + two52 : (x + two52) - two52;
+	return y == 0 ? __builtin_copysign(0.0, x) : y;
+}
+
+double nearbyint(double x) { return rint(x); }   /* no FP exceptions are trapped */
+
+/* modf: split into integral and fractional parts, same sign. */
+double modf(double x, double *ip)
+{
+	const double two52 = 4503599627370496.0;
+	if (__rc_isnan(x)) { *ip = x; return x; }
+	if (!(__builtin_fabs(x) < two52)) {     /* already integral, or inf */
+		*ip = x;
+		return __builtin_copysign(0.0, x);
+	}
+	double i = (double)(long long)x;        /* exact below 2^52 */
+	*ip = __builtin_copysign(i, x);
+	return __builtin_copysign(x - i, x);
+}

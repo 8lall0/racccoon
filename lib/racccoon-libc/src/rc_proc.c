@@ -281,13 +281,124 @@ int system(const char *command)
 
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 {
-	(void)addr; (void)prot; (void)offset;
-	if (fd != -1 || !(flags & MAP_ANONYMOUS)) { errno = ENOSYS; return MAP_FAILED; }
+	(void)addr;
 	if (length == 0) { errno = EINVAL; return MAP_FAILED; }
+	int anon = (flags & MAP_ANONYMOUS) != 0;
+	if (!anon && (flags & MAP_SHARED) && (prot & PROT_WRITE)) { errno = ENODEV; return MAP_FAILED; }
+	if (!anon && fd < 0) { errno = EBADF; return MAP_FAILED; }
 	void *p = __rc_map_pages(length);
 	if (!p) { errno = ENOMEM; return MAP_FAILED; }
+	if (anon) return p;
+	/* a file mapping: copy the bytes in; past EOF stays zero, as with mmap */
+	size_t done = 0;
+	while (done < length) {
+		ssize_t got = pread(fd, (char *)p + done, length - done, offset + (off_t)done);
+		if (got < 0) return MAP_FAILED;   /* errno from pread; the pages leak, as with munmap */
+		if (got == 0) break;
+		done += (size_t)got;
+	}
 	return p;
 }
 
 int munmap(void *addr, size_t length)  { (void)addr; (void)length; return 0; }
 int mprotect(void *addr, size_t length, int prot) { (void)addr; (void)length; (void)prot; return 0; }
+int msync(void *addr, size_t length, int flags) { (void)addr; (void)length; (void)flags; return 0; }   /* nothing shared to write back */
+int madvise(void *addr, size_t length, int advice) { (void)addr; (void)length; (void)advice; return 0; }
+int posix_madvise(void *addr, size_t length, int advice) { (void)addr; (void)length; (void)advice; return 0; }
+
+/* --- uname / rlimits / rusage / alarm / sessions / hostname ----------- */
+#include <sys/utsname.h>
+#include <sys/resource.h>
+#include <time.h>
+
+int uname(struct utsname *u)
+{
+	strcpy(u->sysname, "racccoon");
+	strcpy(u->nodename, "racccoon");
+	strcpy(u->release, "0");
+	strcpy(u->version, "racccoon");
+	strcpy(u->machine, "riscv64");
+	return 0;
+}
+
+int gethostname(char *name, size_t len)
+{
+	const char *h = "racccoon";
+	if (len < strlen(h) + 1) { errno = ENAMETOOLONG; return -1; }
+	strcpy(name, h);
+	return 0;
+}
+
+pid_t getsid(pid_t pid) { (void)pid; return getpid(); }   /* no sessions: each process its own */
+
+/* No timer signals: an alarm is accepted but never delivered. */
+unsigned alarm(unsigned seconds) { (void)seconds; return 0; }
+
+int getrlimit(int resource, struct rlimit *r)
+{
+	if (resource < 0 || resource >= RLIM_NLIMITS) { errno = EINVAL; return -1; }
+	r->rlim_cur = r->rlim_max = RLIM_INFINITY;
+	return 0;
+}
+
+int setrlimit(int resource, const struct rlimit *r)
+{
+	(void)r;
+	if (resource < 0 || resource >= RLIM_NLIMITS) { errno = EINVAL; return -1; }
+	return 0;
+}
+
+static struct timespec rc_start;
+__attribute__((constructor)) static void rc_note_start(void) { clock_gettime(CLOCK_MONOTONIC, &rc_start); }
+
+int getrusage(int who, struct rusage *u)
+{
+	memset(u, 0, sizeof *u);
+	if (who != RUSAGE_SELF) return 0;
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	long long us = (long long)(now.tv_sec - rc_start.tv_sec) * 1000000 + (now.tv_nsec - rc_start.tv_nsec) / 1000;
+	u->ru_utime.tv_sec = (time_t)(us / 1000000);
+	u->ru_utime.tv_usec = (long)(us % 1000000);
+	return 0;
+}
+
+pid_t setsid(void) { return getpid(); }   /* no sessions: already "its own" */
+
+pid_t wait4(pid_t pid, int *status, int options, struct rusage *usage)
+{
+	if (usage) memset(usage, 0, sizeof *usage);
+	return waitpid(pid, status, options);
+}
+
+#include <pwd.h>
+struct passwd *getpwuid(uid_t uid) { (void)uid; return 0; }
+struct passwd *getpwnam(const char *name) { (void)name; return 0; }
+int getpwuid_r(uid_t uid, struct passwd *pw, char *buf, size_t n, struct passwd **result)
+{ (void)uid; (void)pw; (void)buf; (void)n; *result = 0; return 0; }
+int getpwnam_r(const char *name, struct passwd *pw, char *buf, size_t n, struct passwd **result)
+{ (void)name; (void)pw; (void)buf; (void)n; *result = 0; return 0; }
+
+#include <sys/statvfs.h>
+#include <sys/stat.h>
+static void rc_statvfs_fill(struct statvfs *b)
+{
+	memset(b, 0, sizeof *b);
+	b->f_bsize = b->f_frsize = 4096;
+	b->f_flag = b->f_flags = ST_LOCAL;
+	b->f_namemax = 255;
+}
+int statvfs(const char *path, struct statvfs *buf)
+{
+	struct stat st;
+	if (stat(path, &st) != 0) return -1;
+	rc_statvfs_fill(buf);
+	return 0;
+}
+int fstatvfs(int fd, struct statvfs *buf)
+{
+	struct stat st;
+	if (fstat(fd, &st) != 0) return -1;
+	rc_statvfs_fill(buf);
+	return 0;
+}

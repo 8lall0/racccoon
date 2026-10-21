@@ -4,7 +4,7 @@
 #include <stddef.h>
 
 /* Anonymous demand pages, page-rounded, at the process's heap_top.
- * NULL on failure. The libc malloc (malloc.c) is built on this. */
+ * NULL on failure. The libc malloc (rc_malloc.c, dlmalloc) is built on this. */
 void *__rc_map_pages(unsigned long nbytes)
 {
 	long r = __rc_syscall3((long)nbytes, 0, 0, RC_SYS_MAP);

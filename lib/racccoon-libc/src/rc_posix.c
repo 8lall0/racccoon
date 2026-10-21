@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <limits.h>
 
 /* --- direct-syscall bits --------------------------------------------- */
 
@@ -269,7 +270,15 @@ int fcntl(int fd, int cmd, ...)
 	if (fd < 0 || fd >= FD_MAX || fdtab[fd].kind == K_FREE) { errno = EBADF; return -1; }
 	if (cmd == F_GETFL) return fdtab[fd].flags;
 	if (cmd == F_DUPFD) return dup(fd);
-	return 0;   /* F_GETFD/F_SETFD/F_SETFL — accepted, no-op */
+	if (cmd == F_GETLK) {
+		va_list ap;
+		va_start(ap, cmd);
+		struct flock *fl = va_arg(ap, struct flock *);
+		va_end(ap);
+		fl->l_type = F_UNLCK;
+		return 0;
+	}
+	return 0;   /* F_GETFD/F_SETFD/F_SETFL/F_SETLK(W) — accepted, no-op */
 }
 
 int isatty(int fd)
@@ -440,6 +449,8 @@ long sysconf(int name)
 	case _SC_NPROCESSORS_ONLN:  return 1;
 	case _SC_CLK_TCK:           return 1000000;
 	case _SC_OPEN_MAX:          return FD_MAX;
+	case _SC_GETPW_R_SIZE_MAX:  return 1024;
+	case _SC_ARG_MAX:           return _POSIX_ARG_MAX;   /* conservative: the exec argv blob shares a 8 KiB IPC message */
 	default:                    return -1;
 	}
 }
@@ -508,4 +519,72 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
 	if (r < 0) { errno = EINVAL; return -1; }
 	if (r & RC_AW_NOTE) { errno = EINTR; return -1; }
 	return poll_scan(fds, nfds, (r & RC_AW_STDIN) != 0, &want_stdin);
+}
+
+/* pread / pwrite: the same transfer at an explicit offset; the fd's own
+ * offset is left alone. */
+ssize_t pread(int fd, void *buf, size_t count, off_t off)
+{
+	fd_init();
+	if (fd < 0 || fd >= FD_MAX || fdtab[fd].kind != K_FILE) { errno = fd >= 0 && fd < FD_MAX && fdtab[fd].kind != K_FREE ? ESPIPE : EBADF; return -1; }
+	if (off < 0) { errno = EINVAL; return -1; }
+	unsigned long save = fdtab[fd].off;
+	fdtab[fd].off = (unsigned long)off;
+	ssize_t r = read(fd, buf, count);
+	fdtab[fd].off = save;
+	return r;
+}
+
+ssize_t pwrite(int fd, const void *buf, size_t count, off_t off)
+{
+	fd_init();
+	if (fd < 0 || fd >= FD_MAX || fdtab[fd].kind != K_FILE) { errno = fd >= 0 && fd < FD_MAX && fdtab[fd].kind != K_FREE ? ESPIPE : EBADF; return -1; }
+	if (off < 0) { errno = EINVAL; return -1; }
+	unsigned long save = fdtab[fd].off;
+	fdtab[fd].off = (unsigned long)off;
+	ssize_t r = write(fd, buf, count);
+	fdtab[fd].off = save;
+	return r;
+}
+
+int fchmod(int fd, mode_t mode)
+{
+	fd_init();
+	if (fd < 0 || fd >= FD_MAX || fdtab[fd].kind != K_FILE) { errno = EBADF; return -1; }
+	return chmod(fdtab[fd].path, mode);
+}
+
+/* Every write already went to fsd. */
+int fsync(int fd) { (void)fd; return 0; }
+int fdatasync(int fd) { (void)fd; return 0; }
+
+/* racccoon's filesystems have no symbolic or extra hard links. */
+ssize_t readlink(const char *path, char *buf, size_t n)
+{
+	(void)buf; (void)n;
+	struct stat st;
+	if (stat(path, &st) != 0) return -1;
+	errno = EINVAL;   /* exists, and isn't a symlink */
+	return -1;
+}
+int symlink(const char *target, const char *path) { (void)target; (void)path; errno = EPERM; return -1; }
+int link(const char *oldp, const char *newp) { (void)oldp; (void)newp; errno = EPERM; return -1; }
+
+/* Ownership can't be changed through this library (the FS protocol's
+ * chown is root-only and not wired up here): only a no-op request
+ * (both ids -1) succeeds. */
+int chown(const char *path, uid_t uid, gid_t gid)
+{
+	struct stat st;
+	if (stat(path, &st) != 0) return -1;
+	if (uid == (uid_t)-1 && gid == (gid_t)-1) return 0;
+	errno = EPERM;
+	return -1;
+}
+int lchown(const char *path, uid_t uid, gid_t gid) { return chown(path, uid, gid); }
+int fchown(int fd, uid_t uid, gid_t gid)
+{
+	fd_init();
+	if (fd < 0 || fd >= FD_MAX || fdtab[fd].kind != K_FILE) { errno = EBADF; return -1; }
+	return chown(fdtab[fd].path, uid, gid);
 }

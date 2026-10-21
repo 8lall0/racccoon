@@ -31,3 +31,5 @@ void abort(void)
 {
 	_exit(134);
 }
+
+void _Exit(int code) { _exit(code); }

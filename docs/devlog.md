@@ -3,6 +3,69 @@
 Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
+## 2026-10-21 (night) — LLVM milestone 2: dlmalloc, a POSIX-complete-enough libc, `llvm-readelf` on racccoon
+
+The first program built from LLVM's own libraries runs on racccoon:
+`/bin/llvm-readelf` (LLVM's llvm-readobj, 4.6 MiB). Its `-h`/`-S`/`-s` output
+for `/bin/echod.elf` is **byte-identical** to the host's llvm-readelf 23.1.3
+(2,047 lines of symbol table).
+
+- **Allocator: dlmalloc 2.8.6.**
+  - The old allocator's `free` dropped every block over 1 KiB.
+  - Vendored verbatim as `src/dlmalloc.inc`; upstream is now under an MIT-0-style licence.
+  - Configured in `src/rc_malloc.c`: `MORECORE` over SYS_MAP, non-contiguous, no trim, no mmap, no locks.
+  - New `/bin/alloctest`: a churn of 16 B…4 MiB blocks. With dlmalloc it maps 25 MiB in the
+    warm-up and **+0 KiB** in the steady half.
+  - Linked against the old allocator, the same test ran out of heap (512 MiB cap) in the steady
+    half, so the test does detect the leak.
+- **`crt0_mapped.o`:** an 8 MiB SYS_MAP stack for big programs. The `.bss` stack is copied into
+  the flat image, so it can't be big.
+- **CMake for racccoon:**
+  - `lib/racccoon-libc/racccoon.cmake` plus a real `racccoon` platform module
+    (`cmake/Platform/racccoon.cmake`). It has to be a platform module because `UNIX` set in a
+    toolchain file is reset by the platform step, and LLVM then compiled with `LLVM_ON_UNIX` unset.
+  - Every try-compile links for real against crt0_mapped + libc++ + libracccoon, so LLVM's
+    configure checks see what exists.
+  - Empty `libm.a`/`libpthread.a`/`librt.a` satisfy `-lm` and libc++'s autolink requests.
+- **libc++ had to grow.** LLVM's headers use `std::mutex`/`shared_mutex`, `ostringstream`,
+  `std::wstring` and `steady_clock` unconditionally, so M1's stripped config was too small.
+  - Now on: threads, localization, wide characters, monotonic clock, random_device.
+  - On this platform libc++ uses the POSIX-2008 locale fallback, which needs `locale_t` and the
+    `*_l` functions from the libc.
+  - `_LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE` goes in `__config_site`, the same switch musl and wasi use.
+- **racccoon-libc additions** (C locale, single thread, honest stubs):
+  - **Locale:** `<locale.h>` (`newlocale`/`uselocale`, ENOENT for anything but C), `<langinfo.h>`,
+    ctype `*_l`.
+  - **Wide characters:** `<wchar.h>`/`<wctype.h>` (one byte = one wide char; string, number,
+    conversion and wide-stdio functions; `swprintf`).
+  - **stdio:** `sscanf`/`vsscanf`, `vasprintf`/`asprintf`.
+  - **Threads:** a real single-thread `<pthread.h>`: counting mutexes, once, keys, timed waits
+    that sleep; an untimed wait aborts. `<sched.h>`.
+  - **Time:** `timespec`/`clock_gettime`/`nanosleep`, the last a real sleep on `SYS_AWAIT`.
+  - **Signals:** a full `<signal.h>` with `sigaction` over the existing notes mapping, and
+    `strsignal`.
+  - **errno:** the full asm-generic errno set.
+  - **New headers:** `<fenv.h>`, `<dlfcn.h>` (static: `dlopen(NULL)` only), `<sys/resource.h>`,
+    `<sys/utsname.h>`, `<sys/statvfs.h>`, `<sys/un.h>`, `<pwd.h>` (no database), `<sysexits.h>`,
+    `<endian.h>`.
+  - **inttypes:** every `PRI*`/`SCN*` macro.
+  - **Files:**
+    - file `mmap`: a copy into fresh pages; shared writable mappings → ENODEV;
+    - `pread`/`pwrite`, `fcntl` record locks (always granted), `wait4`, `fchmod`;
+    - `symlink`/`link` → EPERM, `readlink` → EINVAL, `chown` → EPERM unless a no-op.
+  - **Math:** `rint`/`nearbyint`/`modf`, `div`/`ldiv`/`lldiv`, `FP_ILOGB*`.
+- **`llvmtest`** builtin: `llvm-readelf -h /bin/echod.elf` captured through a pipe, checks
+  Machine = RISC-V and the entry point. `cxxtest` now shares the capture helper.
+- **Verified:** full QEMU suite (58 + `cxxtest`/`alloctest`/`malloctest`/`llvmtest`) on FAT32
+  and ext2 = the baseline, the four new tests ok, fsck clean.
+- **Not on the Duo:** 4.6 MiB is over its 4 MiB exec cap.
+  `populate_duo_bin.sh` copies it anyway.
+- **Seen, for M3 (`llc`):**
+  - `<math.h>` is thin, and `trunc`/`floor`/`ceil` go through a `long long` cast, wrong for
+    |x| ≥ 2^63, NaN and inf. A real libm (musl's, MIT) is the likely answer.
+  - `usleep` still spins on the `time` CSR, while `nanosleep` now sleeps.
+
+---
 ## 2026-10-21 (evening) — C++ on racccoon (libc++), gdb on QEMU, honest libc stubs
 
 First milestone of "LLVM on racccoon": C++ programs run. Plus the

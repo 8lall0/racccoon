@@ -37,6 +37,11 @@ ext2_seed_tree() {
   # build/libc/cxxtest.bin, seeded with the C programs below.
   bash lib/racccoon-libc/build_cxx.sh
 
+  # LLVM tools cross-built against that libc++ (llvm-readobj ->
+  # /bin/llvm-readelf). Same LLVM_SRC; no-ops without llvm/ in it or a
+  # host llvm-tblgen.
+  bash lib/racccoon-libc/build_llvm.sh
+
   # TinyCC, cross-built against that libc (roadmap §7.7). No-ops unless
   # the third_party/tinycc submodule is checked out. Produces
   # build/tcc/tcc.bin + build/tcc/lib/ (the CONFIG_TCCDIR payload).

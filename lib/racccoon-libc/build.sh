@@ -77,11 +77,21 @@ for src in lib/racccoon-libc/src/*.c lib/racccoon-libc/src/*.S; do
 done
 
 # crt0 (start.o) is linked explicitly by every program, not pulled from
-# the archive — keep it out of the .a.
+# the archive — keep it out of the .a. crt0_mapped.o (start_mapped.o) is
+# the variant with an 8 MiB SYS_MAP stack, for big programs (LLVM tools).
 cp "$OUT/obj/start.o" "$OUT/crt0.o"
+cp "$OUT/obj/start_mapped.o" "$OUT/crt0_mapped.o"
 rm -f "$OUT/libracccoon.a"
-ar rcs "$OUT/libracccoon.a" $(ls "$OUT"/obj/*.o | grep -v '/start\.o$')
-echo "==> Done: $OUT/crt0.o $OUT/libracccoon.a"
+ar rcs "$OUT/libracccoon.a" $(ls "$OUT"/obj/*.o | grep -v -E '/start(_mapped)?\.o$')
+# The math, thread and clock functions all live in libracccoon.a; empty
+# libm.a / libpthread.a / librt.a let ported build systems link with the
+# customary -lm -lpthread -lrt (LLVM's CMake, and libc++'s autolink
+# requests for pthread and rt).
+for l in m pthread rt; do
+  rm -f "$OUT/lib$l.a"
+  ar rc "$OUT/lib$l.a"
+done
+echo "==> Done: $OUT/crt0.o $OUT/crt0_mapped.o $OUT/libracccoon.a"
 
 # --- test programs --------------------------------------------------
 # Linked, then flattened to a raw binary the same way scripts/

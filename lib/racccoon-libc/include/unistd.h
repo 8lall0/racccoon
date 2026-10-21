@@ -6,6 +6,10 @@ extern "C" {
 
 #include <sys/types.h>
 
+/* clock_gettime(CLOCK_MONOTONIC / CLOCK_REALTIME) exist (<time.h>). */
+#define _POSIX_TIMERS          200809L
+#define _POSIX_MONOTONIC_CLOCK 200809L
+
 #define STDIN_FILENO  0
 #define STDOUT_FILENO 1
 #define STDERR_FILENO 2
@@ -29,9 +33,19 @@ int     dup(int fd);
 int     dup2(int oldfd, int newfd);
 int     access(const char *path, int mode);
 int     ftruncate(int fd, off_t length);
+ssize_t pread(int fd, void *buf, size_t count, off_t off);
+ssize_t pwrite(int fd, const void *buf, size_t count, off_t off);
+int     fsync(int fd);
+int     fdatasync(int fd);
+ssize_t readlink(const char *path, char *buf, size_t n);
+int     symlink(const char *target, const char *path);
+int     link(const char *oldp, const char *newp);
 int     pipe(int fds[2]);
 char   *realpath(const char *path, char *resolved);
 int     chmod(const char *path, mode_t mode);
+int     chown(const char *path, uid_t uid, gid_t gid);
+int     fchown(int fd, uid_t uid, gid_t gid);
+int     lchown(const char *path, uid_t uid, gid_t gid);
 long    sysconf(int name);
 int     getpagesize(void);
 unsigned sleep(unsigned sec);
@@ -45,9 +59,15 @@ int     usleep(unsigned usec);
 #define _SC_NPROCESSORS_ONLN 2
 #define _SC_CLK_TCK        3
 #define _SC_OPEN_MAX       4
+#define _SC_ARG_MAX        5
+#define _SC_GETPW_R_SIZE_MAX 6
 
 /* --- process --- */
 pid_t   getpid(void);
+pid_t   getsid(pid_t pid);
+pid_t   setsid(void);
+unsigned alarm(unsigned seconds);
+int     gethostname(char *name, size_t len);
 pid_t   getppid(void);
 int     getuid(void);
 __attribute__((noreturn)) void _exit(int code);

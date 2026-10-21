@@ -12,6 +12,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <stddef.h>
+#include <stdlib.h>
 
 struct out {
 	void (*emit)(struct out *, const char *, size_t);
@@ -322,4 +323,28 @@ int sprintf(char *s, const char *fmt, ...)
 	int r = vsprintf(s, fmt, ap);
 	va_end(ap);
 	return r;
+}
+
+/* GNU/BSD: print into a malloc'd buffer of exactly the right size. */
+int vasprintf(char **out, const char *fmt, va_list ap)
+{
+	va_list ap2;
+	va_copy(ap2, ap);
+	int n = vsnprintf(NULL, 0, fmt, ap2);
+	va_end(ap2);
+	if (n < 0) { *out = NULL; return -1; }
+	char *b = malloc((size_t)n + 1);
+	if (!b) { *out = NULL; return -1; }
+	vsnprintf(b, (size_t)n + 1, fmt, ap);
+	*out = b;
+	return n;
+}
+
+int asprintf(char **out, const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vasprintf(out, fmt, ap);
+	va_end(ap);
+	return n;
 }

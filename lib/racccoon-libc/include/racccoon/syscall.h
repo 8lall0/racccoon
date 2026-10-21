@@ -27,6 +27,7 @@ extern "C" {
 #define RC_SYS_GETUID       35
 #define RC_SYS_CHDIR       37
 #define RC_SYS_GETCWD     38
+#define RC_SYS_YIELD      27   /* sched_yield() */
 #define RC_SYS_MAP        47
 #define RC_SYS_STDIN_ISATTY 48
 #define RC_SYS_TIMEBASE     49

@@ -260,3 +260,19 @@ int ffs(int v)
 	while (!(v & 1)) { v >>= 1; i++; }
 	return i;
 }
+
+/* The C locale collates by byte value. */
+int strcoll(const char *a, const char *b) { return strcmp(a, b); }
+
+size_t strxfrm(char *dst, const char *src, size_t n)
+{
+	size_t len = strlen(src);
+	if (n) {
+		size_t c = len < n ? len + 1 : n;
+		memcpy(dst, src, c);
+	}
+	return len;
+}
+
+int strcoll_l(const char *a, const char *b, locale_t l) { (void)l; return strcoll(a, b); }
+size_t strxfrm_l(char *dst, const char *src, size_t n, locale_t l) { (void)l; return strxfrm(dst, src, n); }

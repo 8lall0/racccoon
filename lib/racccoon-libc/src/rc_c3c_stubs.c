@@ -40,7 +40,6 @@ void bench_mark(const char *label) { (void)label; }
 
 /* --- POSIX bits racccoon libc doesn't have yet; c3c's uses are all in
  *     error/cleanup paths that don't fire in a normal --backend=c run. */
-int symlink(const char *t, const char *l) { (void)t; (void)l; return -1; }
 char *mkdtemp(char *tmpl) { return tmpl; } /* caller-provided template used as-is */
 
 

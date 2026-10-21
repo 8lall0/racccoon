@@ -39,6 +39,16 @@ int    strcasecmp(const char *a, const char *b);
 int    strncasecmp(const char *a, const char *b, size_t n);
 
 char  *strerror(int errnum);
+int    strerror_r(int errnum, char *buf, size_t n);
+char  *strsignal(int sig);
+int    strcoll(const char *a, const char *b);
+size_t strxfrm(char *dst, const char *src, size_t n);
+#ifndef __RC_LOCALE_T
+#define __RC_LOCALE_T
+typedef struct __rc_locale *locale_t;
+#endif
+int    strcoll_l(const char *a, const char *b, locale_t l);   /* the C locale: byte order */
+size_t strxfrm_l(char *dst, const char *src, size_t n, locale_t l);
 
 #ifdef __cplusplus
 }

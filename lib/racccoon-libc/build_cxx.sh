@@ -10,8 +10,11 @@
 #
 # Same ABI and code model as racccoon-libc (lib/racccoon-libc/build.sh),
 # which must already be built (crt0.o, libracccoon.a). The C++ subset is
-# what LLVM itself builds with: no exceptions, no RTTI, no threads, no
-# locale, no <filesystem>.
+# what LLVM itself builds with: no exceptions, no RTTI, no <filesystem>.
+# Threads, locale and wide characters are on because LLVM's headers use
+# std::mutex, std::ostringstream and std::wstring unconditionally: the
+# thread API is racccoon-libc's single-thread pthread stubs (a mutex is a
+# no-op, pthread_create aborts), the locale is "C" only.
 
 set -e
 
@@ -59,15 +62,17 @@ if [ ! -e "$STAMP" ] || [ "$0" -nt "$STAMP" ] \
     -DLLVM_INCLUDE_TESTS=OFF \
     -DLIBCXX_ENABLE_SHARED=OFF \
     -DLIBCXX_ENABLE_STATIC=ON \
-    -DLIBCXX_ENABLE_THREADS=OFF \
-    -DLIBCXX_ENABLE_MONOTONIC_CLOCK=OFF \
-    -DLIBCXX_ENABLE_LOCALIZATION=OFF \
-    -DLIBCXX_ENABLE_WIDE_CHARACTERS=OFF \
+    -DLIBCXX_ENABLE_THREADS=ON \
+    -DLIBCXX_HAS_PTHREAD_API=ON \
+    -DLIBCXX_ENABLE_MONOTONIC_CLOCK=ON \
+    -DLIBCXX_ENABLE_LOCALIZATION=ON \
+    -DLIBCXX_ENABLE_WIDE_CHARACTERS=ON \
     -DLIBCXX_ENABLE_FILESYSTEM=OFF \
-    -DLIBCXX_ENABLE_RANDOM_DEVICE=OFF \
+    -DLIBCXX_ENABLE_RANDOM_DEVICE=ON \
     -DLIBCXX_ENABLE_EXCEPTIONS=OFF \
     -DLIBCXX_ENABLE_RTTI=OFF \
     -DLIBCXX_ENABLE_TIME_ZONE_DATABASE=OFF \
+    -DLIBCXX_EXTRA_SITE_DEFINES="_LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE" \
     -DLIBCXX_INCLUDE_TESTS=OFF \
     -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
     -DLIBCXX_CXX_ABI=libcxxabi \

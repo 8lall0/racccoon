@@ -21,6 +21,7 @@ void *aligned_alloc(size_t alignment, size_t size);
 
 /* --- process exit --- */
 __attribute__((noreturn)) void _exit(int code);
+__attribute__((noreturn)) void _Exit(int code);   /* C99: _exit */
 __attribute__((noreturn)) void exit(int code);
 __attribute__((noreturn)) void abort(void);
 int atexit(void (*fn)(void));
@@ -48,6 +49,17 @@ typedef struct { long long quot, rem; } lldiv_t;
 div_t          div(int num, int den);
 ldiv_t         ldiv(long num, long den);
 lldiv_t        lldiv(long long num, long long den);
+
+/* multibyte: the C locale, one byte per character (src/wchar.c) */
+#define MB_CUR_MAX ((size_t)1)
+#ifndef __cplusplus
+typedef int wchar_t;
+#endif
+int    mblen(const char *s, size_t n);
+int    mbtowc(wchar_t *pwc, const char *s, size_t n);
+int    wctomb(char *s, wchar_t wc);
+size_t mbstowcs(wchar_t *d, const char *s, size_t n);
+size_t wcstombs(char *d, const wchar_t *s, size_t n);
 long long      atoll(const char *s);
 
 /* --- sort / search --- */

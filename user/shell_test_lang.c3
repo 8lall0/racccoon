@@ -3,8 +3,46 @@ module user;
 import std::nolibc::fmt;
 
 // shell_test builtins — language runtimes / toolchains on racccoon:
-// wasm, c3 std::io, Go, tcc. Split out of shell_test.c3's main(), which
-// tries each shell_test_*_dispatch in turn; true = cmd was one of these.
+// wasm, c3 std::io, Go, tcc, C++, LLVM. Split out of shell_test.c3's
+// main(), which tries each shell_test_*_dispatch in turn; true = cmd was
+// one of these.
+
+// Runs `path` (argv = the real arguments) in a child whose stdout is a
+// pipe, echoes what it prints and keeps the first cap-1 bytes in `out`,
+// NUL-terminated. Returns the exit code; 127 = it couldn't be exec'd.
+fn int lang_run_captured(char* path, char** argv, int argc, char* out, int cap) {
+    int p = pipe_new();
+    pipe_hold(p, 0, 1);   // a reader from the start, so no write is dropped
+    uint g = 0;
+    int c = rfork_io(RFPROC, &g, p, -1);
+    if (c == 0) {
+        exec(path, exec_buf(), exec_buf_max(), 0, argv, argc);
+        exitcode(127);
+    }
+    int n = 0;
+    for (;;) {
+        char[128] chunk;
+        int got = pipe_read(p, &chunk, 128);
+        if (got <= 0) { break; }
+        for (int i = 0; i < got; i++) {
+            putchar(chunk[i]);
+            if (n < cap - 1) { out[n] = chunk[i]; n++; }
+        }
+    }
+    out[n] = 0;
+    pipe_hold(p, 0, -1);
+    return join(c, g);
+}
+
+// True if NUL-terminated `hay` contains `needle`.
+fn bool lang_has_text(char* hay, char* needle) {
+    for (int i = 0; hay[i] != 0; i++) {
+        int k = 0;
+        while (needle[k] != 0 && hay[i + k] == needle[k]) { k++; }
+        if (needle[k] == 0) { return true; }
+    }
+    return false;
+}
 
 fn bool shell_test_lang_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
     if (strcmp(cmd, "wasmtest") == 0) {
@@ -482,44 +520,35 @@ fn bool shell_test_lang_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
         }
     } else if (strcmp(cmd, "cxxtest") == 0) {
         // /bin/cxxtest (test/cxx-src/cxxtest.cpp): C++ on racccoon —
-        // static libc++/libc++abi over racccoon-libc. Its stdout comes
-        // back through a pipe and is echoed, because the last check (a
-        // global destructor's "dtor ran", printed after main returned)
-        // can't show up in the exit code. Skips without /bin/cxxtest
-        // (no llvm-project checkout at build time).
-        int ct_p = pipe_new();
-        pipe_hold(ct_p, 0, 1);   // a reader from the start, so no write is dropped
-        uint ct_g = 0;
-        int ct_c = rfork_io(RFPROC, &ct_g, ct_p, -1);
-        if (ct_c == 0) {
-            exec("bin/cxxtest", exec_buf(), exec_buf_max(), 0, null, 0);
-            exitcode(127);
-        }
+        // static libc++/libc++abi over racccoon-libc. Its output is
+        // captured because the last check (a global destructor's "dtor
+        // ran", printed after main returned) can't show up in the exit
+        // code. Skips without /bin/cxxtest (no llvm-project checkout at
+        // build time).
         char[1024] ct_out;
-        int ct_n = 0;
-        for (;;) {
-            char[128] ct_chunk;
-            int got = pipe_read(ct_p, &ct_chunk, 128);
-            if (got <= 0) { break; }
-            for (int i = 0; i < got; i++) {
-                putchar(ct_chunk[i]);
-                if (ct_n < 1023) { ct_out[ct_n] = ct_chunk[i]; ct_n++; }
-            }
-        }
-        ct_out[ct_n] = 0;
-        pipe_hold(ct_p, 0, -1);
-        int ct_code = join(ct_c, ct_g);
-        bool ct_dtor = false;
-        char* ct_mark = "dtor ran";
-        for (int i = 0; i + 8 <= ct_n && !ct_dtor; i++) {
-            int k = 0;
-            while (k < 8 && ct_out[i + k] == ct_mark[k]) { k++; }
-            ct_dtor = k == 8;
-        }
+        int ct_code = lang_run_captured("bin/cxxtest", null, 0, &ct_out, 1024);
         if (ct_code == 127) {
             print("cxxtest: skipped (no /bin/cxxtest)\n");
         } else {
-            print(ct_code == 0 && ct_dtor ? "cxxtest: ok\n" : "cxxtest: FAILED\n");
+            print(ct_code == 0 && lang_has_text(&ct_out, "dtor ran") ? "cxxtest: ok\n" : "cxxtest: FAILED\n");
+        }
+    } else if (strcmp(cmd, "llvmtest") == 0) {
+        // /bin/llvm-readelf (lib/racccoon-libc/build_llvm.sh): LLVM's own
+        // llvm-readobj, cross-built against libc++ + racccoon-libc,
+        // reading a real RISC-V ELF on the disk (echod.elf, also elftest's
+        // fixture). readobj picks readelf mode from argv[0], the path
+        // exec passes. Skips without /bin/llvm-readelf.
+        char*[2] lt_av;
+        lt_av[0] = "-h";
+        lt_av[1] = "/bin/echod.elf";
+        char[2048] lt_out;
+        int lt_code = lang_run_captured("bin/llvm-readelf", &lt_av[0], 2, &lt_out, 2048);
+        if (lt_code == 127) {
+            print("llvmtest: skipped (no /bin/llvm-readelf)\n");
+        } else {
+            bool lt_ok = lt_code == 0 && lang_has_text(&lt_out, "Machine:                           RISC-V")
+                && lang_has_text(&lt_out, "Entry point address:               0x1000000");
+            print(lt_ok ? "llvmtest: ok\n" : "llvmtest: FAILED\n");
         }
     } else {
         return false;

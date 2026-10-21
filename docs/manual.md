@@ -1129,17 +1129,39 @@ cwd, though opens still use the real one). It's an interpreter, running pre-deco
 QEMU, Lua's recursive `fib(22)` takes ~4 s (~500× native). The dev shell's `wasitest` runs
 the fixtures in `test/wasm-src/*.c`.
 
-### 9.8 Path D — C and C++ (racccoon-libc, libc++)
+### 9.8 Path D — C, C++ and LLVM (racccoon-libc, libc++)
 
-**C.** `lib/racccoon-libc/` is a small libc + POSIX layer (stdio, malloc
-over `SYS_MAP`, files over the FS protocol, fork/exec, sockets, `poll`
-on `SYS_AWAIT`). `lib/racccoon-libc/build.sh` builds it with
-`riscv64-unknown-elf-gcc` (rv64imafdc, lp64d, medany) into
-`build/libc/crt0.o` + `libracccoon.a`, and every `test/c-src/*.c` into a
-flat `build/libc/<name>.bin`, which `scripts/build.sh` and
-`populate_duo_bin.sh` seed as `/bin/<name>`. `crt0` sets `sp` and `tp`,
-runs `.preinit_array`/`.init_array` before `main`, and `exit()` runs the
-`atexit`/`__cxa_atexit` handlers (one LIFO table), then `.fini_array`.
+**C.** `lib/racccoon-libc/` is a libc + POSIX layer: stdio, scanf, files
+over the FS protocol (with `pread`/`pwrite` and file `mmap`), fork/exec,
+sockets, `poll` on `SYS_AWAIT`, signals on notes (`signal`/`sigaction`),
+`clock_gettime`/`nanosleep`, the "C" locale with the POSIX-2008
+`locale_t` API, wide characters, and single-thread pthreads.
+`lib/racccoon-libc/build.sh` builds it with `riscv64-unknown-elf-gcc`
+(rv64imafdc, lp64d, medany) into `build/libc/crt0.o`, `crt0_mapped.o` +
+`libracccoon.a` (and empty `libm.a`/`libpthread.a`/`librt.a` so the usual
+`-lm -lpthread -lrt` link), and every `test/c-src/*.c` into a flat
+`build/libc/<name>.bin`, which `scripts/build.sh` and `populate_duo_bin.sh`
+seed as `/bin/<name>`.
+
+- `crt0` sets `sp` (a 64 KiB stack in `.bss`) and `tp`, runs
+  `.preinit_array`/`.init_array` before `main`; `exit()` runs the
+  `atexit`/`__cxa_atexit` handlers (one LIFO table), then `.fini_array`.
+  `crt0_mapped.o` is the same with an 8 MiB demand-paged stack from
+  `SYS_MAP`, for big programs (the `.bss` stack is copied into the flat
+  image, so it can't be large).
+- `malloc` is **dlmalloc 2.8.6** (`src/rc_malloc.c` + the verbatim
+  `src/dlmalloc.inc`), growing through `SYS_MAP`; memory is reused but
+  never handed back to the kernel. `alloctest` checks the reuse.
+- The locale is "C" only: one byte per character, ASCII classes;
+  `newlocale` refuses other names (ENOENT). Threads: one per program —
+  mutexes count, `pthread_once`/keys work, `pthread_create` aborts, an
+  untimed `pthread_cond_wait` aborts (nobody could signal it).
+- Honest gaps: no symlinks or extra hard links (`symlink`/`link` fail
+  EPERM, `readlink` EINVAL), no ownership changes (`chown` EPERM), no
+  dynamic loading (`dlopen(NULL)` only), no password database (`getpw*`
+  find nothing), `alarm` never fires, `statvfs` reports block counts 0,
+  shared writable file mappings fail (ENODEV), signals can't be masked.
+
 tcc (`/bin/tcc`) compiles C on racccoon itself against the same library.
 
 **C++.** `lib/racccoon-libc/build_cxx.sh` cross-builds static **libc++
@@ -1156,12 +1178,29 @@ ld.lld --gc-sections -T lib/racccoon-libc/racccoon-libc.ld \
   build/libc/crt0.o prog.o build/cxx/install/lib/libc++.a build/libc/libracccoon.a libgcc.a
 ```
 
-It's the subset LLVM itself builds with: **no exceptions, no RTTI, no
-threads, no locale/iostreams, no `<filesystem>`, no `random_device`**.
-Containers, strings, algorithms, `std::function`, smart pointers,
-`optional`/`variant`, static constructors and destructors, aligned `new`
-all work (`cxxtest`). A failed allocation or a broken precondition aborts
-the program (exit 134). A C++ "hello" with a few containers is ~110 KiB.
+**No exceptions, no RTTI, no `<filesystem>`** (what LLVM builds with).
+Threads, locale/iostreams and wide characters are on, over the libc's
+single-thread pthreads and C locale (`_LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE`
+in `__config_site`). `random_device` needs `/dev/urandom`, which racccoon
+doesn't have. Containers, strings, algorithms, `std::function`, smart
+pointers, `optional`/`variant`, static constructors and destructors,
+aligned `new` all work (`cxxtest`). A failed allocation or a broken
+precondition aborts the program (exit 134). A C++ "hello" with a few
+containers is ~120 KiB.
+
+**CMake.** `lib/racccoon-libc/racccoon.cmake` is a toolchain file for
+CMake projects (a `racccoon` platform module in `cmake/Platform/` sets
+`UNIX`); every try-compile links for real against crt0_mapped +
+libc++ + racccoon-libc, so configure checks see what the libc has.
+
+**LLVM.** `lib/racccoon-libc/build_llvm.sh` configures LLVM itself from
+`LLVM_SRC/llvm` with that toolchain (MinSizeRel, no threads/zlib/zstd/
+terminfo/backtraces/plugins, the RISC-V target; tablegen = the host's
+`llvm-tblgen`, which must be the same version) into `build/llvm/`, and
+links **`llvm-readobj` as `/bin/llvm-readelf`** (4.6 MiB; readobj picks
+readelf mode from `argv[0]`). Its output on racccoon is byte-identical to
+the host's. `llvmtest` runs `llvm-readelf -h /bin/echod.elf`. It needs
+QEMU's 32 MiB exec cap; the Duo's 4 MiB is too small.
 
 ### 9.9 Debugging with gdb (QEMU)
 
@@ -1512,10 +1551,9 @@ Deliberate or just not done — the honest list:
 
   The Duo's own Ethernet MAC can report a carrier with no cable plugged in.
   ipd then retries DHCP on `ether0` forever, which is harmless.
-- **C++ is the LLVM subset** (§9.8): no exceptions, RTTI, threads,
-  locale/iostreams or `<filesystem>`. racccoon-libc's `malloc` never
-  returns blocks over 1 KiB to its free lists (`free` leaks them), which
-  a real C++ workload will feel.
+- **C/C++ run single-threaded, in the "C" locale** (§9.8): C++ has no
+  exceptions, RTTI or `<filesystem>`; `pthread_create` aborts. `<math.h>`
+  is thin (and `trunc`/`floor`/`ceil` are wrong for |x| ≥ 2^63).
 - Not audited, not hardened. "It boots on my Duo" is the bar for the
   hardware paths.
 
@@ -1578,7 +1616,8 @@ user/
 
 lib/
   racccoon-libc/        the C library + POSIX layer; build.sh (C), build_cxx.sh
-                        (libc++/libc++abi + C++ programs)
+                        (libc++/libc++abi + C++ programs), build_llvm.sh (LLVM
+                        tools), racccoon.cmake (CMake toolchain file)
   tcc/                  TinyCC's racccoon config, crt1, linker script
 
 test/

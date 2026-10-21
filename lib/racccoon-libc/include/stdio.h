@@ -25,7 +25,10 @@ extern "C" {
 #define SEEK_END 2
 #endif
 
+#ifndef __RC_FILE_T
+#define __RC_FILE_T
 typedef struct __FILE FILE;
+#endif
 typedef off_t fpos_t;
 
 extern FILE *stdin;
@@ -78,6 +81,12 @@ int    vprintf(const char *fmt, va_list ap);
 int    vfprintf(FILE *f, const char *fmt, va_list ap);
 int    vsprintf(char *s, const char *fmt, va_list ap);
 int    vsnprintf(char *s, size_t n, const char *fmt, va_list ap);
+#ifndef __cplusplus   /* libc++'s locale layer brings its own inline vasprintf for this platform */
+int    vasprintf(char **out, const char *fmt, va_list ap);
+#endif
+int    asprintf(char **out, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+int    sscanf(const char *s, const char *fmt, ...) __attribute__((format(scanf, 2, 3)));
+int    vsscanf(const char *s, const char *fmt, va_list ap);
 
 void   perror(const char *s);
 int    remove(const char *path);
