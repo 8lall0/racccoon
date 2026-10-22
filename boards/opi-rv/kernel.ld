@@ -60,12 +60,10 @@ SECTIONS {
 
     . = ALIGN(4096);
     __free_ram = .;
-    /* The Orange Pi RV ships in 1/2/4/8 GiB variants; every variant has
-       at least this much contiguous DRAM above the kernel, so a flat
-       64MiB window (same as src/kernel.ld for QEMU) is safe on all of
-       them and needs no runtime DT probe. Raise it once a real board is
-       in hand and the smallest target variant is known — unlike the
-       Duo (64MiB total, tight), there is genuine headroom here. */
-    . += 64 * 1024 * 1024;
+    /* 1792 MiB, like src/kernel.ld for QEMU: this board has 2 GiB
+       (0x40000000-0xC0000000; U-Boot banner "DRAM: 2 GiB"), OpenSBI
+       sits below the kernel at 0x40000000, and this leaves ~230 MiB of
+       slack at the top. A 1 GiB Orange Pi RV would need this lowered. */
+    . += 1792 * 1024 * 1024;
     __free_ram_end = .;
 }

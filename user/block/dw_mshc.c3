@@ -54,8 +54,14 @@ module user;
 //     the thing to add, and DW_CIU_HZ below is the parent rate to pin.
 //  3. Card-detect (CDETECT @ 0x50) — ignored; the slot is assumed
 //     populated, same as sdhci.c3.
-//  4. Bus width > 1-bit, high-speed (CMD6), tuning. 1-bit / SD
-//     default-speed (~25 MHz) only, same conservative target as sdhci.c3.
+//  4. High-speed (50 MHz). The bus is 4-bit (ACMD6) at default speed,
+//     25 MHz. Tried on the board (2026-10-22): CMD6 to high-speed + CLKDIV
+//     0 — boot-time test reads passed, then most multi-block reads failed
+//     with data CRC errors (rintsts 0xa0). Sweeping the sample phase
+//     (UHS_REG_EXT[20:16], Linux dw_mmc-starfive.c) didn't help: all 32
+//     phases passed the test reads and the errors stayed. U-Boot reads this
+//     card at 20.7 MiB/s, so something it sets up is missing here — likely
+//     the SD pads' drive strength / slew (pinctrl), or its clock setup.
 //  5. VERID-dependent FIFO offset. StarFive VERID is >= 0x240A so the
 //     data port is at 0x200 (DWMCI_DATA), asserted at init — see
 //     dw_reg_verid_check().
@@ -72,7 +78,8 @@ const bool DWMSHC_VERBOSE = false; // per-sector trace; on it prints 2 lines/rea
 
 // Failure reporting is rate-limited: a marginal PIO read is retried by fsd,
 // so it must not turn every read into console output. First few are printed
-// in full, then a summary every DW_STATS_EVERY transfers.
+// in full, then (only once something has failed) a summary every
+// DW_STATS_EVERY transfers.
 const uint DW_FAIL_PRINT_MAX = 8;
 const uint DW_STATS_EVERY    = 512;
 uint g_dw_xfers = 0;
@@ -358,7 +365,10 @@ fn bool dw_mshc_init_ctrl()
 // data-bearing command. Response -> dw_response0..3. Same contract as
 // sdhci.c3's sd_send_cmd(): false on timeout/error, caller decides
 // fatality.
-fn bool dw_send_cmd(uint index, uint arg, uint resp_flags, bool data, bool is_write)
+// `bytes`: data length for a data command (a multi-block read passes
+// count * SECTOR_SIZE); `auto_stop`: the controller sends CMD12 itself
+// once the data is done (CMD18).
+fn bool dw_send_cmd(uint index, uint arg, uint resp_flags, bool data, bool is_write, uint bytes = SECTOR_SIZE, bool auto_stop = false)
 {
 	// Wait for the command FSM to be free (STATUS busy = data line held).
 	// Not strictly required with PRV_DAT_WAIT below, but keeps a wedged
@@ -374,8 +384,8 @@ fn bool dw_send_cmd(uint index, uint arg, uint resp_flags, bool data, bool is_wr
 
 	if (data)
 	{
-		dw_write(DWMCI_BLKSIZ, SECTOR_SIZE);
-		dw_write(DWMCI_BYTCNT, SECTOR_SIZE);
+		dw_write(DWMCI_BLKSIZ, bytes < SECTOR_SIZE ? bytes : SECTOR_SIZE);
+		dw_write(DWMCI_BYTCNT, bytes);
 		// FIFO reset between transfers — recommended by the databook so a
 		// partially-drained FIFO from a failed prior transfer can't leak in.
 		uint c = dw_read(DWMCI_CTRL);
@@ -396,6 +406,7 @@ fn bool dw_send_cmd(uint index, uint arg, uint resp_flags, bool data, bool is_wr
 	{
 		cmd |= DWMCI_CMD_DATA_EXP;
 		if (is_write) { cmd |= DWMCI_CMD_RW; }
+		if (auto_stop) { cmd |= DWMCI_CMD_SEND_STOP; }
 	}
 	// CMD0 needs "send initialization sequence" (bit 15) — the 80-clock
 	// warm-up. U-Boot sets it for the very first CMD0 only; harmless to
@@ -454,6 +465,19 @@ fn uint sdc_resp0() { return dw_response0; }
 
 fn bool sdc_run_clock()
 {
+	// The card is selected (CMD7) by now: switch it and the controller to
+	// the 4-bit bus — ACMD6 (CMD55 + CMD6 arg 2). Every SD card supports
+	// 4-bit; 1-bit moved a quarter of the data per clock. A card that
+	// refuses just stays on 1-bit.
+	if (sdc_cmd(55, sd_rca, SDC_RESP_R1) && sdc_cmd(6, 2, SDC_RESP_R1))
+	{
+		dw_write(DWMCI_CTYPE, DWMCI_CTYPE_4BIT);
+		print("dw_mshc: 4-bit bus\n");
+	}
+	else
+	{
+		print("dw_mshc: ACMD6 refused, staying on the 1-bit bus\n");
+	}
 	if (!dw_set_clock(DW_CLKDIV_RUN))
 	{
 		print("dw_mshc: run clock setup failed\n");
@@ -462,6 +486,7 @@ fn bool sdc_run_clock()
 	print("dw_mshc: raised clock to run speed\n");
 	return true;
 }
+
 
 // How many 32-bit words are currently in the FIFO (STATUS[29:17]).
 fn uint dw_fifo_count()
@@ -579,7 +604,7 @@ fn bool dw_block_rw_once(char* data, uint sector, bool is_write)
 			print("\n");
 		}
 	}
-	if (g_dw_xfers % DW_STATS_EVERY == 0)
+	if (g_dw_fails > 0 && g_dw_xfers % DW_STATS_EVERY == 0)
 	{
 		print("dw_mshc: ");
 		print_uint(g_dw_fails);
@@ -635,6 +660,180 @@ fn bool dw_block_rw(char* data, uint sector, bool is_write)
 	return false;
 }
 
+// Multi-block read: CMD18 for `count` consecutive sectors in one data
+// phase, the controller sending CMD12 itself at the end (SEND_STOP), then
+// the same count-driven burst drain as dw_block_rw_once over the whole
+// run. One command per DISKD_READ_MULTI request instead of one per
+// sector. A failure is retried sector by sector through dw_block_rw.
+fn bool dw_read_multi_once(char* data, uint sector, uint count)
+{
+	uint* words = (uint*)data;
+	uint total = count * (SECTOR_SIZE / 4);
+	uint arg = sd_high_capacity ? sector : (sector * SECTOR_SIZE);
+
+	if (!dw_send_cmd(18, arg, DW_R_SHORT | DW_R_CRC, true, false, count * SECTOR_SIZE, true)) { return false; }
+
+	ulong start = rdtime();
+	ulong budget = dw_us_to_ticks(DW_DATA_US) * count;
+	uint got = 0;
+	uint r = 0;
+	for (;;)
+	{
+		r = dw_read(DWMCI_RINTSTS);
+		if ((r & DWMCI_DATA_ERR) != 0) { break; }
+		uint want = total - got;
+		uint avail = dw_fifo_count();
+		uint thresh = want < 16 ? want : 16;
+		if (avail >= thresh && want > 0)
+		{
+			uint n = avail < want ? avail : want;
+			for (uint i = 0; i < n; i++) { words[got + i] = dw_read(DWMCI_DATA); }
+			got += n;
+		}
+		if ((r & DWMCI_INT_DTO) != 0 && got == total) { break; }
+		if (rdtime() - start > budget) { break; }
+	}
+
+	// The auto CMD12 completes after the data; wait for it (ACD) so the
+	// next command doesn't collide with it.
+	ulong astart = rdtime();
+	while ((dw_read(DWMCI_RINTSTS) & DWMCI_INT_ACD) == 0)
+	{
+		if (rdtime() - astart > dw_us_to_ticks(DW_CMD_DONE_US)) { break; }
+	}
+	dw_write(DWMCI_RINTSTS, DWMCI_INT_DTO | DWMCI_INT_RXDR | DWMCI_INT_ACD | DWMCI_DATA_ERR);
+
+	bool ok = got == total && (r & DWMCI_INT_DTO) != 0 && (r & DWMCI_DATA_ERR) == 0;
+	g_dw_xfers++;
+	if (!ok)
+	{
+		g_dw_fails++;
+		if (g_dw_fails <= DW_FAIL_PRINT_MAX)
+		{
+			print("dw_mshc: multi read sector ");
+			print_hex32(sector);
+			print(" x");
+			print_uint(count);
+			print(" FAILED got=");
+			print_uint(got);
+			print(" rintsts=");
+			print_hex32(r);
+			print("\n");
+		}
+	}
+	return ok;
+}
+
+fn bool dw_read_multi(char* data, uint sector, uint count)
+{
+	if (count == 1) { return dw_block_rw(data, sector, false); }
+	if (dw_read_multi_once(data, sector, count)) { return true; }
+
+	// Same recovery as dw_block_rw: reset the FIFO, clear status, then
+	// fall back to one sector at a time (each with its own retries).
+	dw_write(DWMCI_CTRL, dw_read(DWMCI_CTRL) | DWMCI_CTRL_FIFO_RESET);
+	ulong start = rdtime();
+	while ((dw_read(DWMCI_CTRL) & DWMCI_CTRL_FIFO_RESET) != 0)
+	{
+		if (rdtime() - start > dw_us_to_ticks(DW_RESET_US)) { break; }
+	}
+	dw_write(DWMCI_RINTSTS, DWMCI_INT_ALL);
+	for (uint i = 0; i < count; i++)
+	{
+		if (!dw_block_rw(&data[i * SECTOR_SIZE], sector + i, false)) { return false; }
+	}
+	return true;
+}
+
+// Multi-block write: CMD25 for `count` consecutive sectors, the controller
+// sending CMD12 at the end (SEND_STOP); the same count-driven burst FIFO
+// fill as dw_block_rw_once's write over the whole run, then the auto-stop
+// (ACD) and the card's programming busy (DAT0) before returning. One card
+// program cycle per run instead of one per sector — single-block writes
+// each waited for the card to program its sector. A failure is retried
+// sector by sector through dw_block_rw.
+fn bool dw_write_multi_once(char* data, uint sector, uint count)
+{
+	uint* words = (uint*)data;
+	uint total = count * (SECTOR_SIZE / 4);
+	uint arg = sd_high_capacity ? sector : (sector * SECTOR_SIZE);
+
+	if (!dw_send_cmd(25, arg, DW_R_SHORT | DW_R_CRC, true, true, count * SECTOR_SIZE, true)) { return false; }
+
+	ulong start = rdtime();
+	ulong budget = dw_us_to_ticks(DW_DATA_US) * count;
+	uint got = 0;
+	uint r = 0;
+	for (;;)
+	{
+		r = dw_read(DWMCI_RINTSTS);
+		if ((r & DWMCI_DATA_ERR) != 0) { break; }
+		uint want = total - got;
+		if (want > 0)
+		{
+			uint room = DW_FIFO_DEPTH - dw_fifo_count();
+			uint n = room < want ? room : want;
+			for (uint i = 0; i < n; i++) { dw_write(DWMCI_DATA, words[got + i]); }
+			got += n;
+		}
+		if ((r & DWMCI_INT_DTO) != 0) { break; }
+		if (rdtime() - start > budget) { break; }
+	}
+
+	ulong astart = rdtime();
+	while ((dw_read(DWMCI_RINTSTS) & DWMCI_INT_ACD) == 0)
+	{
+		if (rdtime() - astart > dw_us_to_ticks(DW_CMD_DONE_US)) { break; }
+	}
+	dw_write(DWMCI_RINTSTS, DWMCI_INT_DTO | DWMCI_INT_TXDR | DWMCI_INT_ACD | DWMCI_DATA_ERR);
+
+	bool ok = got == total && (r & DWMCI_INT_DTO) != 0 && (r & DWMCI_DATA_ERR) == 0;
+	if (ok)
+	{
+		ulong wstart = rdtime();
+		while ((dw_read(DWMCI_STATUS) & DWMCI_STATUS_BUSY) != 0)
+		{
+			if (rdtime() - wstart > dw_us_to_ticks(DW_BUSY_US)) { break; }
+		}
+	}
+	g_dw_xfers++;
+	if (!ok)
+	{
+		g_dw_fails++;
+		if (g_dw_fails <= DW_FAIL_PRINT_MAX)
+		{
+			print("dw_mshc: multi write sector ");
+			print_hex32(sector);
+			print(" x");
+			print_uint(count);
+			print(" FAILED got=");
+			print_uint(got);
+			print(" rintsts=");
+			print_hex32(r);
+			print("\n");
+		}
+	}
+	return ok;
+}
+
+fn bool dw_write_multi(char* data, uint sector, uint count)
+{
+	if (count == 1) { return dw_block_rw(data, sector, true); }
+	if (dw_write_multi_once(data, sector, count)) { return true; }
+	dw_write(DWMCI_CTRL, dw_read(DWMCI_CTRL) | DWMCI_CTRL_FIFO_RESET);
+	ulong start = rdtime();
+	while ((dw_read(DWMCI_CTRL) & DWMCI_CTRL_FIFO_RESET) != 0)
+	{
+		if (rdtime() - start > dw_us_to_ticks(DW_RESET_US)) { break; }
+	}
+	dw_write(DWMCI_RINTSTS, DWMCI_INT_ALL);
+	for (uint i = 0; i < count; i++)
+	{
+		if (!dw_block_rw(&data[i * SECTOR_SIZE], sector + i, true)) { return false; }
+	}
+	return true;
+}
+
 // ---------------------------------------------------------------------
 // Shim: the names user/block/sdd.c3 calls (sd-prefixed, from sdhci.c3).
 // Keeping sdd.c3 board-agnostic — it only needs these four entry points
@@ -654,6 +853,18 @@ fn void sdd_pad_power_clock_init()
 fn bool sdd_block_rw(char* data, uint sector, bool is_write)
 {
 	return dw_block_rw(data, sector, is_write);
+}
+
+// `count` consecutive sectors into `data` (sdd.c3's DISKD_READ_MULTI).
+fn bool sdd_block_read_multi(char* data, uint sector, uint count)
+{
+	return dw_read_multi(data, sector, count);
+}
+
+// `count` consecutive sectors from `data` (sdd.c3's multi-sector writes).
+fn bool sdd_block_write_multi(char* data, uint sector, uint count)
+{
+	return dw_write_multi(data, sector, count);
 }
 
 // sdd.c3 reads sd_reg_read(SD_CAPABILITIES) to decide the SDMA path.

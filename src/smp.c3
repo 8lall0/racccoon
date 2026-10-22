@@ -57,29 +57,84 @@ struct Hart
 
 Hart[SMP_MAX_HARTS] harts;
 
-// Which hart is executing this code. Stage A/B: only the boot hart ever
-// runs kernel code (secondaries park in wfi with interrupts masked), so
-// this is a constant. Stage C replaces it with a real per-hart source —
-// RISC-V S-mode has no hartid CSR, so the options are a tp reserved for
-// S-mode use or an sscratch-indirect per-hart block; that choice touches
-// the trap entry asm and belongs with the second-hart bring-up, not here.
-// Every Stage B lock / irq nest indexes by this, so getting it wrong
-// later is a compile-time-visible single call site, not a scattered
-// refactor.
-fn uint this_hartid() @inline
+// --- SMP Stage C1: per-hart identity via `tp` + `sscratch` ------------
+// RISC-V S-mode has no hartid CSR, so the kernel carries its per-hart
+// identity itself (the xv6 scheme):
+//   - `sscratch` always holds &hart_scratch[this hart] while in S-mode.
+//   - `tp` holds the same pointer while kernel C code runs (the ABI
+//     reserves tp, the compiler never allocates it, so it survives every
+//     call and every switch_context — a context switch never changes
+//     harts, so tp correctly stays with the hart).
+//   - kernel_entry swaps tp with sscratch on a trap (getting the pointer
+//     back after user code ran with its own tp), parks the user sp in
+//     HartScratch.tmp and builds the trap frame on HartScratch.kstack.
+//   - switch_context stores the resumed process's kernel-stack top into
+//     HartScratch.kstack (it used to `csrw sscratch` it).
+// Only the trap asm touches HartScratch, and its offsets are baked into
+// that asm (KSTACK=0, TMP=8, HARTID=16).
+struct HartScratch
 {
-	return (uint)boot_hartid;
+	uptr  kstack;  // +0  frame anchor: the running process's kstack top, or the bare trap stack
+	uptr  tmp;     // +8  trap-entry scratch: the user sp
+	ulong hartid;  // +16
+	ulong _pad;    // +24 (32-byte stride)
 }
 
-// Called from kernel_main before smp_start_secondaries, once boot_hartid
-// is known, to mark the boot hart as the (currently sole) scheduling hart.
+HartScratch[SMP_MAX_HARTS] hart_scratch @align(32);
+
+// @naked, a0 by the ABI — not read_reg_tmp / write_csr_tmp, whose shared
+// globals two harts would race.
+fn uptr read_tp() @naked @noinline
+{
+	asm(`
+        mv a0, tp
+        ret
+    `);
+}
+
+fn void set_hart_pointer(HartScratch* s) @naked @noinline
+{
+	asm(`
+        mv tp, a0
+        csrw sscratch, a0
+        ret
+    `);
+}
+
+// The hart running this code. Valid once this hart has run
+// hart_identity_init (kernel_main for the boot hart, secondary_main for the
+// others); every Stage B lock / irq nest indexes by it.
+fn uint this_hartid() @noinline
+{
+	HartScratch* s = (HartScratch*)read_tp();
+	return (uint)s.hartid;
+}
+
+// Point this hart's tp + sscratch at its HartScratch. Run once per hart in
+// bare mode, before any trap can be taken on it; `kstack_top` is the
+// anchor kernel_entry builds a frame on until switch_context repoints it
+// at a real process.
+fn void hart_identity_init(uint hartid, uptr kstack_top) @noinline
+{
+	HartScratch* s = &hart_scratch[hartid];
+	s.kstack = kstack_top & ~(uptr)15; // see kernel_main's alignment note
+	s.tmp    = 0;
+	s.hartid = hartid;
+	set_hart_pointer(s);
+}
+
+// Called from kernel_main, once boot_hartid is known: the boot hart's
+// identity (replaces the old plain `write_csr("sscratch", ...)`), and mark
+// it the (currently sole) scheduling hart.
 fn void smp_init_boot_hart() @noinline
 {
 	boot_hartid = boot_hartid_raw;
-	if (boot_hartid < SMP_MAX_HARTS)
+	uint bh = (uint)boot_hartid;
+	if (bh < SMP_MAX_HARTS)
 	{
-		harts[(uint)boot_hartid].hartid = (uint)boot_hartid;
-		harts[(uint)boot_hartid].scheduling = true;
+		harts[bh].hartid = bh;
+		harts[bh].scheduling = true;
+		hart_identity_init(bh, (uptr)&boot_trap_stack + boot_trap_stack.len);
 	}
 }
 

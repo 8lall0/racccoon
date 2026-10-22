@@ -621,6 +621,7 @@ fn bool shell_test_lang_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
         // libracccoon.a, libgcc.a, the linker script), and the result
         // runs. The ELF must be byte-identical to /hello.ref.elf, the
         // host ld.lld's link of the host llc's object (build_llvm.sh).
+        // Links twice, the second time over the first's output.
         // Skips without /bin/ld.lld.
         char[512] ld_out;
         char*[5] ld_cav;
@@ -640,6 +641,10 @@ fn bool shell_test_lang_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
         ld_lav[6] = "-o";
         ld_lav[7] = "/lldtmp";
         int ld_lc = ld_cc == 0 ? lang_run_captured("bin/ld.lld", &ld_lav[0], 8, &ld_out, 512) : -1;
+        // Link again over the existing /lldtmp: ld.lld then deletes the
+        // old file on a "background" thread (lld's unlinkAsync), which
+        // aborted in pthread_create until libc ran threads to completion.
+        if (ld_lc == 0) { ld_lc = lang_run_captured("bin/ld.lld", &ld_lav[0], 8, &ld_out, 512); }
         if (ld_cc == 127 || ld_lc == 127) {
             print("lldtest: skipped (no /bin/llc or /bin/ld.lld)\n");
         } else {

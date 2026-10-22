@@ -422,6 +422,20 @@ struct Process
 	int ipc_q_next;
 	int ipc_q_target;
 
+	// Call/reply pairing. call_seq counts this process's SYS_IPC_CALLs;
+	// a request deposited by one carries it (msg_call_seq, 0 for a plain
+	// ipc_send). A server that consumes a call records who it owes a reply
+	// and for which call (reply_owed_*); SYS_IPC_REPLY then delivers only
+	// while that same call is still waiting. A client whose call timed out
+	// has stopped listening: the reply used to land in its inbox as a
+	// plain message nobody would read, and the server blocked forever
+	// waiting for the ack (fsd killed as wedged, 2026-10-22).
+	uint call_seq;
+	uint msg_call_seq;
+	int  reply_owed_pid;
+	uint reply_owed_gen;
+	uint reply_owed_seq;
+
 	uint msg_from_generation; // sender's own Process.generation, captured at delivery — lets
 	                          // a receiver that intends to reply later (SYS_IPC_RECV_GEN/
 	                          // SYS_IPC_REPLY, src/syscalls.c3) confirm msg_from still names the
@@ -780,7 +794,12 @@ fn bool ns_mount_try(char* prefix, char* srv_name)
 // the byte stride. satp is a genuine ulong here (Sv39's MODE field lives
 // in the top 4 bits of a 64-bit register, not RV32's single top bit — see
 // page.c3's SATP_SV39), not merely "an address happens to be pointer-sized".
-fn void switch_context(uptr* prev_sp, uptr* next_sp, ulong satp, uptr sscratch) @naked @noinline
+// SMP Stage C1: the resumed process's kernel-stack top (a3) goes into
+// HartScratch.kstack (offset 0 through tp, the per-hart pointer — valid
+// here because switch_context is only reached from kernel C code), not
+// straight into sscratch: sscratch now always holds &hart_scratch[this
+// hart] so kernel_entry can find the per-hart block on the next trap.
+fn void switch_context(uptr* prev_sp, uptr* next_sp, ulong satp, uptr kstack_top) @naked @noinline
 {
 	asm(`
         addi sp, sp, -13 * 8
@@ -802,7 +821,7 @@ fn void switch_context(uptr* prev_sp, uptr* next_sp, ulong satp, uptr sscratch) 
         sfence.vma
         csrw satp, a2
         sfence.vma
-        csrw sscratch, a3
+        sd a3, 0(tp)
 
         ld sp, (a1)
         ld ra,  0  * 8(sp)
@@ -1300,6 +1319,10 @@ fn Process* create_process(void* image, uint image_size)
 	proc.ipc_peer_died = false;
 	proc.in_call_reply_wait = false;
 	proc.ipc_bounced = false;
+	proc.call_seq = 0;
+	proc.msg_call_seq = 0;
+	proc.reply_owed_pid = 0;
+	proc.reply_owed_seq = 0;
 	proc.ipc_q_head = 0;   // a reused slot starts with an empty send queue
 	// Notes: a fresh process starts its own note group and has no handler
 	// or pending notes (explicit — a reused slot could leak them).
@@ -1409,12 +1432,12 @@ fn void setup_fsd_mappings(Process* proc, uint partition_start, bool is_secondar
 // the SBI legacy getchar — see boards/opi-rv/board.c3 for why. Like the
 // PLIC pages it must be in EVERY page table: SYS_GETCHAR's console read runs
 // in S-mode under whichever process's satp is active. Kernel-only (no
-// PAGE_U), identity-mapped. A no-op when the board reads input via SBI.
+// PAGE_U), at the board's CONSOLE_MMIO_PAGE (virtual) -> CONSOLE_MMIO_PHYS. A no-op when the board reads input via SBI.
 fn void map_console_mmio(ulong* table)
 {
 	if (board::CONSOLE_MMIO_PAGE != 0)
 	{
-		map_device_page(table, board::CONSOLE_MMIO_PAGE, board::CONSOLE_MMIO_PAGE, PAGE_R | PAGE_W);
+		map_device_page(table, board::CONSOLE_MMIO_PAGE, board::CONSOLE_MMIO_PHYS, PAGE_R | PAGE_W);
 	}
 }
 
@@ -1520,5 +1543,14 @@ fn void yield() @noinline
 	// BSS layout (the Orange Pi's first real boot faulted on it); the
 	// stack is a page-aligned pool allocation now (Process.kstack).
 	uptr next_sscratch = proc_kstack_top(next);
+	// SMP Stage C2: drop the giant kernel lock across the stack swap and
+	// retake it when THIS context resumes. Every yield() caller holds it
+	// (handle_trap, or kernel_main's idle loop), so this is what lets
+	// another hart into the kernel while this one is parked in a wait. A
+	// fresh context (user_entry / fork_entry) never returns here, so its
+	// re-acquire is skipped — right: it is leaving for user mode and takes
+	// the lock again on its next trap.
+	kernel_lock.release();
 	switch_context(&prev.sp, &next.sp, ((ulong)(uptr)next.page_table >> 12) | SATP_SV39, next_sscratch);
+	kernel_lock.acquire();
 }

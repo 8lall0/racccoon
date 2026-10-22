@@ -30,7 +30,13 @@ import sbi;
 // reg = <0x0 0x0c000000 0x0 0x04000000>, riscv,ndev = 136 (JH7110
 // devicetree, jh7110.dtsi). Stock SiFive layout — identical register
 // math to boards/qemu/board.c3.
-const uptr PLIC_BASE = 0x0c000000;
+//
+// PLIC_BASE is the *virtual* base (see boards/qemu/board.c3's comment):
+// aliased above DRAM's top (0xC0000000 on a 2 GiB board), because the
+// physical 0x0c000000 sits ~176 MiB into the user range (USER_BASE
+// 0x1000000 + HEAP_MAX_BYTES) and DRAM itself (identity-mapped from
+// 0x40000000) fills everything above 1 GiB.
+const uptr PLIC_BASE = 0xC8000000;
 
 // SiFive U74 is a plain RV64GC core — no T-Head MAEE PTE-attribute
 // quirk (that is a C906-only thing, see boards/duo/board.c3). Device
@@ -67,12 +73,8 @@ const uint IRQ_VIRTIO_BLK = 0;
 // exists for exactly this.
 const uptr PLIC_S_CONTEXT = 2;
 
-// PLIC_BASE above IS the physical address (0x0c000000, well below DRAM's
-// 0x40000000 base, so no QEMU-style aliasing is needed — see
-// boards/qemu/board.c3's PLIC_PHYS_BASE comment for the case where it
-// would collide with the free_ram pool). Identity-mapped, same stance
-// as boards/duo/board.c3.
-const uptr PLIC_PHYS_BASE = PLIC_BASE;
+// The PLIC's physical base; PLIC_BASE above is its alias.
+const uptr PLIC_PHYS_BASE = 0x0c000000;
 
 // Ceiling on the harts src/smp.c3's scaffold will try to bring up. Kept
 // at 1 for Stage 1 first-boot bring-up: racccoon runs on whichever
@@ -115,6 +117,10 @@ const Device[*] DEVICES = {
 	{
 		.name = "sd",
 		.mmio = { 0x16020000, 0x13030000 },
+		// fsd<->sdd payload arena (src/process.c3 map_disk_arena): sector
+		// data moves through shared memory instead of 8 KiB messages, and
+		// a multi-sector write can be one op. The Duo keeps inline.
+		.disk_arena = true,
 	},
 };
 
@@ -164,12 +170,22 @@ fn int console_getchar()
 
 // Largest image SYS_EXEC will install (src/syscalls.c3's EXEC_MAX_IMAGE_SIZE)
 // and the per-process SYS_MAP ceiling (src/syscalls.c3's HEAP_MAX_BYTES).
-// Sized like boards/duo/board.c3, not boards/qemu/board.c3: the Stage 0
-// kernel.ld window here is a flat 64 MiB free_ram pool (same scale as
-// the Duo's 64 MiB total DRAM), not QEMU's 1792 MiB. Raise both once
-// kernel.ld's window is widened (docs/opi-rv-plan.md open question #4).
-const EXEC_MAX_IMAGE_SIZE = 1048576;
-const uptr HEAP_MAX_BYTES = 16 * 1024 * 1024;
+// The free_ram pool is 1792 MiB (kernel.ld, a 2 GiB board), like QEMU's,
+// so both caps match QEMU's: 128 MiB images (clang is 51 MiB, c3c 57 MiB)
+// and a 1.5 GiB heap (c3c's arenas; ld.lld linking c3c holds ~300 MB of
+// archives plus a 98 MB output — 1000 MiB ran out). The heap is reserved
+// address space, filled lazily; it jumps over USER_VA_HOLE below.
+const EXEC_MAX_IMAGE_SIZE = 134217728;
+const uptr HEAP_MAX_BYTES = 1536 * 1024 * 1024;
+
+// User space starts at USER_BASE 0x1000000, but DRAM is identity-mapped
+// from 0x40000000 (kernel-only), with the PLIC and console aliases just
+// above it (0xC8000000, 0xC9000000): a heap bigger than ~1 GiB would run
+// into them. SYS_MAP and segment attach skip this window — a reservation
+// that would cross it starts at USER_VA_HOLE_END instead — and the heap
+// cap counts the span without it (src/syscalls.c3 user_map_place).
+const uptr USER_VA_HOLE_START = 0x40000000;
+const uptr USER_VA_HOLE_END   = 0xD0000000;
 
 // Console input is read straight from UART0's registers, NOT through the SBI
 // legacy getchar: this board's OpenSBI (v1.2) logs `sbi_ecall_handler: Invalid
@@ -179,5 +195,8 @@ const uptr HEAP_MAX_BYTES = 16 * 1024 * 1024;
 // exempts SBI_EXT_0_1_CONSOLE_GETCHAR). Output (SBI putchar) is unaffected.
 // UART0 is a Synopsys DW-APB 8250-compatible at 0x10000000, reg-shift 2,
 // reg-io-width 4 (jh7110.dtsi `serial@10000000`); process.c3's
-// map_console_mmio maps this page kernel-only into every page table.
-const uptr CONSOLE_MMIO_PAGE = 0x10000000;
+// map_console_mmio maps this page kernel-only into every page table —
+// at an alias above DRAM, like the PLIC: the physical 0x10000000 is
+// ~240 MiB into the user range.
+const uptr CONSOLE_MMIO_PAGE = 0xC9000000;
+const uptr CONSOLE_MMIO_PHYS = 0x10000000;

@@ -850,3 +850,25 @@ fn bool sdd_block_rw(char* data, uint sector, bool is_write)
 
 	return (status & SD_INT_DATA_END) != 0;
 }
+
+// `count` consecutive sectors into `data` (sdd.c3's DISKD_READ_MULTI).
+// One sdd_block_rw per sector here; dw_mshc.c3 has a real multi-block read.
+fn bool sdd_block_read_multi(char* data, uint sector, uint count)
+{
+	for (uint i = 0; i < count; i++)
+	{
+		if (!sdd_block_rw(&data[i * SECTOR_SIZE], sector + i, false)) { return false; }
+	}
+	return true;
+}
+
+// `count` consecutive sectors from `data` (sdd.c3's DISKD_WRITE_MULTI /
+// _ARENA). One sdd_block_rw per sector here.
+fn bool sdd_block_write_multi(char* data, uint sector, uint count)
+{
+	for (uint i = 0; i < count; i++)
+	{
+		if (!sdd_block_rw(&data[i * SECTOR_SIZE], sector + i, true)) { return false; }
+	}
+	return true;
+}

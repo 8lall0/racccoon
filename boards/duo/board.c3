@@ -122,6 +122,12 @@ const uptr HEAP_MAX_BYTES = 16 * 1024 * 1024;
 // (see boards/opi-rv/board.c3); process.c3's map_console_mmio then maps it
 // kernel-only into every page table.
 const uptr CONSOLE_MMIO_PAGE = 0;
+const uptr CONSOLE_MMIO_PHYS = 0; // physical page behind CONSOLE_MMIO_PAGE (unused at 0)
+
+// No hole in the user heap's address range on this board (see
+// boards/opi-rv/board.c3's USER_VA_HOLE_START).
+const uptr USER_VA_HOLE_START = 0;
+const uptr USER_VA_HOLE_END   = 0;
 
 // One-time SD pad/power/clock bring-up (see user/sdd.c3's sdd_init) needs
 // three more, separate MMIO pages besides SD_MMIO_BASE itself — none of

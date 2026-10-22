@@ -3,6 +3,163 @@
 Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
+## 2026-10-22 (evening) — the Orange Pi RV as racccoon's build machine: c3c rebuilds itself in 40 min, a faster SD driver, SMP C1/C2, and the bugs it found
+
+**Goal (the user's):** compile racccoon on racccoon on real hardware,
+faster than QEMU, and later test multicore there (SMP Stage C3).
+
+**Retest of today's tree on the board:** boots unattended from the shared
+racccoon card. The dev-shell battery passes:
+- the filesystem, 9P, IPC and process tests;
+- ipcfifo, notes, await, segments;
+- the fsd/sdd kill and respawn tests;
+- tcptest and socktest, WASM, Lua and tcc.
+
+Go was blocked by the 1 MiB exec cap until the change below.
+
+- **Memory, from scaffold values to the real board:**
+  - The free_ram pool is 64 → **1792 MiB** (the board has 2 GiB at
+    0x40000000). OpenSBI's banner shows it protects only
+    0x40000000-0x4007ffff.
+  - Exec cap 1 → **128 MiB**, heap cap 16 → **1000 MiB**. The heap can't
+    match QEMU's 1.5 GiB: user space starts at 0x1000000 and DRAM is
+    identity-mapped from 0x40000000.
+  - The PLIC (0x0c000000) and the console UART page (0x10000000) were
+    identity-mapped into every process, in the middle of a big heap's
+    range. Both now live at aliases above DRAM: PLIC 0xC8000000, UART
+    0xC9000000. That needed a new board constant, `CONSOLE_MMIO_PHYS`.
+  - oomtest fills the whole 1792 MiB pool and recovers. All six Go tests
+    run.
+- **Toolchain on the card:**
+  - The ext2 root was grown from 512 MiB to 12 GiB (parted + resize2fs,
+    run by the user).
+  - New `scripts/populate_card.sh` (sudo) rsyncs the QEMU ext2 image's
+    tree onto it, leaving the card's /adm and /usr alone.
+- **SD driver (dw_mshc), round 1:**
+  - 4-bit bus (ACMD6, was 1-bit).
+  - CMD18 multi-block reads with auto-stop for sdd's multi-sector
+    requests (new `sdd_block_read_multi`; the Duo's sdhci.c3 loops).
+  - The every-512-transfers progress line now only prints after a failure.
+  - Result: a 53.7 MB read goes from 34 s to 16-18 s. The driver itself
+    reads at ~7.9 MB/s, so ~60% of a file read is now fsd, IPC and copies
+    above it.
+- **High-speed 50 MHz: tried, reverted, kept as an open task.** CMD6
+  switches the card, but at CLKDIV 0 multi-block reads fail with data
+  CRC errors. A sweep of the StarFive sample phase (UHS_REG_EXT[20:16],
+  as Linux's dw_mmc-starfive tunes it) passed all 32 phases and didn't
+  help. U-Boot reads this card at 20.7 MiB/s, so it's possible. Suspects:
+  pad drive strength, the real CIU clock, the card-read threshold.
+- **Bug: ld.lld aborted when its output file already existed.** lld
+  deletes the old output on a "background" thread (`unlinkAsync`), and
+  racccoon-libc's `pthread_create` aborted.
+  - QEMU never saw it: every run boots a fresh image. On the board every
+    second selfbuildtest failed, which looked like SD corruption at
+    first. Checksums of /bin/clang, ld.lld and llc read on the board
+    matched the host exactly.
+  - Fix: `pthread_create` runs the thread to completion before
+    returning. That is a legal schedule as long as the thread doesn't
+    wait for its creator, which still ends in deadlock(). pthread_exit
+    longjmps back, and join/detach free the record.
+  - `lldtest` now links twice to the same output.
+- **Bug: lines longer than 128 characters were cut off** (the Duo
+  "console limit" found this morning). It was the dev shell's 128-byte
+  readline buffer, plus 256 in the production shell's block reader, not
+  UART loss. Both are now 1 KiB, the shell's command limit.
+- **Timings, one U74 core vs QEMU:**
+  - clangtest: 108 s (QEMU 101 s; it loads the 53.7 MB clang twice).
+  - selfbuildtest: 485 s → 229 s with the 4-bit bus and multi-block
+    reads → **216 s** with the writes below (QEMU ~360 s).
+  - c3cselftest (c3c rebuilding itself, byte-identical): the first board
+    run compiled everything in ~40 min, then ld.lld failed with ENOMEM
+    (see the heap hole below). Then **46 min**, and **40 min** with
+    multi-block writes. QEMU: 2 h 47 min.
+- **The user heap jumps over DRAM.** `ld.lld` linking c3c holds ~300 MB of
+  LLVM archives (read whole by libc's copying mmap) plus a 98 MB output,
+  and SYS_MAP is a bump pointer that never reuses space: 1000 MiB ran out.
+  - New board constants `USER_VA_HOLE_START/END` (Orange Pi:
+    0x40000000-0xD0000000, DRAM plus the PLIC/UART aliases).
+  - `user_map_place()` (src/syscalls.c3) is shared by SYS_MAP and segment
+    attach. A reservation that would cross the hole starts above it, and
+    the cap counts the span minus the hole.
+  - try_lazy_fault never maps inside it.
+  - Heap cap 1536 MiB, as on QEMU. oomtest now crosses the hole before the
+    OOM kill.
+- **Multi-block writes and the fsd<->sdd arena:**
+  - fsd `fs_write_sectors()`: one op per run, through the arena (up to 64
+    sectors) or the new inline DISKD_WRITE_MULTI (216, ≤15). Write-through
+    cache; any failure falls back to per-sector `fs_write_sector`.
+  - `ext2_write_block` uses it: a 1 KiB block was 2 round trips.
+  - sdd speaks every verb with a count, arena or inline. Its CMD25 + auto
+    stop is the write twin of the CMD18 read; the Duo's sdhci.c3 loops.
+  - The Orange Pi's "sd" device sets `disk_arena`. diskd honours counts on
+    arena writes too.
+  - Reads through the arena checksum right. Read throughput barely moved
+    (~3.4 MB/s), which says the read cost isn't the fsd<->sdd copies. Not
+    profiled yet: the plan's measurement step, still to do.
+- **FAT32 deletes batched per FAT sector.** `hugefiletest` on FAT32 failed
+  "unlink": freeing ~17 000 clusters was ~34 000 sector writes (one per
+  cluster per FAT copy), past the 15 s IPC deadline — the ext2 bug from
+  this morning, on FAT. `fat32_free_cluster_chain` now clears entries in
+  a buffered sector, written to every FAT copy when the chain leaves it.
+- **SMP Stage C1 + C2 on master**, re-applied by hand from branch
+  `smp-stage-c` (88 commits behind):
+  - **Per-hart identity:** sscratch = `&hart_scratch[hart]`, tp = the same
+    in the kernel. kernel_entry swaps them and builds the frame on
+    `HartScratch.kstack`. switch_context stores the kstack top there
+    instead of in sscratch. `this_hartid()` reads tp.
+  - **Giant `kernel_lock`:** handle_trap takes it (the body moved to
+    `handle_trap_body`), yield drops it around switch_context, and the
+    idle loop holds it.
+  - Transparent: QEMU at 1 and 4 harts (secondaries still park), and the
+    board battery above. C3 (secondaries scheduling) is next. Design
+    notes: a mirrored `current_proc` under the lock, a per-process
+    on-hart marker, the lock held across switch_context (xv6-style
+    hand-off), per-hart idle and timers, killing a process that runs on
+    another hart, and starting harts 1-4 (not the S7 at 0).
+
+**The FAT32 near-full failure (this morning's open bug):**
+- **Chain:** on a 96%-full FAT32 image with 512-byte clusters, writes are
+  slow enough that a request occasionally passed the 15 s IPC deadline.
+  The client gave up, and fsd's `ipc_reply` then blocked forever. The
+  reply went into the client's inbox as a plain message nobody would read
+  or ack. The supervisor then killed fsd as wedged, once diskd too.
+- **How it was found:** the supervisor printed the killed server's saved
+  pc and syscall (since removed): fsd sat in SYS_IPC_REPLY to a client
+  that had stopped waiting.
+- **Fix, call/reply pairing:**
+  - Every `ipc_call` gets a sequence number (`Process.call_seq`), which
+    its request carries.
+  - A server that consumes a call records which call it owes
+    (`reply_owed_*`).
+  - `ipc_reply` delivers only while that same call is still waiting, and
+    otherwise fails at once with -1. This also stops a late reply from
+    being taken as the answer to the client's next call to the same
+    server.
+  - Replies to a plain ipc_send request are unchanged.
+- **diskd waits on the used ring, not just the IRQ:** it waits for the
+  interrupt or 10 ms, then re-checks. A stale notify used to end the wait
+  early, and a lost one hung diskd. Neither was shown to be this bug's
+  cause; kept for robustness.
+- **Left open:** FAT32 near full is still slow (29 min for selfbuildtest
+  on the 256 MiB image, 6 on the 512 MiB one).
+- **Tried and dropped:** console polling from yield(). It was meant for
+  the "128-char" cut, which turned out to be the shell buffer.
+
+**Verified:**
+- QEMU: the full suite on FAT32 and ext2 matches the baseline; all
+  LLVM-arc tests and hugefiletest pass on both. fsck clean.
+- Orange Pi: the dev-shell battery, Go, oomtest across the hole,
+  lldtest/clangtest, selfbuildtest twice, c3cselftest (40 min), and
+  hugefiletest (102 s). Read checksums of clang/ld.lld/llc match the host.
+- Duo: not yet. The card was in the Orange Pi. sdd's inline path changed
+  (counts on every verb, the multi-write loop) and the IPC layer changed
+  (call/reply pairing, C1/C2), so it needs a boot before trusting.
+
+**Next:** SMP C3; the read-path profile; the 50 MHz SD task; the
+AP6256 Wi-Fi (BCM43456 FullMAC on sdio0, WL_REG_ON = sys GPIO 62, plan
+W0-W5 in memory).
+
+---
 ## 2026-10-22 (afternoon) — branch `net` (LLVM M6 included) on the real Duo
 
 One flash of the dev-shell kernel built from `33c0dd7`
@@ -33,7 +190,9 @@ ext2 block-bitmap cache) are all in the kernel image.
     before.
 - **ext2 bitmap cache on the SD card:** Lua wrote an 8 MiB file (it
   spans more than one block group), read it back (8,388,608 bytes),
-  and `rm` deleted it. 41 s.
+  and `rm` deleted it. 41 s. Afterwards `e2fsck -n -f` on the card in the PC
+  was clean, group summary pass included (282 files, 43,774/524,288
+  blocks).
 - **Console input is cut at ~128 characters per line** (the shell's
   own limit is 1 KiB). A long `wasm /lib/lua.wasm -e '…'` got
   "unterminated quote". Worked around by writing the script with short

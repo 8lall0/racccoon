@@ -193,8 +193,8 @@ fn int shell_read_block(char* buf, int cap)
     buf[0] = 0;
     bool first = true;
     for (;;) {
-        char[256] line @noinit;
-        int n = shell_readline_p(&line[0], 256, first ? &g_prompt_str[0] : "> ", first);
+        char[1024] line @noinit;   // the shell's command limit (was 256)
+        int n = shell_readline_p(&line[0], 1024, first ? &g_prompt_str[0] : "> ", first);
         first = false;
         if (n < 0) { return -1; }
         if (len + n + 2 > cap) { print("shell: block too long\n"); return -1; }

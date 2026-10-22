@@ -179,8 +179,8 @@ fn void sys_segattach(Trap_frame* f) @noinline
 	}
 
 	Segment* sg = &segments[si];
-	uptr base = current_proc.heap_top;
-	if (base == 0 || base + (uptr)sg.npages * PAGE_SIZE - (uptr)USER_BASE > HEAP_MAX_BYTES)
+	uptr base = user_map_place(current_proc.heap_top, (uptr)sg.npages * PAGE_SIZE);
+	if (base == 0)
 	{
 		if (created) { sg.refs = 1; seg_unref(si); }
 		f.a0 = (ulong)(-1);

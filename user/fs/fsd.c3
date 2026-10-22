@@ -96,6 +96,7 @@ const uint DISKD_MSG_MAX     = 8192;
 const uint DISKD_READ_ARENA        = 213;
 const uint DISKD_WRITE_ARENA       = 214;
 const uint DISKD_READ_MULTI_ARENA  = 215;
+const uint DISKD_WRITE_MULTI       = 216; // inline: {sector}{count}{data from byte 8}, count <= DISKD_MAX_SECTORS
 
 // The fsd<->diskd shared payload arena — identity-mapped by the kernel
 // into this process (SYS_DISK_ARENA_INFO), so g_arena_base is both the
@@ -119,6 +120,10 @@ char[DISKD_MSG_MAX] g_disk_io_buf @noinit;
 // single-sector subset. After that fs_read_sectors falls back to
 // per-sector DISKD_READ (still cached, still correct, just no batching).
 bool g_diskd_multi_ok = true;
+// Multi-sector writes (DISKD_WRITE_MULTI / DISKD_WRITE_ARENA with a count):
+// used only while g_diskd_multi_ok holds (a backend that reads multi is a
+// current diskd/sdd); off for good on the first reply-verb mismatch.
+bool g_diskd_wmulti_ok = true;
 const uint SECTOR_SIZE   = 512;
 
 // --- read cache -----------------------------------------------------
@@ -759,6 +764,82 @@ fn bool fs_read_sectors(uint start, uint count, char* buf)
 		}
 		fs_cache_misses += run;
 		i += run;
+	}
+	return true;
+}
+
+// `count` (2..) consecutive partition-absolute sectors from `buf` in one
+// storage op: DISKD_WRITE_ARENA with a count when fsd has the arena (up to
+// the arena's size), else the inline DISKD_WRITE_MULTI (up to
+// DISKD_MAX_SECTORS). No cache interaction and no retry — fs_write_sectors
+// does those around it, falling back to per-sector writes on failure.
+fn bool diskd_write_multi(char* buf, uint abs_sector, uint count)
+{
+	g_op_diskd++;
+	char* req = &g_disk_io_buf[0];
+	uint* sector_field = (uint*)req;
+	uint* count_field  = (uint*)&req[4];
+	*sector_field = abs_sector;
+	*count_field  = count;
+	uint n = count * SECTOR_SIZE;
+	uint verb;
+	int  req_len;
+	if (g_arena_ok)
+	{
+		uint* aoff_field = (uint*)&req[8];
+		*aoff_field = 0;
+		for (uint i = 0; i < n; i++) g_arena_base[i] = buf[i];
+		verb = DISKD_WRITE_ARENA;
+		req_len = 12;
+	}
+	else
+	{
+		for (uint i = 0; i < n; i++) req[8 + i] = buf[i];
+		verb = DISKD_WRITE_MULTI;
+		req_len = (int)(8 + n);
+	}
+	uint reply_verb = 0;
+	int from = p9_call(g_diskd_pid, verb, req, req_len, req, DISKD_MSG_MAX, &reply_verb);
+	if (from <= 0) { return false; }
+	if (reply_verb != verb) { g_diskd_wmulti_ok = false; return false; }
+	return req[0] == 0;
+}
+
+// Batched write: `count` consecutive partition-relative sectors from
+// `buf`, as few storage ops as the transport allows (diskd_write_multi),
+// write-through into the cache like fs_write_sector. The same
+// write-protection checks as diskd_rw, for every sector, up front. Any
+// multi-op failure falls back to fs_write_sector for that chunk — sector
+// writes are idempotent, and that path has the respawn retry.
+fn bool fs_write_sectors(uint start, uint count, char* buf)
+{
+	if (count == 0) return true;
+	if (fs_write_disabled) return false;
+	for (uint i = 0; i < count; i++)
+	{
+		if (fs_sector_is_reserved(start + i)) return false;
+	}
+	uint cap = DISKD_MAX_SECTORS;
+	if (g_arena_ok) { cap = g_arena_size / SECTOR_SIZE; }
+	uint i = 0;
+	while (i < count)
+	{
+		uint n = count - i;
+		if (n > cap) n = cap;
+		char* src = &buf[i * SECTOR_SIZE];
+		if (n > 1 && g_diskd_multi_ok && g_diskd_wmulti_ok
+			&& diskd_write_multi(src, fs_partition_start + start + i, n))
+		{
+			for (uint j = 0; j < n; j++) fs_cache_put(start + i + j, &src[j * SECTOR_SIZE]);
+		}
+		else
+		{
+			for (uint j = 0; j < n; j++)
+			{
+				if (!fs_write_sector(start + i + j, &src[j * SECTOR_SIZE])) return false;
+			}
+		}
+		i += n;
 	}
 	return true;
 }

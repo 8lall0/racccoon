@@ -195,7 +195,10 @@ its own page table.
 
 - The **image + a fixed 64 KiB stack** are mapped eagerly.
 - **`SYS_MAP`** hands out address space above the image, page-aligned,
-  bounded by `HEAP_MAX_BYTES` (16 MiB Duo / 1.5 GiB QEMU). It is
+  bounded by `HEAP_MAX_BYTES` (16 MiB Duo / 1.5 GiB QEMU and Orange Pi).
+  On the Orange Pi it jumps over a hole (`USER_VA_HOLE_START/END`,
+  0x40000000-0xD0000000: DRAM and the PLIC/UART aliases are mapped
+  there), and the cap counts the span without it. It is
   **demand-paged**: `SYS_MAP` reserves the range, a page fault in it
   maps one zero page. This is the userspace "give me a heap" primitive —
   `/bin/wasm`'s linear memory, the real-stdlib allocator, Go's arena.
@@ -787,6 +790,13 @@ for (;;) {
 `from_gen` / `ipc_reply`'s `expected_generation` close the window where
 the requester exits and its pid is reused before the reply lands.
 
+Each `ipc_call` carries a sequence number (`Process.call_seq`). A server
+that receives a call records which call it owes; `ipc_reply` delivers
+only while that same call is still waiting, and otherwise returns -1 at
+once. A client whose call timed out (15 s) has stopped listening — the
+reply used to land in its inbox as a plain message nobody read, and the
+server blocked forever. Replies to a plain `ipc_send` are unchanged.
+
 ### 6.3 The 9P verbs
 
 Two families (`user/user.c3`):
@@ -1170,7 +1180,9 @@ seed as `/bin/<name>`.
   checks values, edge cases, classification and printf/strtod.
 - The locale is "C" only: one byte per character, ASCII classes;
   `newlocale` refuses other names (ENOENT). Threads: one per program —
-  mutexes count, `pthread_once`/keys work, `pthread_create` aborts, an
+  mutexes count, `pthread_once`/keys work, `pthread_create` runs the
+  thread to completion before returning (a legal schedule unless it
+  waits for its creator — ld.lld's background unlink is the user), an
   untimed `pthread_cond_wait` aborts (nobody could signal it).
 - `stat()` gives each file an identity: `st_dev` 1 and `st_ino` a hash of
   its normalized absolute path (no inode numbers in the FS protocol, no
@@ -1542,20 +1554,35 @@ What a board provides:
 - **`HAS_SECOND_FS_PARTITION`** — whether a second `fsd` is spawned (this
   is filesystem layout, not a device).
 - **`FS_PARTITION_START_SECTOR`** — where the ext2 root lives
-  (`2099200` on the Duo card, `0` on the QEMU whole-disk image).
-- **`TIMEBASE_HZ`** (10 MHz QEMU / 25 MHz Duo), **`SMP_MAX_HARTS`** (8),
-  **`EXEC_MAX_IMAGE_SIZE`** (32 MiB QEMU / 1 MiB Duo),
-  **`HEAP_MAX_BYTES`** (1.5 GiB QEMU / 16 MiB Duo).
+  (`2099200` on the Duo card and the Orange Pi, `0` on the QEMU
+  whole-disk image).
+- **`TIMEBASE_HZ`** (10 MHz QEMU / 25 MHz Duo / 4 MHz Orange Pi),
+  **`SMP_MAX_HARTS`** (8 QEMU, 1 on the boards for now),
+  **`EXEC_MAX_IMAGE_SIZE`** (128 MiB QEMU and Orange Pi / 4 MiB Duo),
+  **`HEAP_MAX_BYTES`** (1.5 GiB QEMU and Orange Pi / 16 MiB Duo),
+  **`USER_VA_HOLE_START/END`** (the Orange Pi's DRAM window; 0 elsewhere).
+- **`CONSOLE_MMIO_PAGE` / `CONSOLE_MMIO_PHYS`** — the Orange Pi reads
+  console input from UART0 directly (its OpenSBI mangles legacy getchar),
+  mapped at an alias above DRAM; 0 on the others.
 - **`console_putchar` / `console_getchar`** — both currently route to
   the SBI legacy calls.
 
-A third target (JH7110 / Orange Pi RV) has a Stage-0 scaffold on a
-branch. The porting philosophy is: read the vendor's real Linux driver
-and rootfs bring-up scripts, not just the datasheet.
+**Orange Pi RV (JH7110, 2 GiB).** Boots unattended from the same card
+as the Duo (U-Boot's `vf2_uEnv.txt` loads `kernel_opi.bin` from
+DUOBOOT, `scripts/flash_opi.sh`) and mounts the same ext2 root. 1792 MiB
+free_ram pool. Its SD driver (`user/block/dw_mshc.c3`, sdio1) runs the
+card 4-bit at 25 MHz with CMD18/CMD25 multi-block transfers, and fsd and
+sdd share the disk arena. `scripts/populate_card.sh` (sudo) copies the
+QEMU ext2 image's tree — the whole toolchain — onto the card. It is the
+build machine: c3c rebuilds itself there in ~40 min (QEMU: ~2 h 50 min).
+The porting philosophy: read the vendor's real Linux driver and rootfs
+bring-up scripts, not just the datasheet.
 
-Sv39, one hart. The Duo's second C906 core has no MMU and is not a
-target. SMP has a scaffold (per-hart control block, spinlocks) but the
-real multi-hart scheduler is parked until a 4-core board is in hand.
+Sv39. The Duo's second C906 core has no MMU and is not a target. SMP:
+per-hart control blocks, spinlocks, per-hart trap identity (tp/sscratch
+→ `hart_scratch`) and a giant `kernel_lock` are in; secondaries are
+started but still park — the multi-hart scheduler (Stage C3) is next,
+for the Orange Pi's four U74 cores.
 
 ---
 
@@ -1668,7 +1695,8 @@ Deliberate or just not done — the honest list:
   The Duo's own Ethernet MAC can report a carrier with no cable plugged in.
   ipd then retries DHCP on `ether0` forever, which is harmless.
 - **C/C++ run single-threaded, in the "C" locale** (§9.8): C++ has no
-  exceptions, RTTI or `<filesystem>`; `pthread_create` aborts.
+  exceptions or RTTI; a `pthread_create`d thread runs to completion
+  before `pthread_create` returns.
 - Not audited, not hardened. "It boots on my Duo" is the bar for the
   hardware paths.
 
@@ -1756,6 +1784,7 @@ scripts/
   lib_kernel.sh         shared kernel compile / test-shell / link steps
   reflash_duo.sh        repackage fip.bin on the SD card + flash (no sudo)
   populate_duo_bin.sh   seed /bin + the tree onto the Duo's ext2 partition
+  populate_card.sh      copy the QEMU ext2 image's tree onto a card (sudo)
   launch64*.sh          QEMU boot variants (extra args go to QEMU, e.g. -s)
   gdb_qemu.sh           host gdb on QEMU's stub: kernel + one program, ubreak/curproc
   selfbuild_ref.sh      the self-build: stages /src/racccoon, makes the host reference

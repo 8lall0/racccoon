@@ -304,13 +304,23 @@ fn void enable_user_timer_access()
 // 124.
 fn void kernel_entry() @align(4) @section(".text.trap") @export("kernel_entry") @noinline @nostrip
 {
+	// SMP Stage C1 — per-hart trap entry. sscratch holds
+	// &hart_scratch[this hart] (smp.c3), not a bare stack pointer. Swap it
+	// with tp (tp = the per-hart block; the user's tp parks in sscratch for
+	// a moment), stash the user sp in HartScratch.tmp (+8), build the
+	// 31-slot frame on HartScratch.kstack (+0), then put the user tp (from
+	// sscratch) and user sp (from tmp) into their frame slots and restore
+	// sscratch = tp for the next trap. On one hart this is the old
+	// behaviour, one indirection later. (Frame: ra=0 gp=1 tp=2 t0=3 ... sp=30.)
 	asm(`
-        csrrw sp, sscratch, sp
+        csrrw tp, sscratch, tp
+
+        sd sp, 8(tp)
+        ld sp, 0(tp)
 
         addi sp, sp, -8 * 31
         sd ra,  8 * 0(sp)
         sd gp,  8 * 1(sp)
-        sd tp,  8 * 2(sp)
         sd t0,  8 * 3(sp)
         sd t1,  8 * 4(sp)
         sd t2,  8 * 5(sp)
@@ -339,12 +349,13 @@ fn void kernel_entry() @align(4) @section(".text.trap") @export("kernel_entry") 
         sd s10, 8 * 28(sp)
         sd s11, 8 * 29(sp)
 
-        csrr a0, sscratch
-        sd a0, 8 * 30(sp)
+        csrr t0, sscratch
+        sd t0, 8 * 2(sp)
 
-        addi a0, sp, 8 * 31
+        ld t0, 8(tp)
+        sd t0, 8 * 30(sp)
 
-        csrw sscratch, a0
+        csrw sscratch, tp
         mv a0, sp
         call handle_trap
 
@@ -496,6 +507,14 @@ fn bool try_lazy_fault(ulong scause, ulong stval) @noinline
 	{
 		return false;
 	}
+	// The board's hole inside the heap range (kernel mappings; SYS_MAP
+	// never hands it out) is never demand-mapped.
+	$if board::USER_VA_HOLE_END > board::USER_VA_HOLE_START:
+		if (addr >= board::USER_VA_HOLE_START && addr < board::USER_VA_HOLE_END)
+		{
+			return false;
+		}
+	$endif
 	uptr page = addr & ~(uptr)(PAGE_SIZE - 1);
 	// Present already => this is a permission fault, not a demand fault
 	// (SYS_MAP pages are R|W|U, so it shouldn't be, but don't paper over
@@ -589,7 +608,19 @@ fn bool kernel_housekeeping() @noinline
 	return supervisor_tick();
 }
 
+// SMP Stage C2: kernel_entry's `call handle_trap` lands here. Take the
+// giant kernel lock for the whole trap, drop it after — in a thin wrapper
+// so no early return in the body can skip the release. yield() (reached
+// from the blocking-syscall loops in the body) drops and retakes it
+// around its own switch_context.
 fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
+{
+	kernel_lock.acquire();
+	handle_trap_body(f);
+	kernel_lock.release();
+}
+
+fn void handle_trap_body(Trap_frame* f) @noinline @nostrip
 {
 	ulong scause  = read_reg("scause");
 	ulong stval   = read_reg("stval");

@@ -1728,18 +1728,57 @@ fn bool fat32_stat(char* name, uint* out_size, int* out_type)
 // clearing its entry — clearing first would lose the rest of the
 // chain, same ordering concern fat32_write_file's own chain-extension
 // code has in reverse.
+// Writes one FAT sector (partition-relative index `rel` within the FAT)
+// to every FAT copy, and refreshes fat32_next_cluster's one-sector cache
+// if it holds it — fat32_write_fat_entry's per-copy write, for a whole
+// sector at once.
+fn bool fat32_write_fat_sector_all(uint rel, char* sector_buf)
+{
+	for (uint copy = 0; copy < fat32_num_fats; copy++)
+	{
+		uint fat_sector = fat32_fat_start_sector + copy * fat32_fat_size_32 + rel;
+		if (!fs_write_sector(fat_sector, sector_buf)) return false;
+		if (copy == 0 && fat32_fat_cache_valid && fat32_fat_cache_sector == fat_sector)
+		{
+			for (uint i = 0; i < SECTOR_SIZE; i++) fat32_fat_cache_buf[i] = sector_buf[i];
+		}
+	}
+	return true;
+}
+
+// Frees a chain one FAT *sector* at a time: entries are cleared in a
+// buffered copy of the sector, which is written (to every FAT copy) when
+// the chain moves on to another sector. One write per 128 entries of a
+// contiguous chain instead of one per cluster per copy — deleting a
+// 66 MiB file used to take ~34 000 sector writes and ran past the
+// client's 15 s IPC deadline (hugefiletest, 2026-10-22). The next link
+// is always read before its own entry is cleared, and a chain never
+// revisits a cluster, so reading through fat32_next_cluster stays right.
 fn bool fat32_free_cluster_chain(uint first_cluster)
 {
 	uint cluster = first_cluster;
 	uint freed_count = 0;
+	char[SECTOR_SIZE] pend @noinit;
+	uint pend_rel = 0;
+	bool pend_valid = false;
 	while (cluster != 0 && cluster < FAT32_EOC_MIN)
 	{
 		uint next = fat32_next_cluster(cluster);
-		if (!fat32_write_fat_entry(cluster, 0)) return false;
+		uint rel = cluster * 4 / SECTOR_SIZE;
+		if (!pend_valid || rel != pend_rel)
+		{
+			if (pend_valid && !fat32_write_fat_sector_all(pend_rel, &pend)) return false;
+			if (!fs_read_sector(fat32_fat_start_sector + rel, &pend)) return false;
+			pend_rel = rel;
+			pend_valid = true;
+		}
+		uint* entry = (uint*)&pend[cluster * 4 % SECTOR_SIZE];
+		*entry = *entry & ~FAT32_ENTRY_MASK;
 		if (cluster < fat32_alloc_hint) fat32_alloc_hint = cluster; // reuse the freed space next
 		freed_count += 1;
 		cluster = next;
 	}
+	if (pend_valid && !fat32_write_fat_sector_all(pend_rel, &pend)) return false;
 	// One write for the whole chain, not one per cluster — see
 	// fat32_write_free_count's own comment for why its failure isn't
 	// propagated here either.

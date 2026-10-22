@@ -49,6 +49,9 @@ const uint DISKD_MSG_MAX = 8192;
 const uint DISKD_READ_ARENA        = 213;
 const uint DISKD_WRITE_ARENA       = 214;
 const uint DISKD_READ_MULTI_ARENA  = 215;
+// Inline multi-sector write: [0..3] sector, [4..7] count (<= DISKD_MAX_SECTORS),
+// data from byte 8. DISKD_WRITE_ARENA also takes a count (byte 4..7).
+const uint DISKD_WRITE_MULTI       = 216;
 
 const uint SECTOR_SIZE      = 512;
 const uint VIRTIO_BLK_PADDR = 0x10001000;
@@ -159,22 +162,23 @@ fn void main()
 		// rely on unconditionally.
 		if (from == 0) continue;
 		bool is_arena = (verb == DISKD_READ_ARENA || verb == DISKD_WRITE_ARENA || verb == DISKD_READ_MULTI_ARENA);
-		bool is_inline = (verb == DISKD_READ || verb == DISKD_WRITE || verb == DISKD_READ_MULTI);
+		bool is_inline = (verb == DISKD_READ || verb == DISKD_WRITE || verb == DISKD_READ_MULTI || verb == DISKD_WRITE_MULTI);
 		if (!is_arena && !is_inline) continue;
 
-		bool is_write = (verb == DISKD_WRITE || verb == DISKD_WRITE_ARENA);
-		bool is_multi = (verb == DISKD_READ_MULTI || verb == DISKD_READ_MULTI_ARENA);
+		bool is_write = (verb == DISKD_WRITE || verb == DISKD_WRITE_ARENA || verb == DISKD_WRITE_MULTI);
 		uint* sector_ptr = (uint*)&buf;
 		uint sector = *sector_ptr;
 
-		// count: byte 4..7 for the multi verbs, else one sector.
+		// count: byte 4..7 for every verb but the two single inline ones
+		// (the arena verbs' single-sector form sends 1). Inline transfers
+		// are capped by req.data; arena ones by the arena (checked below).
 		uint count = 1;
-		if (is_multi)
+		if (verb != DISKD_READ && verb != DISKD_WRITE)
 		{
 			uint* count_ptr = (uint*)&buf[4];
 			count = *count_ptr;
 			if (count < 1) count = 1;
-			if (count > DISKD_MAX_SECTORS) count = DISKD_MAX_SECTORS;
+			if (!is_arena && count > DISKD_MAX_SECTORS) count = DISKD_MAX_SECTORS;
 		}
 		uint xfer = count * SECTOR_SIZE;
 
@@ -201,8 +205,8 @@ fn void main()
 		req.type   = is_write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
 		if (is_write && !is_arena)
 		{
-			char* src = &buf[4];
-			mem::copy(&req.data, src, SECTOR_SIZE);
+			char* src = verb == DISKD_WRITE_MULTI ? &buf[8] : &buf[4];
+			mem::copy(&req.data, src, xfer);
 		}
 
 		vq.descs[0].addr  = (ulong)req_paddr;
@@ -224,13 +228,24 @@ fn void main()
 		// Wait for the virtio-blk completion IRQ. This used to be a tight
 		// userspace `for(;;){ ipc_poll_type(...) }` spin — one SYS_IPC_POLL
 		// per pass, tens to hundreds of passes per completion, ~330M
-		// syscalls over a `go build` (docs/ipc-rings.md Phase 1). It's now
-		// one SYS_DRIVER_IRQ_WAIT: the same PLIC-hand-draining poll loop,
-		// but the passes happen inside the kernel where the yield()s aren't
-		// syscalls. Still not a true blocking wait — see that syscall's
-		// comment in src/syscalls.c3 for why (sscratch nested-trap hazard,
-		// global SIE-off storms) and why the in-kernel loop is safe anyway.
-		driver_irq_wait();
+		// syscalls over a `go build` (docs/ipc-rings.md Phase 1). Then one
+		// SYS_DRIVER_IRQ_WAIT, now SYS_AWAIT(AW_IRQ): the kernel drains the
+		// PLIC itself and sleeps us until the IRQ or the timeout.
+		//
+		// The IRQ alone isn't trusted: done means the device's used index
+		// caught up with ours. A stale notify (the level line re-raised
+		// before we acked the previous one) could end the wait before the
+		// device finished, and a lost one hung diskd for good — fsd then
+		// waited on it and the supervisor killed both as wedged (a FAT32
+		// self-build, 2026-10-22). So: wait for the IRQ, but re-check the
+		// ring at least every 10 ms.
+		ulong poll_ticks = timebase_hz() / 100;
+		for (;;)
+		{
+			asm("fence");
+			if (*vq.used_index == vq.last_used_index) break;
+			await_any(AW_IRQ, poll_ticks, null, 0);
+		}
 
 		// Clear the device's interrupt-status bits so QEMU drops the
 		// (legacy virtio-mmio, level-triggered) IRQ line. Nothing else

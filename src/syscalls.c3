@@ -106,6 +106,27 @@ const SYS_DEV_INFO   = 60; // a0 = out uptr[] , a1 = capacity (<= 4): the physic
 // process can map its heap arena (docs/go-port-plan.md).
 const uptr HEAP_MAX_BYTES = board::HEAP_MAX_BYTES;
 
+// Where a `bytes`-long reservation at the heap top goes: `top` itself, or
+// board::USER_VA_HOLE_END if it would overlap the board's hole (a window
+// of kernel mappings inside the user range — see boards/opi-rv/board.c3).
+// 0 if it would pass HEAP_MAX_BYTES, which counts the span from USER_BASE
+// minus the hole. Shared by SYS_MAP and segment attach (segment.c3).
+fn uptr user_map_place(uptr top, uptr bytes) @noinline
+{
+	if (top == 0) { return 0; }
+	uptr base = top;
+	uptr hole = 0;
+	$if board::USER_VA_HOLE_END > board::USER_VA_HOLE_START:
+		if (base < board::USER_VA_HOLE_END && base + bytes > board::USER_VA_HOLE_START)
+		{
+			base = board::USER_VA_HOLE_END;
+		}
+		if (base >= board::USER_VA_HOLE_END) { hole = board::USER_VA_HOLE_END - board::USER_VA_HOLE_START; }
+	$endif
+	if (base + bytes - (uptr)USER_BASE - hole > HEAP_MAX_BYTES) { return 0; }
+	return base;
+}
+
 // Flipped by SYS_BOOT_QUIET (the shell, once, after a settle delay).
 // While true, SYS_PUTCHAR from a process with is_boot_server set is
 // dropped — keeps late server init chatter off the prompt.
@@ -477,6 +498,10 @@ fn void sys_rfork(Trap_frame* f) @noinline
 
 		child.has_message = false;
 		child.ipc_progress = 0;
+		child.call_seq = 0;
+		child.msg_call_seq = 0;
+		child.reply_owed_seq = 0;
+		child.ipc_bounced = false;
 		child.wake_pending = false;
 		child.sleep_deadline = 0;
 		child.driver_irq_pending = false; // reused-slot hygiene (a driver's slot never actually gets rfork'd, but keep it clean)
@@ -1219,6 +1244,15 @@ fn void ipc_wake_waiters_on(Process* victim) @noinline
 
 // ipc send: rendezvous a message into the target's single inbox slot and block until it acks.
 // (was inline in handle_syscall; extracted 2026-08-29.)
+// The message just consumed from our inbox: if it was an ipc_call's
+// request, remember which call we owe a reply to (see Process.call_seq).
+fn void ipc_note_reply_owed() @noinline
+{
+	current_proc.reply_owed_pid = current_proc.msg_from;
+	current_proc.reply_owed_gen = current_proc.msg_from_generation;
+	current_proc.reply_owed_seq = current_proc.msg_call_seq;
+}
+
 fn void sys_ipc_send(Trap_frame* f) @noinline
 {
 		// dest_pid/type/data are a0-a2 as usual; len is a4, since a3 is
@@ -1300,6 +1334,7 @@ fn void sys_ipc_send(Trap_frame* f) @noinline
 			ipc_target.msg_from = current_proc.pid;
 			ipc_target.msg_from_generation = current_proc.generation;
 			ipc_target.msg_type = ipc_type;
+			ipc_target.msg_call_seq = 0;
 			current_proc.msg_acked = false;
 			ipc_target.has_message = true;
 			if (ipc_target.state == PROC_BLOCKED)
@@ -1375,6 +1410,25 @@ fn void sys_ipc_reply(Trap_frame* f) @noinline
 			return;
 		}
 
+		// Replying to an ipc_call: deliver only while that same call is
+		// still waiting for us. A client that timed out (or moved on to a
+		// newer call) gets nothing, and we don't block.
+		if (current_proc.reply_owed_seq != 0
+			&& reply_target.pid == current_proc.reply_owed_pid
+			&& reply_target.generation == current_proc.reply_owed_gen)
+		{
+			uint reply_owed = current_proc.reply_owed_seq;
+			current_proc.reply_owed_seq = 0;
+			if (!(reply_target.in_call_reply_wait
+				&& reply_target.ipc_wait_pid == current_proc.pid
+				&& reply_target.ipc_wait_generation == current_proc.generation
+				&& reply_target.call_seq == reply_owed))
+			{
+				f.a0 = (ulong)(-1);
+				return;
+			}
+		}
+
 		current_proc.ipc_wait_pid = reply_dest_pid;
 		current_proc.ipc_wait_generation = reply_target.generation;
 		current_proc.ipc_peer_died = false;
@@ -1399,6 +1453,7 @@ fn void sys_ipc_reply(Trap_frame* f) @noinline
 		reply_target.msg_from = current_proc.pid;
 		reply_target.msg_from_generation = current_proc.generation;
 		reply_target.msg_type = reply_type;
+		reply_target.msg_call_seq = 0;
 		current_proc.msg_acked = false;
 		reply_target.has_message = true;
 		if (reply_target.state == PROC_BLOCKED)
@@ -1497,6 +1552,9 @@ fn void sys_ipc_call(Trap_frame* f) @noinline
 	// to us. See IPC_CALL_DEADLINE_TICKS.
 	current_proc.ipc_call_deadline = read_reg("time") + IPC_CALL_DEADLINE_TICKS;
 
+	current_proc.call_seq++;
+	if (current_proc.call_seq == 0) { current_proc.call_seq = 1; } // 0 means "not a call"
+
 	// Phases 1-2 repeat if the target hands our request back unread
 	// (ipc_bounced — it started an ipc_call of its own first).
 	current_proc.ipc_bounced = false;
@@ -1531,6 +1589,7 @@ fn void sys_ipc_call(Trap_frame* f) @noinline
 		call_target.msg_from = current_proc.pid;
 		call_target.msg_from_generation = current_proc.generation;
 		call_target.msg_type = call_verb;
+		call_target.msg_call_seq = current_proc.call_seq;
 		current_proc.msg_acked = false;
 		call_target.has_message = true;
 		if (call_target.state == PROC_BLOCKED) { call_target.state = PROC_RUNNABLE; }
@@ -1648,6 +1707,7 @@ fn void sys_ipc_recv(Trap_frame* f) @noinline
 				f.a0 = (ulong)current_proc.msg_from;
 				current_proc.has_message = false;
 				current_proc.ipc_progress++;
+				ipc_note_reply_owed();
 				ipc_inbox_freed(current_proc);
 
 				// Wake the sender: it's genuinely blocked (see
@@ -1729,6 +1789,7 @@ fn void sys_ipc_recv_gen(Trap_frame* f) @noinline
 				f.a0 = (ulong)current_proc.msg_from;
 				current_proc.has_message = false;
 				current_proc.ipc_progress++;
+				ipc_note_reply_owed();
 				ipc_inbox_freed(current_proc);
 
 				Process* recv_gen_acked_sender = proc_by_pid(current_proc.msg_from);
@@ -1838,6 +1899,7 @@ fn void sys_ipc_poll(Trap_frame* f) @noinline
 		f.a0 = (ulong)current_proc.msg_from;
 		current_proc.has_message = false;
 		current_proc.ipc_progress++;
+		ipc_note_reply_owed();
 		ipc_inbox_freed(current_proc);
 
 		// Same "wake the real sender" step as SYS_IPC_RECV — normally
@@ -3036,9 +3098,8 @@ fn void handle_syscall(Trap_frame* f) @noinline
 				break;
 			}
 			uint map_pages_n = (uint)((map_bytes + PAGE_SIZE - 1) / PAGE_SIZE);
-			uptr map_base = current_proc.heap_top;
-			if (map_base == 0
-				|| map_base + (uptr)map_pages_n * PAGE_SIZE - (uptr)USER_BASE > HEAP_MAX_BYTES)
+			uptr map_base = user_map_place(current_proc.heap_top, (uptr)map_pages_n * PAGE_SIZE);
+			if (map_base == 0)
 			{
 				f.a0 = (ulong)(-1);
 				break;

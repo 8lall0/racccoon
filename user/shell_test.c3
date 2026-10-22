@@ -43,12 +43,14 @@ fn void main() {
 
         // Cursor editing + history — shell_common.c3's shared reader
         // (arrows, ^A/^E/^K/^U/^W, Home/End/Del, up-arrow recall).
-        char[128] cmdline @noinit;
-        if (shell_readline_p(&cmdline[0], 128, &g_prompt_str[0], true) < 0) { continue; }
+        // 1 KiB, the shell's own command limit (was 128: longer typed or
+        // pasted lines silently lost their tail).
+        char[1024] cmdline @noinit;
+        if (shell_readline_p(&cmdline[0], 1024, &g_prompt_str[0], true) < 0) { continue; }
 
         // $var expansion, then tokenize the result in place.
-        char[512] expanded @noinit;
-        shell_expand(&cmdline[0], &expanded[0], 512);
+        char[2048] expanded @noinit;
+        shell_expand(&cmdline[0], &expanded[0], 2048);
 
         const int SHELL_MAX_TOKENS = 16;
         char*[SHELL_MAX_TOKENS] tokens @noinit;
@@ -81,7 +83,7 @@ fn void main() {
         // `if` / `for` / `while` / `NAME=value` (shell_common.c3);
         // everything else falls through to shell_exec_line (`;` /
         // `&&` / `||`, `$var`, `|`, `<` / `>`, globbing). The dev
-        // shell reads one 128-byte line at a time, so a *multi-line*
+        // shell reads one line (up to 1 KiB) at a time, so a *multi-line*
         // `if (...) { ... }` needs `. script` — single-line
         // `if (test -f x) { echo y }` works here directly.
         shell_exec_block(&cmdline[0]);

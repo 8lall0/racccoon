@@ -126,3 +126,18 @@ fn void Spinlock.release(&self) @noinline
 	amoswap_w_release(&self.locked, 0);
 	irq_pop_off();
 }
+
+// --- SMP Stage C2: the giant kernel lock -------------------------------
+// (docs/roadmap.md §8). Held by whichever hart runs kernel code past the
+// trap-entry asm: handle_trap() takes it on the way in and drops it on the
+// way out, and yield() drops it around switch_context so a hart parked in
+// a blocking wait (every blocking syscall spins on yield()) doesn't keep
+// the others out of the kernel. That makes the whole existing kernel —
+// IPC rendezvous, page tables, namespaces, pipes, the supervisor — correct
+// under SMP without per-structure locking, at the cost of no *kernel*
+// parallelism. User code on several harts still runs in parallel, which is
+// the point (compilers, go build, wasm). Later stages split it where it
+// pays. Uncontended until secondaries schedule (Stage C3). Held with
+// S-mode interrupts off (trap entry cleared SIE; irq_push_off records
+// were_enabled=false, so the matching pop never re-enables mid-trap).
+Spinlock kernel_lock;

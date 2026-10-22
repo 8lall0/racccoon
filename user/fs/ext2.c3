@@ -297,11 +297,9 @@ fn uint ext2_read_contig_run(Ext2_inode_info* inode, Ext2_block_cache* cache,
 // check.
 fn bool ext2_write_block(uint block, char* buf)
 {
-	for (uint s = 0; s < ext2_sectors_per_block; s++)
-	{
-		if (!fs_write_sector(block * ext2_sectors_per_block + s, &buf[s * SECTOR_SIZE])) return false;
-	}
-	return true;
+	// One storage op for the whole block (fs_write_sectors), like
+	// ext2_read_block's fs_read_sectors — a 1 KiB block was 2 round trips.
+	return fs_write_sectors(block * ext2_sectors_per_block, ext2_sectors_per_block, buf);
 }
 
 // Reads inode `inode_num` (1-based) into *out. Fails (returns false,

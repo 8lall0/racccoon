@@ -107,33 +107,22 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 
 	io::print("1: BSS cleared\n");
 
-	// SMP Stage A: publish which hart booted us before anything that
-	// takes a Stage B lock (create_process -> proc_table_lock, alloc_lock)
-	// runs — those index per-hart state by this_hartid(), which reads
-	// boot_hartid. smp_start_secondaries() (called much later) re-runs the
-	// same assignment harmlessly.
+	// SMP Stage A/C1: establish the boot hart's identity before anything
+	// that takes a Stage B lock (create_process -> proc_table_lock,
+	// alloc_lock — indexed by this_hartid()) and before any trap can fire:
+	// tp + sscratch point at hart_scratch[boot_hartid], whose .kstack is
+	// the trap-frame anchor for traps taken while kernel_main itself runs
+	// (boot_trap_stack — a dedicated buffer, not __stack_top, which
+	// kernel_main is running on; see its comment in entry.c3). 16-byte
+	// aligned in hart_identity_init: a char[] global's address isn't
+	// guaranteed aligned, and a misaligned sscratch frame was a real
+	// Orange Pi bug. kernel_entry's first instruction swaps sscratch, so
+	// this must precede stvec.
 	smp_init_boot_hart();
 
 	self_test_pte_roundtrip();
 
 	write_reg("stvec", "kernel_entry");
-
-	// Trap-frame anchor for traps taken *before* the first switch_context
-	// call (i.e. while running kernel_main itself, bare-mode, no process
-	// yet). See boot_trap_stack's comment in entry.c3 for why this is a
-	// dedicated buffer and not __stack_top itself. Must be set before any
-	// interrupt can actually fire — kernel_entry's very first instruction
-	// (csrrw sp, sscratch, sp) would otherwise swap in garbage and build
-	// the trap frame at a bogus address.
-	//
-	// & ~15: same alignment requirement as process.c3's own per-process
-	// sscratch computation (see its comment — the real Orange Pi RV bug
-	// this session found) — a `char[]` global's own start address isn't
-	// guaranteed 8-byte aligned just because it's a global. This one
-	// hasn't been caught misaligned yet, but nothing guarantees it stays
-	// that way after some unrelated global gets added/reordered ahead of
-	// it in BSS; fixing it defensively now costs nothing.
-	write_csr("sscratch", ((uptr)&boot_trap_stack + boot_trap_stack.len) & ~(uptr)15);
 
 	plic_init();
 	plic_arm_devices();
@@ -386,6 +375,13 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 	// the boot servers above must all be up first, since a secondary
 	// today does nothing but wfi and a real scheduler isn't wired in.
 	smp_start_secondaries();
+
+	// SMP Stage C2: the idle loop is kernel code — hold the giant lock for
+	// it, like handle_trap does. yield() drops and retakes it around each
+	// switch_context, so a runnable process gets the kernel while idle is
+	// parked. (Stage C3: an all-blocked system busy-spins yield() here
+	// holding the lock — idle then needs a wfi with the lock dropped.)
+	kernel_lock.acquire();
 
 	// Single call site for create_process(shell) below (a *respawn*
 	// only now — the initial spawn is explicit above): once the console

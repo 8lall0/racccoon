@@ -1,14 +1,19 @@
 /* pthreads for a single-threaded program (racccoon runs one thread per
- * C program). c3c only reaches pthread_create when build_threads > 1,
- * which never happens on racccoon (cpus() returns 1), so it aborts rather
- * than pretend. Everything else is real for one thread: what libc++'s
- * std::mutex / call_once / thread_local-style keys need. */
+ * C program). pthread_create runs the new thread to completion before it
+ * returns — a legal schedule (the new thread ran first and finished) as
+ * long as it never waits for its creator, which would end in deadlock()
+ * like any other wait here. ld.lld relies on it: replacing an existing
+ * output file, it deletes the old one "in the background" (lld's
+ * unlinkAsync) — on racccoon that aborted every link over an existing
+ * file (2026-10-22). Everything else is real for one thread: what
+ * libc++'s std::mutex / call_once / thread_local-style keys need. */
 #include <pthread.h>
 #include <sched.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#include <setjmp.h>
 #include <racccoon/syscall.h>
 
 static void deadlock(const char *what)
@@ -17,16 +22,51 @@ static void deadlock(const char *what)
 	abort();
 }
 
+/* A finished thread: its result, kept until joined or detached. The main
+ * thread is pthread_t 1; a created one is the address of its record. */
+struct rc_thread { void *ret; };
+
+/* The thread running inside pthread_create right now (innermost), and
+ * where its pthread_exit returns to. */
+static struct rc_thread *cur_thread;
+static jmp_buf *cur_exit;
+
 int pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *), void *arg)
 {
-	(void)t; (void)a; (void)fn; (void)arg;
-	fprintf(stderr, "racccoon: pthread_create unsupported (build single-threaded)\n");
-	abort();
+	(void)a;
+	struct rc_thread *th = malloc(sizeof *th);
+	if (!th) return EAGAIN;
+	struct rc_thread *outer = cur_thread;
+	jmp_buf *outer_exit = cur_exit;
+	jmp_buf exit_to;
+	cur_thread = th;
+	cur_exit = &exit_to;
+	if (setjmp(exit_to) == 0) th->ret = fn(arg);
+	cur_thread = outer;
+	cur_exit = outer_exit;
+	*t = (pthread_t)th;
+	return 0;
 }
-int pthread_join(pthread_t t, void **r) { (void)t; (void)r; return 0; }
-int pthread_detach(pthread_t t) { (void)t; return 0; }
-void pthread_exit(void *r) { (void)r; abort(); }
-pthread_t pthread_self(void) { return 1; }
+int pthread_join(pthread_t t, void **r)
+{
+	if (t == 1) return EDEADLK;   /* joining the main thread: it never finishes first */
+	struct rc_thread *th = (struct rc_thread *)t;
+	if (r) *r = th->ret;
+	free(th);
+	return 0;
+}
+int pthread_detach(pthread_t t)
+{
+	if (t != 1) free((struct rc_thread *)t);
+	return 0;
+}
+void pthread_exit(void *r)
+{
+	if (!cur_thread) exit(0);   /* the main thread: the process ends with it */
+	cur_thread->ret = r;
+	longjmp(*cur_exit, 1);
+}
+pthread_t pthread_self(void) { return cur_thread ? (pthread_t)cur_thread : 1; }
 int pthread_equal(pthread_t a, pthread_t b) { return a == b; }
 
 int pthread_attr_init(pthread_attr_t *a) { (void)a; return 0; }
