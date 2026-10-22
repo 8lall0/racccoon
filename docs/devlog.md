@@ -3,6 +3,43 @@
 Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
+## 2026-10-22 (afternoon) — branch `net` (LLVM M6 included) on the real Duo
+
+One flash of the dev-shell kernel built from `33c0dd7`
+(`DUO_TEST_SHELL=1`), driven over the serial console. `/bin` wasn't
+refreshed: M6's Duo-relevant changes (the `ipc_call` bounce fix, fsd's
+ext2 block-bitmap cache) are all in the kernel image.
+
+- **Boot:** clean. sdd brought the card up, ext2 mounted, no `svc:`
+  respawns. Wi-Fi autojoined from `/adm/wifi`, finished the WPA2
+  handshake and got a DHCP lease on ether1.
+- **Filesystem / IPC / processes, all pass:**
+  - cycletest, p9realtest, p9fswritetest, p9mkdirtest, hardentest,
+    killtest, srvtest, envtest, runtest, elftest, argvtest, pathtest;
+  - permtest, fspermtest, chmodtest, stdiotest, maptest, bigdirtest;
+  - ipcfifotest 5/5 in order, ipcdeathtest, hungservertest;
+  - proclimittest 40/40, notetest 5/5, awaittest 4/4, segtest 7/7;
+  - waketest, devinfotest, fputest, faulttest.
+- **Respawn:** fsdkilltest and storagekilltest (sdd) pass.
+- **Runtimes:** wasmtest, wasitest, luatest, tcctest, gotest and
+  gostage2test pass.
+- **Network over Wi-Fi:**
+  - tcptest and socktest pass.
+  - PC → Duo ping 4/4, Duo → router ping 4/4. RTTs are 280–1300 ms, the
+    known Wi-Fi item from 2026-10-21, not a regression.
+  - `rshd &`, then a login from the PC over TCP 23 runs commands.
+  - nettest (pings QEMU's slirp gateway and expects a lease on wired
+    ether0) and netdkilltest (the Duo has no netd) are QEMU-only, as
+    before.
+- **ext2 bitmap cache on the SD card:** Lua wrote an 8 MiB file (it
+  spans more than one block group), read it back (8,388,608 bytes),
+  and `rm` deleted it. 41 s.
+- **Console input is cut at ~128 characters per line** (the shell's
+  own limit is 1 KiB). A long `wasm /lib/lua.wasm -e '…'` got
+  "unterminated quote". Worked around by writing the script with short
+  `echo '…' >> /t.lua` lines. Not fixed.
+
+---
 ## 2026-10-22 (night) — LLVM milestone 6: clang on racccoon, and c3c compiles itself
 
 **Goal: c3c builds c3c on racccoon.** c3c is 111 C files plus one C++ file
