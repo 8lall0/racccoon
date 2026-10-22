@@ -151,9 +151,12 @@ Go was blocked by the 1 MiB exec cap until the change below.
 - Orange Pi: the dev-shell battery, Go, oomtest across the hole,
   lldtest/clangtest, selfbuildtest twice, c3cselftest (40 min), and
   hugefiletest (102 s). Read checksums of clang/ld.lld/llc match the host.
-- Duo: not yet. The card was in the Orange Pi. sdd's inline path changed
-  (counts on every verb, the multi-write loop) and the IPC layer changed
-  (call/reply pairing, C1/C2), so it needs a boot before trusting.
+- Duo (dev-shell kernel from `04a7f6b`): the battery passes. That covers
+  the filesystem/9P/IPC/process tests, the fsd/sdd kill tests, TCP and
+  sockets, WASM/Lua/tcc/Go, and 200-character lines. Wi-Fi autojoins
+  over WPA2. PC → Duo ping 4/4, but with 3 duplicate replies, not seen
+  this morning. Likely 802.11 retransmits the RTL8192EU path doesn't
+  filter, so ipd answers twice. Not chased.
 
 **Next:** SMP C3; the read-path profile; the 50 MHz SD task; the
 AP6256 Wi-Fi (BCM43456 FullMAC on sdio0, WL_REG_ON = sys GPIO 62, plan
