@@ -6,6 +6,14 @@ extern "C" {
 
 #include <sys/types.h>
 
+#ifndef __RC_TIMESPEC
+#define __RC_TIMESPEC
+struct timespec {
+	time_t tv_sec;
+	long   tv_nsec;
+};
+#endif
+
 struct stat {
 	dev_t     st_dev;
 	ino_t     st_ino;
@@ -17,10 +25,21 @@ struct stat {
 	off_t     st_size;
 	blksize_t st_blksize;
 	blkcnt_t  st_blocks;
-	time_t    st_atime;
-	time_t    st_mtime;
-	time_t    st_ctime;
+	struct timespec st_atim;   /* POSIX 2008; the filesystems keep no times, so 0 */
+	struct timespec st_mtim;
+	struct timespec st_ctim;
 };
+#define st_atime st_atim.tv_sec
+#define st_mtime st_mtim.tv_sec
+#define st_ctime st_ctim.tv_sec
+
+#define UTIME_NOW  ((1L << 30) - 1L)
+#define UTIME_OMIT ((1L << 30) - 2L)
+int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags);
+int futimens(int fd, const struct timespec times[2]);
+int fstatat(int dirfd, const char *path, struct stat *st, int flags);
+int mkdirat(int dirfd, const char *path, mode_t mode);
+int fchmodat(int dirfd, const char *path, mode_t mode, int flags);
 
 #define S_IFMT   0170000
 #define S_IFREG  0100000

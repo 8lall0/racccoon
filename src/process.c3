@@ -402,6 +402,12 @@ struct Process
 	// call completes). Replaces user-space p9_call's old P9_STRAY bounce.
 	bool in_call_reply_wait;
 
+	// Set on a sender whose delivered-but-unconsumed message was handed
+	// back because the receiver started an ipc_call of its own (see
+	// sys_ipc_call's entry): the sender's ack wait sees it and delivers
+	// the same message again, once the receiver's inbox frees up.
+	bool ipc_bounced;
+
 	// FIFO send queue (docs/devlog.md, the "one inbox slot" item). A
 	// sender that finds this process's inbox busy used to yield-spin,
 	// RUNNABLE, until whoever happened to look next found it free — no
@@ -1293,6 +1299,7 @@ fn Process* create_process(void* image, uint image_size)
 	proc.ipc_wait_generation = 0;
 	proc.ipc_peer_died = false;
 	proc.in_call_reply_wait = false;
+	proc.ipc_bounced = false;
 	proc.ipc_q_head = 0;   // a reused slot starts with an empty send queue
 	// Notes: a fresh process starts its own note group and has no handler
 	// or pending notes (explicit — a reused slot could leak them).

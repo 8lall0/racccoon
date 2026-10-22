@@ -10,9 +10,12 @@
 #                                        argv[0], which exec passes)
 #   llc          -> /bin/llc            (IR -> RISC-V asm / objects)
 #   lld          -> /bin/ld.lld         (the ELF linker; flavor from argv[0])
+#   clang        -> /bin/clang          (C, and C++ with --driver-mode=g++)
+#   llvm-ar      -> /bin/llvm-ar        (static archives; `llvm-ar s` = ranlib)
 #
-# LLVM_SRC must have llvm/, lld/ and libunwind/ (lld's Mach-O port
-# includes one of its headers) besides what build_cxx.sh needs.
+# LLVM_SRC must have llvm/, clang/, lld/ and libunwind/ (lld's Mach-O port
+# includes one of its headers) besides what build_cxx.sh needs. clang's
+# tablegen is the host's clang-tblgen, same version again.
 #
 # tablegen runs on the host: the system llvm-tblgen must be the same
 # version as the checkout's tag (the host clang's).
@@ -35,53 +38,68 @@ if [ -z "$TBLGEN" ]; then
 fi
 
 OUT="build/llvm-racccoon"   # not build/llvm: scripts/lib_kernel.sh owns that (kernel IR) and wipes it
-if [ ! -e "$OUT/build.ninja" ] || [ "$0" -nt "$OUT/build.ninja" ] \
-   || [ lib/racccoon-libc/racccoon.cmake -nt "$OUT/build.ninja" ]; then
+# Reconfigure (from scratch) only when the configuration itself changes —
+# these arguments or the toolchain files — not whenever this script is
+# edited: a reconfigure means rebuilding all of LLVM.
+CMAKE_ARGS=(
+  -DCMAKE_TOOLCHAIN_FILE="$ROOT/lib/racccoon-libc/racccoon.cmake"
+  -DCMAKE_BUILD_TYPE=MinSizeRel
+  -DLLVM_TABLEGEN="$TBLGEN"
+  -DLLVM_HOST_TRIPLE=riscv64-unknown-elf
+  -DLLVM_DEFAULT_TARGET_TRIPLE=riscv64-unknown-elf
+  -DLLVM_TARGETS_TO_BUILD=RISCV
+  -DLLVM_ENABLE_PROJECTS="clang;lld"
+  -DCLANG_TABLEGEN="$(command -v clang-tblgen)"
+  -DCLANG_ENABLE_STATIC_ANALYZER=OFF
+  -DCLANG_ENABLE_ARCMT=OFF
+  -DCLANG_ENABLE_OBJC_REWRITER=OFF
+  -DCLANG_PLUGIN_SUPPORT=OFF
+  -DCLANG_INCLUDE_TESTS=OFF
+  -DCLANG_INCLUDE_DOCS=OFF
+  -DCLANG_BUILD_EXAMPLES=OFF
+  -DLLVM_APPEND_VC_REV=OFF
+  -DLLVM_ENABLE_THREADS=OFF
+  -DLLVM_ENABLE_PIC=OFF
+  -DLLVM_ENABLE_ZLIB=OFF
+  -DLLVM_ENABLE_ZSTD=OFF
+  -DLLVM_ENABLE_LIBXML2=OFF
+  -DLLVM_ENABLE_TERMINFO=OFF
+  -DLLVM_ENABLE_LIBEDIT=OFF
+  -DLLVM_ENABLE_LIBPFM=OFF
+  -DLLVM_ENABLE_BACKTRACES=OFF
+  -DLLVM_ENABLE_CRASH_OVERRIDES=OFF
+  -DLLVM_ENABLE_PLUGINS=OFF
+  -DLLVM_ENABLE_BINDINGS=OFF
+  -DLLVM_ENABLE_OCAMLDOC=OFF
+  -DLLVM_INCLUDE_TESTS=OFF
+  -DLLVM_INCLUDE_BENCHMARKS=OFF
+  -DLLVM_INCLUDE_EXAMPLES=OFF
+  -DLLVM_INCLUDE_DOCS=OFF
+  -DLLVM_INCLUDE_UTILS=OFF
+  -DLLVM_BUILD_TOOLS=OFF
+  -DLLVM_BUILD_UTILS=OFF
+)
+CFG_HASH=$( (printf '%s\n' "${CMAKE_ARGS[@]}"; cat lib/racccoon-libc/racccoon.cmake lib/racccoon-libc/cmake/Platform/racccoon.cmake) \
+  | md5sum | cut -d' ' -f1)
+if [ ! -e "$OUT/build.ninja" ] || [ "$(cat "$OUT/.rc-config" 2>/dev/null)" != "$CFG_HASH" ]; then
   echo "==> LLVM: configuring ($LLVM_SRC)"
   rm -rf "$OUT"
-  cmake -G Ninja -S "$LLVM_SRC/llvm" -B "$OUT" \
-    -DCMAKE_TOOLCHAIN_FILE="$ROOT/lib/racccoon-libc/racccoon.cmake" \
-    -DCMAKE_BUILD_TYPE=MinSizeRel \
-    -DLLVM_TABLEGEN="$TBLGEN" \
-    -DLLVM_HOST_TRIPLE=riscv64-unknown-elf \
-    -DLLVM_DEFAULT_TARGET_TRIPLE=riscv64-unknown-elf \
-    -DLLVM_TARGETS_TO_BUILD=RISCV \
-    -DLLVM_ENABLE_PROJECTS=lld \
-    -DLLVM_APPEND_VC_REV=OFF \
-    -DLLVM_ENABLE_THREADS=OFF \
-    -DLLVM_ENABLE_PIC=OFF \
-    -DLLVM_ENABLE_ZLIB=OFF \
-    -DLLVM_ENABLE_ZSTD=OFF \
-    -DLLVM_ENABLE_LIBXML2=OFF \
-    -DLLVM_ENABLE_TERMINFO=OFF \
-    -DLLVM_ENABLE_LIBEDIT=OFF \
-    -DLLVM_ENABLE_LIBPFM=OFF \
-    -DLLVM_ENABLE_BACKTRACES=OFF \
-    -DLLVM_ENABLE_CRASH_OVERRIDES=OFF \
-    -DLLVM_ENABLE_PLUGINS=OFF \
-    -DLLVM_ENABLE_BINDINGS=OFF \
-    -DLLVM_ENABLE_OCAMLDOC=OFF \
-    -DLLVM_INCLUDE_TESTS=OFF \
-    -DLLVM_INCLUDE_BENCHMARKS=OFF \
-    -DLLVM_INCLUDE_EXAMPLES=OFF \
-    -DLLVM_INCLUDE_DOCS=OFF \
-    -DLLVM_INCLUDE_UTILS=OFF \
-    -DLLVM_BUILD_TOOLS=OFF \
-    -DLLVM_BUILD_UTILS=OFF \
+  cmake -G Ninja -S "$LLVM_SRC/llvm" -B "$OUT" "${CMAKE_ARGS[@]}" \
     > "$OUT.configure.log" 2>&1 || { tail -40 "$OUT.configure.log"; exit 1; }
+  echo "$CFG_HASH" > "$OUT/.rc-config"
 fi
 
 # racccoon.cmake's link rule names libracccoon.a / libc++.a / crt0 / the linker script as
 # text, not as ninja inputs, so a libc change alone wouldn't relink:
 # drop any tool older than them.
-for t in llvm-readobj llc lld; do
+for t in llvm-readobj llc lld clang-23 llvm-ar; do
   for lib in build/libc/libracccoon.a build/libc/crt0_mapped.o build/cxx/install/lib/libc++.a lib/racccoon-libc/racccoon-libc.ld; do
     [ "$lib" -nt "$OUT/bin/$t" ] && rm -f "$OUT/bin/$t"
   done
 done
 
-echo "==> LLVM: building llvm-readobj llc lld"
-ninja -k 0 -C "$OUT" llvm-readobj llc lld > "$OUT.build.log" 2>&1 \
+echo "==> LLVM: building llvm-readobj llc lld clang llvm-ar"
+ninja -k 0 -C "$OUT" llvm-readobj llc lld clang llvm-ar > "$OUT.build.log" 2>&1 \
   || { grep -E "error|undefined symbol" "$OUT.build.log" | sort -u | head -60; exit 1; }
 
 flat() {   # flat() <tool in $OUT/bin> <name in /bin>
@@ -91,6 +109,8 @@ flat() {   # flat() <tool in $OUT/bin> <name in /bin>
 flat llvm-readobj llvm-readelf
 flat llc llc
 flat lld ld.lld
+flat clang-23 clang
+flat llvm-ar llvm-ar
 
 # llctest's fixture: the host llc's object for test/llvm-src/hello.ll —
 # the same LLVM version, so racccoon's llc must produce identical bytes.
@@ -102,3 +122,14 @@ llc -mattr=+m,+a,+f,+d,+c -filetype=obj test/llvm-src/hello.ll -o build/llvm-fix
 # produce the same bytes.
 ld.lld -T lib/racccoon-libc/racccoon-libc.ld build/libc/crt0.o build/llvm-fixtures/hello.ref.o \
   build/libc/libracccoon.a "$(riscv64-unknown-elf-gcc -print-libgcc-file-name)" -o build/llvm-fixtures/hello.ref.elf
+
+# clangtest's: the host clang (same version) compiling a C and a C++ file
+# with exactly the flags racccoon's clang uses for them (user/
+# shell_test_lang.c3); no debug info, so the include paths don't show.
+RES="$(clang -print-resource-dir)/include"
+CFLAGS_T="--target=riscv64-unknown-elf -march=rv64imafdc -mabi=lp64d -mcmodel=medany -fno-pic -O2 -g0 -nostdinc -isystem lib/racccoon-libc/include -isystem $RES"
+clang $CFLAGS_T -c test/llvm-src/hello.c -o build/llvm-fixtures/clang_c.ref.o
+# C++: libc++'s headers must come before the C library's.
+CXXFLAGS_T="--target=riscv64-unknown-elf -march=rv64imafdc -mabi=lp64d -mcmodel=medany -fno-pic -O2 -g0 -nostdinc -nostdinc++ -isystem build/cxx/install/include/c++/v1 -isystem lib/racccoon-libc/include -isystem $RES"
+clang --driver-mode=g++ $CXXFLAGS_T -std=c++20 -fno-exceptions -fno-rtti \
+  -c test/cxx-src/cxxtest.cpp -o build/llvm-fixtures/clang_cxx.ref.o

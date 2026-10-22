@@ -33,6 +33,13 @@ int     dup(int fd);
 int     dup2(int oldfd, int newfd);
 int     access(const char *path, int mode);
 int     ftruncate(int fd, off_t length);
+int     truncate(const char *path, off_t length);
+int     unlinkat(int dirfd, const char *path, int flags);
+long    pathconf(const char *path, int name);
+long    fpathconf(int fd, int name);
+#define _PC_LINK_MAX 0
+#define _PC_NAME_MAX 3
+#define _PC_PATH_MAX 4
 ssize_t pread(int fd, void *buf, size_t count, off_t off);
 ssize_t pwrite(int fd, const void *buf, size_t count, off_t off);
 int     fsync(int fd);

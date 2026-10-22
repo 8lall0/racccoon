@@ -306,6 +306,7 @@ struct Fs_req
 }
 
 alias FsVerbFn = fn int (Fs_req*);
+alias FsSyncFn = fn void ();
 
 struct Fs_ops
 {
@@ -320,6 +321,7 @@ struct Fs_ops
 	FsVerbFn rename;
 	FsVerbFn chmod;    // FS_CHMOD — ext2 only; FAT32/exFAT reply -1
 	FsVerbFn chown;    // FS_CHOWN — ext2 only; FAT32/exFAT reply -1
+	FsSyncFn sync;     // optional: write back cached metadata; run before each ipc_recv
 }
 
 // Set by fs_mount() alongside fs_type; null until a backend mounts (the
@@ -390,6 +392,7 @@ const Fs_ops EXT2_OPS = {
 	.stat = &ext2_op_stat, .remove = &ext2_op_remove,
 	.list = &ext2_op_list, .mkdir = &ext2_op_mkdir, .rename = &ext2_op_rename,
 	.chmod = &ext2_op_chmod, .chown = &ext2_op_chown,
+	.sync = &ext2_sync,
 };
 const Fs_ops EXFAT_OPS = {
 	.read = &exfat_op_read, .read_at = &exfat_op_read_at,
@@ -1184,6 +1187,11 @@ fn void main(String[] args)
 
 	for (;;)
 	{
+		// A backend that caches metadata (ext2's block bitmap) puts it
+		// on disk now — after the last reply, before the next request —
+		// so the disk is consistent whenever fsd is idle.
+		if (fs_ops != null && fs_ops.sync != null) fs_ops.sync();
+
 		char[FS_MSG_MAX] buf @noinit;
 		uint verb = 0;
 		uint from_gen = 0;

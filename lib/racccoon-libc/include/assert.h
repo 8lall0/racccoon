@@ -15,7 +15,9 @@ void __libc_assert_fail(const char *expr, const char *file, int line, const char
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define static_assert _Static_assert
+#if !defined(__cplusplus) && (!defined(__STDC_VERSION__) || __STDC_VERSION__ < 202311L)
+#define static_assert _Static_assert   /* C11; a keyword in C++ and C23 */
+#endif
 #ifdef __cplusplus
 }
 #endif

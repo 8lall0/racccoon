@@ -38,6 +38,23 @@ ninja -C "$LLVM_OUT" > "$LLVM_OUT.c3c-libs.log" 2>&1 \
 OUT="build/c3c-racccoon"
 DEFS="-DC3_SMALL_ARENAS=128 -DC3_NO_PROC_SELF_EXE -DC3_LLVM_NO_THREADS"
 DEFS="$DEFS -DAVR_DISABLE -DARM_DISABLE -DAARCH64_DISABLE -DWASM_DISABLE -DX86_DISABLE"   # one line: CMake flags can't hold a newline
+# Every host root a compile reads from, as the path it has on racccoon
+# (scripts/c3cbuild_ref.sh seeds that tree): __FILE__ strings — c3c's
+# asserts embed them — are then the same here and in c3c's rebuild of
+# itself on racccoon (c3cselftest).
+# c3c bakes __DATE__/__TIME__ into its version string: pin them (clang's
+# SOURCE_DATE_EPOCH, as a cc1 flag so it travels with the commands) to
+# racccoon's own fixed clock (src/time.c, 2026-06-01), for a reproducible
+# c3c on both machines.
+DEFS="$DEFS -Xclang -source-date-epoch -Xclang 1780272000"
+RES="$(clang -print-resource-dir)/include"
+for m in "$OUT=/src/c3c/build" "$ROOT/$OUT=/src/c3c/build" "$C3C_SRC=/src/c3c" \
+         "$ROOT/lib/racccoon-libc/include=/src/sys/libc/include" \
+         "$ROOT/build/cxx/install/include/c++/v1=/src/sys/libcxx/include" "$RES=/lib/clang/23/include" \
+         "$LLVM_SRC/llvm/include=/src/sys/llvm/include" "$ROOT/$LLVM_OUT/include=/src/sys/llvm-build/include" \
+         "$LLVM_SRC/lld/include=/src/sys/lld/include" "$ROOT/$LLVM_OUT/tools/lld/include=/src/sys/lld-build/include"; do
+  DEFS="$DEFS -ffile-prefix-map=$m"
+done
 if [ ! -e "$OUT/build.ninja" ] || [ "$0" -nt "$OUT/build.ninja" ]; then
   echo "==> c3c: configuring ($C3C_SRC)"
   rm -rf "$OUT"
@@ -47,6 +64,7 @@ if [ ! -e "$OUT/build.ninja" ] || [ "$0" -nt "$OUT/build.ninja" ]; then
     -DLLVM_DIR="$ROOT/$LLVM_OUT/lib/cmake/llvm" \
     -DLLD_DIR="$ROOT/$LLVM_OUT/lib/cmake/lld" \
     -DC3_LINK_DYNAMIC=OFF \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     "-DC3_LLD_INCLUDE_DIR=$LLVM_SRC/lld/include;$ROOT/$LLVM_OUT/tools/lld/include" \
     > "$OUT.configure.log" 2>&1 || { tail -30 "$OUT.configure.log"; exit 1; }
 fi

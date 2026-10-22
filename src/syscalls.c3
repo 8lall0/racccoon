@@ -1266,61 +1266,69 @@ fn void sys_ipc_send(Trap_frame* f) @noinline
 		// wakes us when the inbox frees. If the target exits
 		// meanwhile, ipc_wake_waiters_on wakes us and ipc_peer_gone()
 		// bails us out.
-		ipc_q_enqueue(ipc_target);
-		while (!ipc_can_deposit(ipc_target))
+		current_proc.ipc_bounced = false;
+		// Redelivery loop: a message the target never consumed can be
+		// handed back (ipc_bounced, see sys_ipc_call) — send it again.
+		while (true)
 		{
-			// Interruptible while still queued: nothing was delivered.
-			if (note_deliverable(current_proc))
+			ipc_q_enqueue(ipc_target);
+			while (!ipc_can_deposit(ipc_target))
 			{
-				ipc_q_remove(current_proc);
-				current_proc.ipc_wait_pid = 0;
-				note_interrupted(current_proc);
-				f.a0 = (ulong)(-1);
-				return;
+				// Interruptible while still queued: nothing was delivered.
+				if (note_deliverable(current_proc))
+				{
+					ipc_q_remove(current_proc);
+					current_proc.ipc_wait_pid = 0;
+					note_interrupted(current_proc);
+					f.a0 = (ulong)(-1);
+					return;
+				}
+				if (ipc_peer_gone())
+				{
+					ipc_q_remove(current_proc);
+					current_proc.ipc_wait_pid = 0;
+					current_proc.state = PROC_RUNNABLE;
+					f.a0 = (ulong)(-1);
+					return;
+				}
+				current_proc.state = PROC_BLOCKED;
+				yield();
 			}
-			if (ipc_peer_gone())
-			{
-				ipc_q_remove(current_proc);
-				current_proc.ipc_wait_pid = 0;
-				current_proc.state = PROC_RUNNABLE;
-				f.a0 = (ulong)(-1);
-				return;
-			}
-			current_proc.state = PROC_BLOCKED;
-			yield();
-		}
-		ipc_q_remove(current_proc);
+			ipc_q_remove(current_proc);
 
-		mem::copy(ipc_target.msg_data, ipc_data, (sz)ipc_copy_len);
-		ipc_target.msg_from = current_proc.pid;
-		ipc_target.msg_from_generation = current_proc.generation;
-		ipc_target.msg_type = ipc_type;
-		current_proc.msg_acked = false;
-		ipc_target.has_message = true;
-		if (ipc_target.state == PROC_BLOCKED)
-		{
-			ipc_target.state = PROC_RUNNABLE;
-		}
-
-		// True rendezvous: don't return to the caller until the
-		// receiver has actually consumed *this* message — SYS_IPC_RECV
-		// and SYS_IPC_POLL both wake us explicitly via msg_acked once
-		// they do (targeted at us specifically via msg_from, not just
-		// "the inbox looks empty again", which could just as easily
-		// mean a different sender's message arrived and got consumed
-		// instead). If the target dies still holding our message,
-		// sys_exit/sys_kill's sweep sets ipc_peer_died + wakes us.
-		while (!current_proc.msg_acked)
-		{
-			if (ipc_peer_gone())
+			mem::copy(ipc_target.msg_data, ipc_data, (sz)ipc_copy_len);
+			ipc_target.msg_from = current_proc.pid;
+			ipc_target.msg_from_generation = current_proc.generation;
+			ipc_target.msg_type = ipc_type;
+			current_proc.msg_acked = false;
+			ipc_target.has_message = true;
+			if (ipc_target.state == PROC_BLOCKED)
 			{
-				current_proc.ipc_wait_pid = 0;
-				current_proc.state = PROC_RUNNABLE;
-				f.a0 = (ulong)(-1);
-				return;
+				ipc_target.state = PROC_RUNNABLE;
 			}
-			current_proc.state = PROC_BLOCKED;
-			yield();
+
+			// True rendezvous: don't return to the caller until the
+			// receiver has actually consumed *this* message — SYS_IPC_RECV
+			// and SYS_IPC_POLL both wake us explicitly via msg_acked once
+			// they do (targeted at us specifically via msg_from, not just
+			// "the inbox looks empty again", which could just as easily
+			// mean a different sender's message arrived and got consumed
+			// instead). If the target dies still holding our message,
+			// sys_exit/sys_kill's sweep sets ipc_peer_died + wakes us.
+			while (!current_proc.msg_acked && !current_proc.ipc_bounced)
+			{
+				if (ipc_peer_gone())
+				{
+					current_proc.ipc_wait_pid = 0;
+					current_proc.state = PROC_RUNNABLE;
+					f.a0 = (ulong)(-1);
+					return;
+				}
+				current_proc.state = PROC_BLOCKED;
+				yield();
+			}
+			if (!current_proc.ipc_bounced) { break; }
+			current_proc.ipc_bounced = false;
 		}
 		current_proc.ipc_wait_pid = 0;
 		f.a0 = 0;
@@ -1460,6 +1468,23 @@ fn void sys_ipc_call(Trap_frame* f) @noinline
 		return;
 	}
 
+	// A request already delivered to us but not yet consumed (it
+	// landed after our last ipc_recv — e.g. a client's next request
+	// while we were still finishing the previous one) would otherwise
+	// be taken for call_target's reply in phase 3 below, and its sender
+	// acked as if we had read it. Hand it back instead: the sender's ack
+	// wait sees ipc_bounced and delivers it again once our call is done.
+	if (current_proc.has_message)
+	{
+		Process* pending_sender = proc_by_pid(current_proc.msg_from);
+		current_proc.has_message = false;
+		if (pending_sender != null && pending_sender.generation == current_proc.msg_from_generation)
+		{
+			pending_sender.ipc_bounced = true;
+			if (pending_sender.state == PROC_BLOCKED) { pending_sender.state = PROC_RUNNABLE; }
+		}
+	}
+
 	current_proc.ipc_wait_pid = call_dest;
 	current_proc.ipc_wait_generation = call_target.generation;
 	current_proc.ipc_peer_died = false;
@@ -1472,69 +1497,77 @@ fn void sys_ipc_call(Trap_frame* f) @noinline
 	// to us. See IPC_CALL_DEADLINE_TICKS.
 	current_proc.ipc_call_deadline = read_reg("time") + IPC_CALL_DEADLINE_TICKS;
 
-	// Phase 1: deposit the request into the target's inbox — queued
-	// FIFO behind earlier senders, asleep until ipc_inbox_freed.
-	ipc_q_enqueue(call_target);
-	while (!ipc_can_deposit(call_target))
+	// Phases 1-2 repeat if the target hands our request back unread
+	// (ipc_bounced — it started an ipc_call of its own first).
+	current_proc.ipc_bounced = false;
+	while (true)
 	{
-		// Interruptible while still queued (the request hasn't reached
-		// the server yet); from phase 2 on, the note waits until the
-		// call completes.
-		bool call_intr = note_deliverable(current_proc);
-		if (call_intr || ipc_peer_gone() || current_proc.ipc_timed_out)
+		// Phase 1: deposit the request into the target's inbox — queued
+		// FIFO behind earlier senders, asleep until ipc_inbox_freed.
+		ipc_q_enqueue(call_target);
+		while (!ipc_can_deposit(call_target))
 		{
-			if (call_intr) { current_proc.note_intr = true; }
-			ipc_q_remove(current_proc);
-			current_proc.in_call_reply_wait = false;
-			ipc_inbox_freed(current_proc);
-			current_proc.ipc_wait_pid = 0;
-			current_proc.ipc_call_deadline = 0;
-			current_proc.state = PROC_RUNNABLE;
-			f.a0 = (ulong)(-1);
-			return;
-		}
-		current_proc.state = PROC_BLOCKED;
-		yield();
-	}
-	ipc_q_remove(current_proc);
-	mem::copy(call_target.msg_data, call_buf, (sz)call_req_len);
-	call_target.msg_from = current_proc.pid;
-	call_target.msg_from_generation = current_proc.generation;
-	call_target.msg_type = call_verb;
-	current_proc.msg_acked = false;
-	call_target.has_message = true;
-	if (call_target.state == PROC_BLOCKED) { call_target.state = PROC_RUNNABLE; }
-
-	// Phase 2: wait for the target to consume the request.
-	while (!current_proc.msg_acked)
-	{
-		if (ipc_peer_gone() || current_proc.ipc_timed_out)
-		{
-			// On a timeout the target never picked our request up (still
-			// in its own init, or wedged). Pull it back out of the
-			// target's inbox — safe here because on one hart the target
-			// is not running while we are, so `has_message` still true
-			// and still ours means it was never consumed. Leaving it
-			// there is what let the supervisor watchdog kill an
-			// otherwise-fine server (see IPC_CALL_DEADLINE_TICKS).
-			if (current_proc.ipc_timed_out
-				&& call_target.has_message
-				&& call_target.msg_from == current_proc.pid
-				&& call_target.msg_from_generation == current_proc.generation)
+			// Interruptible while still queued (the request hasn't reached
+			// the server yet); from phase 2 on, the note waits until the
+			// call completes.
+			bool call_intr = note_deliverable(current_proc);
+			if (call_intr || ipc_peer_gone() || current_proc.ipc_timed_out)
 			{
-				call_target.has_message = false;
-				ipc_inbox_freed(call_target);
+				if (call_intr) { current_proc.note_intr = true; }
+				ipc_q_remove(current_proc);
+				current_proc.in_call_reply_wait = false;
+				ipc_inbox_freed(current_proc);
+				current_proc.ipc_wait_pid = 0;
+				current_proc.ipc_call_deadline = 0;
+				current_proc.state = PROC_RUNNABLE;
+				f.a0 = (ulong)(-1);
+				return;
 			}
-			current_proc.in_call_reply_wait = false;
-			ipc_inbox_freed(current_proc);
-			current_proc.ipc_wait_pid = 0;
-			current_proc.ipc_call_deadline = 0;
-			current_proc.state = PROC_RUNNABLE;
-			f.a0 = (ulong)(-1);
-			return;
+			current_proc.state = PROC_BLOCKED;
+			yield();
 		}
-		current_proc.state = PROC_BLOCKED;
-		yield();
+		ipc_q_remove(current_proc);
+		mem::copy(call_target.msg_data, call_buf, (sz)call_req_len);
+		call_target.msg_from = current_proc.pid;
+		call_target.msg_from_generation = current_proc.generation;
+		call_target.msg_type = call_verb;
+		current_proc.msg_acked = false;
+		call_target.has_message = true;
+		if (call_target.state == PROC_BLOCKED) { call_target.state = PROC_RUNNABLE; }
+
+		// Phase 2: wait for the target to consume the request.
+		while (!current_proc.msg_acked && !current_proc.ipc_bounced)
+		{
+			if (ipc_peer_gone() || current_proc.ipc_timed_out)
+			{
+				// On a timeout the target never picked our request up (still
+				// in its own init, or wedged). Pull it back out of the
+				// target's inbox — safe here because on one hart the target
+				// is not running while we are, so `has_message` still true
+				// and still ours means it was never consumed. Leaving it
+				// there is what let the supervisor watchdog kill an
+				// otherwise-fine server (see IPC_CALL_DEADLINE_TICKS).
+				if (current_proc.ipc_timed_out
+					&& call_target.has_message
+					&& call_target.msg_from == current_proc.pid
+					&& call_target.msg_from_generation == current_proc.generation)
+				{
+					call_target.has_message = false;
+					ipc_inbox_freed(call_target);
+				}
+				current_proc.in_call_reply_wait = false;
+				ipc_inbox_freed(current_proc);
+				current_proc.ipc_wait_pid = 0;
+				current_proc.ipc_call_deadline = 0;
+				current_proc.state = PROC_RUNNABLE;
+				f.a0 = (ulong)(-1);
+				return;
+			}
+			current_proc.state = PROC_BLOCKED;
+			yield();
+		}
+		if (!current_proc.ipc_bounced) { break; }
+		current_proc.ipc_bounced = false;
 	}
 
 	// Phase 3: wait for the reply. in_call_reply_wait keeps our inbox

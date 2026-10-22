@@ -302,11 +302,27 @@ static void fill_stat(struct stat *st, unsigned long size, int type)
 	st->st_blocks  = (blkcnt_t)((size + 511) / 512);
 }
 
+/* A file's identity (st_dev, st_ino). The FS protocol has no inode
+ * numbers, but racccoon has no links either, so the normalized absolute
+ * path IS the file: hash it (64-bit FNV-1a). All zeros made every file
+ * "the same file" to anything that dedups by identity — clang's
+ * FileManager handed out one file's contents for every #include. */
+static void fill_identity(struct stat *st, const char *path)
+{
+	char ap[128];
+	__rc_abspath(path, ap);
+	unsigned long h = 1469598103934665603UL;
+	for (const char *p = ap; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211UL; }
+	st->st_dev = 1;
+	st->st_ino = (ino_t)(h ? h : 1);
+}
+
 int stat(const char *path, struct stat *st)
 {
 	unsigned long size = 0; int type = 0;
 	if (__rc_fs_stat(path, &size, &type) != 0) { errno = ENOENT; return -1; }
 	fill_stat(st, size, type);
+	fill_identity(st, path);
 	return 0;
 }
 
@@ -364,6 +380,7 @@ int access(const char *path, int mode)
 /* --- directories ------------------------------------------------- */
 
 struct __dir {
+	int   fd;      /* the fd fdopendir() took over (closed by closedir), or -1 */
 	int   count;
 	int   pos;
 	struct dirent ent;
@@ -380,6 +397,7 @@ DIR *opendir(const char *path)
 
 	DIR *d = malloc(sizeof(struct __dir) + (size_t)DIR_LIST_MAX * RC_FS_LIST_ENTRY_SIZE);
 	if (!d) { errno = ENOMEM; return NULL; }
+	d->fd = -1;
 
 	int n = __rc_fs_list(path, d->buf, DIR_LIST_MAX);
 	if (n < 0) { free(d); errno = EIO; return NULL; }
@@ -403,7 +421,12 @@ struct dirent *readdir(DIR *d)
 
 void rewinddir(DIR *d) { if (d) d->pos = 0; }
 
-int closedir(DIR *d) { free(d); return 0; }
+int closedir(DIR *d)
+{
+	if (d->fd >= 0) close(d->fd);
+	free(d);
+	return 0;
+}
 
 /* --- odds and ends the ported tools reach for ------------------- */
 
@@ -662,4 +685,126 @@ char *mkdtemp(char *tmpl)
 	}
 	errno = EEXIST;
 	return 0;
+}
+
+/* --- the *at() family: dirfd + relative path -> an absolute path ------- */
+static int rc_at_path(int dirfd, const char *path, char *out, size_t cap)
+{
+	if (path[0] == '/' || dirfd == AT_FDCWD) {
+		if (strlen(path) >= cap) { errno = ENAMETOOLONG; return -1; }
+		strcpy(out, path);
+		return 0;
+	}
+	fd_init();
+	if (dirfd < 0 || dirfd >= FD_MAX || fdtab[dirfd].kind != K_FILE) { errno = EBADF; return -1; }
+	size_t dl = strlen(fdtab[dirfd].path);
+	if (dl + 1 + strlen(path) >= cap) { errno = ENAMETOOLONG; return -1; }
+	strcpy(out, fdtab[dirfd].path);
+	out[dl] = '/';
+	strcpy(out + dl + 1, path);
+	return 0;
+}
+
+int openat(int dirfd, const char *path, int flags, ...)
+{
+	char p[256];
+	if (rc_at_path(dirfd, path, p, sizeof p) != 0) return -1;
+	va_list ap;
+	va_start(ap, flags);
+	int mode = (flags & O_CREAT) ? va_arg(ap, int) : 0;
+	va_end(ap);
+	return open(p, flags, mode);
+}
+
+int unlinkat(int dirfd, const char *path, int flags)
+{
+	char p[256];
+	if (rc_at_path(dirfd, path, p, sizeof p) != 0) return -1;
+	return (flags & AT_REMOVEDIR) ? rmdir(p) : unlink(p);
+}
+
+int fstatat(int dirfd, const char *path, struct stat *st, int flags)
+{
+	(void)flags;   /* no symlinks: NOFOLLOW changes nothing */
+	char p[256];
+	if (rc_at_path(dirfd, path, p, sizeof p) != 0) return -1;
+	return stat(p, st);
+}
+
+int mkdirat(int dirfd, const char *path, mode_t mode)
+{
+	char p[256];
+	if (rc_at_path(dirfd, path, p, sizeof p) != 0) return -1;
+	return mkdir(p, mode);
+}
+
+DIR *fdopendir(int fd)
+{
+	fd_init();
+	if (fd < 0 || fd >= FD_MAX || fdtab[fd].kind != K_FILE) { errno = EBADF; return NULL; }
+	DIR *d = opendir(fdtab[fd].path);
+	if (d) d->fd = fd;
+	return d;
+}
+
+int dirfd(DIR *d)
+{
+	if (d->fd < 0) { errno = ENOTSUP; return -1; }   /* only fdopendir()'s have one */
+	return d->fd;
+}
+
+int truncate(const char *path, off_t length)
+{
+	int fd = open(path, O_WRONLY);
+	if (fd < 0) return -1;
+	int r = ftruncate(fd, length);
+	close(fd);
+	return r;
+}
+
+long pathconf(const char *path, int name)
+{
+	struct stat st;
+	if (stat(path, &st) != 0) return -1;
+	switch (name) {
+	case _PC_NAME_MAX: return 255;
+	case _PC_PATH_MAX: return PATH_MAX;
+	case _PC_LINK_MAX: return 1;
+	default: errno = EINVAL; return -1;
+	}
+}
+
+long fpathconf(int fd, int name)
+{
+	fd_init();
+	if (fd < 0 || fd >= FD_MAX || fdtab[fd].kind != K_FILE) { errno = EBADF; return -1; }
+	return pathconf(fdtab[fd].path, name);
+}
+
+/* No file times on racccoon's filesystems: setting them checks the file
+ * exists and does nothing else (like utime()). */
+#include <sys/time.h>
+int utimes(const char *path, const struct timeval times[2]) { (void)times; struct stat st; return stat(path, &st); }
+int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags)
+{
+	(void)times; (void)flags;
+	char p[256];
+	if (rc_at_path(dirfd, path, p, sizeof p) != 0) return -1;
+	struct stat st;
+	return stat(p, &st);
+}
+int futimens(int fd, const struct timespec times[2])
+{
+	(void)times;
+	fd_init();
+	if (fd < 0 || fd >= FD_MAX || fdtab[fd].kind != K_FILE) { errno = EBADF; return -1; }
+	return 0;
+}
+
+int fchmodat(int dirfd, const char *path, mode_t mode, int flags)
+{
+	(void)flags;
+	char p[256];
+	if (rc_at_path(dirfd, path, p, sizeof p) != 0) return -1;
+	return chmod(p, mode);
 }

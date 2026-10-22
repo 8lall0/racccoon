@@ -34,6 +34,27 @@ fn int lang_run_captured(char* path, char** argv, int argc, char* out, int cap) 
     return join(c, g);
 }
 
+// lang_run_captured for a whole command line ("bin/clang -c x.c …"):
+// split on spaces (no quoting) into a copy, word 0 is the program.
+fn int lang_run_line(char* line, char* out, int cap) {
+    char[1024] lb;
+    int n = 0;
+    while (line[n] != 0 && n < 1023) { lb[n] = line[n]; n++; }
+    lb[n] = 0;
+    char*[48] av;
+    int ac = 0;
+    int i = 0;
+    while (lb[i] != 0 && ac < 48) {
+        while (lb[i] == ' ') { lb[i] = 0; i++; }
+        if (lb[i] == 0) { break; }
+        av[ac] = &lb[i];
+        ac++;
+        while (lb[i] != 0 && lb[i] != ' ') { i++; }
+    }
+    if (ac == 0) { return -1; }
+    return lang_run_captured(av[0], &av[1], ac - 1, out, cap);
+}
+
 // Byte-compares two files: their common length if identical, -1 if they
 // differ (in content or size) or either can't be read.
 fn int lang_same_file(char* a, char* b) {
@@ -697,6 +718,68 @@ fn bool shell_test_lang_dispatch(char* cmd, char** cmd_argv, int cmd_argc) {
                 print(" bytes, identical to the host's)\n");
             } else {
                 print("selfbuildtest: FAILED (kernel.elf missing or differs from the host's)\n");
+            }
+        }
+    } else if (strcmp(cmd, "clangtest") == 0) {
+        // /bin/clang (build_llvm.sh) compiling C and C++ on racccoon —
+        // /src/clangtest/hello.c and cxxtest.cpp (libc++ headers), with
+        // the flags build_llvm.sh gave the host clang (same version) for
+        // /src/clangtest/*.ref.o; the objects must be identical. The C
+        // one is then linked with ld.lld and run. Skips without /bin/clang.
+        char[2048] ct_out;
+        int ct_c = lang_run_line("bin/clang --target=riscv64-unknown-elf -march=rv64imafdc -mabi=lp64d -mcmodel=medany -fno-pic -O2 -g0 -nostdinc -isystem /src/sys/libc/include -isystem /lib/clang/23/include -c /src/clangtest/hello.c -o /clangtmp_c.o", &ct_out, 2048);
+        if (ct_c == 127) {
+            print("clangtest: skipped (no /bin/clang)\n");
+        } else {
+            int ct_cx = lang_run_line("bin/clang --driver-mode=g++ --target=riscv64-unknown-elf -march=rv64imafdc -mabi=lp64d -mcmodel=medany -fno-pic -O2 -g0 -nostdinc -nostdinc++ -isystem /src/sys/libcxx/include -isystem /src/sys/libc/include -isystem /lib/clang/23/include -std=c++20 -fno-exceptions -fno-rtti -c /src/clangtest/cxxtest.cpp -o /clangtmp_cxx.o", &ct_out, 2048);
+            int ct_same_c = ct_c == 0 ? lang_same_file("/clangtmp_c.o", "/src/clangtest/clang_c.ref.o") : -1;
+            int ct_same_cx = ct_cx == 0 ? lang_same_file("/clangtmp_cxx.o", "/src/clangtest/clang_cxx.ref.o") : -1;
+            int ct_l = ct_c == 0 ? lang_run_line("bin/ld.lld -T /lib/racccoon/racccoon-libc.ld /lib/racccoon/crt0.o /clangtmp_c.o /lib/racccoon/libracccoon.a /lib/racccoon/libgcc.a -o /clangtmp", &ct_out, 2048) : -1;
+            int ct_r = ct_l == 0 ? lang_run_captured("/clangtmp", null, 0, &ct_out, 2048) : -1;
+            bool ct_ran = ct_r == 0 && lang_has_text(&ct_out, "hello from llc");
+            fs_delete("/clangtmp_c.o");
+            fs_delete("/clangtmp_cxx.o");
+            fs_delete("/clangtmp");
+            if (ct_same_c > 0 && ct_same_cx > 0 && ct_ran) {
+                print("clangtest: ok (C ");
+                print_uint((uint)ct_same_c);
+                print(" + C++ ");
+                print_uint((uint)ct_same_cx);
+                print(" bytes identical to the host clang's; linked and ran)\n");
+            } else {
+                print("clangtest: FAILED (");
+                print(ct_c != 0 ? "C compile" : ct_same_c <= 0 ? "C object differs" : ct_cx != 0 ? "C++ compile" : ct_same_cx <= 0 ? "C++ object differs" : "link/run");
+                print(")\n");
+            }
+        }
+    } else if (strcmp(cmd, "c3cselftest") == 0) {
+        // c3c compiling itself on racccoon: /src/c3c/c3cbuild.rc
+        // (scripts/c3cbuild_ref.sh) runs /bin/clang on c3c's sources and
+        // /bin/ld.lld against the LLVM/lld/libc++ archives in /src/sys/lib
+        // — the cross build's own commands. The ELF must equal
+        // /src/c3c-ref/c3c, the cross-built c3c; then that racccoon-built
+        // c3c compiles /src/c3ctest.c3, which must match the host's object.
+        // Very long under QEMU (an hour or more). Ext2 only: skips without
+        // the script.
+        uint cs_size = 0;
+        int cs_type = 0;
+        if (fs_stat("/src/c3c/c3cbuild.rc", &cs_size, &cs_type) != 0) {
+            print("c3cselftest: skipped (no /src/c3c/c3cbuild.rc)\n");
+        } else {
+            shell_run_script("/src/c3c/c3cbuild.rc", null, 0);
+            chdir("/");
+            int cs_same = lang_same_file("/src/c3c/build/c3c", "/src/c3c-ref/c3c");
+            char[1024] cs_out;
+            int cs_cc = cs_same > 0 ? lang_run_line("/src/c3c/build/c3c compile-only --target elf-riscv64 --use-stdlib=no --no-entry --single-module=yes -g0 /src/c3ctest.c3 -o /c3cselftmp.o", &cs_out, 1024) : -1;
+            int cs_obj = cs_cc == 0 ? lang_same_file("/c3cselftmp.o", "/src/racccoon-ref/c3ctest.o") : -1;
+            fs_delete("/c3cselftmp.o");
+            if (cs_same > 0 && cs_obj > 0) {
+                print("c3cselftest: ok (c3c rebuilt itself on racccoon: ");
+                print_uint((uint)cs_same);
+                print(" bytes, identical to the cross build; and it compiles identically)\n");
+            } else {
+                print(cs_same <= 0 ? "c3cselftest: FAILED (the rebuilt c3c is missing or differs)\n"
+                                   : "c3cselftest: FAILED (the rebuilt c3c's output differs)\n");
             }
         }
     } else {

@@ -102,15 +102,37 @@ bool g_shell_script_stop  = false;
 // source). Returns the status of the last line run.
 fn int shell_run_script(char* path, char** argv, int argc)
 {
-    char[SH_SCRIPT_MAX] buf @noinit;
-    int n = fs_read(path, &buf[0], SH_SCRIPT_MAX - 1);
-    if (n < 0) {
+    // The whole script, read up to its real size: a small one into the
+    // stack buffer, a bigger one into pages mapped for it (never handed
+    // back — SYS_MAP doesn't). It used to be cut at 8 KiB without a word,
+    // which ran half of a 17 KB generated build script.
+    char[SH_SCRIPT_MAX] small @noinit;
+    uint fsize = 0;
+    int ftype = 0;
+    if (fs_stat(path, &fsize, &ftype) != 0 || ftype == 1) {
         print("rc: cannot read ");
         print(path);
         print("\n");
         return 1;
     }
-    buf[n] = 0;
+    char* buf = &small[0];
+    if (fsize >= SH_SCRIPT_MAX) {
+        buf = (char*)map_pages(fsize + 1);
+        if (buf == null) { print("rc: script too big\n"); return 1; }
+    }
+    uint got = 0;
+    while (got < fsize) {
+        int r = fs_read_at(path, &buf[got], (int)(fsize - got), got);
+        if (r <= 0) { break; }
+        got += (uint)r;
+    }
+    if (got != fsize) {
+        print("rc: short read of ");
+        print(path);
+        print("\n");
+        return 1;
+    }
+    buf[got] = 0;
 
     char[SH_PARG_LEN][SH_PARG_MAX] saved_pargs = g_shell_pargs;
     int  saved_pargc = g_shell_pargc;
@@ -130,7 +152,7 @@ fn int shell_run_script(char* path, char** argv, int argc)
     // top-level `\n` / `;` and runs `if` / `for` / `while` constructs
     // (which may span lines) as units. The `#!` line and `#` comments
     // are skipped by shell_exec_stmt.
-    int status = shell_exec_block(&buf[0]);
+    int status = shell_exec_block(buf);
 
     g_shell_script_depth--;
     g_shell_pargs = saved_pargs;

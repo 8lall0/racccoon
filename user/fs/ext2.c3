@@ -84,7 +84,7 @@ const uint EXT2_SB_FREE_BLOCKS_COUNT = 12; // u32 — real hardware consequence 
                                              // (errors=remount-ro), blocking any
                                              // further writes from that side until
                                              // e2fsck -y clears it. See
-                                             // ext2_dec_free_blocks/inodes below.
+                                             // ext2_adjust_free_blocks/ext2_dec_free_inodes below.
 const uint EXT2_SB_FREE_INODES_COUNT = 16; // u32, same reasoning
 const uint EXT2_SB_MAGIC             = 56; // u16, must be 0xEF53
 const uint EXT2_SB_REV_LEVEL         = 76; // u32, 0 = original (fixed 128-byte inodes), >=1 = dynamic
@@ -947,6 +947,11 @@ fn void ext2_mount()
 	uint* inodes_count_field = (uint*)&sb_sector[EXT2_SB_INODES_COUNT];
 	ext2_group_count = (*inodes_count_field + ext2_inodes_per_group - 1) / ext2_inodes_per_group;
 	if (ext2_group_count > EXT2_MAX_GROUPS) ext2_group_count = EXT2_MAX_GROUPS;
+	ext2_block_group_hint = 0;   // allocation hints start over per mount
+	ext2_inode_group_hint = 0;
+	ext2_bm.loaded = false;    // a new mount: nothing cached
+	ext2_bm.dirty = false;
+	ext2_bm.delta = 0;
 
 	uint descriptors_per_block = ext2_block_size / EXT2_BGD_SIZE;
 	uint bgdt_blocks_needed = (ext2_group_count + descriptors_per_block - 1) / descriptors_per_block;
@@ -987,11 +992,12 @@ fn void ext2_mount()
 
 // --- Write path -------------------------------------------------------
 
-// Decrements both copies of the free-block count (superblock's global
+// Adjusts both copies of the free-block count (superblock's global
 // s_free_blocks_count, and `group`'s own bg_free_blocks_count in the
 // block group descriptor table — not always group 0 anymore, since
-// ext2_alloc_block() below now allocates from any group) by one —
-// called once per successful allocation. See EXT2_SB_FREE_BLOCKS_
+// ext2_alloc_block() below now allocates from any group) by `delta`
+// (negative: blocks allocated) — called by ext2_bm_flush_group() with
+// the net change since the last flush. See EXT2_SB_FREE_BLOCKS_
 // COUNT's own comment for why this isn't just a cosmetic e2fsck
 // complaint: a real Linux box's ext2 driver checks this at mount time
 // and auto-remounts read-only if it's wrong, found the hard way while
@@ -1002,12 +1008,12 @@ fn void ext2_mount()
 // block writes (superblock lives in a fixed sector, the BGDT in a
 // block) — same "each copy independently read-modify-written" shape
 // as fat32_write_fat_entry's multiple FAT copies.
-fn bool ext2_dec_free_blocks(uint group)
+fn bool ext2_adjust_free_blocks(uint group, int delta)
 {
 	char[SECTOR_SIZE] sb_sector @noinit;
 	if (!fs_read_sector(EXT2_SUPERBLOCK_SECTOR, &sb_sector)) return false;
 	uint* sb_free = (uint*)&sb_sector[EXT2_SB_FREE_BLOCKS_COUNT];
-	*sb_free -= 1;
+	*sb_free = (uint)((int)*sb_free + delta);
 	if (!fs_write_sector(EXT2_SUPERBLOCK_SECTOR, &sb_sector)) return false;
 
 	uint descriptors_per_block = ext2_block_size / EXT2_BGD_SIZE;
@@ -1017,11 +1023,11 @@ fn bool ext2_dec_free_blocks(uint group)
 	char[EXT2_MAX_BLOCK_SIZE] bgdt_buf @noinit;
 	if (!ext2_read_block(bgdt_block, &bgdt_buf)) return false;
 	ushort* bg_free = (ushort*)&bgdt_buf[offset_in_block];
-	*bg_free -= 1;
+	*bg_free = (ushort)((int)*bg_free + delta);
 	return ext2_write_block(bgdt_block, &bgdt_buf);
 }
 
-// Same shape as ext2_dec_free_blocks(), for inodes — called once per
+// Same shape as ext2_adjust_free_blocks(), for inodes, by one — called once per
 // successful ext2_alloc_inode().
 fn bool ext2_dec_free_inodes(uint group)
 {
@@ -1039,27 +1045,6 @@ fn bool ext2_dec_free_inodes(uint group)
 	if (!ext2_read_block(bgdt_block, &bgdt_buf)) return false;
 	ushort* bg_free = (ushort*)&bgdt_buf[offset_in_block];
 	*bg_free -= 1;
-	return ext2_write_block(bgdt_block, &bgdt_buf);
-}
-
-// Same shape as ext2_dec_free_blocks(), incrementing instead — called
-// once per successful ext2_free_block().
-fn bool ext2_inc_free_blocks(uint group)
-{
-	char[SECTOR_SIZE] sb_sector @noinit;
-	if (!fs_read_sector(EXT2_SUPERBLOCK_SECTOR, &sb_sector)) return false;
-	uint* sb_free = (uint*)&sb_sector[EXT2_SB_FREE_BLOCKS_COUNT];
-	*sb_free += 1;
-	if (!fs_write_sector(EXT2_SUPERBLOCK_SECTOR, &sb_sector)) return false;
-
-	uint descriptors_per_block = ext2_block_size / EXT2_BGD_SIZE;
-	uint bgdt_block = ext2_first_data_block + 1 + (group / descriptors_per_block);
-	uint offset_in_block = (group % descriptors_per_block) * EXT2_BGD_SIZE + EXT2_BGD_FREE_BLOCKS_COUNT;
-
-	char[EXT2_MAX_BLOCK_SIZE] bgdt_buf @noinit;
-	if (!ext2_read_block(bgdt_block, &bgdt_buf)) return false;
-	ushort* bg_free = (ushort*)&bgdt_buf[offset_in_block];
-	*bg_free += 1;
 	return ext2_write_block(bgdt_block, &bgdt_buf);
 }
 
@@ -1128,26 +1113,93 @@ fn bool ext2_inc_used_dirs(uint group)
 // is always either unused or the boot block, never allocatable) once
 // every group has been scanned with nothing free, or on any read/write
 // failure along the way.
+// Groups are scanned starting at the last one that had a free block
+// (wrapping around), not from group 0: a file grown block by block on a
+// mostly-full disk otherwise re-read every full group's bitmap for every
+// single block — ~25 KB/s writing a big file (2026-10-22).
+uint ext2_block_group_hint;
+uint ext2_inode_group_hint;
+
+// Block bitmaps go through a write-back cache of one group's bitmap
+// (2026-10-22). Writing it, plus the group descriptor's and the
+// superblock's free counts, for every block cost six disk round trips
+// per block: a 66 MiB file took ~18 min to write and longer than the
+// client's 15 s IPC deadline to delete. Now alloc/free only flip bits
+// in memory and keep a running count delta; the bitmap and the counts
+// reach the disk when the next block lands in another group, or at
+// ext2_sync(), which fsd's loop runs before taking the next request —
+// so between requests the disk is always consistent. Every block-bitmap
+// access goes through here, so the cached copy is never stale.
+struct Ext2_bitmap_cache
+{
+	bool loaded;
+	bool dirty;
+	uint group;
+	int delta;       // net free-count change not yet on disk
+	uint scan_from;  // bytes below this are all 0xFF (allocated)
+	char[EXT2_MAX_BLOCK_SIZE] bitmap;
+}
+Ext2_bitmap_cache ext2_bm;
+
+fn bool ext2_bm_flush_group()
+{
+	if (!ext2_bm.loaded) return true;
+	if (ext2_bm.dirty)
+	{
+		if (!ext2_write_block(ext2_block_bitmap_blocks[ext2_bm.group], &ext2_bm.bitmap)) return false;
+		ext2_bm.dirty = false;
+	}
+	if (ext2_bm.delta != 0)
+	{
+		if (!ext2_adjust_free_blocks(ext2_bm.group, ext2_bm.delta)) return false;
+		ext2_bm.delta = 0;
+	}
+	return true;
+}
+
+fn bool ext2_bm_load(uint group)
+{
+	if (ext2_bm.loaded && ext2_bm.group == group) return true;
+	if (!ext2_bm_flush_group()) return false;
+	ext2_bm.loaded = false;
+	if (!ext2_read_block(ext2_block_bitmap_blocks[group], &ext2_bm.bitmap)) return false;
+	ext2_bm.loaded = true;
+	ext2_bm.group = group;
+	ext2_bm.scan_from = 0;
+	return true;
+}
+
+// Puts the cached bitmap and the free counts on disk. Run by fsd after
+// every request (Fs_ops.sync).
+fn void ext2_sync()
+{
+	ext2_bm_flush_group();
+}
+
 fn uint ext2_alloc_block()
 {
-	for (uint group = 0; group < ext2_group_count; group++)
+	uint bytes = ext2_blocks_per_group / 8;
+	for (uint k = 0; k < ext2_group_count; k++)
 	{
-		char[EXT2_MAX_BLOCK_SIZE] bitmap_buf @noinit;
-		if (!ext2_read_block(ext2_block_bitmap_blocks[group], &bitmap_buf)) return 0;
+		uint group = (ext2_block_group_hint + k) % ext2_group_count;
+		if (!ext2_bm_load(group)) return 0;
 
-		for (uint i = 0; i < ext2_blocks_per_group; i++)
+		for (uint byte_i = ext2_bm.scan_from; byte_i < bytes; byte_i++)
 		{
-			uint byte_i = i / 8;
-			uint bit_i = i % 8;
-			uint b = (uint)bitmap_buf[byte_i] & 0xFF;
-			if ((b & (1 << bit_i)) == 0)
+			uint b = (uint)ext2_bm.bitmap[byte_i] & 0xFF;
+			if (b == 0xFF) continue;
+			for (uint bit_i = 0; bit_i < 8; bit_i++)
 			{
-				bitmap_buf[byte_i] = (char)(b | (1 << bit_i));
-				if (!ext2_write_block(ext2_block_bitmap_blocks[group], &bitmap_buf)) return 0;
-				if (!ext2_dec_free_blocks(group)) return 0;
-				return ext2_first_data_block + group * ext2_blocks_per_group + i;
+				if ((b & (1 << bit_i)) != 0) continue;
+				ext2_bm.bitmap[byte_i] = (char)(b | (1 << bit_i));
+				ext2_bm.dirty = true;
+				ext2_bm.delta -= 1;
+				ext2_bm.scan_from = byte_i;
+				ext2_block_group_hint = group;
+				return ext2_first_data_block + group * ext2_blocks_per_group + byte_i * 8 + bit_i;
 			}
 		}
+		ext2_bm.scan_from = bytes;   // group full
 	}
 	return 0;
 }
@@ -1159,8 +1211,9 @@ fn uint ext2_alloc_block()
 // no special-cased reserved-inode-number logic needed.
 fn uint ext2_alloc_inode()
 {
-	for (uint group = 0; group < ext2_group_count; group++)
+	for (uint k = 0; k < ext2_group_count; k++)
 	{
+		uint group = (ext2_inode_group_hint + k) % ext2_group_count;
 		char[EXT2_MAX_BLOCK_SIZE] bitmap_buf @noinit;
 		if (!ext2_read_block(ext2_inode_bitmap_blocks[group], &bitmap_buf)) return 0;
 
@@ -1174,6 +1227,7 @@ fn uint ext2_alloc_inode()
 				bitmap_buf[byte_i] = (char)(b | (1 << bit_i));
 				if (!ext2_write_block(ext2_inode_bitmap_blocks[group], &bitmap_buf)) return 0;
 				if (!ext2_dec_free_inodes(group)) return 0;
+				ext2_inode_group_hint = group;
 				return group * ext2_inodes_per_group + i + 1;
 			}
 		}
@@ -1191,15 +1245,18 @@ fn bool ext2_free_block(uint block)
 	uint group = (block - ext2_first_data_block) / ext2_blocks_per_group;
 	uint bit_index = (block - ext2_first_data_block) % ext2_blocks_per_group;
 	if (group >= ext2_group_count) return false;
+	if (!ext2_bm_load(group)) return false;
 
-	char[EXT2_MAX_BLOCK_SIZE] bitmap_buf @noinit;
-	if (!ext2_read_block(ext2_block_bitmap_blocks[group], &bitmap_buf)) return false;
 	uint byte_i = bit_index / 8;
-	uint bit_i = bit_index % 8;
-	uint b = (uint)bitmap_buf[byte_i] & 0xFF;
-	bitmap_buf[byte_i] = (char)(b & ~(1 << bit_i));
-	if (!ext2_write_block(ext2_block_bitmap_blocks[group], &bitmap_buf)) return false;
-	return ext2_inc_free_blocks(group);
+	uint b = (uint)ext2_bm.bitmap[byte_i] & 0xFF;
+	uint mask = 1 << (bit_index % 8);
+	// Only count a bit that was set: a block freed twice must not inflate the free counts.
+	if ((b & mask) == 0) return true;
+	ext2_bm.bitmap[byte_i] = (char)(b & ~mask);
+	ext2_bm.dirty = true;
+	ext2_bm.delta += 1;
+	if (byte_i < ext2_bm.scan_from) ext2_bm.scan_from = byte_i;
+	return true;
 }
 
 // Frees every block a file occupies: the 12 direct blocks, then — if
@@ -1207,8 +1264,8 @@ fn bool ext2_free_block(uint block)
 // blocks that addressed them (ext2_ensure_block_for_write may have
 // allocated all of those when a write grew the file). Reads `inode`'s
 // in-memory copy (already loaded by the caller); doesn't touch the inode
-// record itself. Triple-indirect isn't walked — this driver never
-// writes one, so a file it created can't have one.
+// record itself. Triple-indirect too: this driver writes them since
+// 2026-10-22, and a file written by Linux can have one.
 fn bool ext2_free_data_and_indirect(Ext2_inode_info* inode)
 {
 	for (uint b = 0; b < 12; b++)
@@ -1251,6 +1308,35 @@ fn bool ext2_free_data_and_indirect(Ext2_inode_info* inode)
 			if (!ext2_free_block(top_ptrs[t])) return false;
 		}
 		if (!ext2_free_block(inode.double_indirect_block)) return false;
+	}
+
+	if (inode.triple_indirect_block != 0)
+	{
+		char[EXT2_MAX_BLOCK_SIZE] l1_buf @noinit;
+		if (!ext2_read_block(inode.triple_indirect_block, &l1_buf)) return false;
+		uint* l1 = (uint*)&l1_buf;
+		for (uint a = 0; a < n; a++)
+		{
+			if (l1[a] == 0) continue;
+			char[EXT2_MAX_BLOCK_SIZE] l2_buf @noinit;
+			if (!ext2_read_block(l1[a], &l2_buf)) return false;
+			uint* l2 = (uint*)&l2_buf;
+			for (uint t = 0; t < n; t++)
+			{
+				if (l2[t] == 0) continue;
+				char[EXT2_MAX_BLOCK_SIZE] l3_buf @noinit;
+				if (!ext2_read_block(l2[t], &l3_buf)) return false;
+				uint* l3 = (uint*)&l3_buf;
+				for (uint i = 0; i < n; i++)
+				{
+					if (l3[i] == 0) continue;
+					if (!ext2_free_block(l3[i])) return false;
+				}
+				if (!ext2_free_block(l2[t])) return false;
+			}
+			if (!ext2_free_block(l1[a])) return false;
+		}
+		if (!ext2_free_block(inode.triple_indirect_block)) return false;
 	}
 
 	return true;
@@ -1337,10 +1423,10 @@ fn bool ext2_write_inode(uint inode_num, Ext2_inode_info* info)
 // ext2 counts indirect blocks in i_blocks), so the caller can bump
 // inode.blocks correctly.
 //
-// Returns 0 on allocation failure or for a `b` past double-indirect
-// reach (12 + n + n*n, n = ext2_block_size/4). Triple-indirect writes
-// aren't supported: with 1 KiB blocks double-indirect already reaches
-// ~64 MiB, past anything this project writes, and i_size is 32-bit.
+// Returns 0 on allocation failure or for a `b` past triple-indirect
+// reach (12 + n + n*n + n*n*n, n = ext2_block_size/4). With 1 KiB blocks
+// double-indirect stops at ~64 MiB — c3c's own ELF, linked on racccoon,
+// is 98 MB (2026-10-22) — so the triple level is walked too.
 fn uint ext2_ensure_block_for_write(Ext2_inode_info* inode, uint b, uint* new_blocks, bool* data_new)
 {
 	*data_new = false;
@@ -1433,7 +1519,67 @@ fn uint ext2_ensure_block_for_write(Ext2_inode_info* inode, uint b, uint* new_bl
 		return mid_ptrs[leaf_idx];
 	}
 
-	return 0; // past double-indirect reach — see this function's own comment
+	// --- triple indirect: i_block[14] -> n blocks -> n blocks -> n pointers ---
+	if ((ulong)b < (ulong)12 + n + (ulong)n * n + (ulong)n * n * n)
+	{
+		uint rel = b - (12 + n + n * n);
+		uint i1 = rel / (n * n);
+		uint i2 = (rel / n) % n;
+		uint i3 = rel % n;
+		if (inode.triple_indirect_block == 0)
+		{
+			uint tb = ext2_alloc_block();
+			if (tb == 0) return 0;
+			for (uint i = 0; i < ext2_block_size; i++) top_buf[i] = 0;
+			if (!ext2_write_block(tb, &top_buf)) return 0;
+			inode.triple_indirect_block = tb;
+			*new_blocks += 1;
+		}
+		// level 1: i_block[14]'s pointers
+		if (!ext2_read_block(inode.triple_indirect_block, &top_buf)) return 0;
+		uint* l1 = (uint*)&top_buf;
+		uint b2 = l1[i1];
+		if (b2 == 0)
+		{
+			b2 = ext2_alloc_block();
+			if (b2 == 0) return 0;
+			for (uint i = 0; i < ext2_block_size; i++) mid_buf[i] = 0;
+			if (!ext2_write_block(b2, &mid_buf)) return 0;
+			l1[i1] = b2;
+			if (!ext2_write_block(inode.triple_indirect_block, &top_buf)) return 0;
+			*new_blocks += 1;
+		}
+		// level 2 (top_buf is free again: level 1 is written back)
+		if (!ext2_read_block(b2, &top_buf)) return 0;
+		uint* l2 = (uint*)&top_buf;
+		uint b3 = l2[i2];
+		if (b3 == 0)
+		{
+			b3 = ext2_alloc_block();
+			if (b3 == 0) return 0;
+			for (uint i = 0; i < ext2_block_size; i++) mid_buf[i] = 0;
+			if (!ext2_write_block(b3, &mid_buf)) return 0;
+			l2[i2] = b3;
+			if (!ext2_write_block(b2, &top_buf)) return 0;
+			*new_blocks += 1;
+		}
+		// level 3: the data block pointers
+		if (!ext2_read_block(b3, &mid_buf)) return 0;
+		uint* l3 = (uint*)&mid_buf;
+		if (l3[i3] == 0)
+		{
+			uint db = ext2_alloc_block();
+			if (db == 0) return 0;
+			l3[i3] = db;
+			if (!ext2_write_block(b3, &mid_buf)) return 0;
+			*new_blocks += 1;
+			*data_new = true;
+			return db;
+		}
+		return l3[i3];
+	}
+
+	return 0; // past triple-indirect reach — see this function's own comment
 }
 
 // Zeroes a freshly allocated inode's ENTIRE on-disk record (all
@@ -1735,14 +1881,14 @@ fn uint ext2_write_file(Ext2_inode_info* inode, char* src, uint len)
 // new data, while inode.size claims they're valid content, would
 // silently corrupt every future read of this file. So offset >
 // inode.size is rejected outright (-1), same as offset already being
-// at/past the double-indirect reach (12 + n + n*n blocks — see
+// at/past the triple-indirect reach (12 + n + n*n + n*n*n blocks — see
 // ext2_ensure_block_for_write()).
 // That still covers both real pwrite use cases this project needs:
 // overwriting existing bytes anywhere in the file, and appending
 // exactly at the current end (offset == inode.size) to grow it.
 //
 // Per logical block, ext2_ensure_block_for_write() returns the real
-// on-disk block, allocating the data block and any single/double
+// on-disk block, allocating the data block and any single/double/triple
 // indirect pointer blocks needed to address it, and reports (via
 // data_new) whether the data block itself is fresh so a partial write
 // zero-fills rather than reading stale on-disk content. A partial write
@@ -1752,7 +1898,7 @@ fn uint ext2_write_file(Ext2_inode_info* inode, char* src, uint len)
 // end, by the right amount.
 //
 // Returns bytes actually written (a short write, not an error, if len
-// would run past the double-indirect ceiling), or -1 for either
+// would run past the triple-indirect ceiling), or -1 for either
 // invariant violation above. The
 // caller is responsible for growing inode.size (never shrinking it)
 // and writing the inode back — this function only ever touches
@@ -1762,14 +1908,14 @@ fn int ext2_write_file_at(Ext2_inode_info* inode, char* src, uint len, uint offs
 {
 	if (offset > inode.size) return -1;
 
-	// Reach: 12 direct + single-indirect (n) + double-indirect (n*n)
+	// Reach: 12 direct + single (n) + double (n*n) + triple (n*n*n)
 	// blocks, n = ext2_block_size/4. Computed in 64-bit and clamped to
-	// 0xFFFFFFFF — with a 4 KiB block n=1024 and the block count alone
-	// overflows uint32 at the double-indirect ceiling, well past i_size's
-	// own 32-bit range anyway. ext2_ensure_block_for_write() returns 0
-	// (a short write here, not an error) for anything past this.
+	// 0xFFFFFFFF — i_size is 32-bit, so 4 GiB is the real ceiling with
+	// any block size (1 KiB blocks reach ~16 GiB through triple).
+	// ext2_ensure_block_for_write() returns 0 (a short write here, not an
+	// error) for anything past this.
 	uint n = ext2_block_size / 4;
-	ulong reach = ((ulong)12 + (ulong)n + (ulong)n * (ulong)n) * (ulong)ext2_block_size;
+	ulong reach = ((ulong)12 + (ulong)n + (ulong)n * (ulong)n + (ulong)n * (ulong)n * (ulong)n) * (ulong)ext2_block_size;
 	uint max_offset = reach > 0xFFFFFFFF ? 0xFFFFFFFF : (uint)reach;
 	if (offset >= max_offset) return -1;
 

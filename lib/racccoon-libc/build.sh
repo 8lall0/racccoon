@@ -104,10 +104,10 @@ cp "$OUT/obj/start_mapped.o" "$OUT/crt0_mapped.o"
 rm -f "$OUT/libracccoon.a"
 ar rcs "$OUT/libracccoon.a" $(ls "$OUT"/obj/*.o | grep -v -E '/start(_mapped)?\.o$')
 # The math, thread and clock functions all live in libracccoon.a; empty
-# libm.a / libpthread.a / librt.a let ported build systems link with the
-# customary -lm -lpthread -lrt (LLVM's CMake, and libc++'s autolink
-# requests for pthread and rt).
-for l in m pthread rt; do
+# libm.a / libpthread.a / librt.a / libdl.a let ported build systems link
+# with the customary -lm -lpthread -lrt -ldl (LLVM's and c3c's CMake, and
+# libc++'s autolink requests for pthread and rt).
+for l in m pthread rt dl; do
   rm -f "$OUT/lib$l.a"
   ar rc "$OUT/lib$l.a"
 done

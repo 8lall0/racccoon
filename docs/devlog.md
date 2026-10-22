@@ -3,6 +3,128 @@
 Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
+## 2026-10-22 (night) — LLVM milestone 6: clang on racccoon, and c3c compiles itself
+
+**Goal: c3c builds c3c on racccoon.** c3c is 111 C files plus one C++ file
+(`wrapper.cpp`, the LLVM/lld C++ API glue), so racccoon needed a C/C++
+compiler. The user picked porting clang over tcc. LLVM's own libraries are
+**not** rebuilt on racccoon (thousands of C++ files: days under QEMU). c3c's
+sources are compiled on racccoon and linked against the cross-built
+LLVM/lld/libc++ archives, which are seeded on the disk, the same way c3c's
+own build links them.
+
+**c3c rebuilt itself on racccoon.** `c3cselftest` runs on racccoon:
+- `/bin/clang` compiles c3c's 113 sources (C, and the C++ wrapper);
+- `/bin/llvm-ar` makes its 3 archives;
+- `/bin/ld.lld` links the result into a 98,609,824-byte c3c,
+  **byte-identical** to the cross-built c3c.
+
+That new c3c then compiles c3ctest's file to an object identical to the
+reference. 2 h 47 min under QEMU, ext2, e2fsck clean.
+
+- **clang 23.1.3 on racccoon:**
+  - `build_llvm.sh` now builds `clang;lld`. Tablegen is the host's
+    `clang-tblgen` (same version). The static analyzer, ARCMT, ObjC rewriter,
+    plugins, tests and docs are off.
+  - Result: `/bin/clang`, 51.2 MiB flat, under the 128 MiB exec cap. C++ is
+    `clang --driver-mode=g++`, since racccoon has no symlinks.
+  - `/bin/llvm-ar` (archives, `llvm-ar s` = ranlib). c3c's build makes three
+    archives.
+  - The resource headers are seeded as `/lib/clang/23/include`.
+  - `build_llvm.sh` reconfigures only when its cmake arguments or toolchain
+    files change (a config hash in `.rc-config`). Editing the script used to
+    trigger a full LLVM rebuild.
+  - `clangtest` compiles a C file and a C++ file on racccoon. Both objects
+    are **byte-identical** to the host clang's (C 2,760 B, C++ 36,432 B).
+    It then links and runs the C one. ~100 s.
+- **libc, for clang:**
+  - `assert.h` defined `static_assert` as a macro in C++ too, which broke
+    clang's keyword table. It's now C-only (pre-C23).
+  - clang reads files with `std::ifstream`, which libc++ only builds with
+    `LIBCXX_ENABLE_FILESYSTEM=ON`. That needed: `st_atim`/`st_mtim`/`st_ctim`
+    timespecs; `openat`/`unlinkat`/`fstatat`/`mkdirat`/`fchmodat` + `AT_*`
+    (relative to an `open(dir)` fd's path); `fdopendir`/`dirfd`;
+    `truncate`; `pathconf`/`fpathconf`; `utimes`/`utimensat`/`futimens`
+    (the filesystems keep no times, so these only check the file exists);
+    `O_NOFOLLOW`.
+  - Empty `libdl.a` next to `libm`/`libpthread`/`librt`, because c3c links `-ldl`.
+- **Bug: `stat()` gave every file `st_ino` 0.** clang's FileManager
+  dedupes files by (st_dev, st_ino), so every header *was* the first file
+  opened. The C++ test failed with cxxtest.cpp's own lines reported
+  "inside `<algorithm>`".
+  - `stat` now fills a per-path identity: FNV-1a 64 of the normalized
+    absolute path, `st_dev` 1. No hard links, so the path is the file.
+- **The device build** (`scripts/c3cbuild_ref.sh`, run by build.sh):
+  - `build_c3c.sh` exports `compile_commands.json`. A Python step turns it
+    and `ninja -t commands` into `/src/c3c/c3cbuild.rc`: 113 compiles, 3
+    archives, 1 ld.lld link.
+  - Compile flags go in response files (`/src/c3c/rsp/N.rsp`, 4 distinct
+    sets) because a shell command is capped at 1 KiB.
+  - It stages c3c's sources, the generated headers, LLVM/lld headers and
+    the 297 MB of archives (`/src/sys/lib`), about 446 MB in all, so it is
+    ext2 only. **The ext2 test image goes 448 MiB → 2 GiB.** It's
+    disk only, so QEMU's RAM use doesn't change.
+  - Reproducibility: the cross build uses `-ffile-prefix-map` from every
+    host root to its device path, so c3c's `__FILE__` assert strings match.
+    `-source-date-epoch` pins `__DATE__`/`__TIME__`: the first full run
+    differed only in `compiler.c.o`'s build date.
+  - `c3cselftest` runs the script in-process, compares the result with
+    the cross-built c3c, then has the new c3c compile c3ctest's file and
+    compares that object too.
+- **Shell: scripts over 8 KiB were silently cut.** `shell_run_script`
+  read one 8 KiB buffer. `c3cbuild.rc` is longer, and the first run
+  stopped mid-compile list. It now reads the whole file: a stack buffer
+  under 8 KiB, `map_pages` above, and "rc: short read" on a short read.
+- **ext2: files past 64.3 MiB.** The first full self-build compiled
+  everything (1 h 48 min), then the link failed with "failed to open
+  c3c: Input/output error". c3c is 98 MB, and with 1 KiB blocks
+  double-indirect stops at 12 + 256 + 256² KiB.
+  - **Triple-indirect** reads, writes and frees are in. Files go up to
+    the 4 GiB a 32-bit size allows.
+  - **Allocation group hint.** Every allocation scanned from group 0, so a
+    big file re-read every full group's bitmap per block: ~25 KB/s.
+  - **Deleting a 66 MiB file failed** ("rm: failed", e2fsck: ~66 K
+    blocks marked used with no owner). Each freed block cost six disk
+    round trips (bitmap, superblock, group descriptor, each read +
+    written), ~150 blocks/s. The client's 15 s IPC deadline expired while
+    fsd was still freeing.
+  - Fix: **a write-back cache of one group's block bitmap**
+    (`ext2_bm`) for both allocate and free. Bits flip in memory, and the
+    free-count change accumulates. The bitmap and both counts reach the
+    disk when allocation moves to another group, or in `ext2_sync()`.
+    fsd runs that (new `Fs_ops.sync`) before every `ipc_recv`, so the disk
+    is consistent whenever fsd is idle.
+  - `hugefiletest` (new, `test/c-src`): write 66 MiB, read it all back
+    checking every byte, delete. Passes, and e2fsck is clean with the
+    image's counts back to the original.
+- **Kernel IPC bug, found by that cache:** a message already in a server's
+  inbox when the server starts an `ipc_call` of its own was **taken as
+  the callee's reply**. Phase 3 just waited for `has_message`, which was
+  already true, and the real sender was acked as if its message had been
+  read.
+  - fsd's new sync runs right after a reply, while the client is already
+    sending its next request, so the next diskd call ate it every time:
+    p9fswritetest's read after a write failed.
+  - Before this it needed a server to be preempted between two calls of
+    its own while another client sent, so it was rare but real.
+  - Fix: `sys_ipc_call` hands such a message back (`Process.ipc_bounced`,
+    sender woken). `sys_ipc_send` and `sys_ipc_call` wrap their deposit +
+    ack wait in a loop that delivers it again once the inbox frees.
+- **FAT32 test image 256 → 512 MiB.** clang and its headers took it to
+  97%, and `selfbuildtest` failed there with diskd + fsd killed as wedged
+  mid-link. Not chased further on the full image. On 512 MiB it passes.
+- **Harness:** the 2 GiB image copies hit the /tmp quota (EDQUOT), so test
+  copies now live in `build/qtest_*.img`.
+- **Verified:** the full QEMU suite on FAT32 and ext2 matches the baseline.
+  - cxxtest, llvmtest, llctest, lldtest, c3ctest, selfbuildtest and
+    clangtest pass on both.
+  - hugefiletest passes on ext2.
+  - c3cselftest passes on ext2 (above). Two earlier runs timed out at the
+    harness's 3 h limit while ld.lld was still writing the output (91 and
+    96 MB written), so the limit is now 5 h.
+  - fsck clean.
+
+---
 ## 2026-10-22 (later) — LLVM milestone 5: c3c on racccoon, and racccoon builds its own kernel
 
 **racccoon compiles and links its own kernel.** `selfbuildtest`:

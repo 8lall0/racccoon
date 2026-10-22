@@ -21,6 +21,15 @@ extern "C" {
 #define O_NONBLOCK  04000      /* accepted, ignored */
 #define O_CLOEXEC   02000000   /* accepted, ignored (no exec fd inheritance yet) */
 #define O_DIRECTORY 0200000
+#define O_NOFOLLOW  0400000    /* accepted: racccoon has no symlinks */
+
+/* The *at() family (rc_posix.c): a relative path is taken relative to the
+ * directory dirfd was opened on (open(dir, O_DIRECTORY)), or the cwd for
+ * AT_FDCWD. */
+#define AT_FDCWD            (-100)
+#define AT_SYMLINK_NOFOLLOW 0x100
+#define AT_REMOVEDIR        0x200
+#define AT_SYMLINK_FOLLOW   0x400
 
 /* fcntl commands — mostly accepted-and-ignored for now */
 #define F_DUPFD  0
@@ -49,6 +58,7 @@ struct flock {
 int open(const char *path, int flags, ...);
 int creat(const char *path, mode_t mode);
 int fcntl(int fd, int cmd, ...);
+int openat(int dirfd, const char *path, int flags, ...);
 
 #ifdef __cplusplus
 }

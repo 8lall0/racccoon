@@ -19,6 +19,7 @@ struct timezone {
 /* No wall clock — fills the struct from the `time` CSR (µs since boot)
  * so a bench delta is still meaningful; tz is zeroed. Always returns 0. */
 int gettimeofday(struct timeval *tv, void *tz);
+int utimes(const char *path, const struct timeval times[2]);   /* no file times: checks existence */
 
 #ifdef __cplusplus
 }

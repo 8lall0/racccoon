@@ -45,6 +45,8 @@ ext2_seed_tree() {
   # c3c itself, LLVM backend + lld inside, for racccoon (/bin/c3c). Needs
   # C3C_SRC (default ~/Workspace/c3c-llvm); no-op without it.
   bash lib/racccoon-libc/build_c3c.sh
+  # ...and the tree for c3c rebuilding itself on racccoon (c3cselftest).
+  bash scripts/c3cbuild_ref.sh
 
   # TinyCC, cross-built against that libc (roadmap §7.7). No-ops unless
   # the third_party/tinycc submodule is checked out. Produces
@@ -146,9 +148,10 @@ ext2_seed_tree() {
   # `-F 32` forces FAT32 specifically: dosfstools defaults to FAT16 below
   # its own size threshold, and fsd.c3 only parses the FAT32 BPB layout.
   # mtools' mcopy writes into the image directly, no root/loop-mount
-  # needed. 256 MiB: the LLVM tools (llc 28 MiB, ld.lld 32 MiB) filled 64.
+  # needed. 512 MiB: the LLVM tools (llc 28 MiB, ld.lld 32 MiB) filled 64;
+  # clang (51 MiB) + its headers left 256 too full for selfbuildtest.
   rm -f build/disk.img
-  dd if=/dev/zero of=build/disk.img bs=1M count=256 status=none
+  dd if=/dev/zero of=build/disk.img bs=1M count=512 status=none
   mkfs.vfat -F 32 build/disk.img > /dev/null
   mcopy -i build/disk.img disk/*.txt ::
   mcopy -i build/disk.img disk/greet.rc ::greet.rc   # §2.5 shell-script fixture
@@ -272,7 +275,10 @@ ext2_seed_tree() {
   # tool binaries) plus a prepopulated build cache is ~60 MiB on top of
   # the Stage 4.3 toolchain payload. 458752 1-KiB blocks / 8192 per
   # group = 56 groups, far under ext2.c3's EXT2_MAX_GROUPS (2048).
-  dd if=/dev/zero of=build/disk_ext2.img bs=1M count=448 status=none
+  # 2 GiB since c3c's self-build (c3cselftest) seeds ~330 MB of LLVM
+  # archives + headers: 2097152 1-KiB blocks / 8192 = 256 groups, still
+  # far under EXT2_MAX_GROUPS.
+  dd if=/dev/zero of=build/disk_ext2.img bs=1M count=2048 status=none
   mke2fs -q -F -b 1024 build/disk_ext2.img
   debugfs -w -R "write disk-ext2/hello.txt hello.txt" build/disk_ext2.img > /dev/null
   debugfs -w -R "write disk-ext2/greet.rc greet.rc" build/disk_ext2.img > /dev/null   # §2.5 shell-script fixture
@@ -522,6 +528,9 @@ GOEOF
   bash scripts/selfbuild_ref.sh
   bash scripts/seed_selfbuild.sh fat32 build/disk.img
   bash scripts/seed_selfbuild.sh ext2 build/disk_ext2.img
+  # Headers for /bin/clang and clangtest's fixtures.
+  bash scripts/seed_toolchain.sh fat32 build/disk.img
+  bash scripts/seed_toolchain.sh ext2 build/disk_ext2.img
 
   # build_tcc.sh applied lib/tcc/racccoon.patch to the submodule in place
   # (seed_tcc.sh needs the patched riscv64-link.c / riscv64-asm.c on the
