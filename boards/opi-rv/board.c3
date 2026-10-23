@@ -76,13 +76,11 @@ const uptr PLIC_S_CONTEXT = 2;
 // The PLIC's physical base; PLIC_BASE above is its alias.
 const uptr PLIC_PHYS_BASE = 0x0c000000;
 
-// Ceiling on the harts src/smp.c3's scaffold will try to bring up. Kept
-// at 1 for Stage 1 first-boot bring-up: racccoon runs on whichever
-// single U74 OpenSBI hands it, and SMP is an explicit non-goal until
-// this port itself is booted and verified (docs/opi-rv-plan.md's
-// "Non-goals"). Raise when resuming SMP Stage C3 on this board — see
-// the smp memory note (racccoon_smp) — not before.
-const uint SMP_MAX_HARTS = 1;
+// How many harts to run (src/smp.c3), counted from SMP_HART_MIN: the four
+// U74s, harts 1-4. Hart 0 is the S7 monitor core (no MMU) — never started.
+// SMP Stage C3 (2026-10-22): every started hart schedules.
+const uint SMP_MAX_HARTS = 4;
+const uint SMP_HART_MIN = 1;
 
 // --- Devices ------------------------------------------------------------
 // No boot-driver hardware is declared yet — DEVICES below is empty, so

@@ -88,6 +88,10 @@ const uptr PLIC_PHYS_BASE = PLIC_BASE;
 // secondaries just announce and park (no SMP scheduler — non-goal).
 const uint SMP_MAX_HARTS = 1;
 
+// The lowest hart racccoon may start (src/smp.c3's smp_start_secondaries
+// starts SMP_MAX_HARTS of them from here). 0 here.
+const uint SMP_HART_MIN = 0;
+
 // --- Devices ---------------------------------------------------------
 // sifive_u has no virtio-mmio and racccoon has no SPI-SD driver, so this
 // harness declares no boot-driver hardware (DEVICES is empty) and boots with

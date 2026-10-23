@@ -523,6 +523,20 @@ fn bool try_lazy_fault(ulong scause, ulong stval) @noinline
 	// mapped high now (boards/qemu/board.c3 PLIC_BASE).
 	if (pte_present(current_proc.page_table, page))
 	{
+		// SMP Stage C3: already mapped with the access this fault needs =
+		// a spurious fault, not a real one — another hart mapped it first
+		// (two threads of one address space faulting the same page), or
+		// this hart still held a stale "not mapped" translation. Flush the
+		// local entry and retry, as Linux does; killing the process here
+		// broke wasmtest on four harts.
+		ulong leaf = pte_leaf(current_proc.page_table, page);
+		ulong need = (ulong)(scause == SCAUSE_STORE_PAGE_FAULT ? PAGE_W
+			: scause == SCAUSE_INST_PAGE_FAULT ? PAGE_X : PAGE_R);
+		if ((leaf & PAGE_U) != 0 && (leaf & need) != 0)
+		{
+			flush_tlb_page(page);
+			return true;
+		}
 		return false;
 	}
 	uptr phys = try_alloc_pages(1); // zero-filled
@@ -616,6 +630,10 @@ fn bool kernel_housekeeping() @noinline
 fn void handle_trap(Trap_frame* f) @export("handle_trap") @noinline @nostrip
 {
 	kernel_lock.acquire();
+	// SMP Stage C3: current_proc names the process of the hart holding
+	// kernel_lock — this one now (smp.c3's Hart.current).
+	current_proc = harts[this_hartid()].current;
+	if ((read_reg("sstatus") & SSTATUS_SPP) == 0) { sched_check_kill(); }
 	handle_trap_body(f);
 	kernel_lock.release();
 }

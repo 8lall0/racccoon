@@ -102,6 +102,10 @@ const ulong TIMEBASE_HZ = 25000000;
 // smp_start_secondaries() is a no-op at this value.
 const uint SMP_MAX_HARTS = 1;
 
+// The lowest hart racccoon may start (src/smp.c3's smp_start_secondaries
+// starts SMP_MAX_HARTS of them from here). 0 here.
+const uint SMP_HART_MIN = 0;
+
 // Largest image SYS_EXEC will install (src/syscalls.c3's EXEC_MAX_IMAGE_SIZE
 // and the staging arrays it sizes). 4 MiB: racccoon's own binaries are
 // 70-190 KiB and TinyCC ~640 KiB, but a GOOS=racccoon program is 0.9-1.5

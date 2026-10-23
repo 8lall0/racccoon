@@ -152,6 +152,10 @@ const ulong TIMEBASE_HZ = 10000000;
 // secondaries only announce themselves and park (no SMP scheduler yet).
 const uint SMP_MAX_HARTS = 8;
 
+// The lowest hart racccoon may start (src/smp.c3's smp_start_secondaries
+// starts SMP_MAX_HARTS of them from here). 0 here.
+const uint SMP_HART_MIN = 0;
+
 // Largest image SYS_EXEC will install (src/syscalls.c3's EXEC_MAX_IMAGE_SIZE
 // and the staging arrays it sizes at this value, 12 bytes per page: 384 KiB
 // of kernel .bss here). 128 MiB on QEMU — RAM is plentiful (1792 MiB

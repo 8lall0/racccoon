@@ -194,8 +194,57 @@ const ulong IPC_CALL_DEADLINE_TICKS = board::TIMEBASE_HZ * 15;
 // called by the supervisor watchdog (src/supervisor.c3) on a wedged
 // server. Safe from the timer-trap context the watchdog runs in — it's
 // the same page alloc/free machinery the respawn path there already uses.
+// A fresh read of p.on_hart per call: @noinline so the -O2 optimizer can't
+// hoist it out of proc_destroy's wait loop (another hart clears it) —
+// same trick as smp.c3's hart_is_online.
+fn int proc_on_hart(Process* p) @noinline
+{
+	return p.on_hart;
+}
+
 fn void proc_destroy(Process* target, int exit_code) @noinline
 {
+	// SMP Stage C3: never free an address space another hart runs in.
+	// Caught mid-switch (its hart has dropped kernel_lock and is saving it),
+	// wait the few instructions for sched_after_switch; running there, it
+	// can only be in user mode or queued on kernel_lock (this hart holds
+	// it) — mark it and let it destroy itself at its next trap
+	// (sched_check_kill).
+	if (target.on_hart >= 0 && target.on_hart != (int)this_hartid())
+	{
+		int th = target.on_hart;
+		bool waited_out = false;
+		if (harts[th].current != target)
+		{
+			ulong spins = 0;
+			while (proc_on_hart(target) == th)
+			{
+				spins++;
+				if (spins == 50_000_000) // DBG-ONHART (temporary)
+				{
+					io::printfn("ONHART stuck: target pid=%d state=%d on_hart=%d kill_pending=%d (I am hart %d)",
+						target.pid, target.state, target.on_hart, target.kill_pending ? 1 : 0, this_hartid());
+					for (uint dh = 0; dh < SMP_MAX_HARTS; dh++)
+					{
+						if (!harts[dh].scheduling) { continue; }
+						Process* dc = harts[dh].current;
+						Process* ds = harts[dh].switched_from;
+						io::printfn("  hart %d: current pid=%d (on_hart=%d) switched_from=%d", dh,
+							dc != null ? dc.pid : -1, dc != null ? dc.on_hart : -9, ds != null ? ds.pid : -1);
+					}
+					waited_out = true;
+					break;
+				}
+			}
+		}
+		if (harts[th].current == target || waited_out)
+		{
+			target.kill_pending = true;
+			target.kill_code = exit_code;
+			return;
+		}
+	}
+
 	proc_record_exit(target.pid, target.generation, target.parent_pid, exit_code);
 
 	// A target torn down mid-blocking-wait would otherwise leak its
@@ -294,6 +343,13 @@ fn void sys_kill(Trap_frame* f) @noinline
 	// `&&` / `||` (code -1). Teardown is shared with sys_exit and the
 	// supervisor watchdog — see proc_destroy.
 	proc_destroy(kill_target, -1);
+	// Deferred (running on another hart): wait, briefly, for it to go —
+	// kill stays synchronous for callers that check right after.
+	ulong kill_until = time_now() + board::TIMEBASE_HZ * 2;
+	while (kill_target.kill_pending && kill_target.pid == kill_pid && time_now() < kill_until)
+	{
+		yield();
+	}
 	f.a0 = 0;
 }
 
@@ -501,6 +557,8 @@ fn void sys_rfork(Trap_frame* f) @noinline
 		child.call_seq = 0;
 		child.msg_call_seq = 0;
 		child.reply_owed_seq = 0;
+		child.on_hart = -1;
+		child.kill_pending = false;
 		child.ipc_bounced = false;
 		child.wake_pending = false;
 		child.sleep_deadline = 0;

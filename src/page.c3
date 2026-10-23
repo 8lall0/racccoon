@@ -267,6 +267,19 @@ fn bool pte_present(ulong* table2, uptr vaddr)
 	return (table0[vpn0] & PAGE_V) != 0;
 }
 
+// The leaf PTE mapping `vaddr`, or 0 when there is none (same walk as
+// pte_present).
+fn ulong pte_leaf(ulong* table2, uptr vaddr)
+{
+	uint vpn2 = (uint)((vaddr >> 30) & 0x1ff);
+	if ((table2[vpn2] & PAGE_V) == 0) return 0;
+	ulong* table1 = (ulong*)pte_to_paddr(table2[vpn2]);
+	uint vpn1 = (uint)((vaddr >> 21) & 0x1ff);
+	if ((table1[vpn1] & PAGE_V) == 0) return 0;
+	ulong* table0 = (ulong*)pte_to_paddr(table1[vpn1]);
+	return table0[(uint)((vaddr >> 12) & 0x1ff)];
+}
+
 fn void map_page(ulong* table2, uptr vaddr, uptr paddr, uint flags)
 {
 	if (!mem::ptr_is_aligned((void*)vaddr, PAGE_SIZE))

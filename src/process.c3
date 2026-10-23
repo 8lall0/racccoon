@@ -408,6 +408,17 @@ struct Process
 	// the same message again, once the receiver's inbox frees up.
 	bool ipc_bounced;
 
+	// SMP Stage C3: the hart this process is running on, or -1. The
+	// scheduler never picks a process another hart runs; it stays set
+	// from the switch onto a hart until that hart has switched away and
+	// saved it (sched_after_switch clears it on the far side).
+	int on_hart;
+	// A kill aimed at a process running on another hart (proc_destroy
+	// can't free an address space a hart is executing in): the victim
+	// destroys itself with kill_code at its next trap (handle_trap).
+	bool kill_pending;
+	int  kill_code;
+
 	// FIFO send queue (docs/devlog.md, the "one inbox slot" item). A
 	// sender that finds this process's inbox busy used to yield-spin,
 	// RUNNABLE, until whoever happened to look next found it free — no
@@ -1053,6 +1064,7 @@ fn void user_entry() @naked @noinline @noreturn
 	// a leftover kernel-boot-time value nothing had zeroed before —
 	// harmless as long as nothing used tp, same as a0/a1 above.
 	asm(`
+        call sched_after_switch
         fence.i
         li t0, 0x1000000
         csrw sepc, t0
@@ -1089,6 +1101,7 @@ fn void user_entry() @naked @noinline @noreturn
 fn void fork_entry() @naked @noinline @noreturn
 {
 	asm(`
+        call sched_after_switch
         fence.i
         addi t0, sp, 8 * 31
         ld t0, 0(t0)
@@ -1319,6 +1332,8 @@ fn Process* create_process(void* image, uint image_size)
 	proc.ipc_peer_died = false;
 	proc.in_call_reply_wait = false;
 	proc.ipc_bounced = false;
+	proc.on_hart = -1;
+	proc.kill_pending = false;
 	proc.call_seq = 0;
 	proc.msg_call_seq = 0;
 	proc.reply_owed_pid = 0;
@@ -1497,11 +1512,13 @@ fn void yield() @noinline
 		service_pending_external_irq();
 	}
 
-	Process* next = idle_proc;
+	uint me = this_hartid();
+	Process* next = harts[me].idle;
 	for (int i = 0; i < PROCS_MAX; i++)
 	{
 		Process* proc = &procs[(current_proc.pid + i) % PROCS_MAX];
-		if (proc.state == PROC_RUNNABLE && proc.pid > 0)
+		if (proc.state == PROC_RUNNABLE && proc.pid > 0
+			&& (proc.on_hart < 0 || proc == current_proc))
 		{
 			next = proc;
 			break;
@@ -1510,10 +1527,18 @@ fn void yield() @noinline
 
 	if (next == current_proc)
 	{
+		// SMP Stage C3: a wait loop spins on yield() and lands here when
+		// nothing else is runnable on this hart. Let the other harts into
+		// the kernel before spinning again — holding the lock here would
+		// keep out the very process (on another hart) being waited for.
+		if (g_sched_harts > 1) { kernel_lock_breathe(); }
 		return;
 	}
 
 	Process* prev = current_proc;
+	next.on_hart = (int)me;
+	harts[me].current = next;
+	harts[me].switched_from = prev;
 	current_proc = next;
 
 	// Bracket the switch with an FP save/restore — switch_context is
@@ -1552,5 +1577,65 @@ fn void yield() @noinline
 	// the lock again on its next trap.
 	kernel_lock.release();
 	switch_context(&prev.sp, &next.sp, ((ulong)(uptr)next.page_table >> 12) | SATP_SV39, next_sscratch);
+	// Resumed — possibly on another hart than the one that switched away.
+	sched_after_switch();
 	kernel_lock.acquire();
+	current_proc = harts[this_hartid()].current;
+	sched_check_kill();
+}
+
+// A kill that arrived while this process ran on another hart
+// (proc_destroy's deferral): it is on this hart now, holding kernel_lock,
+// so tear it down here — like SYS_EXIT, the yield() never returns.
+fn void sched_check_kill() @noinline
+{
+	if (current_proc.kill_pending && current_proc.pid > 0)
+	{
+		current_proc.kill_pending = false;
+		proc_destroy(current_proc, current_proc.kill_code);
+		yield();
+	}
+}
+
+// SMP Stage C3: the context that just started running on this hart syncs
+// the instruction cache and marks the one it switched away from as free for
+// other harts — only now, its registers are saved. Called from yield() after switch_context and from
+// user_entry / fork_entry (a fresh context never returns into yield).
+// Runs without kernel_lock: a single store, read by the scheduler under it.
+fn void sched_after_switch() @export("sched_after_switch") @noinline @nostrip
+{
+	// The context now running may have last run on another hart, and the
+	// U74's instruction cache isn't coherent: this hart can still hold
+	// lines for those physical pages from code that lived there before
+	// (another program's, freed and reused). user_entry / fork_entry and
+	// exec already fence.i on their own hart; a context resumed through
+	// yield() went back to user mode on a different hart without one —
+	// illegal instructions and jumps into garbage on the real board, never
+	// in QEMU (it models no I-cache). Every switch passes through here.
+	asm(`fence.i`);
+	uint me = this_hartid();
+	Hart* h = &harts[me];
+	Process* p = h.switched_from;
+	h.switched_from = null;
+	// Clear only our own mark. This runs without kernel_lock: if `p` exited
+	// on the way out, its slot may already be reused (the supervisor
+	// respawning fsd into it) and the new process picked by another hart —
+	// an unconditional clear wiped that hart's mark, letting a second hart
+	// run the same process (found by fsdkilltest on 4 harts). Safe without
+	// the lock: other harts only ever mark a process whose mark is clear.
+	if (p != null && p != h.current && p.on_hart == (int)me) { p.on_hart = -1; }
+}
+
+// Drop the giant lock for a moment and take it back (yield's idle spin,
+// the idle loops). Releasing and immediately re-acquiring would usually
+// win the lock straight back from a hart spinning on it, so wait a few
+// microseconds first. Leaves current_proc pointing at this hart's process.
+fn void kernel_lock_breathe() @noinline
+{
+	kernel_lock.release();
+	ulong until = time_raw() + board::TIMEBASE_HZ / 100000 + 1;
+	while (time_raw() < until) { }
+	kernel_lock.acquire();
+	current_proc = harts[this_hartid()].current;
+	sched_check_kill();
 }

@@ -158,6 +158,9 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 	proc_set_name(idle_proc, "idle");
 	idle_proc.pid = 0;
 	current_proc = idle_proc;
+	harts[(uint)boot_hartid].idle = idle_proc;
+	harts[(uint)boot_hartid].current = idle_proc;
+	idle_proc.on_hart = (int)boot_hartid;
 
 	io::print("4: Idle configured\n");
 
@@ -386,14 +389,18 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 	// on a single-hart boot (default QEMU, the Duo). Deliberately last —
 	// the boot servers above must all be up first, since a secondary
 	// today does nothing but wfi and a real scheduler isn't wired in.
-	smp_start_secondaries();
-
-	// SMP Stage C2: the idle loop is kernel code — hold the giant lock for
-	// it, like handle_trap does. yield() drops and retakes it around each
-	// switch_context, so a runnable process gets the kernel while idle is
-	// parked. (Stage C3: an all-blocked system busy-spins yield() here
-	// holding the lock — idle then needs a wfi with the lock dropped.)
+	// SMP Stage C2/C3: the idle loop is kernel code — hold the giant lock
+	// for it, like handle_trap does. Taken before the secondaries start, so
+	// they queue on it (each creates its idle context under it) instead of
+	// running alongside the rest of kernel_main. yield() drops and retakes
+	// it around each switch_context.
+	// Kernel code runs with interrupts off (only idle's sched_idle_wait opens
+	// a window) — and the lock's interrupt nest must not record them as on:
+	// kernel_main ran with SIE set since enable_external_interrupts().
+	asm(`csrci sstatus, 2`);
 	kernel_lock.acquire();
+
+	smp_start_secondaries();
 
 	// Single call site for create_process(shell) below (a *respawn*
 	// only now — the initial spawn is explicit above): once the console
@@ -422,6 +429,10 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 		}
 
 		yield();
+		// Wait for work without the lock, interrupts open (sched_idle_wait).
+		// One hart: a zero-length window per pass — the old tight loop,
+		// which ran with interrupts on so idle still took the timer tick.
+		sched_idle_wait(g_sched_harts > 1 ? SCHED_IDLE_WAIT_TICKS : 0);
 	}
 }
 

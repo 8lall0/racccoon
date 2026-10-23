@@ -1,5 +1,7 @@
 module kernel;
 
+import panic;
+
 // SMP scheduler, Stage B (docs/roadmap.md §8, docs/devlog.md): a real
 // test-and-set spinlock plus a per-hart interrupt-disable nest, and the
 // first shared kernel structures put behind them (the page allocator, the
@@ -107,22 +109,31 @@ fn void irq_pop_off() @noinline
 struct Spinlock
 {
 	uint locked;
+	int  holder;   // hart + 1 while held, 0 free — the recursion check
 }
 
 fn void Spinlock.acquire(&self) @noinline
 {
 	irq_push_off();
-	// Uncontended in Stage B — the loop body never runs. The compiler
-	// can't hoist the amoswap (it's an opaque asm with a memory side
-	// effect), so this is a correct spin for Stage C too.
+	// SMP Stage C3: a hart re-taking a lock it holds would spin forever
+	// (and so would every other hart behind it) — fail loudly instead.
+	int me = (int)this_hartid() + 1;
+	if (self.locked != 0 && self.holder == me)
+	{
+		panic::panic("spinlock: recursive acquire on the same hart");
+	}
+	// The compiler can't hoist the amoswap (an opaque asm with a memory
+	// side effect), so this is a correct spin.
 	while (amoswap_w_acquire(&self.locked, 1) != 0)
 	{
 		asm(`nop`);
 	}
+	self.holder = me;
 }
 
 fn void Spinlock.release(&self) @noinline
 {
+	self.holder = 0;
 	amoswap_w_release(&self.locked, 0);
 	irq_pop_off();
 }
