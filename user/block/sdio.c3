@@ -196,3 +196,36 @@ fn bool sdio_set_bus_width(uint bits)
 	dw_write(DWMCI_CTYPE, bits == 4 ? DWMCI_CTYPE_4BIT : DWMCI_CTYPE_1BIT);
 	return true;
 }
+
+// --- the card interrupt ------------------------------------------------
+// The card side is CCCR 0x04 (bit 0 master enable, bit n function n).
+// In-band, the card signals on DAT1 between transfers and the controller
+// latches it in RINTSTS/INTMASK bit 16 (SDIO_INT, slot 0 — Linux dw_mmc
+// SDMMC_INT_SDIO(0) with sdio_id0 = 0), raising its IRQ line with
+// CTRL.INT_ENABLE. On the Orange Pi's sdio0 that latch never sets (the
+// card shows the interrupt pending in CCCR 0x05, the controller never
+// sees it — 2026-10-23; mainline Linux doesn't declare cap-sdio-irq there
+// either), so brcmd uses the module's out-of-band line instead and only
+// needs the card side.
+const uint DWMCI_INT_SDIO0 = 1u << 16;
+
+fn bool sdio_card_irq_enable(uint func_mask)
+{
+	return sdio_cmd52(true, 0, 0x04, (func_mask & 0xFE) | 1, null);
+}
+
+// The controller side of an in-band interrupt; only this bit is unmasked,
+// so the polled command / data paths are unaffected.
+fn void sdio_host_irq_enable()
+{
+	dw_write(DWMCI_RINTSTS, DWMCI_INT_SDIO0);
+	dw_write(DWMCI_INTMASK, DWMCI_INT_SDIO0);
+	dw_write(DWMCI_CTRL, dw_read(DWMCI_CTRL) | DWMCI_CTRL_INT_ENABLE);
+}
+
+// After the card's own interrupt source is cleared: drop the latched
+// controller bit (it latches again if the card still asserts).
+fn void sdio_host_irq_ack()
+{
+	dw_write(DWMCI_RINTSTS, DWMCI_INT_SDIO0);
+}

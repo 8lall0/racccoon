@@ -284,9 +284,9 @@ C3_OPT=-O2 build_user_program diskd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RA
 build_user_program sdd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 ${SDD_SOC_SRC:-user/block/sdhci.c3} user/block/sd_card.c3 user/block/sdd.c3
 # brcmd: the Orange Pi's AP6256 Wi-Fi (sdio0) — the same DW-MSHC driver as
 # the OPi's sdd (+ sd_card.c3 for the globals it shares), the SDIO layer
-# (sdio.c3) and the JH7110 iomux helpers. Built for every
+# (sdio.c3) and gpiod's client (its pins are gpiod's). Built for every
 # board (kernel.c3 embeds it unconditionally); only a "wifi" device spawns it.
-build_user_program brcmd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/block/dw_mshc.c3 user/block/sd_card.c3 user/block/sdio.c3 user/soc/jh7110_iomux.c3 user/net/link.c3 user/wifi/brcmd.c3
+build_user_program brcmd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/block/dw_mshc.c3 user/block/sd_card.c3 user/block/sdio.c3 user/gpio/gpio_client.c3 user/net/link.c3 user/wifi/brcmd.c3
 C3_OPT=-O2 build_user_program fsd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/fs/fsd.c3 user/fs/fat32.c3 user/fs/ext2.c3 user/fs/exfat.c3
 # procd — real stdlib: its /proc/<pid>/status text is now formatted with
 # io::bprintf (into the wire buffer, no allocation). Pure-IPC, supervised,
@@ -300,7 +300,9 @@ C3_OPT=-O2 build_user_program netd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RAC
 # ipd — the IP stack (user/net/ipd.c3): ARP/IPv4/ICMP/UDP/TCP/DHCP over the
 # link rings, serving /net/.
 C3_OPT=-O2 build_user_program ipd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/net/eth_proto.c3 user/net/dhcp.c3 user/net/link.c3 user/net/ipd.c3 user/net/ipd_conv.c3 user/net/ipd_tcp.c3
-build_user_program gpiod user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/gpio/gpiod.c3
+# gpiod: the board-neutral core + the SoC backend (GPIO_SOC_SRC —
+# scripts/build_opi.sh picks the JH7110 one; the Duo's is the default).
+build_user_program gpiod user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/gpio/gpio_client.c3 ${GPIO_SOC_SRC:-user/gpio/gpio_cv1800.c3} user/gpio/gpiod.c3
 build_user_program i2cd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/i2c/i2cd.c3
 build_user_program cifd user/user.c3 $RACCCOON_STD_DIR/atomic.c3 $RACCCOON_STD_DIR/mem.c3 $RACCCOON_STD_DIR/fmt.c3 $RACCCOON_STD_DIR/main_stub.c3 user/cif/cifd.c3
 

@@ -5,31 +5,36 @@ import std::nolibc::fmt;
 import std::nolibc::main_stub;
 
 // brcmd: the Orange Pi RV's onboard Wi-Fi — an AP6256 module (Broadcom
-// BCM43456, FullMAC) on the JH7110's sdio0 controller (0x16010000, the
-// "mmc 0" U-Boot fails to probe on every boot). Stages W0-W5 in the
-// memory note / devlog; this is W0 + W1 only:
+// BCM43456, FullMAC: the 802.11 stack and the WPA2 handshake run in the
+// chip's firmware) on the JH7110's sdio0 controller (0x16010000, the
+// "mmc 0" U-Boot fails to probe on every boot). Stages, as in the devlog:
 //
 //   W0  power: WL_REG_ON is sys GPIO 62 (mainline Linux's dts:
 //       mmc-pwrseq-simple, reset-gpios = <&sysgpio 62 GPIO_ACTIVE_LOW>),
-//       held low — the chip in reset — until someone drives it high.
+//       held low — the chip in reset — until someone drives it high. The
+//       pin, the sdio0 pads and the WL_HOST_WAKE line (GPIO21) are on the
+//       sys iomux, which gpiod owns: brcmd asks it (gpio_client.c3).
 //   W1  SDIO enumeration on sdio0 through dw_mshc.c3 (the same DesignWare
-//       controller sdd drives on sdio1): CMD0, CMD5 until the card is
-//       ready, CMD3, CMD7, then CMD52 reads of its common registers
-//       (CCCR) and the manufacturer tuple — Broadcom is vendor 0x02D0.
-//
-//   W2a SDIO setup: function 1 on, block sizes, 4-bit bus; CMD53 transfers.
-//   W2b the chip itself: the ALP clock request, then its id register on
-//       the backplane (through function 1's 32 KiB address window).
-//
-//   W2c the cores, from the chip's enumeration ROM.
-//   W2d the firmware: halt the ARM CR4, download /lib/firmware's
-//       brcmfmac43456-sdio.bin + .txt (NVRAM) into its RAM, release it,
-//       wait for function 2 (data) to come up.
-//
-// Prints what it finds, then idles as a server. The control channel and
-// joining a network (W3/W4) build on this.
+//       controller sdd drives on sdio1) and sdio.c3: CMD0, CMD5 until the
+//       card is ready, CMD3, CMD7, the CCCR and the manufacturer tuple —
+//       Broadcom is vendor 0x02D0.
+//   W2  function 1, block sizes, 4-bit 25 MHz; the chip id and its cores
+//       (the enumeration ROM) through function 1's backplane window; the
+//       firmware: halt the ARM CR4, download /lib/firmware's
+//       brcmfmac43456-sdio.bin + .txt (NVRAM), release it, function 2 up.
+//   W3  the control channel: SDPCM frames on function 2, BCDC commands
+//       ("ver", the CLM blob, the event mask, country, WLC_UP, escan).
+//   W4  station: the WPA2-PSK join through the firmware supplicant, from
+//       /adm/wifi or /bin/wifi (the same verbs usbd answers on the Duo).
+//   W5  data: SDPCM channel 2 <-> the "ether1" link ring for ipd; glom
+//       superframes; the firmware's tx window. Frame-ready reaches us as
+//       the out-of-band WL_HOST_WAKE interrupt: gpiod watches GPIO21 and
+//       wakes us (the in-band SDIO interrupt never reaches sdio0's
+//       controller on this board).
 
-const uint WL_REG_ON  = 62;          // sys GPIO, the AP6256 WL_REG_ON line
+const uint WL_REG_ON  = 62;          // sys GPIO, the AP6256 WL_REG_ON line (via gpiod)
+const uint WL_HOST_WAKE = 21;        // sys GPIO, its out-of-band interrupt (via gpiod)
+const uint SDIO_CCCR_BRCM_SEPINT = 0xF2;
 const uptr SDIO0_BASE   = 0x16010000;
 
 // --- the chip's backplane through function 1 (brcmfmac bcmsdh.c) ------
@@ -735,6 +740,13 @@ fn int cat(char* out, int n, char* s)
 	return n;
 }
 
+fn int cat_hex(char* out, int n, uint v)
+{
+	char* hx = "0123456789abcdef";
+	for (int sh = 28; sh >= 0; sh -= 4) { out[n] = hx[(v >> sh) & 0xF]; n++; }
+	return n;
+}
+
 // The scan list as /bin/wifi prints it: bssid channel signal security ssid.
 fn int scan_text(char* out, int cap)
 {
@@ -1246,6 +1258,17 @@ fn bool control_hello(Brcm_core* sdc)
 		if (g_link_ok) { g_link_ring.h.link_up = 0; } else { print("brcmd: can't create link ether1\n"); }
 	}
 	print("brcmd: W3a done\n");
+	// The firmware's frame-ready (I_HMB_FRAME_IND, in hostintmask) as an
+	// interrupt: enabled at the card for functions 1 + 2, then redirected
+	// to the module's WL_HOST_WAKE pin (Broadcom CCCR 0xF2 SEPINT: mask |
+	// output enable | active high — brcmfmac's OOB setup; the NVRAM's
+	// muxenab=0x10 routes it to the pin), which is sys GPIO21: gpiod
+	// watches it and wakes us. In-band doesn't reach sdio0's controller
+	// on this board (user/block/sdio.c3).
+	g_irq_ok = sdio_card_irq_enable((1u << 1) | (1u << 2))
+		&& sdio_cmd52(true, 0, SDIO_CCCR_BRCM_SEPINT, 0x07, null)
+		&& gpio_request(GPIO_IPC_WATCH, WL_HOST_WAKE, GPIO_TRIG_LEVEL_HIGH, null) == GPIO_OK;
+	print(g_irq_ok ? "brcmd: interrupts via WL_HOST_WAKE (GPIO21, gpiod)\n" : "brcmd: no host-wake interrupt — polling\n");
 
 	clm_load(sdc);
 	event_mask_enable(sdc);
@@ -1285,6 +1308,10 @@ const uint WIFI_IPC_STATUS = 42;
 const uint WIFI_IPC_JOIN   = 43;   // req: [ssid, NUL-padded to 33][have_pmk][pmk 32]
 const uint WIFI_IPC_LEAVE  = 44;
 
+bool g_irq_ok;
+ulong g_wakes;
+ulong g_wake_window;
+uint g_wake_burst;
 char[4096] g_reply;
 ulong g_rx_kicked;
 
@@ -1326,6 +1353,8 @@ fn void wifi_ipc(int from, uint verb, uint from_gen, char* req, bool up)
 		n = cat(&r[4], n, "/");
 		n += fmt::format_uint((uint)g_tx_data, &r[4 + n]);
 		if (g_rx_gloms != 0) { n = cat(&r[4], n, " gloms "); n += fmt::format_uint((uint)g_rx_gloms, &r[4 + n]); }
+		n = cat(&r[4], n, g_irq_ok ? " host-wake, wakes " : " polled");
+		if (g_irq_ok) { n += fmt::format_uint((uint)g_wakes, &r[4 + n]); }
 		if (g_sta_reason != 0) { n = cat(&r[4], n, " last reason "); n += fmt::format_uint(g_sta_reason, &r[4 + n]); }
 		n = cat(&r[4], n, " (AP6256)\n");
 	}
@@ -1360,15 +1389,24 @@ fn bool sdio_enumerate()
 
 fn void main()
 {
-	print("brcmd: AP6256 Wi-Fi — powering on (WL_REG_ON = GPIO 62)\n");
-	jh7110_gpio_out(WL_REG_ON, false);
-	delay_ms(20);
-	jh7110_gpio_out(WL_REG_ON, true);
-	delay_ms(250); // the chip's own power-up before SDIO answers
-
-	bool up = false;
+	// The pins live on the sys iomux, gpiod's page: power, pads, host wake.
 	srv_post("brcmd");   // /bin/wifi: ns_mount("/srv/brcmd/", "brcmd")
-	jh7110_sdio0_pads();
+	bool up = false;
+	if (ns_mount_wait("/srv/gpiod/", "gpiod", 200) < 0) { print("brcmd: gpiod isn't running — can't power the AP6256\n"); }
+	print("brcmd: AP6256 Wi-Fi — powering on (WL_REG_ON = GPIO 62)\n");
+	gpio_request(GPIO_IPC_SET_DIR, WL_REG_ON, 1, null);
+	gpio_request(GPIO_IPC_WRITE, WL_REG_ON, 0, null);
+	delay_ms(20);
+	gpio_request(GPIO_IPC_WRITE, WL_REG_ON, 1, null);
+	delay_ms(250); // the chip's own power-up before SDIO answers
+	// sdio0's pads (PAD_SD0_CLK 64 .. PAD_SD0_DATA7 73) as jh7110-common.dtsi's
+	// mmc0_pins sets them: pull-up, 12 mA, input enabled — nothing in the
+	// boot chain does (U-Boot gives up on mmc 0 first). WL_HOST_WAKE as
+	// the pcie1 wake-pins set GPIO21 there: an input with a pull-up.
+	for (uint pad = 64; pad <= 73; pad++) { gpio_request(GPIO_IPC_PAD, pad, GPIO_PAD_INPUT | GPIO_PAD_PULL_UP | GPIO_PAD_STRONG, null); }
+	gpio_request(GPIO_IPC_SET_DIR, WL_HOST_WAKE, 0, null);
+	gpio_request(GPIO_IPC_PAD, WL_HOST_WAKE, GPIO_PAD_INPUT | GPIO_PAD_PULL_UP, null);
+
 	g_dw_base = SDIO0_BASE;
 	g_dw_timebase_hz = timebase_hz();
 	if (!dw_mshc_init_ctrl())
@@ -1396,11 +1434,31 @@ fn void main()
 		}
 	}
 
-	// Serve /bin/wifi; between requests, poll the firmware for events
-	// (20 Hz — there's no interrupt yet: the OOB line is GPIO21, W5).
+	// Serve /bin/wifi; sleep until a request, a doorbell (AW_WAKE: gpiod
+	// for WL_HOST_WAKE, ipd for a TX frame) or the fallback timer. The
+	// fallback is 200 ms with the host-wake line (a missed wake costs at
+	// most that), 50 ms without: the firmware's receive path stalls,
+	// handshake frames included, when the host leaves frames queued ~1 s.
 	for (;;)
 	{
-		int ready = await_any(AW_MSG | AW_WAKE, timebase_hz() / 20, null, 0);
+		ulong wait = g_irq_ok ? timebase_hz() / 5 : timebase_hz() / 20;
+		int ready = await_any(AW_MSG | AW_WAKE, wait, null, 0);
+		bool woken = ready > 0 && ((uint)ready & AW_WAKE) != 0;
+		if (woken)
+		{
+			g_wakes++;
+			// A line that won't drop would spin this loop (and starve the
+			// console): > 2000 wakes in a second -> drop the watch, poll.
+			ulong now = rdtime();
+			if (now - g_wake_window > timebase_hz()) { g_wake_window = now; g_wake_burst = 0; }
+			g_wake_burst++;
+			if (g_irq_ok && g_wake_burst > 2000)
+			{
+				gpio_request(GPIO_IPC_UNWATCH, WL_HOST_WAKE, 0, null);
+				g_irq_ok = false;
+				print("brcmd: host-wake storm — watch dropped, polling at 20 Hz\n");
+			}
+		}
 		if (ready > 0 && ((uint)ready & AW_MSG) != 0)
 		{
 			char[516] buf @noinit;
@@ -1409,7 +1467,17 @@ fn void main()
 			int from = ipc_recv_type_gen(&buf, 516, &verb, &from_gen);
 			if (from > 0) { wifi_ipc(from, verb, from_gen, &buf[0], up); }
 		}
-		if (up) { f2_drain(g_sdc); data_output(); f2_drain(g_sdc); }
+		if (up)
+		{
+			// Drain (f2_poll clears the firmware's intstatus each pass, which
+			// drops WL_HOST_WAKE), send, drain, then re-arm the watch: gpiod
+			// masked the pin when it woke us, and a line still high at
+			// re-arm fires again at once, so nothing is lost.
+			f2_drain(g_sdc);
+			data_output();
+			f2_drain(g_sdc);
+			if (g_irq_ok && woken) { gpio_request(GPIO_IPC_REARM, WL_HOST_WAKE, 0, null); }
+		}
 		if (up && g_link_ok && g_rx_data != g_rx_kicked) { g_rx_kicked = g_rx_data; link_kick(&g_link_ring); }
 	}
 }

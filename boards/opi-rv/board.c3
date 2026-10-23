@@ -120,11 +120,22 @@ const Device[*] DEVICES = {
 		// a multi-sector write can be one op. The Duo keeps inline.
 		.disk_arena = true,
 	},
-	// The AP6256 Wi-Fi (Broadcom BCM43456) on sdio0, and the sys iomux page
-	// for its WL_REG_ON line (GPIO 62) — user/wifi/brcmd.c3. Polled.
+	// The AP6256 Wi-Fi (Broadcom BCM43456) on sdio0 — user/wifi/brcmd.c3.
+	// Its pins (WL_REG_ON GPIO 62, the WL_HOST_WAKE interrupt on GPIO21,
+	// the sdio0 pads) belong to the sys iomux, gpiod's: brcmd asks for them.
 	{
 		.name = "wifi",
-		.mmio = { 0x16010000, 0x13040000 },
+		.mmio = { 0x16010000 },
+	},
+	// The sys pinctrl / GPIO block (sys iomux) — gpiod with the JH7110
+	// backend (user/gpio/gpio_jh7110.c3). One PLIC source for all 64 GPIO
+	// interrupts (jh7110.dtsi sysgpio: 86), level: gpiod re-arms it.
+	{
+		.name = "gpio",
+		.mmio = { 0x13040000 },
+		.irq = 86,
+		.irq_level = true,
+		.irq_armed = true,
 	},
 };
 

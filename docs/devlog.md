@@ -3,6 +3,82 @@
 Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
+## 2026-10-23 (later) — Wi-Fi interrupts through a board-neutral gpiod: ping 50 ms → 2 ms
+
+**Goal (the user's):** cut the Wi-Fi latency, and use gpiod for the
+board's GPIO rather than having brcmd poke pins itself.
+
+**Result, on the real Orange Pi:**
+- `ping 192.168.1.1`: 20/20 at ~2 ms, down from ~50 ms (the 20 Hz poll).
+- The HTTP fetch still works.
+- gpiod and brcmd sit blocked between packets.
+
+**How it was found (board diagnostics, temporary code since removed):**
+- **In-band SDIO interrupt: dead on this board.** Before each drain,
+  out of 7 wakes with frames waiting: the firmware had them flagged 7×,
+  the card showed the interrupt pending (CCCR 0x05) 7×, the DW-MSHC
+  latched it (RINTSTS bit 16) 0×. Mainline Linux's DT has no
+  `cap-sdio-irq` on mmc0 either.
+- **Out-of-band works.** The module's WL_HOST_WAKE is sys GPIO21. Per
+  the Orange Pi RV DT author on LKML, it was left out of Linux only
+  because the StarFive pinctrl driver and brcmfmac don't fit together.
+  It needs:
+  - CCCR 0xF2 SEPINT = 0x07 (mask | output enable | active high);
+  - the NVRAM's `muxenab=0x10` (already there);
+  - the pad as an input with pull-up;
+  - **GPIOEN (0x0dc) = 1.** Without it the JH7110's GPIOIN reads all
+    zeroes; that cost one board cycle.
+  With all four set, GPIO21 was high 8/8 times with frames pending and
+  0 times idle.
+- **A 1 s fallback poll breaks the join.** The firmware's receive path
+  stalls, handshake frames included, when the host leaves frames queued
+  that long (associated, but never keyed; once a deauth, reason 2).
+  20 Hz is fine; the fallback with interrupts is now 200 ms.
+
+**gpiod, redesigned:**
+- **Core** (`user/gpio/gpiod.c3`):
+  - Board-neutral: pins are global numbers, checked against the
+    backend's allowlist.
+  - Sleeps in `await_any` (request / IRQ / the backend's tick) instead of
+    busy-polling with yield.
+  - Pin watches: a fire masks the pin and `wake()`s the subscriber,
+    which re-arms it. A line still high at re-arm fires again, so
+    nothing is lost.
+- **Backends**, picked per board by `GPIO_SOC_SRC`:
+  - `gpio_cv1800.c3` — the Duo's DW-APB GPIO: the same 4-pin allowlist,
+    LED blink and C8 reset as before, still poll-only;
+  - `gpio_jh7110.c3` — the sys GPIO block: pad config, pin interrupts on
+    PLIC 86 (level), and the init Linux does (IE masked, edge flags
+    cleared, GPIOEN).
+  It absorbed `user/soc/jh7110_iomux.c3`.
+- **Protocol + client** (`user/gpio/gpio_client.c3`): new verbs PAD,
+  WATCH, REARM, UNWATCH. Requests are `'#'` + a 16-bit pin number. The
+  old bank-letter form (`'C'`, 24) still works, so camtest/caminit/
+  cifinit/i2cd/`/bin/gpio` are unchanged.
+- **Orange Pi board:** a "gpio" device (sys iomux, IRQ 86). "wifi" is now
+  sdio0 only: brcmd asks gpiod for WL_REG_ON, the sdio0 pads and a
+  watch on GPIO21.
+- **SDIO layer:** the card and controller halves of the interrupt enable
+  are separate functions; out-of-band uses only the card half.
+
+**Noticed, not fixed:**
+- `PLIC_S_CONTEXT = 2` on the Orange Pi is hart 1's S context. Interrupts
+  only reach the kernel if OpenSBI boots it on hart 1, which it did
+  today. It should be derived from the boot hart.
+- The first ping after boot often gets 1/4 replies (ARP warm-up?).
+
+**Duo re-check (same session):** with the new gpiod and the SMP C3 kernel:
+- gpiod comes up with the CV1800B backend and the LED blinks (the user
+  watched it); `gpio C24 read` stays 0 (EXT_PORT on an output).
+- The old-form `gpio A28 dir out/write/read` round-trips 1/0; an off-list
+  pin is refused.
+- gpiodkilltest ok.
+- Battery: p9/ns/ps/srv/env/elf/argv/perm/stdio/map/oom/fault/devinfo/fpu/
+  ipcdeath/rfork/thread/mutex, wasm/lua/tcc/go, fsdkill, bigdir,
+  ipcfifo 5/5, note, await, seg, sig, wake — all ok.
+- Not covered: the camera reset pin (camtest needs the camera attached).
+
+---
 ## 2026-10-23 — the Orange Pi RV's onboard Wi-Fi (AP6256): from power-on to an HTTP page
 
 **Goal (the user's):** use the board's own Wi-Fi chip, an AP6256 module

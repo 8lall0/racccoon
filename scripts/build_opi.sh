@@ -31,7 +31,7 @@ set -e
   # User-mode binaries have no board dependency (see build_duo.sh's own
   # comment — every board:: reference in user/ is in a comment; the
   # real board facts reach user code by syscall).
-  SDD_SOC_SRC=user/block/dw_mshc.c3 bash scripts/build_user.sh
+  SDD_SOC_SRC=user/block/dw_mshc.c3 GPIO_SOC_SRC=user/gpio/gpio_jh7110.c3 bash scripts/build_user.sh
 
   kernel_compile racccoon-opi kernel_opi
 
