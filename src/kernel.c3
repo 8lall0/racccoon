@@ -66,6 +66,8 @@ extern char[] _binary_netd_bin_start @cname("_binary_netd_bin_start");
 extern char[] _binary_netd_bin_end @cname("_binary_netd_bin_end");
 extern char[] _binary_gpiod_bin_start @cname("_binary_gpiod_bin_start");
 extern char[] _binary_gpiod_bin_end @cname("_binary_gpiod_bin_end");
+extern char[] _binary_brcmd_bin_start @cname("_binary_brcmd_bin_start");
+extern char[] _binary_brcmd_bin_end @cname("_binary_brcmd_bin_end");
 extern char[] _binary_i2cd_bin_start @cname("_binary_i2cd_bin_start");
 extern char[] _binary_i2cd_bin_end @cname("_binary_i2cd_bin_end");
 extern char[] _binary_cifd_bin_start @cname("_binary_cifd_bin_start");
@@ -360,6 +362,16 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 		service_boot("i2cd", (char*)&_binary_i2cd_bin_start, (char*)&_binary_i2cd_bin_end,
 			device: i2c_dev);
 		io::print("i2cd created\n");
+	}
+	// The Orange Pi RV's AP6256 Wi-Fi on sdio0 (user/wifi/brcmd.c3): loads
+	// the firmware, joins /adm/wifi, serves /bin/wifi at /srv/brcmd/ and
+	// the "ether1" link ring for ipd. Polled.
+	int wifi_dev = device_find("wifi");
+	if (wifi_dev >= 0)
+	{
+		service_boot("brcmd", (char*)&_binary_brcmd_bin_start, (char*)&_binary_brcmd_bin_end,
+			device: wifi_dev);
+		io::print("brcmd created\n");
 	}
 	int cif_dev = device_find("cif");
 	if (cif_dev >= 0)

@@ -230,8 +230,12 @@ const uint DW_SYSCON_PHASE_OFF   = 0x9C;       // starfive,sysreg arg 0 (mmc1; m
 const uint DW_SYSCON_PHASE_MASK  = 0x3E;       // starfive,sysreg arg 2 (mmc1; mmc0: 0x7C000000)
 const uint DW_SYSCON_PHASE_SHIFT = 1;          // starfive,sysreg arg 1 (mmc1; mmc0: 26)
 
-fn uint dw_read(uint off)  { return mmio_read32((uptr)(DW_BASE + off)); }
-fn void dw_write(uint off, uint v) { mmio_write32((uptr)(DW_BASE + off), v); }
+// The controller this binary drives: sdio1 (the microSD) for sdd; brcmd
+// (user/wifi/brcmd.c3) points it at sdio0 (the AP6256 Wi-Fi) before init.
+uptr g_dw_base = DW_BASE;
+
+fn uint dw_read(uint off)  { return mmio_read32(g_dw_base + off); }
+fn void dw_write(uint off, uint v) { mmio_write32(g_dw_base + off, v); }
 
 // print_hex32 / print_uint / rdtime / mmio_* / timebase_hz : user/user.c3
 

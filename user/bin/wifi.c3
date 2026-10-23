@@ -2,8 +2,10 @@ module user;
 
 import std::io;
 
-// wifi [scan|list|status] — the USB Wi-Fi adapter's driver lives in usbd
-// (user/usb/rtl8192eu.c3); this talks to it over IPC at /srv/usbd/.
+// wifi [scan|list|status] — talks over IPC to whichever Wi-Fi driver the
+// board has: brcmd (the Orange Pi's onboard AP6256, user/wifi/brcmd.c3) at
+// /srv/brcmd/, else usbd (the Duo's USB adapter, user/usb/rtl8192eu.c3)
+// at /srv/usbd/. Both answer the same verbs.
 //   wifi scan     start a scan of channels 1-13 (~3 s), then list
 //   wifi list     the networks seen: bssid channel signal security ssid
 //   wifi status   adapter / station state
@@ -22,6 +24,7 @@ const uint WIFI_IPC_STATUS = 42;
 const uint WIFI_IPC_JOIN   = 43;
 const uint WIFI_IPC_LEAVE  = 44;
 
+char* g_srv = "/srv/usbd/";
 char[33] g_ssid;
 char[65] g_pass;
 bool g_have_pass;
@@ -36,7 +39,7 @@ fn int wifi_call(uint verb, char* out, int cap) {
         if (g_have_pass) wifi_pmk(&buf[34]);
     }
     uint rv = 0;
-    int from = p9_call_path("/srv/usbd/", verb, &buf[0], 516, &buf[0], 4096, &rv);
+    int from = p9_call_path(g_srv, verb, &buf[0], 516, &buf[0], 4096, &rv);
     if (from <= 0) return -1;
     int n = (int)((uint)buf[0] | ((uint)buf[1] << 8));
     if (n > cap - 1) n = cap - 1;
@@ -121,7 +124,8 @@ fn bool save_adm_wifi() {
 }
 
 fn void main(String[] args) {
-    if (ns_mount_wait("/srv/usbd/", "usbd", 20) < 0) { io::print("wifi: usbd isn't running\n"); exitcode(1); }
+    if (ns_mount("/srv/brcmd/", "brcmd") == 0) { g_srv = "/srv/brcmd/"; }
+    else if (ns_mount_wait("/srv/usbd/", "usbd", 20) < 0) { io::print("wifi: no Wi-Fi driver running (brcmd / usbd)\n"); exitcode(1); }
     char[4096] out;
     uint verb = WIFI_IPC_STATUS;
     bool then_list = false;
@@ -153,7 +157,7 @@ fn void main(String[] args) {
             if (!check_pass()) exitcode(1);
         }
     }
-    if (wifi_call(verb, &out[0], 4096) < 0) { io::print("wifi: no answer from usbd\n"); exitcode(1); }
+    if (wifi_call(verb, &out[0], 4096) < 0) { io::print("wifi: no answer from the Wi-Fi driver\n"); exitcode(1); }
     if (then_list) {
         ulong end = rdtime() + timebase_hz() * 4;
         while (rdtime() < end) { await_any(0, timebase_hz() / 10, null, 0); }

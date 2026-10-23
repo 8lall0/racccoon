@@ -3,6 +3,84 @@
 Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
+## 2026-10-23 — the Orange Pi RV's onboard Wi-Fi (AP6256): from power-on to an HTTP page
+
+**Goal (the user's):** use the board's own Wi-Fi chip, an AP6256 module
+(Broadcom BCM43456, "FullMAC": the 802.11 stack and the WPA2 handshake
+run in firmware on the chip's ARM core). The host side is all ours:
+SDIO, firmware download, the control protocol, events, data frames.
+
+**Result, on the real board:** at boot `brcmd` powers the chip, loads its
+firmware, scans, joins the network in `/adm/wifi` with WPA2, and ipd gets
+a DHCP lease on `ether1`. `ping 192.168.1.1` 4/4, `dnsq example.com`
+resolves, `nc 172.66.147.243 80 < req` fetches example.com's page.
+`wifi scan|list|status|join|leave` work as on the Duo.
+
+**Layers (split at the user's request):**
+- `user/block/sdio.c3` — generic SDIO on the DW-MSHC driver: CMD52,
+  CMD53 byte and block mode, abort, identification (CMD5/3/7), CIS
+  MANFID, function enable, block size, bus width. A library linked into
+  the driver, not a server: every register access is a command, and an
+  IPC round trip on each would dominate.
+- `user/soc/jh7110_iomux.c3` — sys GPIO output and the sdio0 pad setup.
+- `user/wifi/brcmd.c3` — the Broadcom protocol, a boot server spawned by
+  the Orange Pi's "wifi" device (sdio0 0x16010000 + sys iomux).
+- `dw_mshc.c3`'s base address is now a variable (`g_dw_base`), so sdd
+  (sdio1) and brcmd (sdio0) share the driver.
+
+**Stages, each checked on the board:**
+- **W0 power:** WL_REG_ON is sys GPIO 62 (active-low reset in the device
+  tree). The sdio0 pads need IE|PU|12 mA; nothing in the boot chain sets
+  them.
+- **W1 enumeration:** CMD5 OCR 0x30ffff00 (3 functions), CIS vendor
+  0x02D0 (Broadcom).
+- **W2 backplane + firmware:** chip id 0x15294345 (BCM4345 rev 9), the
+  core list from the EROM, CR4 RAM 800 KiB at 0x198000. 482927 bytes of
+  firmware written and verified in 124 ms (4-bit, 25 MHz), then the
+  NVRAM, and the ARM core released. Gotchas:
+  - brcmfmac's clock sequence is required (CHIPCLKCSR 0x28, wait for
+    ALP, then force ALP + SDIOPULLUP=0). Without it CMD53 never returns
+    data.
+  - Byte-mode CMD53 max = the function's block size (64 on F1).
+- **W3 control channel:** SDPCM framing over F2, BCDC commands: "ver" →
+  `wl0: Jun 16 2017 ... version 7.45.96.2`, MAC 9c:b8:b4:8d:a9:70. Then
+  the CLM blob (regulatory data, 1400-byte chunks), the event mask,
+  country IT, WLC_UP, and escan: ~20 networks on 2.4 and 5 GHz.
+  Frames over 512 bytes go in block mode.
+- **W4 join:** infra/auth/wsec/wpa_auth/sup_wpa, the PMK, SET_SSID.
+  Two things the firmware insisted on:
+  - The PMK as **32 raw bytes**, not 64 hex digits: any length of the hex
+    form gives BCME_BADARG (-2).
+  - The **RSN element via "wpaie"** (WPA2, CCMP, PSK). Without it the
+    join is silently ignored: no event at all.
+  Then AUTH (3), LINK up (16), PSK_SUP status 6 (keyed), SET_SSID 0.
+  `/adm/wifi` is the same file the Duo's usbd reads (SSID + PMK hex).
+- **W5 data:** SDPCM channel 2 ↔ the `ether1` link ring. RX strips the
+  BCDC data header; TX adds one and respects the firmware's tx window
+  (SDPCM header word 2). Glom superframes (channel 3) are unpacked; the
+  LINK event first arrived inside one.
+
+**/bin/wifi** now tries brcmd (`/srv/brcmd/`) first, then usbd.
+
+**Firmware files** (Broadcom, not in git): brcmfmac43456-sdio.bin,
+.clm_blob, and the AP6256 nvram as brcmfmac43456-sdio.txt, from
+Armbian's firmware repo, on the card in /lib/firmware.
+
+**On reverse-engineering the firmware (the user asked):** not worth it.
+The blob is a whole 802.11 MAC plus PHY microcode; the realistic route to
+firmware-level control is Nexmon-style binary patches. The Duo's
+RTL8192EU path is already fully open.
+
+**Open:**
+- Interrupts: polling at 20 Hz, so ping is ~50 ms. Next: the OOB line
+  GPIO21 or the in-band SDIO card interrupt.
+- `nc -N` to example.com returned with no output while plain `nc` worked.
+  Probably not Wi-Fi; check on ethernet.
+- Bluetooth (same chip, BCM4345C5 over UART + BT_REG_ON + a .hcd patch):
+  the pins are not in the mainline device tree; a separate `btd` later.
+- 50 MHz on the SD card is still open (racccoon_opi_sd_highspeed).
+
+---
 ## 2026-10-22 (evening) — the Orange Pi RV as racccoon's build machine: c3c rebuilds itself in 40 min, a faster SD driver, SMP C1/C2, and the bugs it found
 
 **Goal (the user's):** compile racccoon on racccoon on real hardware,

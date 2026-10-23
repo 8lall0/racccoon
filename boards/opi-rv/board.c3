@@ -122,6 +122,12 @@ const Device[*] DEVICES = {
 		// a multi-sector write can be one op. The Duo keeps inline.
 		.disk_arena = true,
 	},
+	// The AP6256 Wi-Fi (Broadcom BCM43456) on sdio0, and the sys iomux page
+	// for its WL_REG_ON line (GPIO 62) — user/wifi/brcmd.c3. Polled.
+	{
+		.name = "wifi",
+		.mmio = { 0x16010000, 0x13040000 },
+	},
 };
 
 // fsd's per-board partition offset (learned via syscall, see fsd.c3). This is
