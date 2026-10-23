@@ -1534,8 +1534,10 @@ What a board provides:
 - **PLIC** placement — three constants: `PLIC_PHYS_BASE` (physical),
   `PLIC_BASE` (the virtual address the kernel uses once paging is on;
   identity on real boards, aliased to `0x7a000000` on QEMU virt) and
-  `PLIC_S_CONTEXT` (1 on QEMU virt/Duo, 2 on the JH7110/sifive_u). The driver
-  itself — register formulas, `plic_init` (threshold only), `plic_arm`,
+  `PLIC_S_CONTEXT_BASE` (1 on QEMU virt/Duo, 0 on the JH7110/sifive_u):
+  the S-mode context is `BASE + 2 * boot hart`, picked by `plic_init(boot_hart)`
+  — OpenSBI may start racccoon on any hart. The driver
+  itself — register formulas, `plic_init` (context + threshold), `plic_arm`,
   `plic_claim`/`plic_complete`/`plic_set_enabled`, and `map_plic(page_table)` —
   is shared, in `src/plic.c3`. **Which sources get armed at boot is data**: a
   `Device` with `irq_armed` in `DEVICES` (`plic_arm_devices()`, `device.c3`).

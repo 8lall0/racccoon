@@ -59,10 +59,11 @@ const ulong PTE_DEVICE_BITS = (1UL << 63) | (1UL << 60);
 // pretending a real vendor IRQ number.
 const uint IRQ_VIRTIO_BLK = 0;
 
-// Context = (hart, privilege mode) pair the PLIC targets — UNVERIFIED
-// for c900-plic, kept as QEMU virt's own convention (context 1 =
-// hart0 S-mode) pending real confirmation. See PLIC_BASE's comment.
-const uptr PLIC_S_CONTEXT = 1;
+// Context = (hart, privilege mode) pair the PLIC targets: QEMU virt's own
+// convention (context 1 = hart0 S-mode), confirmed on the board since the
+// interrupt-driven USB/SD work. src/plic.c3 adds 2 * the boot hart (0
+// here: the Duo runs one hart).
+const uptr PLIC_S_CONTEXT_BASE = 1;
 
 // The Duo identity-maps the PLIC: 0x70000000 is far above any 16 MiB Duo
 // heap, so virtual == physical. (QEMU virt aliases them apart — see

@@ -126,7 +126,8 @@ fn void kernel_main(ulong boot_hart) @export("kernel_main") @noinline @nostrip
 
 	write_reg("stvec", "kernel_entry");
 
-	plic_init();
+	plic_init((uint)boot_hartid);
+	io::printfn("PLIC: S-mode context %d (boot hart %d)", (int)g_plic_ctx, (int)boot_hartid);
 	plic_arm_devices();
 
 	// Turn the FPU on (sstatus.FS = Initial) — the C906 and QEMU virt both

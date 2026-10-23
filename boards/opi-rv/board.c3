@@ -21,7 +21,7 @@ import sbi;
 //   2. Hart 0 is a SiFive S7 "monitor" core with only an M-mode PLIC
 //      context; the four U74 application cores are harts 1..4. So the
 //      S-mode PLIC context of the hart racccoon actually runs on is
-//      NOT 1 (see PLIC_S_CONTEXT).
+//      2 * hart, not 1 (see PLIC_S_CONTEXT_BASE).
 //   3. timebase-frequency is 4 MHz (see TIMEBASE_HZ).
 // The PLIC register block itself is a stock SiFive design at the same
 // 0x0c000000 QEMU virt uses, so the offset formulas are unchanged.
@@ -60,18 +60,12 @@ const uint IRQ_VIRTIO_BLK = 0;
 //   context 2 : hart 1 (U74) S-mode          <&cpu1_intc 9>
 //   context 3 : hart 2 (U74) M-mode
 //   context 4 : hart 2 (U74) S-mode          ... etc.
-// i.e. for U74 hart h (h >= 1) the S-mode context is 2*h. racccoon is
-// single-hart and does not read its own hartid — it runs on whichever
-// hart OpenSBI/U-Boot hands it. On VisionFive 2 that is hart 1, giving
-// S-context 2. If the Orange Pi RV's firmware starts the S-mode payload
-// on a different U74, this must become 2*that-hart.
+// i.e. for U74 hart h (h >= 1) the S-mode context is 2*h.
 //
-// THIS IS THE #1 THING TO CHECK ON FIRST HARDWARE BOOT. If interrupts
-// never fire (or plic_claim() always returns 0 while sip.SEIP stays
-// asserted), the running hart's S-context does not match this value —
-// fix it here, nothing else in the kernel changes. The `board` seam
-// exists for exactly this.
-const uptr PLIC_S_CONTEXT = 2;
+// Confirmed on the board (brcmd's interrupts, 2026-10-23). OpenSBI starts
+// racccoon on any of harts 1-4, so the context isn't fixed: src/plic.c3
+// takes BASE + 2 * the boot hart (hart 1 -> 2, hart 3 -> 6).
+const uptr PLIC_S_CONTEXT_BASE = 0;
 
 // The PLIC's physical base; PLIC_BASE above is its alias.
 const uptr PLIC_PHYS_BASE = 0x0c000000;

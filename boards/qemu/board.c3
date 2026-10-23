@@ -56,9 +56,9 @@ const ulong PTE_DEVICE_BITS = 0;
 const uint IRQ_VIRTIO_BLK = 1;
 
 // Context = (hart, privilege mode) pair the PLIC targets. QEMU virt wires
-// context 2*hart for M-mode and 2*hart+1 for S-mode; single-hart S-mode
-// kernel, so context 1.
-const uptr PLIC_S_CONTEXT = 1;
+// context 2*hart for M-mode and 2*hart+1 for S-mode: S contexts start at 1
+// (src/plic.c3 adds 2 * the boot hart).
+const uptr PLIC_S_CONTEXT_BASE = 1;
 
 // fsd.c3 (see its own header comment) adds this to every logical sector
 // number before touching the disk — see boards/duo/board.c3's matching

@@ -24,7 +24,7 @@ import sbi;
 //   2. PLIC S-mode context = 2. sifive_u's PLIC `interrupts-extended`
 //      enumerates context 0 = hart0 M, context 1 = hart1 M, context 2 =
 //      hart1 S — the same `2 * hartid` layout the JH7110 devicetree has,
-//      and the same PLIC_S_CONTEXT = 2 that boards/opi-rv/board.c3 sets
+//      and the same S-context base 0 (2 * hartid) boards/opi-rv/board.c3 sets
 //      and flags as "THE #1 THING TO CHECK ON FIRST HARDWARE BOOT".
 //
 // So a green boot here retires open questions 1 (boot hart / context), 2
@@ -71,10 +71,9 @@ const uint IRQ_VIRTIO_BLK = 0;
 //   context 2 : hart 1 (U54)         S-mode   <-- racccoon runs here
 // i.e. the same `2 * hartid` rule as the JH7110. OpenSBI hands the S-mode
 // payload to hart 1 (hart 0 has no S-mode), giving S-context 2 — the
-// exact value boards/opi-rv/board.c3 assumes for the real board. If
-// interrupts never fire here, that assumption is wrong and this is where
-// it shows up.
-const uptr PLIC_S_CONTEXT = 2;
+// exact rule boards/opi-rv/board.c3 uses for the real board (src/plic.c3
+// adds 2 * the boot hart to this base).
+const uptr PLIC_S_CONTEXT_BASE = 0;
 
 // PLIC_BASE IS the physical address (0x0c000000, well below DRAM's
 // 0x80000000 base here, so no QEMU-`virt`-style aliasing is needed).

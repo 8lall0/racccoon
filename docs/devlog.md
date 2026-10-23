@@ -3,6 +3,36 @@
 Running log of work sessions with Claude Code. Newest entry on top.
 
 ---
+## 2026-10-23 (evening) — the PLIC context follows the boot hart
+
+**The fix:** the PLIC S-mode context was a per-board constant: hart 1's (2)
+on the Orange Pi, hart 0's (1) on QEMU virt / the Duo. OpenSBI may start
+racccoon on any of the Orange Pi's harts 1-4, and the boot hart is the one
+that takes external interrupts. Booted on hart 2-4, every interrupt
+would have been lost silently: no brcmd host-wake, no gpiod.
+
+- **Boards** state only `PLIC_S_CONTEXT_BASE`: 1 on QEMU virt / Duo, 0 on
+  the JH7110 / sifive_u. The rule on all four is BASE + 2 × hart.
+- **`plic_init(boot_hart)`** picks the context. The enable / threshold /
+  claim addresses and `map_plic`'s pages are computed from it; each
+  context's claim register sits on its own page.
+- The kernel prints `PLIC: S-mode context N (boot hart H)`.
+
+**Verified:**
+- QEMU ext2 at 1 and 4 harts: p9fswrite, fsdkill, net, tcp, sock,
+  ipcfifo ok.
+- Orange Pi: context 2 on boot hart 1; scan, WPA2 join, DHCP, ping
+  1.6-2.7 ms.
+- Not yet seen: a boot on hart 2-4. OpenSBI picks, and every boot today
+  landed on hart 1.
+
+**Open, intermittent:** on one Orange Pi boot brcmd stopped after
+"interface up". The escan never reported (not even its 15 s timeout
+message) and `wifi status` got no answer, though the shell itself was
+fine. The reboot was clean. Same PLIC context as the good boots, so not
+this change. Next time: `ps` / dmesg before rebooting.
+
+---
 ## 2026-10-23 (later) — Wi-Fi interrupts through a board-neutral gpiod: ping 50 ms → 2 ms
 
 **Goal (the user's):** cut the Wi-Fi latency, and use gpiod for the
